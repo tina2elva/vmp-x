@@ -83,24 +83,25 @@ fail=0
 run_case() {
     fn="$1"
     arg="$2"
-    # 注意：脚本是 set -e。命令替换里的命令失败会**直接终止脚本**（第一轮 CI 就因此在
-    # 打印任何 [FAIL] 之前退出，退出码 2），所以这里统一用 "cmd || rc=$?" 的形式。
+    # 注意：脚本是 set -e，命令替换里命令失败会直接终止脚本，所以统一用 "cmd || rc=$?"。
     nrc=0
-    n=$(./build/linux_target "$fn" "$arg" 2>/dev/null) || nrc=$?
+    nout=$(./build/linux_target "$fn" "$arg" 2>&1) || nrc=$?
     vrc=0
-    v=$(./build/linux_target.vmp "$fn" "$arg" 2>/dev/null) || vrc=$?
-    # 退出码单独报出来：139=SIGSEGV、132=SIGILL、134=SIGABRT、136=SIGFPE，
-    # 只显示 <crash> 的话在 CI 注解里没法判断方向。
-    v="${v:-}"
-    n="${n:-}"
-    [ "$vrc" -eq 0 ] || v="<crash rc=$vrc>"
-    [ "$nrc" -eq 0 ] || n="<crash rc=$nrc>"
-    if [ "$n" = "$v" ] && [ -n "$n" ]; then
+    vout=$(./build/linux_target.vmp "$fn" "$arg" 2>&1) || vrc=$?
+    n=$(printf '%s' "$nout" | head -n 1)
+    v=$(printf '%s' "$vout" | head -n 1)
+    if [ "$n" = "$v" ] && [ -n "$n" ] && [ "$nrc" -eq 0 ] && [ "$vrc" -eq 0 ]; then
         pass=$((pass + 1))
         echo "  [OK  ] $fn($arg): native=$n protected=$v"
     else
         fail=$((fail + 1))
-        echo "  [FAIL] $fn($arg): native=$n protected=$v"
+        echo "  [FAIL] $fn($arg): native=$n (rc=$nrc) protected=$v (rc=$vrc)"
+        # 崩溃/panic 的正文在 stderr 里：把它打印出来（Go 程序 panic 时退出码就是 2，
+        # 光看 rc=2 完全不知道原因 —— 上一轮 CI 就是这样）。
+        if [ "$vrc" -ne 0 ]; then
+            echo "         --- protected stderr/stdout ---"
+            printf '%s' "$vout" | head -n 12 | sed 's/^/         /'
+        fi
     fi
 }
 
