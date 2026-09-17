@@ -185,9 +185,13 @@ jobs:
           fi
           exit $rc
 
-  # ---------------------------------------------------------------- Windows/arm64: blob build only
-  # Needs a compiler that emits aarch64 COFF; apt does not have one by default, so this job is
-  # allowed to fail (continue-on-error) but still reports the concrete missing tool.
+  # ---------------------------------------------------------------- Windows/arm64: blob build（clang + aarch64-w64-windows-gnu）
+  # 以前这里找的是 aarch64-w64-mingw32-gcc（apt 里没有）→ 长期是「已知缺口」。
+  # clang/LLVM 自带 aarch64 的 COFF 后端，而 blob 是 freestanding（不 include 任何系统头），
+  # 所以不需要 mingw sysroot：clang --target=aarch64-w64-windows-gnu -c 就能产出 aarch64 COFF；
+  # 合并走内置合并器（-merge go），不需要 ld。
+  # 说明：若还想验证「运行」这一半，可改用 GitHub 的 windows-11-arm 原生 runner（arm64 Windows），
+  #   那样能在本机直接跑打包后的 arm64 PE；本作业只负责 blob 构建这一半。
   windows-arm64-blob:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -196,19 +200,23 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: look for an aarch64 COFF compiler
+      - name: toolchain
         run: |
-          set -x
-          command -v aarch64-w64-mingw32-gcc || true
-          command -v clang || true
+          clang --version | head -n 1
+          clang -dumpmachine || true
+          command -v llvm-objdump || true
       - name: build Windows/arm64 blob
         run: |
+          set -e
+          mkdir -p build
           go build -o build/vmpbuild ./cmd/vmpbuild
-          if command -v aarch64-w64-mingw32-gcc >/dev/null 2>&1; then
-            ./build/vmpbuild -src stub/win/arm64 -out build/vm_interp_win_arm64.bin \
-              -manifest build/vm_interp_win_arm64.json -entry vm_entry -guest arm64 \
-              -cc aarch64-w64-mingw32-gcc -objdump aarch64-w64-mingw32-objdump
-          else
-            echo "::error::no aarch64-w64-mingw32-gcc available: Windows/arm64 blob build is still unverified (known gap, not a regression)"
-            exit 1
-          fi
+          printf '#!/bin/sh\nexec clang --target=aarch64-w64-windows-gnu "$@"\n' > build/clang-a64w
+          chmod +x build/clang-a64w
+          ./build/vmpbuild -src stub/win/arm64 -out build/vm_interp_win_arm64.bin \
+            -manifest build/vm_interp_win_arm64.json -entry vm_entry -guest arm64 -merge go \
+            -cc "$PWD/build/clang-a64w" -objdump llvm-objdump || {
+              echo "::error::Windows/arm64 blob build failed（若仅仅缺工具链，仍属已知缺口）"
+              exit 1
+            }
+          ls -l build/vm_interp_win_arm64.bin
+          grep -E 'guest|regCount|blobSize' build/vm_interp_win_arm64.json | head -n 3

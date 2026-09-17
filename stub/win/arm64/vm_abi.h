@@ -39,10 +39,8 @@
 #define VM_SAVE_TOP    (VM_SCRATCH_OFF)
 
 /* ---- 栈余量与 skew ---- */
-#define VM_MARGIN       0x10000 /* 64KB（实验值）：vmpbuild 量不出 aarch64 的栈帧（CI 里 stub max frame=0x0，
-                                   * measureMaxFrame 只认 x86 的 sub rsp 语法），于是 margin > 帧+512 的守卫形同虚设。
-                                   * 若解释器真实帧大于 margin，客户机模拟栈就会与解释器自己的帧重叠 ——
-                                   * 现场（客户机 ret 跳到 stub 收尾地址）与之吻合。先用 64KB 验证这个假设。 */
+#define VM_MARGIN       0x2000 /* 8KB：守卫要求 margin > 解释器最大帧 + 512（aarch64 上已能测出 4688），
+                                   * 8KB 有充裕余量；再大只是白占宿主栈（宿主栈通常 MB 级，改了也不影响语义）。 */
                                   * 于是 margin > maxFrame+512 的检查形同虚设。
                                   * 若解释器真实帧大于 margin，客户机的模拟栈就会与解释器自己的帧重叠 ——
                                   * 现象正好是"vm_run 返回后第一条 ldr [sp] 就 SIGSEGV"。

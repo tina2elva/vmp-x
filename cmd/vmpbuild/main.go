@@ -415,7 +415,9 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	// 会变成对 libgcc 助手（例如 __aarch64_swp4_acq）的调用，而我们的 blob 是 freestanding、
 	// 不带 libgcc —— CI 的 linux-arm64 作业报的就是这个符号。
 	// -mno-outline-atomics 让它改成内联的 LL/SC 循环，语义不变。
-	if strings.Contains(machine, "aarch64") || strings.Contains(machine, "arm64") {
+	// 注意：clang 不认这个选项（Windows/arm64 原生 runner 用的是 clang）——只对 gcc 加。
+	isClang := strings.Contains(strings.ToLower(filepath.Base(cc)), "clang") || strings.Contains(machine, "msvc")
+	if (strings.Contains(machine, "aarch64") || strings.Contains(machine, "arm64")) && !isClang {
 		common = append(common, "-mno-outline-atomics")
 	}
 
