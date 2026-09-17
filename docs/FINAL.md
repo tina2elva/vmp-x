@@ -121,7 +121,7 @@ x87 与浮点转换扩展、AES-NI、AVX/VEX、REP 字符串、`SYSCALL`、以�
 |---|---|
 | `windows-amd64` | **success**（runner 上无失败步骤）：146 例 x86-64 E2E、3 例 DLL、ARM64 客户机差分、Linux 载荷 —— 全部在 runner 上通过。第 96 轮修掉了 runner 上唯一失败项 `mt`（并发用例）的真因：多余的「兜底缓冲池」在 4 线程 × 嵌套下被耗尽 |
 | `linux-amd64` | **全绿**（CI `failedSteps=[]`）：打包 ✓、**无 W+X** ✓、payload 探针 ✓、差分 E2E ✓。根因（重叠 PT_LOAD 的映射顺序导致 `.bss` 被 RX 覆盖）已修 |
-| `linux-arm64` | blob 构建 ✓、AArch64 打包 ✓（补丁经反汇编核实）、**qemu 能执行** ✓；修掉三个真 bug（stub 寄存器还原、标志位换算、`VM_FRAME_SKEW_EXTRA` 被兼容分支误改）后不再崩溃，但被保护函数仍返回 0 —— 故障已钉在 `check_key` 字节码第 6 条（pc=0x29），诊断通道已打通 |
+| `linux-arm64` | blob 构建 ✓、打包 ✓（补丁经反汇编核实）、**qemu 能执行** ✓；修掉三个真 bug（stub 寄存器还原、标志位换算、`VM_FRAME_SKEW_EXTRA` 误改 16）后不再崩溃，但被保护函数仍返回 0 —— 故障钉在第 6 条字节码（pc 序列多构建一致），命名需先解密（payload 里是密文）；另有 `maxStubStackFrame=0` 的假绿待修 |
 | `windows-arm64-blob` | 需要能产出 aarch64 COFF 的编译器，runner 镜像没有 —— 外部缺口（作业显式失败） |
 
 ### 对原目标 ⑤（arm64 执行验证 + CI 实跑）的判定
@@ -173,6 +173,7 @@ x87 与浮点转换扩展、AES-NI、AVX/VEX、REP 字符串、`SYSCALL`、以�
 9. **`VM_FRAME_SKEW_EXTRA` 的兼容分支把 arm64 的显式 0 改成了 16** → lifter 对 `[sp+disp]`（disp>=0）整体偏 16 字节（CI `FRAME_SKEW=70240` 为铁证，修后 70224）。
 10. **`tools/e2e_arm64.sh` 的 heredoc 残骸**导致脚本在探针之前就被 `set -e` 终止（arm64 的失败长期被掩盖在真正的诊断之前）。
 11. **`maxStubStackFrame=0` 的假绿**：aarch64 目标量不到帧，`margin > 帧+512` 守卫静默通过（待修：测量失败即报错）。
+12. **诊断通道本身的三处缺陷**（都属于我自己）：`bytecodeBytes` 字段名取错、`codeRVA` 未减 `sectionRVA`、`e2e_arm64.sh` 的 heredoc 残骸让脚本在探针前就终止 —— 它们让 arm64 的多次"仍在失败"读数其实是读不到数据。
 
 ## 7. 文档索引
 

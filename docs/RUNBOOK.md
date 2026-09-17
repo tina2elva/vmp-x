@@ -147,5 +147,5 @@ git push -u origin main
 | └ Linux/arm64 的已知缺口 | 该目标 ELF 只有 3 个 phdr，NOTE 槽位要留给覆盖段，缺少第二个空槽 → payload 段**退回 RWX**（代码里明确 `[warn]`，不是静默降级） |
 | （第 96/97 轮更新）`windows-amd64` | **runner 上无失败步骤**：帧 640 + margin 3KB + 16 个缓存槽的配置下，146 例 E2E 全部通过。此前 runner 上失败的是 `mt(0)`（多线程），真因是「兜底缓冲池」在 4 线程 × 嵌套下被耗尽 —— 已删除该池（见 STATUS 289/290） |
 | （第 103 轮）`linux-amd64` | **全绿**（CI `failedSteps=[]`）：打包 ✓、无 W+X ✓、payload 探针 ✓、差分 E2E ✓。此前失败的根因是**重叠 PT_LOAD 的映射顺序**（可写覆盖段被 payload 的 RX 映射盖回去），见 §5 踩坑 |
-| （第 104–108 轮更新）`linux-arm64` | blob 构建 ✓、打包 ✓（补丁经反汇编核实）、**qemu 能执行** ✓；修掉两个宿主 stub bug 后不再崩溃，但每个被保护函数返回 0（用 payload 探针二分中）。另有 payload 段退回 RWX 的缺口 |
+| （第 104–117 轮更新）`linux-arm64` | blob 构建 ✓、打包 ✓（补丁经反汇编核实）、**qemu 能执行** ✓；修掉三个真 bug（stub 寄存器还原、标志位换算、`VM_FRAME_SKEW_EXTRA` 被兼容分支误改 16）后不再崩溃，但被保护函数仍返回 0 —— 故障钉在 `check_key` 字节码**第 6 条**（环形缓冲 pc 序列多构建一致）。注：直接从 payload 读到的字节码是**密文**，命名需先解密；另有 `maxStubStackFrame=0` 的**假绿**（aarch64 帧测量失效）待修 |
 | Windows/arm64 blob 构建 | **需要外部工具链**：runner 镜像里没有能产出 aarch64 COFF 的编译器（作业按设计显式失败，`continue-on-error`） |
