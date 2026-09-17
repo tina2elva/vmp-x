@@ -43,10 +43,6 @@
                                    * measureMaxFrame 只认 x86 的 sub rsp 语法），于是 margin > 帧+512 的守卫形同虚设。
                                    * 若解释器真实帧大于 margin，客户机模拟栈就会与解释器自己的帧重叠 ——
                                    * 现场（客户机 ret 跳到 stub 收尾地址）与之吻合。先用 64KB 验证这个假设。 */
-                                  * 于是 margin > maxFrame+512 的检查形同虚设。
-                                  * 若解释器真实帧大于 margin，客户机的模拟栈就会与解释器自己的帧重叠 ——
-                                  * 现象正好是"vm_run 返回后第一条 ldr [sp] 就 SIGSEGV"。
-                                  * arm64 目标跑在大栈上，放宽 margin 没有 x86-Go 那种 goroutine 限制。 */
 /* BL 不压栈（返回地址在 LR 里），因此没有 x86 那种"返回地址额外 8 字节" */
 #define VM_FRAME_SKEW_EXTRA 0
 #define VM_FRAME_SKEW   (VM_FRAME_SIZE + VM_FRAME_SKEW_EXTRA + VM_MARGIN)
