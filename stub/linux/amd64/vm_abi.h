@@ -84,7 +84,11 @@
 /* 解密缓冲放在帧内：每次调用都有自己的副本 → 嵌套调用/递归不会互相覆盖。 */
 #define VM_SCRATCH_OFF  448
 #define VM_SCRATCH_SIZE 4096
-#define VM_FRAME_SIZE   4544 /* = VM_SCRATCH_OFF + VM_SCRATCH_SIZE，≡ 0 (mod 16) */
+/* 4544 = VM_SCRATCH_OFF + VM_SCRATCH_SIZE，但那会让 RSP ≡ 8 (mod 16) 一路传到 call vm_run，
+ * 而 SysV 要求"调用点 RSP 16 字节对齐"（即被调用者入口 ≡ 8）——差 8 字节。
+ * gcc 给 vm_run 生成的序言可能据此用对齐的 SSE 存取，于是运行期炸掉。
+ * 这里 +8 变成 4552（≡ 8 mod 16），scratch 仍在其内（448..4544），末尾多出的 8 字节空着。 */
+#define VM_FRAME_SIZE   4552
 #define VM_SAVE_TOP     (VM_SAVE_XMM15 + 16) /* 最后一个保存槽的结束偏移 */
 
 /* ---- vm_run 及其调用者可用的栈余量（模拟栈在其下方） ---- */

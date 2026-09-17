@@ -38,7 +38,15 @@ echo "    payloadVA=$va thunkOff=$thunk_off"
 pass=0; fail=0
 for a in 0 1 10 255 12345 1000000; do
     want=$(./build/linux_target check-key "$a")
-    got=$(./build/payload_probe_linux build/linux_payload.bin "$va" "$thunk_off" "$a" | grep -o '= [0-9]*' | head -n1 | cut -d' ' -f2)
+    prc=0
+    pout=$(./build/payload_probe_linux build/linux_payload.bin "$va" "$thunk_off" "$a") || prc=$?
+    if [ "$prc" -ne 0 ]; then
+        echo "  [FAIL] 探针在 check-key($a) 上异常退出：rc=$prc（139=SIGSEGV / 132=SIGILL）"
+        printf '%s' "$pout" | head -n 5 | sed 's/^/         /'
+        fail=$((fail+1))
+        continue
+    fi
+    got=$(printf '%s' "$pout" | grep -o '= [0-9]*' | head -n1 | cut -d' ' -f2)
     if [ "$want" = "$got" ]; then
         pass=$((pass+1)); echo "  [OK  ] check-key($a) = $got"
     else
