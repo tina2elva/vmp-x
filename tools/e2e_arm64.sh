@@ -93,29 +93,20 @@ except Exception as ex:
 PY
         echo "[*] 操作码解码: $(tr '\n' ' ' < build/opnames.txt)"
         python3 - <<'PY' 2>/dev/null || true
-import json
+import json, glob
 m = json.load(open("build/vm_interp_arm64.json"))
 inv = {v: k for k, v in m["opcodeMap"].items()}
 rep = json.load(open("build/arm64_vmp.json"))
 pl = rep["placements"][0]
-print("MISMATCH placement 字段:", list(pl.keys()))
-print("MISMATCH maxStubStackFrame =", m.get("maxStubStackFrame"), " margin =", m.get("margin"), " frameSkew =", m.get("frameSkew"))
-code_rva = pl.get("codeRVA", 0) - rep.get("sectionRVA", 0)   # codeRVA 是目标 RVA；payload 内的偏移要减去 sectionRVA
-code_len = pl.get("bytecodeBytes") or pl.get("bytecodeSize") or 0
-import glob
+want = pl.get("bytecodeBytes", 0)
 code = b""
 for _f in sorted(glob.glob("build/bcdump/bytecode_*.bin")):
     _b = open(_f, "rb").read()
-    if len(_b) == code_len:
+    if len(_b) == want:
         code = _b
-        print("MISMATCH 明文来源:", _f)
         break
-print("MISMATCH placement 全量:", pl)
-print("MISMATCH 明文字节码长度:", len(code))
-print("MISMATCH 明文字节码(%d): %s" % (len(code), code.hex()))
-for pc in (0, 9, 0xF, 0x18, 0x23, 0x29):
-    if pc < len(code):
-        print("MISMATCH   pc=0x%X op=0x%02X = %s" % (pc, code[pc], inv.get(code[pc], "?")))
+names = " ".join("0x%X=%s" % (code[_p], inv.get(code[_p], "?")) for _p in (0, 9, 0xF, 0x18, 0x23, 0x29) if _p < len(code))
+print("MISMATCH 解码: len=%d maxFrame=%s margin=%s %s" % (len(code), m.get("maxStubStackFrame"), m.get("margin"), names))
 PY
         # 直接把明文字节码打出来：环形缓冲给的是 pc（指令起始偏移），对着字节看第 6 条
         off=$(grep -o '"codeRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
@@ -123,7 +114,7 @@ PY
             od -An -tx1 -j "$off" -N 48 build/arm64_payload.bin 2>/dev/null | tr -s ' ' | sed 's/^/[!] 字节码: /'
         fi
         probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" 0 1 10 255 2>&1) || true
-        echo "[!] payload 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
+        echo "MISMATCH 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
         # 探针崩了的话，用 qemu 的指令级日志再看一次，打印尾部 —— 定位炸在哪条 arm64 指令
         if printf '%s' "$probe_out" | grep -q "signal"; then
             set +e
