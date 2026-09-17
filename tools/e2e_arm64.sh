@@ -94,6 +94,19 @@ PY
         python3 - <<'PY' 2>/dev/null || true
 import json
 m = json.load(open("build/vm_interp_arm64.json"))
+inv = {v: k for k, v in m["opcodeMap"].items()}
+rep = json.load(open("build/arm64_vmp.json"))
+pl = rep["placements"][0]
+code_rva, code_len = pl["codeRVA"], pl["BytecodeSize"]
+data = open("build/arm64_payload.bin", "rb").read()
+code = data[code_rva:code_rva + code_len]
+print("[!] 明文字节码(%d): %s" % (len(code), code.hex()))
+for pc in (0, 9, 0xF, 0x18, 0x23, 0x29):
+    if pc < len(code):
+        print("[!]   pc=0x%X op=0x%02X = %s" % (pc, code[pc], inv.get(code[pc], "?")))
+PY' 2>/dev/null || true
+import json
+m = json.load(open("build/vm_interp_arm64.json"))
 print("[*] manifest 顶层键:", list(m.keys()))
 for k in ("opcodes", "opcodeValues", "opcodeMap", "symbols"):
     if k in m and isinstance(m[k], dict):
