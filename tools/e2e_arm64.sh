@@ -55,6 +55,7 @@ echo "[*] building the linux/arm64 blob (built-in merger)..."
 echo "[*] packing check_key / sum_to..."
 ./build/vmpack -exe build/arm64_target -func check_key -func sum_to \
     -blob build/vm_interp_arm64.bin -manifest build/vm_interp_arm64.json \
+    -dumpbytecode build/bcdump \
     -out build/arm64_target.vmp -report build/arm64_vmp.json
 
 # 入口补丁检查：在打包产物里反汇编被保护函数开头，确认 8 字节补丁真的写进去了
@@ -101,15 +102,15 @@ print("MISMATCH placement 字段:", list(pl.keys()))
 print("MISMATCH maxStubStackFrame =", m.get("maxStubStackFrame"), " margin =", m.get("margin"), " frameSkew =", m.get("frameSkew"))
 code_rva = pl.get("codeRVA", 0) - rep.get("sectionRVA", 0)   # codeRVA 是目标 RVA；payload 内的偏移要减去 sectionRVA
 code_len = pl.get("bytecodeBytes") or pl.get("bytecodeSize") or 0
-data = open("build/arm64_payload.bin", "rb").read()
-code = data[code_rva:code_rva + code_len]
-print("MISMATCH placement 全量:", pl)
-print("MISMATCH payload 文件大小:", len(data), " codeRVA=", code_rva, " code_len=", code_len)
-print("MISMATCH 明文字节码(%d): %s" % (len(code), code.hex()))
-for pc in (0, 9, 0xF, 0x18, 0x23, 0x29):
-    if pc < len(code):
-        print("MISMATCH   pc=0x%X op=0x%02X = %s" % (pc, code[pc], inv.get(code[pc], "?")))
-PY
+import glob, os
+want = pl.get("bytecodeBytes", 0)
+code = b""
+for f in glob.glob("build/bcdump/bytecode_*.bin"):
+    blob = open(f, "rb").read()
+    if len(blob) == want:
+        code = blob
+        print("MISMATCH 明文来源:", f)
+        break
         # 直接把明文字节码打出来：环形缓冲给的是 pc（指令起始偏移），对着字节看第 6 条
         off=$(grep -o '"codeRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
         if [ -n "$off" ] && [ -f build/arm64_payload.bin ]; then
