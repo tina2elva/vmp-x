@@ -33,13 +33,22 @@ read -r sec_rva sec_size thunk_rva < build/payload_args.txt
 echo "[*] running the payload probe (payload mapped at its original VA)..."
 thunk_off=$(printf '0x%x' $((thunk_rva - sec_rva)))
 va=$(grep -o 'payloadVA=0x[0-9A-Fa-f]*' build/payload_meta.txt | head -n1 | cut -d= -f2)
+# 两个关键符号在 blob 内的偏移（payload 的第 0 字节就是 blob 的第 0 字节），用于把故障 PC 映射回函数
+read -r vm_run_off vm_entry_off < <(python3 - <<'PY'
+import json
+d = json.load(open('build/vm_interp_linux.json'))
+s = d['symbols']
+print(s['vm_run'], s['vm_entry'])
+PY
+)
+echo "    vm_run=+0x$vm_run_off vm_entry=+0x$vm_entry_off"
 echo "    payloadVA=$va thunkOff=$thunk_off"
 
 pass=0; fail=0
 for a in 0 1 10 255 12345 1000000; do
     want=$(./build/linux_target check-key "$a")
     prc=0
-    pout=$(./build/payload_probe_linux build/linux_payload.bin "$va" "$thunk_off" "$a") || prc=$?
+    pout=$(./build/payload_probe_linux build/linux_payload.bin "$va" "$thunk_off" "$vm_run_off" "$vm_entry_off" "$a") || prc=$?
     if [ "$prc" -ne 0 ]; then
         echo "  [FAIL] 探针在 check-key($a) 上异常退出：rc=$prc（139=SIGSEGV / 132=SIGILL）"
         printf '%s' "$pout" | head -n 5 | sed 's/^/         /'
