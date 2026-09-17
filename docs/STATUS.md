@@ -779,6 +779,35 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 > | linux-amd64 | 打包 ✓、无 W+X ✓、PC 相对重定位已修；剩余问题是宿主栈深度（本轮定位） |
 > | linux-arm64 | blob 构建 ✓、AArch64 打包 ✓、qemu 首次执行 segfault；另有 payload 段退回 RWX 的缺口 |
 > | windows-arm64-blob | 外部工具链缺口 |
+>
+> ## 第九十三轮：CI 结论写回文档；本机门禁恢复全绿
+>
+> ### 282. 先修掉"上一个残留"
+> 上一轮我报告 `TestConformanceAgainstCInterpreter` 失败 —— 查清后是**产物过期**、不是代码问题：
+> 该测试自带 staleness 守卫，明确报出 `build/runbc.exe 比 stub/win/x64/vm_abi.h 旧，请先重建`。
+> 重建 harness 后：
+> - `go test ./...` **11 个包全绿**；
+> - `tools/gates.ps1` **7 条门禁全绿**（gofmt / vet / test / x86-64 E2E 146 例 / DLL 3 例 / ARM64 客户机差分 / Linux 载荷在本机执行）。
+>
+> ### 283. 文档写回（目标 ③）
+> - `docs/RUNBOOK.md` §6「本机 vs CI 边界」：把原来那句『需要 CI/真机』换成**四个作业的真实结论**：
+>   windows-amd64 全绿；linux-amd64 打包 ✓、无 W+X ✓、差分因"客户机栈深度"未绿（含根因）；linux-arm64 blob ✓、打包 ✓、
+>   qemu 首次执行段错误；windows-arm64-blob 缺 aarch64 COFF 编译器（外部缺口）。
+> - `docs/FINAL.md` 新增 §8：四作业结论表 + **对原目标 ⑤ 的判定** + 这一路修掉的 6 个真缺陷清单。
+>
+> ### 284. 目标 ⑤ 的判定（写进 FINAL）
+> - 已达成：CI 矩阵实跑且四个结论可匿名阅读；ARM64 **客户机**语义链在真实差分中验证并纳入门禁；
+>   ARM64 **宿主** blob 从"从未构建"到"能构建、能打包、能被 qemu 执行"；
+> - 未达成：ARM64 宿主 blob 执行仍段错误；Linux/amd64 差分未全绿（根因已定位）；
+> - 结论：⑤ 从『完全受限』推进到『可在 CI 上闭环』，**尚未完成**。
+>
+> ### 285. 下一轮的候选修法（按风险排序）
+> 1. **压缩栈深度**（推荐先做）：把解密缓冲从 `vm_run` 的栈帧搬进 `.bss`（它本来就只在缓存槽全忙时兜底），
+>    于是 `VM_FRAME_SIZE` 从 4544 缩到几百字节，再把 `VM_MARGIN` 降到 4KB —— 总深度 ≈4.6KB，装得进 8KB 的 goroutine 栈。
+>    已知代价：极深嵌套的"缓存槽全忙"情形会共用同一个兜底缓冲（当前 E2E 的嵌套深度在缓存槽容量内）。
+> 2. linux/arm64 的 qemu 段错误：先加"入口补丁检查"（用 aarch64-linux-gnu-objdump 反汇编确认 8 字节补丁在场），
+>    再按需给 payload 段扩容 phdr（顺带解决 RWX 退回）。
+
 
 
 

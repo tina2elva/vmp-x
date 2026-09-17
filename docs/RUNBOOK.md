@@ -141,4 +141,8 @@ git push -u origin main
 | Windows/amd64 真机 E2E（146 用例）、DLL E2E（3 用例）、Go 单测、差分测试 | **本机已验证** |
 | ELF 去 RWX 断言、PIE（两个加载地址）、明文缓存线程安全（多线程原子计数 80000） | **本机已验证** |
 | Linux/amd64 **注入载荷**在 Windows 上执行（`tools/verify_linux_payload.ps1`：ET_EXEC 6/6、PIE 两个装载地址一致） | **本机已验证** |
-| Linux 加载器映射并跳转、`tools/e2e.sh`、Linux/arm64 qemu E2E、Windows/arm64 blob 构建 | **需要 CI/真机** |
+| Linux/amd64 的 `tools/e2e.sh`（打包 + readelf 断言 + 差分） | **CI 已跑到运行期**：打包成功、**无 W+X 段**、差分用例尚未全绿（根因见下一行） |
+| └ Linux/amd64 运行期问题的定位 | 模拟栈位于宿主 RSP 之下约 12.7KB（FRAME 4544 + EXTRA 16 + MARGIN 8192），而 Go 程序的 **goroutine 栈初始只有 8KB** → `runtime: split stack overflow`。单纯的『把客户机栈搬走』已试过并回退（见 docs/STATUS.md 第 92 轮） |
+| Linux/arm64 的 `tools/e2e_arm64.sh`（交叉编译 + qemu） | **CI 已跑到执行**：blob 构建 ✓、AArch64 打包 ✓（补丁是 8 字节 `mov x16,x30 ; b thunk`）、qemu 首次执行 → **段错误**（尚未定位） |
+| └ Linux/arm64 的已知缺口 | 该目标 ELF 只有 3 个 phdr，NOTE 槽位要留给覆盖段，缺少第二个空槽 → payload 段**退回 RWX**（代码里明确 `[warn]`，不是静默降级） |
+| Windows/arm64 blob 构建 | **需要外部工具链**：runner 镜像里没有能产出 aarch64 COFF 的编译器（作业按设计显式失败，`continue-on-error`） |
