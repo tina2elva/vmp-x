@@ -38,9 +38,11 @@ VM_ENTRY_SYMBOL:
     str     x16, [sp, #(VM_CTX_OFF_REGS + 8*30)]
 
     /* ---- 标志位：NZCV（bit31..28）→ VM 位序（N=1,Z=2,C=4,V=8） ---- */
+    /* rbit 把 NZCV（31..28）翻到 0..3 —— 这正好是 VM 的位序（N=1,Z=2,C=4,V=8），
+     * 所以取低 4 位即可。原来写的是 lsr #28，那取到的是"反转后的高 4 位"，是垃圾。 */
     mrs     x9, nzcv
     rbit    w9, w9
-    lsr     w9, w9, #28
+    and     w9, w9, #0xF
     str     w9, [sp, #VM_CTX_FLAGS]
 
     /* ---- 从 LR 反推描述符：X30 = thunk + 4 ---- */
@@ -98,7 +100,6 @@ VM_ENTRY_SYMBOL:
     /* ---- 标志位还原：VM 位序 → NZCV ---- */
     ldr     w9, [sp, #VM_CTX_FLAGS]
     lsl     w9, w9, #28
-    rbit    w9, w9
     msr     nzcv, x9
 
     mov     x9, #VM_FRAME_SIZE
