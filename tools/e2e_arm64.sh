@@ -56,6 +56,17 @@ echo "[*] packing check_key / sum_to..."
     -blob build/vm_interp_arm64.bin -manifest build/vm_interp_arm64.json \
     -out build/arm64_target.vmp -report build/arm64_vmp.json
 
+# 入口补丁检查：在打包产物里反汇编被保护函数开头，确认 8 字节补丁真的写进去了
+# （期望 F0 03 1E AA = mov x16,x30，紧跟一条 B）。x86-64 侧正是靠这一步排除/确认了补丁问题。
+if [ -n "$OBJDUMP" ] && command -v "$OBJDUMP" >/dev/null 2>&1; then
+    echo "[*] 入口补丁检查（$OBJDUMP）:"
+    for rva in $(grep -o '"funcRVA": *[0-9]*' build/arm64_vmp.json | sed 's/.*: *//' | head -n 2); do
+        va=$((0x400000 + rva))
+        start=$(printf '0x%x' "$va"); end=$(printf '0x%x' $((va + 8)))
+        line=$($OBJDUMP -d --start-address=$start --stop-address=$end build/arm64_target.vmp 2>/dev/null | grep -E '^\s+[0-9a-f]+:' | head -n 2 | tr '\n' ';')
+        echo "[!]   补丁 rva=0x$(printf '%x' $rva): $line"
+    done
+fi
 echo "[*] running native vs protected under $QEMU..."
 # 注意：脚本是 set -e。qemu 里客户机崩溃时命令替换会直接终止脚本（上一轮 CI 就只留下
 # "qemu: uncaught target signal 11" 而没有我们的诊断输出），所以统一用 "cmd || rc=$?"。
