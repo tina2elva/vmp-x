@@ -212,11 +212,16 @@ jobs:
           go build -o build/vmpbuild ./cmd/vmpbuild
           printf '#!/bin/sh\nexec clang --target=aarch64-w64-windows-gnu "$@"\n' > build/clang-a64w
           chmod +x build/clang-a64w
+          set +e
           ./build/vmpbuild -src stub/win/arm64 -out build/vm_interp_win_arm64.bin \
             -manifest build/vm_interp_win_arm64.json -entry vm_entry -guest arm64 -merge go \
-            -cc "$PWD/build/clang-a64w" -objdump llvm-objdump || {
-              echo "::error::Windows/arm64 blob build failed（若仅仅缺工具链，仍属已知缺口）"
-              exit 1
-            }
+            -cc "$PWD/build/clang-a64w" -objdump llvm-objdump > build/ci_step.log 2>&1
+          rc=$?
+          tail -n 25 build/ci_step.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 18 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=Windows/arm64 blob build (exit $rc)::$msg"
+            exit $rc
+          fi
           ls -l build/vm_interp_win_arm64.bin
           grep -E 'guest|regCount|blobSize' build/vm_interp_win_arm64.json | head -n 3
