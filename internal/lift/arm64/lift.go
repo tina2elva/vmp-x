@@ -188,8 +188,17 @@ func (l *Lifter) liftAddSubReg(f *ir.Func, ins *dec.Insn) error {
 	}
 	rn := (ins.Raw >> 5) & 31
 	rd := ins.Raw & 31
-	if rn == 31 || rd == 31 {
-		return fmt.Errorf("涉及 SP 的寄存器加减暂不支持（SP 只支持立即数调整）")
+	// 寄存器（移位）形式的 ADD/SUB 里 31 是 **XZR**，不是 SP（SP 只能用立即数形式调整）：
+	//   · Rn=31 → 操作数是零
+	//   · Rd=31 → 结果丢弃，但带 S 时**标志位仍然要更新**（cmp/cmn 就是 subs/adds xzr,..., 的形式）
+	// 之前这里直接报错，导致 cmp 被丢掉（也是 sum_to 循环不退出的直接原因）。
+	rnSlotReg := ir.Reg(rn)
+	if rn == 31 {
+		rnSlotReg = ZR // 客户机零寄存器槽位：读恒 0、写丢弃
+	}
+	dstReg := ir.Reg(rd)
+	if rd == 31 {
+		dstReg = ZR
 	}
 	src, err := slotZR((ins.Raw >> 16) & 31)
 	if err != nil {
@@ -205,16 +214,13 @@ func (l *Lifter) liftAddSubReg(f *ir.Func, ins *dec.Insn) error {
 			Width: w, Dst: SCR, A: SCR, Imm: uint64(shiftAmt), SrcOff: uint32(ins.PC), Text: ins.Text()})
 		src = SCR
 	}
-	rnSlot, err := slotZR(rn)
-	if err != nil {
-		return err
-	}
+	rnSlot := rnSlotReg
 	kind := ir.Add
 	if sub {
 		kind = ir.Sub
 	}
 	f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRR, Kind: aluKind(kind, setFlags), Width: w,
-		Dst: ir.Reg(rd), A: rnSlot, B: src, SrcOff: uint32(ins.PC), Text: ins.Text()})
+		Dst: dstReg, A: rnSlot, B: src, SrcOff: uint32(ins.PC), Text: ins.Text()})
 	return nil
 }
 

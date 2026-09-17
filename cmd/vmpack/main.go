@@ -220,6 +220,12 @@ func (a a64Adapter) LiftFunc(name string, code []byte, rva uint32) (*ir.Func, er
 	}
 	fn := &ir.Func{Name: name, RVA: rva, Size: len(code)}
 	a.l.Lift(fn, insns)
+	// 关键：不能吞掉 Unsupported。之前这里直接 return fn,nil，于是 arm64 上
+	// "lifter 不认识某条指令"会被静默丢掉（sum_to 的 cmp 就是这样消失的，
+	// 结果循环永远不退出）。x86 侧是会报错的，这里必须一致 —— fail-fast。
+	if len(fn.Unsupported) > 0 {
+		return fn, fmt.Errorf("ARM64 有 %d 条指令无法翻译：%v", len(fn.Unsupported), fn.Unsupported[0])
+	}
 	return fn, nil
 }
 
