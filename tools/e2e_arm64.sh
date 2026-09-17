@@ -79,6 +79,14 @@ if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
         extract_out=$(./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin 2>&1) || echo "[!] extractpayload 失败: $(printf '%s' "$extract_out" | tr '\n' '|')"
         probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" 0 1 10 255 2>&1) || true
         echo "[!] payload 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
+        # 探针崩了的话，用 qemu 的指令级日志再看一次，打印尾部 —— 定位炸在哪条 arm64 指令
+        if printf '%s' "$probe_out" | grep -q "signal"; then
+            set +e
+            $QEMU -d in_asm,cpu -D build/qemu_probe.log ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" 0 >/dev/null 2>&1
+            set -e
+            echo "[!] 探针现场（qemu 指令日志尾部 $(wc -l < build/qemu_probe.log 2>/dev/null || echo 0) 行）:"
+            tail -n 40 build/qemu_probe.log 2>/dev/null | sed 's/^/[!]   /'
+        fi
     else
         echo "[!] payload 探针编译失败: $(tail -n 2 build/probe_cc.log | tr '\n' '|')"
     fi
