@@ -49,7 +49,7 @@ $CC -O1 -fno-tree-vectorize -fno-unwind-tables -fno-asynchronous-unwind-tables \
 echo "[*] building the linux/arm64 blob (built-in merger)..."
 ./build/vmpbuild -src stub/linux/arm64 \
     -out build/vm_interp_arm64.bin -manifest build/vm_interp_arm64.json \
-    -entry vm_entry -guest arm64 -merge go \
+    -entry vm_entry -guest arm64 -merge go -random-opcodes=false \
     -cc "$CC" -objdump "$OBJDUMP"
 
 echo "[*] packing check_key / sum_to..."
