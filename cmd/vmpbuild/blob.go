@@ -277,7 +277,9 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 				}
 				imm := delta / 4
 				if imm < -(1<<25) || imm >= (1<<25) {
-					return 0, fmt.Errorf("%s+0x%X: AArch64 分支超出 ±128MB", o.Sections[r.SecIdx].Name, r.Off)
+					// 诊断：把算式的每个输入都打出来 —— 越界通常意味着 target/field 有一个用了 RVA/VA 而不是合并后的偏移（Windows/arm64 blob 就死在这条）。
+					return 0, fmt.Errorf("%s+0x%X: AArch64 分支超出 ±128MB（target=0x%X field=0x%X addend=%d sym=%q targetSec=%d delta=%d）",
+						o.Sections[r.SecIdx].Name, r.Off, target, field, r.Addend, r.SymName, r.TargetSec, delta)
 				}
 				insn := binary.LittleEndian.Uint32(m.Data[field:])
 				insn = (insn &^ 0x03FFFFFF) | (uint32(imm) & 0x03FFFFFF)
