@@ -99,7 +99,7 @@ rep = json.load(open("build/arm64_vmp.json"))
 pl = rep["placements"][0]
 print("MISMATCH placement 字段:", list(pl.keys()))
 print("MISMATCH maxStubStackFrame =", m.get("maxStubStackFrame"), " margin =", m.get("margin"), " frameSkew =", m.get("frameSkew"))
-code_rva = pl.get("codeRVA", 0)
+code_rva = pl.get("codeRVA", 0) - rep.get("sectionRVA", 0)   # codeRVA 是目标 RVA；payload 内的偏移要减去 sectionRVA
 code_len = pl.get("bytecodeBytes") or pl.get("bytecodeSize") or 0
 data = open("build/arm64_payload.bin", "rb").read()
 code = data[code_rva:code_rva + code_len]
