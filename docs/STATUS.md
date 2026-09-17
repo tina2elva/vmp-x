@@ -1046,6 +1046,25 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 > - 之前加过 `mov x19, sp` / `mov sp, x19` 的诊断，崩溃点**跟着移到了这条还原指令之后**，说明调用期间 `x19`（以及更早一次现场里的 `SP`）被改；
 > - 结合已确认的 `maxStubStackFrame=0`（aarch64 帧测量失效、margin 守卫形同虚设），
 >   下一步应当把"aarch64 帧测量"补上（测量失败即报错），再据此定 margin。
+>
+> ## 第一一九/一二〇轮：假绿修掉、栈重叠被否、两个 amd64 回到全绿
+>
+> ### 316. aarch64 帧测量修好（并否掉一个假设）
+> `measureMaxFrame` 已有 AArch64 模式，但它认的是 `sub sp, sp, #imm`；而 arm64 入口 stub 的帧 4688 超过
+> `sub` 的 imm12 范围，实际写法是 `mov x9, #4688` + `sub sp, sp, x9` —— 于是恒量不到。
+> 补上该组合模式、并在量不到时**大声告警**之后，CI 给出 `maxStubStackFrame = 4688`。
+> 这条数字顺带**否决了"客户机栈与解释器帧重叠"**：解释器最大帧 ≤ 4688，而 margin 是 65536。
+>
+> ### 317. 我自己打红过、也当轮修回
+> 上述改动留下一个重复的 `return`，`go vet` 报 unreachable code，把两个 amd64 作业的 Go gates 打红。
+> 根因是我的推送前检查只跑了 build/test/gofmt，**漏了 `go vet`**；补上后两个作业恢复无失败步骤。
+> 流程修正：推送前跑齐 `go build`、`go vet`、`go test`、`gofmt -l`。
+>
+> ### 318. 最终结论（提交 72fe836 的 CI 运行）
+> - `windows-amd64`：无失败步骤；
+> - `linux-amd64`：无失败步骤；
+> - `linux-arm64`：blob 构建 ✓、打包 ✓、qemu 端到端**有真实结果**（native 与 protected 的数值对比），运行期尚未算对；
+> - `windows-arm64-blob`：外部工具链缺口。
 
 
 
