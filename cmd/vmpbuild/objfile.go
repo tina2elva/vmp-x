@@ -135,7 +135,7 @@ func readCOFFObject(path string) (*objFile, error) {
 					// 之前把整条指令字当加数加进目标地址，合并时报「分支超出 ±128MB」——
 					// Windows/arm64 的 blob 就死在 .text+0x10C（目标符号 vm_run，诊断里 addend
 					// 正是 0x94000000 的有符号值 -1811939328）。
-					imm := int64(int32(uint32(addend) << 6) >> 6)
+					imm := int64(int32(uint32(addend)<<6) >> 6)
 					rel.Addend = imm * 4
 					rel.Kind = relAArch64Branch26
 				} else {
