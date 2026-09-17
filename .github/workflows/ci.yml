@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ---------------------------------------------------------------- Windows/amd64（本机已验证的那一套）
+  # ---------------------------------------------------------------- Windows/amd64
   windows-amd64:
     runs-on: windows-latest
     steps:
@@ -14,77 +14,94 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: 工具链（msys2 UCRT64：gcc / objdump / ld）
+      - name: toolchain (msys2 UCRT64 - gcc, objdump, ld)
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           install: mingw-w64-ucrt-x86_64-gcc
-      - name: Go 门禁
+      - name: Go gates
         shell: pwsh
         run: |
           go build ./...
           go test ./...
           gofmt -l .
           go vet ./...
-      # 下面几步用 msys2 的 shell：这样 gcc/objdump/ld 一定在 PATH 上
-      # （上一次失败就是因为 setup-msys2 的工具不在 PowerShell 的 PATH 里）。
-      # 脚本本身是 .ps1，所以在 msys2 bash 里显式调 powershell。
-      - name: 真机 E2E（x86-64，146 例）
-        shell: msys2 {0}
+      - name: E2E x86-64 (146 cases)
+        shell: pwsh
         run: |
-          cd "$GITHUB_WORKSPACE"
-          mkdir -p build
-          set +e
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e.ps1 > build/ci_step.log 2>&1
-          rc=$?
-          tail -n 40 build/ci_step.log
-          if [ $rc -ne 0 ]; then
-            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
-            echo "::error title=真机 E2E（x86-64，146 例） (exit $rc)::$msg"
-          fi
-          exit $rc
-      - name: 真机 E2E（DLL，3 例）
-        shell: msys2 {0}
+          New-Item -ItemType Directory -Force build | Out-Null
+          $msys = "${{ steps.msys2.outputs.msys2-location }}"
+          if (-not $msys -or -not (Test-Path $msys)) { $msys = "C:\msys64" }
+          $goDir = Split-Path (Get-Command go -ErrorAction SilentlyContinue).Source
+          $env:PATH = "$goDir;$msys\ucrt64\bin;$msys\usr\bin;" + $env:PATH
+          Write-Host "::notice::msys=$msys go=$goDir gcc=$((Get-Command gcc -ErrorAction SilentlyContinue).Source)"
+          $log = "build/ci_step.log"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e.ps1 *>&1 | Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            $msg = ((Get-Content $log -Tail 25) -join "%0A") -replace "%", "%25"
+            $msg = $msg -replace [char]13, ""
+            Write-Host "::error title=E2E x86-64 (146 cases) (exit $rc)::$msg"
+            exit $rc
+          }
+
+      - name: E2E DLL (3 cases)
+        shell: pwsh
         run: |
-          cd "$GITHUB_WORKSPACE"
-          mkdir -p build
-          set +e
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_dll.ps1 > build/ci_step.log 2>&1
-          rc=$?
-          tail -n 40 build/ci_step.log
-          if [ $rc -ne 0 ]; then
-            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
-            echo "::error title=真机 E2E（DLL，3 例） (exit $rc)::$msg"
-          fi
-          exit $rc
-      - name: ARM64 客户机语义差分（宿主仍是 x86-64）
-        shell: msys2 {0}
+          New-Item -ItemType Directory -Force build | Out-Null
+          $msys = "${{ steps.msys2.outputs.msys2-location }}"
+          if (-not $msys -or -not (Test-Path $msys)) { $msys = "C:\msys64" }
+          $goDir = Split-Path (Get-Command go -ErrorAction SilentlyContinue).Source
+          $env:PATH = "$goDir;$msys\ucrt64\bin;$msys\usr\bin;" + $env:PATH
+          Write-Host "::notice::msys=$msys go=$goDir gcc=$((Get-Command gcc -ErrorAction SilentlyContinue).Source)"
+          $log = "build/ci_step.log"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_dll.ps1 *>&1 | Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            $msg = ((Get-Content $log -Tail 25) -join "%0A") -replace "%", "%25"
+            $msg = $msg -replace [char]13, ""
+            Write-Host "::error title=E2E DLL (3 cases) (exit $rc)::$msg"
+            exit $rc
+          }
+
+      - name: ARM64 guest differential (host is still x86-64)
+        shell: pwsh
         run: |
-          cd "$GITHUB_WORKSPACE"
-          mkdir -p build
-          set +e
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_arm64guest.ps1 > build/ci_step.log 2>&1
-          rc=$?
-          tail -n 40 build/ci_step.log
-          if [ $rc -ne 0 ]; then
-            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
-            echo "::error title=ARM64 客户机语义差分（宿主仍是 x86-64） (exit $rc)::$msg"
-          fi
-          exit $rc
-      - name: Linux 载荷（在 Windows 上执行注入后的 ELF 载荷）
-        shell: msys2 {0}
+          New-Item -ItemType Directory -Force build | Out-Null
+          $msys = "${{ steps.msys2.outputs.msys2-location }}"
+          if (-not $msys -or -not (Test-Path $msys)) { $msys = "C:\msys64" }
+          $goDir = Split-Path (Get-Command go -ErrorAction SilentlyContinue).Source
+          $env:PATH = "$goDir;$msys\ucrt64\bin;$msys\usr\bin;" + $env:PATH
+          Write-Host "::notice::msys=$msys go=$goDir gcc=$((Get-Command gcc -ErrorAction SilentlyContinue).Source)"
+          $log = "build/ci_step.log"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_arm64guest.ps1 *>&1 | Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            $msg = ((Get-Content $log -Tail 25) -join "%0A") -replace "%", "%25"
+            $msg = $msg -replace [char]13, ""
+            Write-Host "::error title=ARM64 guest differential (host is still x86-64) (exit $rc)::$msg"
+            exit $rc
+          }
+
+      - name: Linux payload executed on Windows
+        shell: pwsh
         run: |
-          cd "$GITHUB_WORKSPACE"
-          mkdir -p build
-          set +e
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_linux_payload.ps1 > build/ci_step.log 2>&1
-          rc=$?
-          tail -n 40 build/ci_step.log
-          if [ $rc -ne 0 ]; then
-            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
-            echo "::error title=Linux 载荷（在 Windows 上执行注入后的 ELF 载荷） (exit $rc)::$msg"
-          fi
-          exit $rc
+          New-Item -ItemType Directory -Force build | Out-Null
+          $msys = "${{ steps.msys2.outputs.msys2-location }}"
+          if (-not $msys -or -not (Test-Path $msys)) { $msys = "C:\msys64" }
+          $goDir = Split-Path (Get-Command go -ErrorAction SilentlyContinue).Source
+          $env:PATH = "$goDir;$msys\ucrt64\bin;$msys\usr\bin;" + $env:PATH
+          Write-Host "::notice::msys=$msys go=$goDir gcc=$((Get-Command gcc -ErrorAction SilentlyContinue).Source)"
+          $log = "build/ci_step.log"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_linux_payload.ps1 *>&1 | Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            $msg = ((Get-Content $log -Tail 25) -join "%0A") -replace "%", "%25"
+            $msg = $msg -replace [char]13, ""
+            Write-Host "::error title=Linux payload executed on Windows (exit $rc)::$msg"
+            exit $rc
+          }
 
   # ---------------------------------------------------------------- Linux/amd64
   linux-amd64:
@@ -94,18 +111,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: 依赖（gcc / binutils / readelf）
+      - name: deps (gcc / binutils / readelf)
         run: sudo apt-get update && sudo apt-get install -y gcc binutils file
-      - name: Go 门禁
+      - name: Go gates
         run: |
           go build ./...
           go test ./...
           gofmt -l .
           go vet ./...
-      - name: ELF 端到端（含「不得有 W+X 段」断言）
+      - name: ELF end-to-end (readelf must show no W+X)
         run: bash tools/e2e.sh
 
-  # ---------------------------------------------------------------- Linux/arm64（qemu-user）
+  # ---------------------------------------------------------------- Linux/arm64 (qemu-user)
   linux-arm64:
     runs-on: ubuntu-latest
     steps:
@@ -113,18 +130,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: 依赖（aarch64 交叉工具链 + qemu-user）
+      - name: deps (aarch64 cross toolchain + qemu-user)
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
-      - name: Linux/arm64 端到端（qemu-aarch64）
+      - name: Linux/arm64 end-to-end (qemu-aarch64)
         run: |
           CC=aarch64-linux-gnu-gcc OBJDUMP=aarch64-linux-gnu-objdump QEMU=qemu-aarch64 \
             bash tools/e2e_arm64.sh
 
-  # ---------------------------------------------------------------- Windows/arm64：只构建 blob
-  # 需要的编译器是「产出 aarch64 COFF」的那一类，apt 默认没有；拿不到就明确失败并报出缺什么，
-  # 因此这里允许失败（continue-on-error），不让它把整个 CI 变红，但结果仍然可见。
+  # ---------------------------------------------------------------- Windows/arm64: blob build only
+  # Needs a compiler that emits aarch64 COFF; apt does not have one by default, so this job is
+  # allowed to fail (continue-on-error) but still reports the concrete missing tool.
   windows-arm64-blob:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -133,23 +150,19 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: 找 aarch64 COFF 编译器
+      - name: look for an aarch64 COFF compiler
         run: |
           set -x
           command -v aarch64-w64-mingw32-gcc || true
           command -v clang || true
-          sudo apt-get update -qq || true
-          sudo apt-get install -y --no-install-recommends clang lld llvm || true
-          command -v clang || true
-      - name: 构建 Windows/arm64 blob
+      - name: build Windows/arm64 blob
         run: |
           go build -o build/vmpbuild ./cmd/vmpbuild
-          # 先按常规名字试；不行就退回 llvm 的交叉形式（clang --target=aarch64-w64-windows-gnu）。
           if command -v aarch64-w64-mingw32-gcc >/dev/null 2>&1; then
             ./build/vmpbuild -src stub/win/arm64 -out build/vm_interp_win_arm64.bin \
               -manifest build/vm_interp_win_arm64.json -entry vm_entry -guest arm64 \
               -cc aarch64-w64-mingw32-gcc -objdump aarch64-w64-mingw32-objdump
           else
-            echo "::warning::没有 aarch64-w64-mingw32-gcc；Windows/arm64 的 blob 构建仍未验证（这是已知缺口，不是回归）"
+            echo "::error::no aarch64-w64-mingw32-gcc available: Windows/arm64 blob build is still unverified (known gap, not a regression)"
             exit 1
           fi

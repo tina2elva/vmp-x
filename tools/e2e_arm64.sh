@@ -18,13 +18,17 @@ set -euo pipefail
 # 这样我（或者任何 reviewer）不用登录就能看到"为什么红"。
 mkdir -p build
 exec > >(tee build/e2e_run.log) 2>&1
-on_err() {
+# 注意用 EXIT 而不是 ERR：脚本里有若干显式的 "exit 1"（例如段权限断言），
+# 那些路径不会触发 ERR trap，结果注解里什么都看不到（CI 上真踩过这一脚）。
+ok=0
+on_exit() {
     rc=$?
-    msg=$(tail -n 20 build/e2e_run.log 2>/dev/null | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
-    echo "::error title=$(basename "$0") failed (exit $rc)::$msg"
-    exit $rc
+    if [ "$ok" = "0" ] && [ "$rc" -ne 0 ]; then
+        msg=$(tail -n 20 build/e2e_run.log 2>/dev/null | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+        echo "::error title=$(basename "$0") failed (exit $rc)::$msg"
+    fi
 }
-trap on_err ERR
+trap on_exit EXIT
 
 cd "$(dirname "$0")/.."
 mkdir -p build
@@ -65,3 +69,4 @@ else
     echo "[!] arm64 end-to-end: MISMATCH"
     exit 1
 fi
+ok=1
