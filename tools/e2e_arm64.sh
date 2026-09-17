@@ -107,6 +107,12 @@ for f in sorted(glob.glob("build/bcdump/bytecode_*.bin")):
         break
 names = " ".join("0x%X=%s" % (code[p], inv.get(code[p], "?")) for p in (0, 9, 0xF, 0x18, 0x23, 0x29) if p < len(code))
 print("MISMATCH 解码: len=%d maxFrame=%s margin=%s %s" % (len(code), m.get("maxStubStackFrame"), m.get("margin"), names))
+  # 第二个函数（sum_to，带循环）的字节码与它循环里的 op：环形缓冲显示 pc 在 0x20/0x26/0x2F 之间打转
+  dumps = sorted(glob.glob("build/bcdump/bytecode_*.bin"))
+  if len(dumps) > 1:
+      c2 = open(dumps[1], "rb").read()
+      print("MISMATCH sum_to 字节码(%d): %s" % (len(c2), c2.hex()))
+      print("MISMATCH sum_to 循环 op: " + " ".join("0x%X=%s" % (c2[p], inv.get(c2[p], "?")) for p in (0x20, 0x26, 0x2F) if p < len(c2)))
 PY
         if printf '%s' "$probe_out" | grep -q "signal"; then
             set +e
