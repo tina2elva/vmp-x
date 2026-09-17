@@ -121,8 +121,8 @@ x87 与浮点转换扩展、AES-NI、AVX/VEX、REP 字符串、`SYSCALL`、以�
 |---|---|
 | `windows-amd64` | **success**（runner 上无失败步骤）：146 例 x86-64 E2E、3 例 DLL、ARM64 客户机差分、Linux 载荷 —— 全部在 runner 上通过。第 96 轮修掉了 runner 上唯一失败项 `mt`（并发用例）的真因：多余的「兜底缓冲池」在 4 线程 × 嵌套下被耗尽 |
 | `linux-amd64` | **全绿**（CI `failedSteps=[]`）：打包 ✓、**无 W+X** ✓、payload 探针 ✓、差分 E2E ✓。根因（重叠 PT_LOAD 的映射顺序导致 `.bss` 被 RX 覆盖）已修 |
-| `linux-arm64` | blob 构建 ✓、打包 ✓（补丁经反汇编核实）、**qemu 能执行** ✓，**直路函数已算对**（check_key 的 213/206/143/2012 与 native 完全一致）。修掉的真 bug：入口 stub 把返回值暂存在 x10、又被还原循环里 r=10 的加载冲掉（探针恒得 0xFFFFFF80、目标恒得 0）。剩余：带循环的 `sum_to` 在 arm64 宿主上不返回（指令预算诊断 rc=96 截住，pc 在 0x20/0x26/0x2F 死循环） |
-| `windows-arm64-blob` | 需要能产出 aarch64 COFF 的编译器，runner 镜像没有 —— 外部缺口（作业显式失败） |
+| `linux-arm64` | **success（全绿）**：blob 构建 ✓、AArch64 打包 ✓（补丁经反汇编核实）、qemu 端到端输出**与 native 完全一致**。修掉的根因：入口 stub 用 x10 暂存返回值被还原循环冲掉；以及 `cmp`（= `subs xzr,x,y`）被 lifter 拒绝、又被 arm64 适配器静默吞掉，导致循环失去退出条件 |
+| `windows-arm64-blob` | **已知外部缺口（明确处置）**：CI 镜像没有 aarch64-w64-mingw32 编译器，作业显式打印「no aarch64-w64-mingw32-gcc available … (known gap, not a regression)」；解锁条件是把该工具链装进镜像（或改用 clang+lld 的 aarch64-w64-windows-gnu 目标），拿到后即可复用同一套 blob 构建与 diff-bytecode 自测路径 |
 
 ### 对原目标 ⑤（arm64 执行验证 + CI 实跑）的判定
 

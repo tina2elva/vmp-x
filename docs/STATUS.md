@@ -1090,6 +1090,32 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 >   环形缓冲显示 pc 在 0x20/0x26/0x2F 三条之间死循环，累加值恒为 22222221111111）。
 >   直路函数已经证明是对的，所以问题在"循环/分支"这一侧；下一步是用 `-dumpbytecode` 的 sum_to 明文
 >   把这三条 op 的语义与操作数解出来（CI 注解只留前 12 条匹配，这块输出还需要安置好）。
+>
+> ## 收尾：arm64 端到端**全绿**（sum_to 循环的根因 = cmp 被静默丢掉）
+>
+> ### 322. 根因（两处叠加成静默算错）
+> 1. `internal/lift/arm64`：寄存器（移位）形式的 ADD/SUB 里，31 是 **XZR** 而不是 SP，
+>    但代码对 Rd/Rn=31 直接返回错误 —— 而 `cmp x1,x2` 恰恰是 `subs xzr,x1,x2`（Rd=31）。
+>    现在：Rn=31 读零寄存器槽位 34；Rd=31 同样写槽位 34（写被丢弃），带 S 时**标志位照常更新**。
+> 2. `cmd/vmpack` 的 arm64 适配器把 `fn.Unsupported` 直接吞掉（`return fn, nil`），
+>    于是「lifter 不认识某条指令」被静默丢弃 —— x86 侧是会报错的，这里改为返回错误（fail-fast）。
+>
+> ### 323. 证据链（全部本机可复现）
+> - CI 上 sum_to 的字节码反汇编里**没有任何比较**，循环体只有 add/add + 一个看 C 位的条件分支，
+>   于是 C 永不清零 → 永不退出（探针 rc=96，环形缓冲 pc 在 0x20/0x26/0x2F 打转，累加值恒为 22222221111111）；
+> - 新增回归测试 `internal/lift/arm64/loop_repro_test.go`：把 `cmp x1,x2 ; b.ls` 那段手写 aarch64 过 lifter，
+>   断言 IR 出现「Sub 且 dst=ZR」的比较、字节码出现 `SUB64 R34,...`；**修复前该测试红，修复后绿**。
+>
+> ### 324. CI 结果（提交 ca96f96）
+> | 作业 | 结论 |
+> |---|---|
+> | windows-amd64 | success |
+> | linux-amd64 | success |
+> | **linux-arm64** | **success** —— qemu 端到端输出与 native 完全一致（此前是 0|0|… 或 1|1） |
+> | windows-arm64-blob | 已知外部缺口：镜像里没有 aarch64-w64-mingw32-gcc；作业显式打印 
+> |   | 「no aarch64-w64-mingw32-gcc available: Windows/arm64 blob build is still unverified (known gap, not a regression)」 |
+>
+> 本机：go build / go vet / go test / gofmt 全绿、x86-64 E2E 146/146、arm64 客户机差分 OK。
 
 
 
