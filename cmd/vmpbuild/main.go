@@ -574,8 +574,11 @@ func readABIConstants(src string) (frameSize, margin, skewExtra int, err error) 
 	if got["VM_FRAME_SIZE"] == 0 || got["VM_MARGIN"] == 0 {
 		return 0, 0, 0, fmt.Errorf("vm_abi.h 里缺少 VM_FRAME_SIZE / VM_MARGIN")
 	}
-	if got["VM_FRAME_SKEW_EXTRA"] == 0 {
-		got["VM_FRAME_SKEW_EXTRA"] = 16 // 兼容旧头文件
+	// 只在**旧头文件里缺少该宏**时按 16 兼容；显式写 0 的必须保持 0。
+	// arm64 平台就是显式 0（BL 不压栈，没有 x86 那种返回地址额外 8 字节）。
+	// 之前用 == 0 判断，会把它的 0 改成 16，于是 lifter 对 [sp+disp]（disp>=0，调用方帧）的换算整体偏 16 字节。
+	if _, present := got["VM_FRAME_SKEW_EXTRA"]; !present {
+		got["VM_FRAME_SKEW_EXTRA"] = 16
 	}
 	return got["VM_FRAME_SIZE"], got["VM_MARGIN"], got["VM_FRAME_SKEW_EXTRA"], nil
 }
