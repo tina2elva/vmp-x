@@ -107,7 +107,14 @@ func applyRelocsObj(obj *objFile, blob []byte, secBlobOff map[int]int, verbose b
 
 		switch r.Kind {
 		case relPCRel32:
-			frame := field + 4 + r.PlusN
+			// ELF 的加数是显式的（RELA 的 r_addend；x86-64 上 call/jmp 通常是 -4），
+			// 所以写入值就是 target - field；COFF 的加数藏在字段里，才需要 +4 / PlusN 补偿。
+			// 之前不分格式一律 +4，等于把 ELF 的每条 PC 相对 call/jmp 都写偏 4 字节
+			// —— 这正是"Windows 正常、Linux SIGILL"的根因（探针把它定位到 blob+0xCBF）。
+			frame := field + r.PlusN
+			if obj.Format != "elf" {
+				frame = field + 4 + r.PlusN
+			}
 			binary.LittleEndian.PutUint32(blob[field:], uint32(int32(target-frame)))
 		case relAArch64Branch26:
 			// BL/B：imm26 = (target - field) / 4，写进低 26 位（操作码位保留）
@@ -258,7 +265,10 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 			}
 			switch r.Kind {
 			case relPCRel32:
-				frame := field + 4 + r.PlusN
+				frame := field + r.PlusN
+				if o.Format != "elf" { // 同 applyRelocsObj：ELF 的加数在 RELA 里，不再 +4
+					frame = field + 4 + r.PlusN
+				}
 				binary.LittleEndian.PutUint32(m.Data[field:], uint32(int32(target-frame)))
 			case relAArch64Branch26:
 				delta := int64(target) - int64(field)
