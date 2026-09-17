@@ -1,0 +1,91 @@
+# vmp-x：路线 B 的 VMP PoC（x86-64 / ARM64，PE + ELF）
+
+把**已经编译好的**原生函数搬进自建虚拟机的保护方案。不需要源码、不需要重编译目标程序：
+读 PE/ELF 映像 → 反汇编目标函数 → 翻译成自建 VM 的字节码 → 注入解释器 blob → 把函数入口改成跳板。
+
+- 目标平台：Windows/amd64、Linux/amd64、Windows/arm64、Linux/arm64
+- 载入格式：PE（新增 RX/RW/RX 三节）与 ELF（不引入 W+X 段，见 docs/DESIGN.md）
+- 解释器是**自包含**的 freestanding blob：无 libc 依赖、无导入表、无动态符号
+
+## 快速开始（Windows / amd64）
+
+```powershell
+# 1) 构建工具
+go build -o build/vmpbuild.exe ./cmd/vmpbuild
+go build -o build/vmpack.exe   ./cmd/vmpack
+go build -o build/coverage.exe ./cmd/coverage
+
+# 2) 编译解释器 blob（会同时写出 build/vm_interp.json 清单）
+./build/vmpbuild.exe -src stub/win/x64 -out build/vm_interp.bin -manifest build/vm_interp.json -entry vm_entry
+
+# 3) 准备一个目标程序，并保护其中一个函数（可多次 -func）
+gcc -O2 -o build/target.exe testdata/target.c
+./build/vmpack.exe -exe build/target.exe -func check_key -out build/target_vmp.exe
+
+# 4) 跑起来（输出应与原生完全一致）
+./build/target.exe     check_key 12345
+./build/target_vmp.exe check_key 12345
+```
+
+
+## 一条命令跑完全部门禁（本机 Windows/amd64）
+
+```powershell
+powershell -NoProfile -File tools/gates.ps1
+```
+
+它依次跑 gofmt / go vet / go test / x86-64 E2E / DLL E2E，并在最后打印一张通过表；任何一步失败都会以非零退出码结束。
+## 全量验证（真机 E2E）
+
+| 命令 | 覆盖 | 本机实测 |
+|---|---|---|
+| `powershell -NoProfile -File tools/e2e.ps1` | Windows/amd64 x86-64：24 个被保护函数 × 多组取值，逐字节比对原生 | **146 passed, 0 failed**（第 79 轮复测） |
+| `powershell -NoProfile -File tools/e2e_dll.ps1` | 把 DLL 里的导出函数也保护起来（含 LoadLibrary/GetProcAddress 调用链） | **3 passed, 0 failed** |
+| `powershell -NoProfile -File tools/verify_linux_payload.ps1` | Linux ELF 载荷：ET_EXEC 与 PIE（两个加载地址） | 6/6 与 6/6 |
+| `bash tools/e2e.sh` | Linux/amd64：ELF 打包 + readelf 断言（不得出现 W+X 段） | 需在 Linux 上跑 |
+| `bash tools/e2e_arm64.sh` | Linux/arm64：qemu 端到端（**只能在 CI/真机跑**） | 见 docs/RUNBOOK.md |
+| `go test ./...` | 11 个包：解码、lifter、参考 VM、注入、扫描、覆盖率 | 全绿 |
+| `powershell -NoProfile -File tools/difftest.ps1` | 与独立参考实现（x86asm/arm64asm/Go 参考 VM）的差分测试 | 全绿 |
+
+## 覆盖到的指令子集
+
+在**真实编译产物**上的实测（`build/coverage.exe <目标>`，函数级 = 整段可翻译的比例）：
+
+| 目标 | 函数级 | 指令级 |
+|---|---|---|
+| Go 1.22 编译的 Linux 二进制（`build/linux_target`，1797 函数） | **86.8%** | **99.3%** |
+| libstdc++-6.dll（5441 函数） | **91.4%** | **99.5%** |
+| testdata/target.c（80 函数） | **87.5%** | **99.4%** |
+
+子集包含（x86-64）：通用整数 ALU 全宽（含 ADC/SBB/乘法高低半/位扫描）、条件与控制流、
+调用（直接/间接、含 thunk 回宿主）、栈与内存、跳转表（含 gcc 的分裂形态）、
+SIMD 位运算与打包整数算术/洗牌/标量搬移、浮点标量（ADDSD/MULSD/DIVSD/CVTSI2SD/CVTTSD2SI/UCOMISD）、
+以及**真正的原子读改写**（XCHG/LOCK 系列，用宿主 `__atomic_*` 实现，多线程语义与原生一致）。
+
+## 已知限制（如实清单）
+
+1. **调用约定只覆盖整数参数/返回值**（x86-64 SysV/Win64 的整数寄存器），浮点/向量参数不进出宿主；
+   浮点只在函数**内部**可用（testdata 的 `fp_mix` 是这种用法）。
+2. **解释器用 `-O1` 编译**：-O2 下只要浮点函数里含整数↔浮点转换，**整个解释器**会被 gcc 编译错
+   （已二分到触发点，根因疑为解释器里既有的 UB）。代价约 1.3–1.7×（见 docs/STATUS.md 第 71/72 轮）。
+3. `fp_mix` 的**两个大参数**取值仍与原生不符（未定位），因此这两个参数没有进 E2E 用例清单。
+4. 未支持：x87、AES-NI、AVX/VEX、REP 字符串指令、`SYSCALL`、冷块（switch 默认目标在符号范围外）的部分形态。
+5. 明文缓存与线程安全：缓存条目按描述符指针键控并加锁；**跨进程/跨模块仍建议视为同机可信环境**。
+6. 没有 JIT、没有反调试、没有 CET/Authenticode 兼容处理。
+7. ARM64 侧：lifter/解码/ABI 已就绪（含 Linux/arm64 与 Windows/arm64 的 blob 构建），
+   但**尚未在本机真机执行过**（本机无 aarch64 工具链/qemu），需要 CI 或真机确认。
+
+## 性能（Windows/amd64，含明文缓存）
+
+| 函数 | 原生 | 被保护 | 倍率 |
+|---|---|---|---|
+| check_key | 0.4 ns/iter | 50 ns/iter | ~125× |
+| sum_to | 12.5 ns/iter | 1100 ns/iter | ~88× |
+
+开销主要来自解释器的取指/分发循环；这是"用可移植性换性能"的路线 B 固有代价。
+
+## 文档
+
+- `docs/DESIGN.md`：设计（VM ISA、字节码、PE/ELF 注入、去 RWX、PIE/共享库、缓存与线程安全）
+- `docs/STATUS.md`：逐轮进展与**逐条证据**（每一轮做了什么、验到了什么、哪些没验证）
+- `docs/RUNBOOK.md`：四平台的可复制执行清单（含 CI 未闭环项的说明）

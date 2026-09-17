@@ -1,0 +1,59 @@
+package arm64
+
+import (
+	"encoding/binary"
+	"testing"
+
+	dec "github.com/vmpx/vmp-x/internal/decode/arm64"
+	"github.com/vmpx/vmp-x/internal/ir"
+	"github.com/vmpx/vmp-x/internal/vm"
+)
+
+// 调试用：单条指令，打印解码文本、IR、两条路径的结果
+func TestDbgSingle(t *testing.T) {
+	words := []uint32{1392541233, 3509988752, 4051138508, 2856590619, 0x11000000, 0x0B000000}
+	for _, w := range words {
+		b := make([]byte, 4)
+		binary.LittleEndian.PutUint32(b, w)
+		ins, err := dec.Decode(b, 0x1000)
+		if err != nil {
+			t.Logf("0x%08X 解码失败: %v", w, err)
+			continue
+		}
+		t.Logf("0x%08X  class=%v  %s", w, ins.Class, ins.Text())
+		var regs [35]uint64
+		for i := 0; i < 31; i++ {
+			regs[i] = uint64(i+1) * 0x1111111111
+		}
+		ref := &refMachine{regs: regs}
+		if err := ref.step(&ins); err != nil {
+			t.Logf("   参考实现拒绝: %v", err)
+		}
+		fn := &ir.Func{}
+		l := &Lifter{}
+		l.Lift(fn, []dec.Insn{ins})
+		if len(fn.Unsupported) > 0 {
+			t.Logf("   lifter 拒绝: %v", fn.Unsupported)
+			continue
+		}
+		for i := range fn.Insns {
+			in := &fn.Insns[i]
+			t.Logf("   IR[%d] op=%v kind=0x%X w=%d dst=%d a=%d b=%d imm=0x%X", i, in.Op, in.Kind, in.Width, in.Dst, in.A, in.B, in.Imm)
+		}
+		fn.Insns = append(fn.Insns, ir.Insn{Op: ir.Ret})
+		res, err := vm.Generate(fn)
+		if err != nil {
+			t.Logf("   codegen 失败: %v", err)
+			continue
+		}
+		st := &vm.RefState{Guest: vm.GuestARM64, Mem: map[uint64]byte{}}
+		st.Regs = regs
+		st.Run(res.Code, 64)
+		t.Logf("   flags vm=0x%X ref=0x%X", st.Flags, ref.flags)
+		for i := 0; i < 6; i++ {
+			if st.Regs[i] != ref.regs[i] {
+				t.Logf("   R%d vm=0x%X ref=0x%X  <<< 不一致", i, st.Regs[i], ref.regs[i])
+			}
+		}
+	}
+}

@@ -1,0 +1,7 @@
+# 统一换行：仓库里一律 LF，检出到 Windows 时再按需转换。
+# 关键点：tools/*.sh 必须是 LF —— 否则在 Linux CI 上会以 /bin/bash^M 失败。
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.exe binary
+*.bin binary

@@ -1,0 +1,613 @@
+// vmpbuild - 构建可注入的 VM 解释器 blob。
+//
+// 它做四件事：
+//  1. 把 C 源码 stage 到 ASCII 临时目录后编译（msys2 工具链不支持非 ASCII 路径），
+//     编译参数保证无 libc、无编译器辅助函数、无 unwind 表。
+//  2. 解析 .o —— COFF（Windows 工具链）与 ELF 可重定位目标（Linux 工具链）都读，
+//     直接读符号表与节重定位，而不是去解析 objdump 的文本输出（见 objfile.go）。
+//  3. 把 .text/.rdata/.rodata/.data 拼成一个 blob，并把节内 PC-relative 重定位**自行解析**：
+//     blob 是整块搬运的，节间相对距离由我们决定，所以 PC-relative 引用必须重算，
+//     绝对引用则直接判为失败（不可注入）。
+//  4. 输出 blob + manifest.json（入口偏移、符号表、校验和、重定位统计）。
+//
+// 失败即报错：任何指向 blob 之外的符号、任何绝对重定位都会让构建失败。
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	relAMD64Addr64   = 0x0001
+	relAMD64Addr32   = 0x0002
+	relAMD64Addr32NB = 0x0003
+	relAMD64Rel32    = 0x0004
+	relAMD64Rel32N   = 0x0009 // REL32_1 .. REL32_5
+)
+
+type sectInfo struct {
+	Name    string `json:"name"`
+	BlobOff int    `json:"blobOff"`
+	Size    int    `json:"size"`
+}
+
+type manifest struct {
+	Source       string         `json:"source"`
+	Entry        string         `json:"entry"`
+	EntryOff     int            `json:"entryOff"`
+	BlobSize     int            `json:"blobSize"`
+	SHA256       string         `json:"sha256"`
+	FrameSize    int            `json:"frameSize"`
+	Margin       int            `json:"margin"`
+	FrameSkew    int            `json:"frameSkew"`
+	MaxStubFrame int            `json:"maxStubStackFrame"`
+	BSSOff       int            `json:"bssOff"`  // blob 里可写数据（.bss）的起始偏移
+	BSSSize      int            `json:"bssSize"` // 可写数据大小：这一段必须单独映射成 RW
+	RelocsTotal  int            `json:"relocsTotal"`
+	RelocsPatch  int            `json:"relocsPatched"`
+	Sections     []sectInfo     `json:"sections"`
+	Symbols      map[string]int `json:"symbols"`
+	OpcodeMap    map[string]int `json:"opcodeMap"` // 逻辑操作码名 -> 本 blob 的实际编码
+	Key          string         `json:"key"`       // AEAD 主密钥（hex）；M2.2 用，定位见 DESIGN §2
+	Guest        string         `json:"guest"`     // 客户机 ISA：x86-64 / arm64
+	RegCount     int            `json:"regCount"`  // ctx 的寄存器槽位数：18（x86-64）/ 35（arm64）
+	UndefinedSym []string       `json:"undefinedSymbols,omitempty"`
+}
+
+func main() {
+	src := flag.String("src", "stub/win/x64", "stub 源码目录")
+	obj := flag.String("obj", "", "已有 .o 路径（留空则先编译）")
+	entry := flag.String("entry", "vm_entry", "入口符号名")
+	out := flag.String("out", "internal/inject/vm_interp.bin", "输出 blob")
+	man := flag.String("manifest", "internal/inject/vm_interp.json", "输出 manifest")
+	cc := flag.String("cc", "gcc", "编译器")
+	keep := flag.Bool("keep", false, "保留临时目录")
+	tmpRoot := flag.String("tmp", "", "临时目录（默认系统临时目录；必须是 ASCII 路径）")
+	objdump := flag.String("objdump", "objdump", "objdump 路径（用于测量解释器栈帧）")
+	stageRoot := flag.String("stage-root", "stub", "要整体 stage 的源码树根（BLOB.sources 的路径相对它）")
+	randomOpcodes := flag.Bool("random-opcodes", true, "为本次构建生成随机的 VM 操作码映射（默认开启）")
+	guest := flag.String("guest", "x86-64", "客户机 ISA：x86-64（默认）或 arm64")
+	merge := flag.String("merge", "ld", "目标文件合并方式：ld（GNU ld -r）或 go（内置直拼，COFF 用它）")
+	verbose := flag.Bool("v", false, "打印符号与重定位详情")
+	flag.Parse()
+
+	tmp, err := os.MkdirTemp(*tmpRoot, "vmpbuild-")
+	must(err)
+	if !*keep {
+		defer os.RemoveAll(tmp)
+	}
+	if !isASCII(tmp) {
+		fatalf("临时目录必须是非 ASCII 路径会破坏 msys2 工具链: %s", tmp)
+	}
+
+	// 构建期随机操作码映射：每个 blob 一套独立编码。
+	// 生成的 vm_opcode_values.h 放进临时目录，编译时用 -include 强制先包含它，
+	// 于是解释器里的 OP_* 常量就是本 blob 的实际编码（编译期常量，零运行时开销）。
+	opcodeValuesPath, opMap, err := generateOpcodeValues(tmp, *randomOpcodes)
+	must(err)
+	keyPath, keyHex, err := generateKeyFile(tmp)
+	must(err)
+	_ = keyPath
+	keyRel := ""
+	_ = keyRel
+	if *verbose {
+		fmt.Printf("[*] opcode map: %d entries (random=%v)\n", len(opMap), *randomOpcodes)
+	}
+
+	// 汇编/编译：先各自成对象；合并方式可选
+	//   -merge ld  ：GNU ld -r 合并（x86-64 一直用的路径，默认）
+	//   -merge go  ：内置直拼（COFF 没有 ld -r 的等价物，Windows/arm64 走这条）
+	objs := []string{*obj}
+	if *obj == "" {
+		objs, err = compile(*cc, *stageRoot, *src, tmp, opcodeValuesPath, keyPath, *guest, *verbose)
+		must(err)
+	}
+	var merged *mergedBlob
+	var single *objFile
+	objPath := ""
+	switch *merge {
+	case "go":
+		parsed := make([]*objFile, 0, len(objs))
+		for _, p := range objs {
+			ob, err := readObject(p)
+			must(err)
+			parsed = append(parsed, ob)
+		}
+		merged, err = buildBlobMulti(parsed)
+		must(err)
+		objPath = objs[0]
+		_ = parsed
+	case "ld", "":
+		objPath = objs[0]
+		if len(objs) > 1 {
+			objPath, err = mergeWithLd(tmp, objs, *verbose)
+			must(err)
+		}
+		ob, err := readObject(objPath)
+		must(err)
+		single = ob
+	default:
+		fatalf("-merge 只支持 ld 或 go（收到 %q）", *merge)
+	}
+
+	frameSize, margin, skewExtra, err := readABIConstants(*src)
+	must(err)
+	// 多目标直拼时 objPath 只是第一个对象，栈帧要**在所有对象上取最大**
+	maxFrame := 0
+	for _, p := range objs {
+		f, err := measureMaxFrame(*objdump, p, *verbose)
+		must(err)
+		if f > maxFrame {
+			maxFrame = f
+		}
+	}
+	if len(objs) == 0 {
+		maxFrame, err = measureMaxFrame(*objdump, objPath, *verbose)
+		must(err)
+	}
+	if maxFrame+512 >= margin {
+		fatalf("VM_MARGIN(0x%X) 对解释器最大栈帧(0x%X) 来说太小：模拟栈会与宿主栈重叠", margin, maxFrame)
+	}
+	frameSkew := frameSize + skewExtra + margin
+
+	var (
+		sections []sectInfo
+		blob     []byte
+		nReloc   int
+		syms     = map[string]int{}
+	)
+	if merged != nil {
+		sections = merged.Sections
+		blob = merged.Data
+		nReloc, err = merged.applyAllRelocs(parsedObjs(objs), *verbose)
+		must(err)
+		for k, v := range merged.symOff {
+			syms[k] = v
+		}
+	} else {
+		var secBlobOff map[int]int
+		sections, blob, secBlobOff, err = buildBlobObj(single)
+		must(err)
+		nReloc, err = applyRelocsObj(single, blob, secBlobOff, *verbose)
+		must(err)
+		for _, s := range single.Symbols {
+			if s.Sec >= 0 {
+				if off, ok := secBlobOff[s.Sec]; ok {
+					syms[s.Name] = off + int(s.Value)
+				}
+			}
+		}
+	}
+
+	entryOff, ok := syms[*entry]
+	if !ok {
+		keys := make([]string, 0, len(syms))
+		for k := range syms {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fatalf("入口符号 %q 不在 blob 中；可用符号: %s", *entry, strings.Join(keys, ", "))
+	}
+
+	must(os.MkdirAll(filepath.Dir(*out), 0o755))
+	must(os.WriteFile(*out, blob, 0o644))
+
+	// 可写数据区间：sections 里名为 .bss 的那一段（buildBlob* 已保证它在最后）
+	bssOff, bssSize := 0, 0
+	for _, s := range sections {
+		if s.Name == ".bss" && s.Size > 0 {
+			// 长度按节对齐补齐：blob 里 .bss 后面已经补过零，注入器要按补齐后的长度划段
+			bssOff = s.BlobOff
+			bssSize = (s.Size + 0xFFF) &^ 0xFFF
+		}
+	}
+
+	sum := sha256.Sum256(blob)
+	m := manifest{
+		Source:       *src,
+		Entry:        *entry,
+		EntryOff:     entryOff,
+		FrameSize:    frameSize,
+		Margin:       margin,
+		FrameSkew:    frameSkew,
+		Guest:        *guest,
+		RegCount:     regCountFor(*guest),
+		MaxStubFrame: maxFrame,
+		BlobSize:     len(blob),
+		SHA256:       fmt.Sprintf("%x", sum[:]),
+		RelocsTotal:  nReloc,
+		RelocsPatch:  nReloc,
+		Sections:     sections,
+		Symbols:      syms,
+		OpcodeMap:    opMap,
+		BSSOff:       bssOff,
+		BSSSize:      bssSize,
+		Key:          keyHex,
+	}
+	b, _ := json.MarshalIndent(m, "", "  ")
+	must(os.WriteFile(*man, b, 0o644))
+
+	fmt.Printf("[+] blob: %s (%d bytes), entry %s @ +0x%X\n", *out, len(blob), *entry, entryOff)
+	for _, s := range sections {
+		fmt.Printf("    %-8s blobOff=0x%-6X size=0x%X\n", s.Name, s.BlobOff, s.Size)
+	}
+	fmt.Printf("    relocations resolved internally: %d\n", nReloc)
+	fmt.Printf("    stack: frame=%d margin=0x%X frameSkew=%d | stub max frame=0x%X\n", frameSize, margin, frameSkew, maxFrame)
+	fmt.Printf("    guest=%s regCount=%d（宿主 harness 必须用同一套 ctx 布局，否则会以 rc=1 的形式静默失败）\n",
+		*guest, regCountFor(*guest))
+	fmt.Printf("[+] manifest: %s\n", *man)
+}
+
+// regCountFor 返回客户机的 ctx 槽位数。写进 manifest 是为了让调用方（测试/harness）
+// 能在运行前就发现"harness 与 blob 布局不一致"——这个坑真踩过一次：
+// 少给 harness 传 -DVM_REG_COUNT=35，症状就是解释器 rc=1，排查了很久。
+func regCountFor(guest string) int {
+	if guest == "arm64" {
+		return 35
+	}
+	return 18
+}
+
+// generateOpcodeValues 生成 vm_opcode_values.h（默认或随机映射），返回文件路径与"名字->编码"表。
+//
+// 随机映射的意义：每个 blob 的操作码字节都不一样，静态特征扫描失效。
+// 解释器用编译期常量分发，所以随机化**不带来任何运行时开销**。
+func generateOpcodeValues(tmp string, random bool) (string, map[string]int, error) {
+	outDir := filepath.Join(tmp, "opcodes")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return "", nil, err
+	}
+	outPath := filepath.Join(outDir, "vm_opcode_values.h")
+	nl := string(rune(10))
+
+	type entry struct {
+		name string
+		val  int
+	}
+	// 顺序与 stub/win/x64/vm_opcode_values.h 及 internal/vm/opcodes.go 一致（有交叉校验测试）
+	entries := []entry{
+		{"VM_OP_HALT", 0x00}, {"VM_OP_NOP", 0x01}, {"VM_OP_RET", 0x02},
+		{"VM_OP_MOV_RR", 0x10}, {"VM_OP_MOV_RI", 0x11}, {"VM_OP_MOV_RI32", 0x12}, {"VM_OP_LEA", 0x13},
+		{"VM_OP_ALU_RR", 0x20}, {"VM_OP_ALU_RI", 0x21}, {"VM_OP_ALU_U", 0x22},
+		{"VM_OP_CMP_RR", 0x23}, {"VM_OP_CMP_RI", 0x24},
+		{"VM_OP_EXT", 0x30},
+		{"VM_OP_LOAD", 0x40}, {"VM_OP_STORE", 0x41}, {"VM_OP_ATOMIC", 0x42}, {"VM_OP_FP", 0x43},
+		{"VM_OP_PUSH_R", 0x50}, {"VM_OP_PUSH_I", 0x51}, {"VM_OP_POP_R", 0x52},
+		{"VM_OP_JCC", 0x60}, {"VM_OP_JMP", 0x61}, {"VM_OP_JBZ", 0x62}, {"VM_OP_JBNZ", 0x63},
+		{"VM_OP_CALLN", 0x70}, {"VM_OP_CALLR", 0x71},
+	}
+
+	vals := make([]int, len(entries))
+	for i, e := range entries {
+		vals[i] = e.val
+	}
+	if random {
+		pool := make([]int, 0, 254)
+		for v := 1; v <= 0xFE; v++ {
+			pool = append(pool, v)
+		}
+		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+		rnd.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
+		copy(vals, pool)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("/* 由 cmd/vmpbuild 生成：本 blob 的 VM 操作码编码 */" + nl)
+	sb.WriteString("#ifndef VM_OPCODE_VALUES_H" + nl + "#define VM_OPCODE_VALUES_H" + nl)
+	opMap := map[string]int{}
+	for i, e := range entries {
+		fmt.Fprintf(&sb, "#define %s 0x%02X"+nl, e.name, vals[i])
+		opMap[strings.TrimPrefix(e.name, "VM_")] = vals[i]
+	}
+	sb.WriteString("#endif" + nl)
+	if err := os.WriteFile(outPath, []byte(sb.String()), 0o644); err != nil {
+		return "", nil, err
+	}
+	return outPath, opMap, nil
+}
+
+// generateKeyFile 生成本 blob 的 AEAD 主密钥（vm_crypto_key.h，宏形式：避免外部符号引用
+// 在 mingw 下变成 .rdata$.refptr 绝对指针表，那是位置无关 blob 不能接受的）。
+//
+// 定位：密钥最终在 blob 里，因此这不是密码学级保护（见 docs/DESIGN.md §2）——
+// 它挡住静态分析，真正的级别需要 KeyProvider 的 TPM/TEE/远程证明。
+func generateKeyFile(tmp string) (string, string, error) {
+	nl := string(rune(10))
+	outDir := filepath.Join(tmp, "opcodes")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return "", "", err
+	}
+	key := make([]byte, 32)
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano() ^ 0x5DEECE66D))
+	for i := range key {
+		key[i] = byte(rnd.Intn(256))
+	}
+	var sb strings.Builder
+	sb.WriteString("/* 由 cmd/vmpbuild 生成：本 blob 的 AEAD 主密钥 */" + nl)
+	sb.WriteString("#ifndef __ASSEMBLER__" + nl)
+	sb.WriteString("#define VM_KEY_BYTES {")
+	for i, b := range key {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, "0x%02X", b)
+	}
+	sb.WriteString("}" + nl)
+	sb.WriteString("#endif" + nl)
+	p := filepath.Join(outDir, "vm_crypto_key.h")
+	if err := os.WriteFile(p, []byte(sb.String()), 0o644); err != nil {
+		return "", "", err
+	}
+	return p, fmt.Sprintf("%x", key), nil
+}
+
+func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, verbose bool) ([]string, error) {
+	// 把整个 stageRoot（默认 stub/）树按原样拷进 ASCII 临时目录。
+	// 这样平台目录之间可以互相引用（例如 Linux 复用 win/x64 的 vm_interp.c），
+	// 而不需要复制出会漂移的两份实现。
+	if err := stageTree(stageRoot, tmp); err != nil {
+		return nil, err
+	}
+
+	platformRel, err := filepath.Rel(stageRoot, src)
+	if err != nil {
+		return nil, err
+	}
+	platformRel = filepath.ToSlash(platformRel)
+	platformDir := filepath.Join(tmp, filepath.FromSlash(platformRel))
+	if _, err := os.Stat(filepath.Join(platformDir, "vm_abi.h")); err != nil {
+		return nil, fmt.Errorf("平台目录 %s 缺少 vm_abi.h", platformRel)
+	}
+	// 编译器目标 ABI：mingw 编译出来的 blob 内部是 Win64 约定，
+	// 即使在为 Linux 构建时也必须告诉入口（否则调用 vm_run 会传错寄存器）。
+	compilerIsWindows := false
+	if out, derr := exec.Command(cc, "-dumpmachine").Output(); derr == nil {
+		t := strings.ToLower(string(out))
+		compilerIsWindows = strings.Contains(t, "mingw") || strings.Contains(t, "w64")
+	}
+	if verbose && compilerIsWindows {
+		fmt.Println("[*] 编译器目标是 Windows ABI：将定义 VM_BLOB_USES_WIN64")
+	}
+
+	common := []string{
+		"-c", "-O1", "-std=c11", // -O2 会把解释器编译错（见 STATUS 第 71/72 轮），先用 -O1
+		"-ffreestanding", "-nostdlib", "-fno-builtin",
+		"-fno-stack-protector", "-fno-asynchronous-unwind-tables",
+		"-fno-unwind-tables", "-fno-ident", "-mno-red-zone",
+		"-fno-jump-tables",
+		// 解释器里有大量类型双关（u64 ↔ u8* ↔ double/float）。没有这个开关时，
+		// 把浮点写回加进来会让 gcc 对**整个函数**启用更激进的别名假设，
+		// 结果连不执行浮点的函数都算错（实测就是这么来的）。
+		"-fno-strict-aliasing",
+		"-Wall", "-Wextra",
+	}
+
+	// 只编译 BLOB.sources 里显式列出的文件（测试/工具程序不能被链进 blob）
+	sources, err := readSourceList(src)
+	if err != nil {
+		return nil, err
+	}
+	// 加密支持：解释器固定编进 vm_crypto.c；密钥用 -include 注入（见下）
+	sources = append(sources, "win/x64/vm_crypto.c")
+	if guest == "arm64" {
+		// ARM64 客户机：标志位/条件码语义来自 stub/arm64 的独立模块
+		sources = append(sources, "arm64/guest_semantics_arm64.c")
+	}
+
+	var objs []string
+	for _, srcName := range sources {
+		srcPath := filepath.Join(tmp, filepath.FromSlash(srcName))
+		if _, err := os.Stat(srcPath); err != nil {
+			return nil, fmt.Errorf("BLOB.sources 里的 %s 不存在（路径相对 %s）", srcName, stageRoot)
+		}
+		objName := strings.ReplaceAll(srcName, "/", "_") + ".o"
+		// -include 强制先包含平台的 vm_abi.h：
+		// 同一个 vm_interp.c 因此可以用不同 ABI 头编译（Windows / Linux）。
+		args := append(append([]string{}, common...),
+			"-include", filepath.Join(platformDir, "vm_abi.h"),
+			"-include", opcodeValuesPath,
+			"-include", keyPath)
+		if guest == "arm64" {
+			// ARM64 客户机：语义模块在 arm64/ 下，它自己又 include vm_types.h
+			args = append(args,
+				"-DVM_GUEST_ARM64=1", "-DVM_REG_COUNT=35",
+				"-I", platformDir,
+				"-I", filepath.Join(tmp, "arm64"))
+		}
+		if compilerIsWindows {
+			args = append(args, "-DVM_BLOB_USES_WIN64=1")
+		}
+		args = append(args, "-o", objName, srcPath)
+		if verbose {
+			fmt.Println("[*]", cc, strings.Join(args, " "))
+		}
+		cmd := exec.Command(cc, args...)
+		cmd.Dir = tmp
+		cmd.Env = append(os.Environ(), "LC_ALL=C")
+		combined, err := cmd.CombinedOutput()
+		if len(combined) > 0 {
+			fmt.Fprint(os.Stderr, string(combined))
+		}
+		if err != nil {
+			return nil, fmt.Errorf("编译 %s 失败: %w", srcName, err)
+		}
+		// 返回**绝对路径**：多目标直拼要直接读它们，而 cmd.Dir 只是编译时的工作目录
+		objs = append(objs, filepath.Join(tmp, objName))
+	}
+	if len(objs) == 0 {
+		return nil, fmt.Errorf("目录 %s 里没有可编译的源文件", src)
+	}
+
+	return objs, nil
+}
+
+// parsedObjs 读取一批目标文件（多目标直拼的输入）
+func parsedObjs(paths []string) []*objFile {
+	out := make([]*objFile, 0, len(paths))
+	for _, p := range paths {
+		ob, err := readObject(p)
+		must(err)
+		out = append(out, ob)
+	}
+	return out
+}
+
+// mergeWithLd 用 GNU ld -r 把多个目标文件合并成一个（x86-64 路径一直用它）
+func mergeWithLd(tmp string, objs []string, verbose bool) (string, error) {
+	out := filepath.Join(tmp, "vm_all.o")
+	ldArgs := append([]string{"-r", "-o", out}, objs...)
+	if verbose {
+		fmt.Println("[*] ld", strings.Join(ldArgs, " "))
+	}
+	ldCmd := exec.Command("ld", ldArgs...)
+	ldCmd.Dir = tmp
+	ldOut, err := ldCmd.CombinedOutput()
+	if len(ldOut) > 0 {
+		fmt.Fprint(os.Stderr, string(ldOut))
+	}
+	if err != nil {
+		return "", fmt.Errorf("ld -r 合并失败（可用 -merge go 走内置直拼）: %w", err)
+	}
+	return out, nil
+}
+
+// stageTree 递归复制目录树（保留相对路径）
+func stageTree(root, dst string) error {
+	return filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, b, 0o644)
+	})
+}
+
+// readSourceList 读取 BLOB.sources（每行一个文件名，# 开头为注释）
+func readSourceList(dir string) ([]string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "BLOB.sources"))
+	if err != nil {
+		return nil, fmt.Errorf("读取 BLOB.sources 失败: %w", err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("BLOB.sources 为空")
+	}
+	return out, nil
+}
+
+// readABIConstants 从 vm_abi.h 读取帧大小与栈余量（单一事实来源在 C 头文件里）
+func readABIConstants(src string) (frameSize, margin, skewExtra int, err error) {
+	b, err := os.ReadFile(filepath.Join(src, "vm_abi.h"))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	re := regexp.MustCompile("(?m)^#define\\s+(VM_FRAME_SIZE|VM_MARGIN|VM_FRAME_SKEW_EXTRA)\\s+(0x[0-9A-Fa-f]+|\\d+)")
+	got := map[string]int{}
+	for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+		v, perr := strconv.ParseInt(m[2], 0, 64)
+		if perr != nil {
+			return 0, 0, 0, perr
+		}
+		got[m[1]] = int(v)
+	}
+	if got["VM_FRAME_SIZE"] == 0 || got["VM_MARGIN"] == 0 {
+		return 0, 0, 0, fmt.Errorf("vm_abi.h 里缺少 VM_FRAME_SIZE / VM_MARGIN")
+	}
+	if got["VM_FRAME_SKEW_EXTRA"] == 0 {
+		got["VM_FRAME_SKEW_EXTRA"] = 16 // 兼容旧头文件
+	}
+	return got["VM_FRAME_SIZE"], got["VM_MARGIN"], got["VM_FRAME_SKEW_EXTRA"], nil
+}
+
+// measureMaxFrame 用 objdump 统计各函数的最大 sub rsp，作为 VM_MARGIN 的安全性依据
+func measureMaxFrame(objdump, obj string, verbose bool) (int, error) {
+	out, err := exec.Command(objdump, "-d", obj).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("objdump 失败: %w", err)
+	}
+	cur := ""
+	max := 0
+	reFn := regexp.MustCompile("^[0-9a-f]+ <([^>]+)>:")
+	reSub := regexp.MustCompile("sub\\s+\\$0x([0-9a-f]+),%rsp")
+	// AArch64：帧分配是 `sub sp, sp, #imm` 或前索引 `str/stp ...[sp, #-imm]!`
+	reSubA64 := regexp.MustCompile("sub\\s+sp,\\s+sp,\\s+#0x([0-9a-f]+)")
+	rePreA64 := regexp.MustCompile("\\[sp,\\s+#-0x([0-9a-f]+)\\]!")
+	for _, line := range strings.Split(string(out), "\n") {
+		if m := reFn.FindStringSubmatch(line); m != nil {
+			cur = m[1]
+		}
+		record := func(hexv string) {
+			v, _ := strconv.ParseInt(hexv, 16, 64)
+			if verbose {
+				fmt.Printf("    [frame] %-24s 0x%X\n", cur, v)
+			}
+			if int(v) > max {
+				max = int(v)
+			}
+		}
+		if m := reSub.FindStringSubmatch(line); m != nil {
+			record(m[1])
+		}
+		if m := reSubA64.FindStringSubmatch(line); m != nil {
+			record(m[1])
+		}
+		if m := rePreA64.FindStringSubmatch(line); m != nil {
+			record(m[1])
+		}
+	}
+	return max, nil
+}
+
+// buildBlob 按顺序拼接需要保留的节，并记录每个节在 blob 中的偏移
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+func must(err error) {
+	if err != nil {
+		fatalf("%v", err)
+	}
+}
+
+func fatalf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "[!] "+format+"\n", a...)
+	os.Exit(1)
+}
+
+var _ = io.Discard

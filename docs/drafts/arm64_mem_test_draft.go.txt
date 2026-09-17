@@ -1,0 +1,567 @@
+package arm64
+
+import (
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"testing"
+
+	dec "github.com/vmpx/vmp-x/internal/decode/arm64"
+	arm64sem "github.com/vmpx/vmp-x/internal/guest/arm64"
+	"github.com/vmpx/vmp-x/internal/ir"
+	"github.com/vmpx/vmp-x/internal/vm"
+)
+
+// 内存访问的语义差分：参考侧自己实现一份（含内存模型），
+// 与"lift → 在 Go 参考 VM 里跑"对比寄存器、标志位与内存内容。
+//
+// 布局约定（让所有地址都落在同一个窗口里）：
+//   mem 窗口   : [0x14000, 0x20000)
+//   SP         : 0x1A000（VM 侧用 SP - FrameSkew，验证 FRAME_SKEW 机制）
+//   X19..X28   : 0x16000 附近
+//   代码/literal: 0x1F000..0x1F800（LDR literal 从代码区取常量）
+
+const (
+	memLo      = 0x14000
+	memHi      = 0x20000
+	memSP      = 0x1A000
+	memCode    = 0x1F000
+	memSkew    = 0x2000
+	memPattern = 0x5A
+)
+
+func memFill(m map[uint64]byte) {
+	for a := uint64(memLo); a < memHi; a++ {
+		m[a] = byte((a*7 + 3) & 0xFF)
+	}
+}
+
+type memRefMachine struct {
+	regs  [35]uint64
+	flags uint32
+	mem   map[uint64]byte
+}
+
+// write 用于**数据操作**的目标寄存器；Rd=31 在调用方按 SP/XZR 语义处理
+func (m *memRefMachine) write(r uint32, w ir.Width, v uint64) {
+	if r == 31 {
+		return // XZR
+	}
+	if w == ir.W32 {
+		m.regs[r] = v & 0xFFFFFFFF
+		return
+	}
+	m.regs[r] = v
+}
+
+func (m *memRefMachine) readZR(r uint32) uint64 {
+	if r == 31 {
+		return 0
+	}
+	return m.regs[r]
+}
+
+func (m *memRefMachine) loadMem(addr uint64, w ir.Width) uint64 {
+	var v uint64
+	for i := uint32(0); i < uint32(w)/8; i++ {
+		v |= uint64(m.mem[addr+uint64(i)]) << (8 * i)
+	}
+	return v
+}
+
+func (m *memRefMachine) storeMem(addr uint64, w ir.Width, val uint64) {
+	for i := uint32(0); i < uint32(w)/8; i++ {
+		m.mem[addr+uint64(i)] = byte(val >> (8 * i))
+	}
+}
+
+// refSingleMem：参考侧**独立**解析单寄存器访存的寻址方式
+func refSingleMem(raw uint32) (base uint32, disp int64, mode int, idxReg int, scale uint64) {
+	idxReg, scale = -1, 1
+	switch {
+	case (raw>>24)&1 == 1:
+		base = (raw >> 5) & 31
+		disp = int64((raw>>10)&0xFFF) << ((raw >> 30) & 3)
+		mode = 0
+	case (raw>>21)&1 == 1:
+		base = (raw >> 5) & 31
+		idxReg = int((raw >> 16) & 31)
+		scale = uint64(1) << ((raw >> 12) & 1)
+		mode = 0
+	default:
+		base = (raw >> 5) & 31
+		disp = signExtendN((raw>>12)&0x1FF, 9)
+		switch (raw >> 10) & 3 {
+		case 1:
+			mode = 1 // post
+		case 3:
+			mode = 2 // pre
+		}
+	}
+	return
+}
+
+func (m *memRefMachine) stepMem(ins *dec.Insn) error {
+	raw := ins.Raw
+	size := (raw >> 30) & 3
+	opc := (raw >> 22) & 3
+	rt := raw & 31
+	w := accessWidth(size)
+	switch ins.Class {
+	case dec.ClassLoadStore:
+		if opc == 3 {
+			return fmt.Errorf("opc=3")
+		}
+		base, disp, mode, idxReg, scale := refSingleMem(raw)
+		// 后索引（[Xn],#imm）：访问地址就是 Xn，立即数只用于写回
+		accDisp := disp
+		if mode == 1 {
+			accDisp = 0
+		}
+		addr := m.regs[base] + uint64(accDisp)
+		if idxReg >= 0 {
+			addr += m.readZR(uint32(idxReg)) * scale
+		}
+		if opc == 0 {
+			m.storeMem(addr, w, m.readZR(rt))
+		} else if opc == 2 || opc == 3 {
+			dstW := ir.W32
+			if ins.RegWidth(0) == 64 {
+				dstW = ir.W64
+			}
+			v := m.loadMem(addr, w)
+			sv := uint64(int64(v<<(64-uint32(w))) >> (64 - uint32(w)))
+			m.write(rt, dstW, sv)
+		} else if size == 3 || ins.RegWidth(0) == 64 {
+			m.write(rt, ir.W64, m.loadMem(addr, w))
+		} else {
+			m.write(rt, ir.W32, m.loadMem(addr, w))
+		}
+		// 前/后索引对单次访问等价：访问之后写回
+		if mode == 1 || mode == 2 {
+			m.regs[base] += uint64(disp)
+		}
+		return nil
+	case dec.ClassLoadStorePair:
+		var w2 ir.Width
+		switch size {
+		case 0:
+			w2 = ir.W32
+		case 2:
+			w2 = ir.W64
+		default:
+			return fmt.Errorf("size")
+		}
+		base := (raw >> 5) & 31
+		rt2 := (raw >> 10) & 31
+		disp := signExtendN((raw>>15)&0x7F, 7) * int64(w2/8)
+		mode := (raw >> 23) & 3
+		if mode == 0 {
+			return fmt.Errorf("no-alloc")
+		}
+		load := raw&(1<<22) != 0
+		accDisp := disp
+		if mode == 1 {
+			accDisp = 0 // 后索引：立即数只用于写回
+		}
+		addr := uint64(int64(m.regs[base]) + accDisp)
+		if load {
+			m.write(rt, w2, m.loadMem(addr, w2))
+			m.write(rt2, w2, m.loadMem(addr+uint64(w2/8), w2))
+		} else {
+			m.storeMem(addr, w2, m.readZR(rt))
+			m.storeMem(addr+uint64(w2/8), w2, m.readZR(rt2))
+		}
+		if mode == 1 || mode == 3 {
+			m.regs[base] += uint64(disp)
+		}
+		return nil
+	case dec.ClassLoadLiteral:
+		tgt, ok := ins.PCRelTarget()
+		if !ok {
+			return fmt.Errorf("literal target")
+		}
+		if size == 3 {
+			m.write(rt, ir.W64, m.loadMem(tgt, ir.W64))
+		} else {
+			m.write(rt, ir.W32, m.loadMem(tgt, w))
+		}
+		return nil
+	}
+	return fmt.Errorf("不是内存指令")
+}
+
+// run 执行整个程序（数据指令复用 refMachine.step）
+func (m *memRefMachine) run(insns []dec.Insn, maxSteps int) (int, error) {
+	idx := map[uint64]int{}
+	for i := range insns {
+		idx[insns[i].PC] = i
+	}
+	plain := &refMachine{flags: m.flags}
+	pc := 0
+	for steps := 0; steps < maxSteps; steps++ {
+		if pc < 0 || pc >= len(insns) {
+			return steps, nil
+		}
+		ins := &insns[pc]
+		switch ins.Class {
+		case dec.ClassLoadStore, dec.ClassLoadStorePair, dec.ClassLoadLiteral:
+			if err := m.stepMem(ins); err != nil {
+				return steps, err
+			}
+			pc++
+			continue
+		case dec.ClassBranchReg:
+			if ins.Op.String() == "RET" {
+				return steps, nil
+			}
+			return steps, fmt.Errorf("不支持 %v", ins.Op)
+		case dec.ClassBranchImm:
+			tgt, _ := ins.PCRelTarget()
+			pc = idx[tgt]
+			continue
+		case dec.ClassBranchCond:
+			cond, _ := ins.Cond()
+			if arm64sem.CondHolds(cond, m.flags) {
+				tgt, _ := ins.PCRelTarget()
+				pc = idx[tgt]
+			} else {
+				pc++
+			}
+			continue
+		case dec.ClassCompareBranch:
+			rt := ins.Raw & 31
+			w := uint32(32)
+			if ins.Raw&(1<<31) != 0 {
+				w = 64
+			}
+			taken := m.readZR(rt)&MaskW64(w) == 0
+			if ins.Op.String() == "CBNZ" {
+				taken = !taken
+			}
+			if taken {
+				tgt, _ := ins.PCRelTarget()
+				pc = idx[tgt]
+			} else {
+				pc++
+			}
+			continue
+		case dec.ClassTestBranch:
+			rt := ins.Raw & 31
+			bit := (ins.Raw >> 19) & 31
+			w := uint32(32)
+			if ins.Raw&(1<<31) != 0 {
+				bit |= 32
+				w = 64
+			}
+			taken := m.readZR(rt)&MaskW64(w)&(uint64(1)<<bit) == 0
+			if ins.Op.String() == "TBNZ" {
+				taken = !taken
+			}
+			if taken {
+				tgt, _ := ins.PCRelTarget()
+				pc = idx[tgt]
+			} else {
+				pc++
+			}
+			continue
+		}
+		// ARM64：ADD/SUB (immediate) 且 Rd=31、S=0 时写的是 **SP**
+		if ins.Class == dec.ClassAddSubImm && (ins.Raw&31) == 31 && ins.Raw&(1<<29) == 0 {
+			imm := int64((ins.Raw >> 10) & 0xFFF)
+			if ins.Raw&(1<<22) != 0 {
+				imm <<= 12
+			}
+			if ins.Raw&(1<<30) != 0 {
+				m.regs[31] -= uint64(imm)
+			} else {
+				m.regs[31] += uint64(imm)
+			}
+			pc++
+			continue
+		}
+		plain.regs = m.regs
+		plain.flags = m.flags
+		if err := plain.step(ins); err != nil {
+			return steps, err
+		}
+		m.regs = plain.regs
+		m.flags = plain.flags
+		pc++
+	}
+	return maxSteps, fmt.Errorf("超过步数上限")
+}
+
+// 生成"数据 + SP 调整 + 访存"的程序
+// spOffsetFor 为 SP 基址挑一个"访问落在调用方栈帧"的偏移。
+// 说明：本设计里"自有帧"（eff < 0）的访问是**故意被重定位**到模拟栈下方的，
+// 因此与忠实模拟 guest 语义的参考实现无法比对；差分只覆盖 eff >= 0 的访问。
+func spOffsetFor(rng *rand.Rand, spDelta int32) uint32 {
+	need := uint32(0)
+	if spDelta < 0 {
+		need = uint32(-spDelta)
+	}
+	return need + 0x40 + uint32(rng.Intn(0x100))
+}
+
+// genSimpleData 只生成**必定合法**的数据指令（ADD/SUB 立即数、ADD/SUB 移位寄存器、MOVZ），
+// 目的是让访存用例的通过率足够高（genDataInsn 偏随机，常产出非法编码）。
+func genSimpleData(rng *rand.Rand) uint32 {
+	rd := uint32(rng.Intn(16))
+	rn := uint32(rng.Intn(16))
+	rm := uint32(rng.Intn(16))
+	sfBit := uint32(0)
+	if rng.Intn(2) == 0 {
+		sfBit = 1 << 31
+	}
+	switch rng.Intn(4) {
+	case 0: // ADD/SUB (immediate)
+		w := uint32(0x11000000) | sfBit | (rn << 5) | rd | (uint32(rng.Intn(0x1000)) << 10)
+		if rng.Intn(2) == 0 {
+			w |= 1 << 30
+		}
+		if rng.Intn(3) == 0 {
+			w |= 1 << 29 // S
+		}
+		return w
+	case 1: // ADD/SUB (shifted register)
+		amt := uint32(rng.Intn(31))
+		st := uint32(rng.Intn(3))
+		w := uint32(0x0B000000) | sfBit | (rn << 5) | rd | (rm << 16) | (st << 22) | (amt << 10)
+		if rng.Intn(2) == 0 {
+			w |= 1 << 30
+		}
+		if rng.Intn(3) == 0 {
+			w |= 1 << 29
+		}
+		return w
+	case 2: // MOVZ
+		hw := uint32(rng.Intn(4))
+		if sfBit == 0 && hw > 1 {
+			hw = uint32(rng.Intn(2))
+		}
+		return uint32(0x52800000) | sfBit | (hw << 21) | (uint32(rng.Intn(0x10000)) << 5) | rd
+	default: // AND/ORR/EOR (shifted register)
+		opc := uint32(rng.Intn(3))
+		amt := uint32(rng.Intn(31))
+		st := uint32(rng.Intn(3))
+		return uint32(0x0A000000) | sfBit | (rn << 5) | rd | (rm << 16) | (opc << 29) | (st << 22) | (amt << 10)
+	}
+}
+
+// memBaseReg：访存只用 X26/X27/X28 或 SP；这些寄存器不会被子程序里的数据指令改写
+// （用例过滤器会跳过"数据指令写了 26-28 或 SP"的随机用例）。
+func memBaseReg(rng *rand.Rand) uint32 {
+	switch rng.Intn(4) {
+	case 0:
+		return 26
+	case 1:
+		return 27
+	case 2:
+		return 28
+	default:
+		return 31 // SP
+	}
+}
+
+func genMemProgram(rng *rand.Rand, n int) []uint32 {
+	words := make([]uint32, 0, n)
+	spDelta := int32(0)
+	for i := 0; i < n-1; i++ {
+		switch rng.Intn(10) {
+		case 0, 1: // SUB/ADD SP, SP, #imm —— **有界**，避免地址漂出内存窗口
+			imm := uint32(rng.Intn(0x80) + 16)
+			if spDelta > -0x200 && (spDelta >= 0 || rng.Intn(2) == 0) {
+				words = append(words, 0xD1000000|(imm<<10)|(31<<5)|31)
+				spDelta -= int32(imm)
+			} else if spDelta < 0x200 {
+				words = append(words, 0x91000000|(imm<<10)|(31<<5)|31)
+				spDelta += int32(imm)
+			} else {
+				words = append(words, genSimpleData(rng))
+			}
+		case 2, 3, 4: // LDR/STR 单寄存器
+			size := uint32(rng.Intn(4))
+			opc := uint32(rng.Intn(2)) // 0=store, 1=load(zx)
+			kind := []uint32{0, 1, 3}[rng.Intn(3)]
+			base := memBaseReg(rng)
+			imm9 := uint32(rng.Intn(0x400))
+			if base == 31 {
+				imm9 = spOffsetFor(rng, spDelta)
+			}
+			rt := uint32(rng.Intn(16)) // 数据寄存器只用 X0..X15，避免覆盖基址寄存器
+			words = append(words, (size<<30)|(0x7<<27)|(opc<<22)|(imm9<<12)|(kind<<10)|(base<<5)|rt)
+		case 5: // 有符号加载（opc=2）
+			size := uint32(rng.Intn(3))
+			base := memBaseReg(rng)
+			imm9 := uint32(rng.Intn(0x400))
+			if base == 31 {
+				imm9 = spOffsetFor(rng, spDelta)
+			}
+			rt := uint32(rng.Intn(16))
+			words = append(words, (size<<30)|(0x7<<27)|(2<<22)|(imm9<<12)|(base<<5)|rt)
+		case 6: // LDP/STP
+			size := []uint32{0, 2}[rng.Intn(2)]
+			load := uint32(rng.Intn(2))
+			mode := []uint32{1, 2, 3}[rng.Intn(3)]
+			imm7 := uint32(rng.Intn(0x40))
+			base := memBaseReg(rng)
+			if base == 31 {
+				// 让访问落在调用方帧（eff >= 0）：偏移按 8 字节单位给足
+				need := uint32(0)
+				if spDelta < 0 {
+					need = uint32(-spDelta)/8 + 8
+				}
+				imm7 = need + uint32(rng.Intn(0x20))
+			}
+			rt := uint32(rng.Intn(16))
+			rt2 := uint32(rng.Intn(16))
+			words = append(words, (size<<30)|(0x5<<27)|(mode<<23)|(load<<22)|(imm7<<15)|(rt2<<10)|(base<<5)|rt)
+		case 7: // LDR literal
+			rt := uint32(rng.Intn(16))
+			words = append(words, (0x18<<24)|(0<<5)|rt) // 目标 = 当前 PC（代码区内）
+		default:
+			words = append(words, genSimpleData(rng))
+		}
+	}
+	words = append(words, 0xD65F03C0)
+	return words
+}
+
+func TestArm64LiftMemoryDifferential(t *testing.T) {
+	rng := rand.New(rand.NewSource(20240618))
+	const iterations = 2000
+	checked, bad := 0, 0
+	var skipDecode, skipRef, skipLift, skipLimit int
+	for it := 0; it < iterations; it++ {
+		n := 4 + rng.Intn(9)
+		words := genMemProgram(rng, n)
+		var code []byte
+		for _, w := range words {
+			b := make([]byte, 4)
+			binary.LittleEndian.PutUint32(b, w)
+			code = append(code, b...)
+		}
+		insns, err := dec.DecodeRange(code, memCode, 0)
+		if err != nil {
+			skipDecode++
+			continue
+		}
+		var regs [35]uint64
+		for i := 0; i < 31; i++ {
+			regs[i] = rng.Uint64() & 0xFFFFFFFF
+		}
+		for i := 26; i <= 28; i++ {
+			regs[i] = 0x16000 + uint64(rng.Intn(0x800))
+		}
+		regs[31] = memSP
+		preX26, preX27, preX28 := regs[26], regs[27], regs[28]
+		mem0 := map[uint64]byte{}
+		memFill(mem0)
+		ref := &memRefMachine{regs: regs, mem: map[uint64]byte{}}
+		for k, v := range mem0 {
+			ref.mem[k] = v
+		}
+		if _, err := ref.run(insns, 512); err != nil {
+			if err.Error() == "超过步数上限" {
+				skipLimit++
+			} else {
+				skipRef++
+			}
+			continue
+		}
+		// 随机用例过滤：数据指令若写了基址寄存器（X26-X28）或 SP，
+		// 会使后续访存地址飞出内存窗口——这类用例跳过（生成器随机性所致）。
+		badCase := false
+		for i := range insns {
+			in := &insns[i]
+			switch in.Class {
+			case dec.ClassLoadStore, dec.ClassLoadStorePair, dec.ClassLoadLiteral:
+				continue
+			}
+			// 只排除"写了基址寄存器 X26-X28"的情况：
+			// Rd=31 要么是 XZR（设标志位的 CMP/TST 等，无害），
+			// 要么正是被测的 SP 调整（ADD/SUB 立即数），要么会被 lifter 拒绝。
+			rd := in.Raw & 31
+			if rd >= 26 && rd <= 28 {
+				badCase = true
+			}
+		}
+		if badCase {
+			skipRef++
+			continue
+		}
+		// lift 路径
+		fn := &ir.Func{}
+		(&Lifter{ImageBase: memCode, ImageSize: 0x1000, FrameSkew: memSkew}).Lift(fn, insns)
+		if len(fn.Unsupported) > 0 {
+			skipLift++
+			continue
+		}
+		res, err := vm.Generate(fn)
+		if err != nil {
+			t.Fatalf("codegen: %v", err)
+		}
+		st := &vm.RefState{Guest: vm.GuestARM64, BufBase: memLo, BufSize: memHi - memLo, Mem: map[uint64]byte{}}
+		for k, v := range mem0 {
+			st.Mem[k] = v
+		}
+		st.Regs = regs
+		st.Regs[31] = memSP - memSkew // 入口把模拟 SP 放在宿主 SP 之下一个 skew
+		st.Regs[32] = memCode         // VBASE
+		if rc, err := st.Run(res.Code, 4096); err != nil || rc != 0 {
+			for i := range insns {
+				t.Logf("   src[%d] pc=0x%X %s", i, insns[i].PC, insns[i].Text())
+			}
+			t.Logf("   pre X26=0x%X X27=0x%X X28=0x%X", preX26, preX27, preX28)
+			t.Logf("   ref SP=0x%X X26=0x%X X27=0x%X X28=0x%X", ref.regs[31], ref.regs[26], ref.regs[27], ref.regs[28])
+			t.Logf("   vm  SP=0x%X X26=0x%X X27=0x%X X28=0x%X (+skew for SP)", st.Regs[31], st.Regs[26], st.Regs[27], st.Regs[28])
+			for _, line := range vm.DisasmAll(res.Code) {
+				t.Logf("   BC  %s", line)
+			}
+			t.Fatalf("VM 执行失败 rc=%d err=%v", rc, err)
+		}
+		diff := ""
+		// SP（槽位 31）：VM 侧是"宿主 SP - skew"，加回来再比
+		if st.Regs[31]+memSkew != ref.regs[31] {
+			diff = fmt.Sprintf("SP: vm=0x%X(+skew=0x%X) ref=0x%X", st.Regs[31], st.Regs[31]+memSkew, ref.regs[31])
+		}
+		for i := 0; diff == "" && i < 31; i++ {
+			if st.Regs[i] != ref.regs[i] {
+				diff = fmt.Sprintf("R%d: vm=0x%X ref=0x%X", i, st.Regs[i], ref.regs[i])
+				break
+			}
+		}
+		if diff == "" && st.Flags != ref.flags {
+			diff = fmt.Sprintf("flags: vm=0x%X ref=0x%X", st.Flags, ref.flags)
+		}
+		if diff == "" {
+			for a := uint64(memLo); a < memHi; a++ {
+				if st.Mem[a] != ref.mem[a] {
+					diff = fmt.Sprintf("mem[0x%X]: vm=0x%02X ref=0x%02X", a, st.Mem[a], ref.mem[a])
+					break
+				}
+			}
+		}
+		if diff != "" {
+			bad++
+			if bad <= 6 {
+				var txt []string
+				for i := range insns {
+					txt = append(txt, insns[i].Text())
+				}
+				t.Errorf("用例 %d %v: %s", it, txt, diff)
+				for _, line := range vm.DisasmAll(res.Code) {
+					t.Logf("   BC  %s", line)
+				}
+			}
+			continue
+		}
+		checked++
+	}
+	t.Logf("ARM64 访存差分：校验 %d 组，不一致 %d 组；跳过：解码失败 %d、参考不支持 %d、lifter 拒绝 %d、超步数 %d",
+		checked, bad, skipDecode, skipRef, skipLift, skipLimit)
+	if bad != 0 {
+		t.Fatalf("不一致 %d 组", bad)
+	}
+}

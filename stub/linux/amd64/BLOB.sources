@@ -1,0 +1,4 @@
+# Linux/amd64 blob 源文件（路径相对 stub/）
+# 解释器主体与宿主无关，直接复用 Windows 目录下的同一份文件（不复制、不漂移）
+win/x64/vm_interp.c
+linux/amd64/vm_entry_asm.S

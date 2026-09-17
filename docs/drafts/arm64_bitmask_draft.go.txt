@@ -1,0 +1,85 @@
+package arm64
+
+import "fmt"
+
+// decodeBitMasks 实现 ARM ARM 的 DecodeBitMasks()：把 N:imms:immr 解码成 wmask。
+// 逻辑立即数是**重复位模式**，这是 ARM64 与 x86 差异最大的地方之一：
+// 同一个 #0xFF 在 64 位下由 N=1,imms=7,immr=0 表示（元素宽度 64），
+// 而 #0x1010101010101010 由 imms=0,immr=4 表示（元素宽度 8）。
+//
+// 验证方式：与参考解码器 arm64asm 打印出来的 #imm 文本做大规模比对
+// （见 bitmask_test.go）——参考实现已经把位模式算好并打印成十进制/十六进制。
+func decodeBitMasks(n, immr, imms uint32, is64 bool) (uint64, error) {
+	if !is64 && n != 0 {
+		return 0, fmt.Errorf("32 位逻辑立即数的 N 必须为 0")
+	}
+	// len = HighestSetBit(N:NOT(imms))，7 位字段，返回**下标**（0 基）
+	// 注意：无论 32/64 位，NOT(imms) 都要取 **6 位**——
+	// N 只提供第 7 位，32 位形式下 N=0 但高位的 NOT(imms) 仍然有效。
+	field := (n << 6) | ((^imms) & 0x3F)
+	len := int(highestSetBitIndex(field))
+	if len < 1 {
+		return 0, fmt.Errorf("无效的位掩码立即数 (N=%d immr=%d imms=%d)", n, immr, imms)
+	}
+	levels := uint32(31) // 32 位
+	if is64 {
+		levels = 63
+	}
+	if imms&levels == levels {
+		return 0, fmt.Errorf("保留的位掩码编码 (imms=0x%X)", imms)
+	}
+	S := imms & levels
+	R := immr & levels
+	esize := uint32(1) << uint(len)
+	if esize > 64 {
+		return 0, fmt.Errorf("元素宽度 %d 超过 64", esize)
+	}
+	welem := ones(S + 1)
+	elem := ror(welem, R, esize)
+	return replicate(elem, esize, is64), nil
+}
+
+func highestSetBitIndex(v uint32) int {
+	for i := 31; i >= 0; i-- {
+		if v&(1<<uint(i)) != 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+func ones(k uint32) uint64 {
+	if k >= 64 {
+		return ^uint64(0)
+	}
+	return (uint64(1) << k) - 1
+}
+
+// ror 在 width 位宽内右旋转
+func ror(v uint64, r, width uint32) uint64 {
+	if width == 0 {
+		return v
+	}
+	r %= width
+	mask := ones(width)
+	v &= mask
+	if r == 0 {
+		return v
+	}
+	return ((v >> r) | (v << (width - r))) & mask
+}
+
+func replicate(elem uint64, esize uint32, is64 bool) uint64 {
+	total := uint32(64)
+	if !is64 {
+		total = 32
+	}
+	var out uint64
+	for shift := uint32(0); shift < total; shift += esize {
+		out |= elem << shift
+	}
+	if !is64 {
+		out &= 0xFFFFFFFF
+	}
+	return out
+}

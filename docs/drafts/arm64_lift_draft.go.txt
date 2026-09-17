@@ -1,0 +1,622 @@
+// Package arm64 把 ARM64（A64）指令翻译成平台无关 IR。
+//
+// 与 x86-64 lifter 共用同一套 IR / VM ISA，差异在于：
+//   - 寄存器槽位：X0-X30 → 0..30，SP → 31，VBASE → 32，VMSCR → 33，ZR → 34；
+//   - **标志位**：ARM64 的 ADD/SUB/AND/... 不带 S 时不修改标志位，
+//     因此这些形式用 VM 的 "keep flags" 位（KEEP_FLAGS）发射；
+//   - 条件码用 ARM64 语义（C = 无借位），由 guest 选择；
+//   - 逻辑立即数是任意 64 位掩码，需要先用 MOV_RI 物化到暂存寄存器。
+//
+// 原则不变：遇到不能**精确**表达的形式就拒绝翻译并记录原因，绝不近似。
+package arm64
+
+import (
+	"fmt"
+	"sort"
+
+	dec "github.com/vmpx/vmp-x/internal/decode/arm64"
+	"github.com/vmpx/vmp-x/internal/ir"
+	"golang.org/x/arch/arm64/arm64asm"
+)
+
+// 客户机寄存器槽位
+const (
+	SP  ir.Reg = 31
+	VB  ir.Reg = 32 // VBASE：模块运行时基址
+	SCR ir.Reg = 33 // VM 暂存
+	ZR  ir.Reg = 34 // 恒为 0，只读
+)
+
+// KEEP_FLAGS：kind 字节的 bit7，对应 C 侧的 VM_ALU_KEEP_FLAGS
+const keepFlags uint8 = 0x80
+
+// Lifter ARM64 → IR
+type Lifter struct {
+	ImageBase uint64 // 模块基址
+	ImageSize uint64 // 模块 VA 范围（ADR/ADRP 目标合法性检查）
+}
+
+// 寄存器映射：X0-X30 / W0-W30 → 槽位 0..30；SP → 31；XZR/WZR → ZR
+func regSlot(r arm64asm.Reg) (ir.Reg, bool) {
+	s := r.String()
+	if s == "SP" || s == "WSP" {
+		return SP, true
+	}
+	if s == "XZR" || s == "WZR" {
+		return ZR, true
+	}
+	if len(s) < 2 {
+		return 0, false
+	}
+	switch s[0] {
+	case 'X', 'W':
+	default:
+		return 0, false
+	}
+	n := 0
+	for i := 1; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	if n < 0 || n > 30 {
+		return 0, false
+	}
+	return ir.Reg(n), true
+}
+
+// widthOf 取操作宽度：X → 64，W → 32
+func widthOf(r arm64asm.Reg) ir.Width {
+	if r.String()[0] == 'X' {
+		return ir.W64
+	}
+	return ir.W32
+}
+
+func sf(w uint32) ir.Width {
+	if w&(1<<31) != 0 {
+		return ir.W64
+	}
+	return ir.W32
+}
+
+// Lift 翻译一段已解码的指令
+func (l *Lifter) Lift(insns []dec.Insn) (*ir.Func, error) {
+	f := &ir.Func{}
+	// 先建立 guest 地址 → IR 下标 的映射，供分支解析
+	addrToIdx := map[uint64]int{}
+	for i := range insns {
+		addrToIdx[insns[i].PC] = i
+	}
+	var unsup []string
+	for i := range insns {
+		ins := &insns[i]
+		before := len(f.Insns)
+		if err := l.liftOne(f, ins, addrToIdx); err != nil {
+			unsup = append(unsup, fmt.Sprintf("+0x%X %s: %v", ins.PC-l.firstPC(insns), ins.Text(), err))
+			// 拒绝翻译：不生成任何指令（保持 IR 与源指令一一对应）
+			f.Insns = f.Insns[:before]
+		}
+	}
+	f.Unsupported = unsup
+	if len(unsup) > 0 {
+		sort.Strings(f.Unsupported)
+	}
+	return f, nil
+}
+
+func (l *Lifter) firstPC(insns []dec.Insn) uint64 {
+	if len(insns) == 0 {
+		return 0
+	}
+	return insns[0].PC
+}
+
+func (l *Lifter) liftOne(f *ir.Func, ins *dec.Insn, addrToIdx map[uint64]int) error {
+	switch ins.Class {
+	case dec.ClassAddSubImm:
+		return l.liftAddSubImm(f, ins)
+	case dec.ClassAddSubShifted, dec.ClassAddSubExtended:
+		return l.liftAddSubReg(f, ins)
+	case dec.ClassLogicalImm:
+		return l.liftLogicalImm(f, ins)
+	case dec.ClassLogicalShifted:
+		return l.liftLogicalShifted(f, ins)
+	case dec.ClassMoveWide:
+		return l.liftMoveWide(f, ins)
+	case dec.ClassBitfield:
+		return l.liftBitfield(f, ins)
+	case dec.ClassBranchImm:
+		return l.liftBranchImm(f, ins, addrToIdx)
+	case dec.ClassBranchCond:
+		return l.liftBranchCond(f, ins, addrToIdx)
+	case dec.ClassCompareBranch:
+		return l.liftCompareBranch(f, ins, addrToIdx)
+	case dec.ClassTestBranch:
+		return l.liftTestBranch(f, ins, addrToIdx)
+	case dec.ClassBranchReg:
+		return l.liftBranchReg(f, ins)
+	case dec.ClassPCRel:
+		return l.liftPCRel(f, ins)
+	}
+	return fmt.Errorf("暂不支持的编码类 %v", ins.Class)
+}
+
+// ---------- 算术/逻辑 ----------
+
+func (l *Lifter) liftAddSubImm(f *ir.Func, ins *dec.Insn) error {
+	// ADD/SUB (immediate)；CMP/CMN 是 Rd=XZR 且 S=1 的别名
+	op := ins.Op
+	sfBit, sub, setFlags := ins.Raw&(1<<31), ins.Raw&(1<<30) != 0, ins.Raw&(1<<29) != 0
+	shift12 := ins.Raw&(1<<22) != 0
+	imm := (ins.Raw >> 10) & 0xFFF
+	if shift12 {
+		imm <<= 12
+	}
+	rn := (ins.Raw >> 5) & 31
+	rd := ins.Raw & 31
+	w := sf(sfBit)
+	kind := ir.Add
+	if sub {
+		kind = ir.Sub
+	}
+	// CMP/CMN：只是把结果丢掉、保留标志位设置
+	alias := op == arm64asm.CMP || op == arm64asm.CMN || op == arm64asm.SUBS || op == arm64asm.ADDS
+	if op != arm64asm.ADD && op != arm64asm.ADDS && op != arm64asm.SUB && op != arm64asm.SUBS &&
+		op != arm64asm.CMP && op != arm64asm.CMN {
+		return fmt.Errorf("未预期的助记符 %v", op)
+	}
+	src, ok := slotOfRaw(rn)
+	if !ok {
+		return fmt.Errorf("Rn 不是通用寄存器")
+	}
+	dst := ir.Reg(rd)
+	if rd == 31 {
+		// XZR 作为目标：结果丢弃（CMP/CMN），但标志位必须保留下来
+		dst = SCR
+	}
+	k := uint8(kind)
+	if !setFlags {
+		k |= keepFlags
+	}
+	// ARM64 的 imm12 是**无符号**的
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRI, Kind: k, Width: w, Dst: dst, A: src, Imm: uint64(imm),
+		SrcOff: uint32(ins.PC), Text: ins.Text()})
+	_ = alias
+	return nil
+}
+
+func (l *Lifter) liftAddSubReg(f *ir.Func, ins *dec.Insn) error {
+	// ADD/SUB (shifted register) 或 (extended register)
+	if ins.Class == dec.ClassAddSubExtended {
+		return fmt.Errorf("带扩展的加减（ADD/SUB extended register）暂不支持")
+	}
+	setFlags := ins.Raw&(1<<29) != 0
+	sub := ins.Raw&(1<<30) != 0
+	shiftType := (ins.Raw >> 22) & 3
+	shiftAmt := (ins.Raw >> 10) & 0x3F
+	rm := (ins.Raw >> 16) & 31
+	rn := (ins.Raw >> 5) & 31
+	rd := ins.Raw & 31
+	w := sf(ins.Raw)
+	if shiftType == 3 {
+		return fmt.Errorf("无效的移位类型 11")
+	}
+	src, ok := slotOfRaw(rm)
+	if !ok {
+		return fmt.Errorf("Rm 不是通用寄存器")
+	}
+	dst := regOrScratch(rd)
+	// 先做移位（MOV_RR + ALU_RI 移位，保留标志位）
+	if shiftAmt != 0 {
+		if shiftAmt >= uint32(w) {
+			return fmt.Errorf("移位量 %d 超出宽度 %d", shiftAmt, w)
+		}
+		f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRR, Width: w, Dst: SCR, A: src, SrcOff: uint32(ins.PC), Text: ins.Text()})
+		sk := uint8(shiftKind(shiftType)) | keepFlags
+		f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRI, Kind: sk, Width: w, Dst: SCR, A: SCR, Imm: uint64(shiftAmt),
+			SrcOff: uint32(ins.PC), Text: ins.Text()})
+		src = SCR
+	}
+	rnSlot, ok := slotOfRaw(rn)
+	if !ok {
+		return fmt.Errorf("Rn 不是通用寄存器")
+	}
+	kind := ir.Add
+	if sub {
+		kind = ir.Sub
+	}
+	k := uint8(kind)
+	if !setFlags {
+		k |= keepFlags
+	}
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRR, Kind: k, Width: w, Dst: dst, A: rnSlot, B: src,
+		SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+func shiftKind(t uint32) ir.Kind {
+	switch t {
+	case 0:
+		return ir.Shl
+	case 1:
+		return ir.Shr
+	default:
+		return ir.Sar
+	}
+}
+
+func (l *Lifter) liftLogicalShifted(f *ir.Func, ins *dec.Insn) error {
+	// AND/ORR/EOR/ANDS/BIC/... (shifted register)；MOV/MVN 是 ORR/ORN 的别名
+	setFlags := ins.Raw&(1<<29) != 0
+	opc := (ins.Raw >> 29) & 3
+	negate := ins.Raw&(1<<21) != 0
+	shiftType := (ins.Raw >> 22) & 3
+	shiftAmt := (ins.Raw >> 10) & 0x3F
+	rm := (ins.Raw >> 16) & 31
+	rn := (ins.Raw >> 5) & 31
+	rd := ins.Raw & 31
+	w := sf(ins.Raw)
+	switch ins.Op {
+	case arm64asm.AND, arm64asm.ANDS, arm64asm.BIC, arm64asm.BICS,
+		arm64asm.ORR, arm64asm.ORN, arm64asm.EOR, arm64asm.EON,
+		arm64asm.MOV, arm64asm.MVN, arm64asm.TST:
+	default:
+		return fmt.Errorf("未预期的逻辑助记符 %v", ins.Op)
+	}
+	if shiftType == 3 {
+		return fmt.Errorf("无效的移位类型 11")
+	}
+	src, ok := slotOfRaw(rm)
+	if !ok {
+		return fmt.Errorf("Rm 不是通用寄存器")
+	}
+	if shiftAmt != 0 {
+		f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRR, Width: w, Dst: SCR, A: src, SrcOff: uint32(ins.PC), Text: ins.Text()})
+		sk := uint8(shiftKind(shiftType)) | keepFlags
+		f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRI, Kind: sk, Width: w, Dst: SCR, A: SCR, Imm: uint64(shiftAmt),
+			SrcOff: uint32(ins.PC), Text: ins.Text()})
+		src = SCR
+	}
+	if negate {
+		// BIC/ORN/EON/MVN：先把源取反（NOT 不影响标志位）
+		notDst := ir.Reg(18 + 0) // 使用另一个暂存槽：这里借 x18? 不行，见下
+		_ = notDst
+		return fmt.Errorf("取反形式（BIC/ORN/EON/MVN）暂不支持")
+	}
+	var kind ir.Kind
+	switch opc {
+	case 0:
+		kind = ir.And
+	case 1:
+		kind = ir.Or
+	case 2:
+		kind = ir.Eor
+	default:
+		kind = ir.And // ANDS/TST
+	}
+	k := uint8(kind)
+	if !setFlags && ins.Op != arm64asm.TST {
+		k |= keepFlags
+	}
+	dst := regOrScratch(rd)
+	rnSlot, ok := slotOfRaw(rn)
+	if !ok {
+		// MOV/MVN 的 Rn 字段是 31（XZR），语义上就是"全零"
+		if rn == 31 {
+			f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRI, Width: w, Dst: dst, Imm: 0,
+				SrcOff: uint32(ins.PC), Text: ins.Text()})
+			if kind == ir.Or {
+				// MOV Xd, Xm：直接搬移即可
+				f.Insns = f.Insns[:len(f.Insns)-1]
+				f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRR, Width: w, Dst: dst, A: src,
+					SrcOff: uint32(ins.PC), Text: ins.Text()})
+				return nil
+			}
+			return fmt.Errorf("Rn=XZR 的逻辑形式暂不支持")
+		}
+		return fmt.Errorf("Rn 不是通用寄存器")
+	}
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRR, Kind: k, Width: w, Dst: dst, A: rnSlot, B: src,
+		SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+func (l *Lifter) liftLogicalImm(f *ir.Func, ins *dec.Insn) error {
+	// AND/ORR/EOR/ANDS (immediate)，立即数是按 N:imms:immr 编码的位掩码
+	setFlags := ins.Raw&(1<<29) != 0
+	opc := (ins.Raw >> 29) & 3
+	N := (ins.Raw >> 22) & 1
+	immr := (ins.Raw >> 16) & 0x3F
+	imms := (ins.Raw >> 10) & 0x3F
+	rn := (ins.Raw >> 5) & 31
+	rd := ins.Raw & 31
+	w := sf(ins.Raw)
+	mask, err := decodeBitMasks(N, immr, imms, uint32(w) == 64)
+	if err != nil {
+		return err
+	}
+	var kind ir.Kind
+	switch opc {
+	case 0:
+		kind = ir.And
+	case 1:
+		kind = ir.Or
+	case 2:
+		kind = ir.Eor
+	default:
+		kind = ir.And // ANDS/TST
+	}
+	k := uint8(kind)
+	if !setFlags {
+		k |= keepFlags
+	}
+	// 掩码物化到暂存寄存器（64 位任意掩码，ALU_RI 放不下）
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRI, Width: ir.W64, Dst: SCR, Imm: mask,
+		SrcOff: uint32(ins.PC), Text: ins.Text()})
+	rnSlot, ok := slotOfRaw(rn)
+	dst := regOrScratch(rd)
+	if !ok {
+		if ins.Op == arm64asm.MOV || ins.Op == arm64asm.MVN {
+			// MOV Xd, #imm（逻辑立即数形式）：直接把掩码写进目标
+			f.Insns = []ir.Insn{{Op: ir.MovRI, Width: w, Dst: dst, Imm: mask, SrcOff: uint32(ins.PC), Text: ins.Text()}}
+			if ins.Op == arm64asm.MVN {
+				f.Insns = append(f.Insns, ir.Insn{Op: ir.AluU, Kind: uint8(ir.Not) | keepFlags, Width: w, Dst: dst, A: dst,
+					SrcOff: uint32(ins.PC), Text: ins.Text()})
+			}
+			return nil
+		}
+		return fmt.Errorf("Rn 不是通用寄存器")
+	}
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRR, Kind: k, Width: w, Dst: dst, A: rnSlot, B: SCR,
+		SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+func (l *Lifter) liftMoveWide(f *ir.Func, ins *dec.Insn) error {
+	opc := (ins.Raw >> 29) & 3
+	hw := (ins.Raw >> 21) & 3
+	imm16 := (ins.Raw >> 5) & 0xFFFF
+	rd := ins.Raw & 31
+	w := sf(ins.Raw)
+	if w == ir.W32 && hw > 1 {
+		return fmt.Errorf("32 位 MOVZ/MOVN 的 hw=%d 无效", hw)
+	}
+	shift := uint32(hw) * 16
+	val := uint64(imm16) << shift
+	switch opc {
+	case 0, 3: // MOVN（opc=00 且 hw=00 是别名的伪指令；arm64asm 会给 MOVN/MOV）
+		val = ^val
+		if w == ir.W32 {
+			val &= 0xFFFFFFFF
+		}
+	case 2: // MOVZ
+	default:
+		// opc=3 是 MOVK
+		f.Insns = append(f.Insns, l.movkSequence(rd, w, imm16, shift, ins)...)
+		return nil
+	}
+	_ = opc
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRI, Width: w, Dst: ir.Reg(rd), Imm: val,
+		SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+// MOVK：保留其余位，插入 16 位。用 MOV_RI(掩码) + AND(keep flags) + MOV_RI(值) + OR(keep flags)。
+func (l *Lifter) movkSequence(rd uint32, w ir.Width, imm16, shift uint32, ins *dec.Insn) []ir.Insn {
+	dst := ir.Reg(rd)
+	keep := uint64(0xFFFF) << shift
+	clear := ^keep
+	if w == ir.W32 {
+		clear &= 0xFFFFFFFF
+	}
+	val := uint64(imm16) << shift
+	return []ir.Insn{
+		{Op: ir.MovRI, Width: ir.W64, Dst: SCR, Imm: clear, SrcOff: uint32(ins.PC), Text: ins.Text()},
+		{Op: ir.AluRR, Kind: uint8(ir.And) | keepFlags, Width: w, Dst: dst, A: dst, B: SCR, SrcOff: uint32(ins.PC), Text: ins.Text()},
+		{Op: ir.MovRI, Width: ir.W64, Dst: SCR, Imm: val, SrcOff: uint32(ins.PC), Text: ins.Text()},
+		{Op: ir.AluRR, Kind: uint8(ir.Or) | keepFlags, Width: w, Dst: dst, A: dst, B: SCR, SrcOff: uint32(ins.PC), Text: ins.Text()},
+	}
+}
+
+func (l *Lifter) liftBitfield(f *ir.Func, ins *dec.Insn) error {
+	// 只支持"纯移位"别名（LSL/LSR/ASR 立即数），其余位域形式拒绝
+	switch ins.Op {
+	case arm64asm.LSL, arm64asm.LSR, arm64asm.ASR:
+	default:
+		return fmt.Errorf("位域形式（UBFM/SBFM/BFM 及其别名）暂不支持")
+	}
+	w := sf(ins.Raw)
+	rd := ins.Raw & 31
+	rn := (ins.Raw >> 5) & 31
+	amt, ok := ins.Imm(2)
+	if !ok {
+		return fmt.Errorf("取不到移位量")
+	}
+	src, ok := slotOfRaw(rn)
+	if !ok {
+		return fmt.Errorf("Rn 不是通用寄存器")
+	}
+	var kind ir.Kind
+	switch ins.Op {
+	case arm64asm.LSL:
+		kind = ir.Shl
+	case arm64asm.LSR:
+		kind = ir.Shr
+	default:
+		kind = ir.Sar
+	}
+	// 移位类指令在 ARM64 里不设置标志位（除非是 LSLS 等，arm64asm 会给出不同助记符）
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRI, Kind: uint8(kind) | keepFlags, Width: w, Dst: ir.Reg(rd), A: src,
+		Imm: uint64(amt), SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+// ---------- 分支 ----------
+
+func (l *Lifter) liftBranchImm(f *ir.Func, ins *dec.Insn, addrToIdx map[uint64]int) error {
+	tgt, ok := ins.PCRelTarget()
+	if !ok {
+		return fmt.Errorf("取不到分支目标")
+	}
+	idx, ok := addrToIdx[tgt]
+	if !ok {
+		return fmt.Errorf("分支目标 0x%X 不在本函数内（暂不支持跨函数跳转）", tgt)
+	}
+	if ins.Op == arm64asm.BL {
+		// 直接调用：OP_CALLN 用 RVA（VM 会加上 VBASE），并把返回地址写进 X30
+		if tgt < l.ImageBase {
+			return fmt.Errorf("调用目标 0x%X 低于模块基址", tgt)
+		}
+		rva := tgt - l.ImageBase
+		retAddr := ins.PC + 4
+		if retAddr < l.ImageBase {
+			return fmt.Errorf("返回地址 0x%X 低于模块基址", retAddr)
+		}
+		f.Insns = append(f.Insns,
+			ir.Insn{Op: ir.MovRI, Width: ir.W64, Dst: 30, Imm: retAddr - l.ImageBase, SrcOff: uint32(ins.PC), Text: ins.Text()},
+			ir.Insn{Op: ir.AluRR, Kind: uint8(ir.Add) | keepFlags, Width: ir.W64, Dst: 30, A: 30, B: VB, SrcOff: uint32(ins.PC), Text: ins.Text()},
+			ir.Insn{Op: ir.CallN, Width: ir.W64, Imm: rva, SrcOff: uint32(ins.PC), Text: ins.Text()},
+		)
+		return nil
+	}
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.Jmp, Target: idx, SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+func (l *Lifter) liftBranchCond(f *ir.Func, ins *dec.Insn, addrToIdx map[uint64]int) error {
+	tgt, ok := ins.PCRelTarget()
+	if !ok {
+		return fmt.Errorf("取不到分支目标")
+	}
+	idx, ok := addrToIdx[tgt]
+	if !ok {
+		return fmt.Errorf("分支目标 0x%X 不在本函数内", tgt)
+	}
+	cond, ok := ins.Cond()
+	if !ok {
+		return fmt.Errorf("取不到条件码")
+	}
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.Jcc, Cond: ir.Cond(cond), Target: idx, SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+func (l *Lifter) liftCompareBranch(f *ir.Func, ins *dec.Insn, addrToIdx map[uint64]int) error {
+	// CBZ/CBNZ Xt, label —— 与 0 比较（ARM64：SUBS XZR, Xt, #0）
+	tgt, ok := ins.PCRelTarget()
+	if !ok {
+		return fmt.Errorf("取不到分支目标")
+	}
+	idx, ok := addrToIdx[tgt]
+	if !ok {
+		return fmt.Errorf("分支目标 0x%X 不在本函数内", tgt)
+	}
+	rt := ins.Raw & 31
+	w := sf(ins.Raw)
+	rtSlot, ok := slotOfRaw(rt)
+	if !ok {
+		return fmt.Errorf("Rt 不是通用寄存器")
+	}
+	f.Insns = append(f.Insns,
+		ir.Insn{Op: ir.CmpRI, Kind: uint8(ir.Cmp), Width: w, A: rtSlot, Imm: 0, SrcOff: uint32(ins.PC), Text: ins.Text()},
+	)
+	cond := ir.Eq
+	if ins.Op == arm64asm.CBNZ {
+		cond = ir.Ne
+	}
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.Jcc, Cond: cond, Target: idx, SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+func (l *Lifter) liftTestBranch(f *ir.Func, ins *dec.Insn, addrToIdx map[uint64]int) error {
+	// TBZ/TBNZ Rt, #bit, label —— 逻辑测试不修改标志位
+	tgt, ok := ins.PCRelTarget()
+	if !ok {
+		return fmt.Errorf("取不到分支目标")
+	}
+	idx, ok := addrToIdx[tgt]
+	if !ok {
+		return fmt.Errorf("分支目标 0x%X 不在本函数内", tgt)
+	}
+	rt := ins.Raw & 31
+	bit := (ins.Raw >> 19) & 31
+	if ins.Raw&(1<<31) != 0 {
+		bit |= 32
+	}
+	w := ir.W64
+	if ins.Raw&(1<<31) == 0 {
+		w = ir.W32
+	}
+	rtSlot, ok := slotOfRaw(rt)
+	if !ok {
+		return fmt.Errorf("Rt 不是通用寄存器")
+	}
+	f.Insns = append(f.Insns,
+		ir.Insn{Op: ir.MovRI, Width: ir.W64, Dst: SCR, Imm: uint64(1) << bit, SrcOff: uint32(ins.PC), Text: ins.Text()},
+		ir.Insn{Op: ir.CmpRI, Kind: uint8(ir.Test), Width: w, A: rtSlot, Imm: 0, B: SCR, SrcOff: uint32(ins.PC), Text: ins.Text()},
+	)
+	cond := ir.Eq
+	if ins.Op == arm64asm.TBNZ {
+		cond = ir.Ne
+	}
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.Jcc, Cond: cond, Target: idx, SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+func (l *Lifter) liftBranchReg(f *ir.Func, ins *dec.Insn) error {
+	switch ins.Op {
+	case arm64asm.RET:
+		f.Insns = append(f.Insns, ir.Insn{Op: ir.Ret, SrcOff: uint32(ins.PC), Text: ins.Text()})
+		return nil
+	case arm64asm.BR, arm64asm.BLR:
+		return fmt.Errorf("间接跳转/调用（BR/BLR）暂不支持：VM 没有间接跳转指令")
+	}
+	return fmt.Errorf("未预期的助记符 %v", ins.Op)
+}
+
+func (l *Lifter) liftPCRel(f *ir.Func, ins *dec.Insn) error {
+	// ADR/ADRP：目标必须是模块内的地址，翻译成 LEA dst, [VBASE + rva]
+	imm, ok := ins.Imm(1)
+	if !ok {
+		return fmt.Errorf("取不到立即数")
+	}
+	rd := ins.Raw & 31
+	var target uint64
+	if ins.Op == arm64asm.ADR {
+		target = ins.PC + uint64(imm)
+	} else {
+		target = (ins.PC &^ 0xFFF) + uint64(imm)
+	}
+	if target < l.ImageBase {
+		return fmt.Errorf("ADR/ADRP 目标 0x%X 低于模块基址", target)
+	}
+	rva := target - l.ImageBase
+	if l.ImageSize != 0 && rva >= l.ImageSize {
+		return fmt.Errorf("ADR/ADRP 目标 0x%X 超出模块范围（跨模块引用暂不支持）", target)
+	}
+	f.Insns = append(f.Insns, ir.Insn{Op: ir.Lea, Width: ir.W64, Dst: ir.Reg(rd), Base: VB, Disp: int32(rva),
+		SrcOff: uint32(ins.PC), Text: ins.Text()})
+	return nil
+}
+
+// ---------- 辅助 ----------
+
+func slotOfRaw(r uint32) (ir.Reg, bool) {
+	if r <= 30 {
+		return ir.Reg(r), true
+	}
+	if r == 31 {
+		return SP, true // 作为基址/源时 X31 常表示 SP；具体由指令语义决定
+	}
+	return 0, false
+}
+
+func regOrScratch(r uint32) ir.Reg {
+	if r <= 30 {
+		return ir.Reg(r)
+	}
+	return SCR // XZR 目标：结果丢弃
+}
+
+var _ = ZR
