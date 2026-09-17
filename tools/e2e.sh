@@ -83,12 +83,18 @@ fail=0
 run_case() {
     fn="$1"
     arg="$2"
-    n=$(./build/linux_target "$fn" "$arg" 2>/dev/null || echo "<crash>")
-    # 被保护程序的退出码要单独捕获：139=SIGSEGV、132=SIGILL、134=SIGABRT、136=SIGFPE。
-    # 只打印 "<crash>" 的话，CI 注解里看不出是段错误还是非法指令（排查时这是关键信息）。
-    v=$(./build/linux_target.vmp "$fn" "$arg" 2>/dev/null)
-    vrc=$?
-    if [ $vrc -ne 0 ]; then v="<crash rc=$vrc>"; fi
+    # 注意：脚本是 set -e。命令替换里的命令失败会**直接终止脚本**（第一轮 CI 就因此在
+    # 打印任何 [FAIL] 之前退出，退出码 2），所以这里统一用 "cmd || rc=$?" 的形式。
+    nrc=0
+    n=$(./build/linux_target "$fn" "$arg" 2>/dev/null) || nrc=$?
+    vrc=0
+    v=$(./build/linux_target.vmp "$fn" "$arg" 2>/dev/null) || vrc=$?
+    # 退出码单独报出来：139=SIGSEGV、132=SIGILL、134=SIGABRT、136=SIGFPE，
+    # 只显示 <crash> 的话在 CI 注解里没法判断方向。
+    v="${v:-}"
+    n="${n:-}"
+    [ "$vrc" -eq 0 ] || v="<crash rc=$vrc>"
+    [ "$nrc" -eq 0 ] || n="<crash rc=$nrc>"
     if [ "$n" = "$v" ] && [ -n "$n" ]; then
         pass=$((pass + 1))
         echo "  [OK  ] $fn($arg): native=$n protected=$v"
