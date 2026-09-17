@@ -374,10 +374,14 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	// 编译器目标 ABI：mingw 编译出来的 blob 内部是 Win64 约定，
 	// 即使在为 Linux 构建时也必须告诉入口（否则调用 vm_run 会传错寄存器）。
 	compilerIsWindows := false
+	machine := ""
 	if out, derr := exec.Command(cc, "-dumpmachine").Output(); derr == nil {
-		t := strings.ToLower(string(out))
-		compilerIsWindows = strings.Contains(t, "mingw") || strings.Contains(t, "w64")
+		machine = strings.ToLower(string(out))
+		compilerIsWindows = strings.Contains(machine, "mingw") || strings.Contains(machine, "w64")
 	}
+	// -mno-red-zone 是 x86 专有选项：aarch64-linux-gnu-gcc 之类会直接报 unrecognized。
+	// 只在 x86 宿主（或探测不到目标时）加上它。
+	isX86Host := machine == "" || strings.Contains(machine, "x86_64") || strings.Contains(machine, "amd64") || strings.Contains(machine, "i686")
 	if verbose && compilerIsWindows {
 		fmt.Println("[*] 编译器目标是 Windows ABI：将定义 VM_BLOB_USES_WIN64")
 	}
@@ -386,13 +390,16 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		"-c", "-O1", "-std=c11", // -O2 会把解释器编译错（见 STATUS 第 71/72 轮），先用 -O1
 		"-ffreestanding", "-nostdlib", "-fno-builtin",
 		"-fno-stack-protector", "-fno-asynchronous-unwind-tables",
-		"-fno-unwind-tables", "-fno-ident", "-mno-red-zone",
+		"-fno-unwind-tables", "-fno-ident",
 		"-fno-jump-tables",
 		// 解释器里有大量类型双关（u64 ↔ u8* ↔ double/float）。没有这个开关时，
 		// 把浮点写回加进来会让 gcc 对**整个函数**启用更激进的别名假设，
 		// 结果连不执行浮点的函数都算错（实测就是这么来的）。
 		"-fno-strict-aliasing",
 		"-Wall", "-Wextra",
+	}
+	if isX86Host {
+		common = append(common, "-mno-red-zone")
 	}
 
 	// 只编译 BLOB.sources 里显式列出的文件（测试/工具程序不能被链进 blob）
