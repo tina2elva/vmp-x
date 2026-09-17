@@ -29,8 +29,7 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     (void)si;
     ucontext_t *u = (ucontext_t *)uc;
     unsigned long pc = (unsigned long)u->uc_mcontext.gregs[REG_RIP];
-    fprintf(stderr, "[!] signal %d at PC=0x%lX" "
-", sig, pc);
+    fprintf(stderr, "[!] signal %d at PC=0x%lX\n", sig, pc);
     if (pc >= (unsigned long)g_payload && pc < (unsigned long)g_payload + g_len) {
         unsigned long off = pc - (unsigned long)g_payload;
         const char *who = "blob";
@@ -38,19 +37,16 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
         for (int i = 0; i < g_nsyms; i++) {
             if (off >= g_syms[i].off) { who = g_syms[i].name; base = g_syms[i].off; }
         }
-        fprintf(stderr, "[!] PC 在 payload 内: %s+0x%lX" "
-", who, off - base);
+        fprintf(stderr, "[!] PC 在 payload 内: %s+0x%lX\n", who, off - base);
         fprintf(stderr, "[!] 该处字节(前后各若干):");
         long start = (long)off - 8;
         for (long p = start; p < start + 24; p++) {
             if (p >= 0 && p < (long)g_len) fprintf(stderr, " %02x", g_payload[p]);
             else fprintf(stderr, " --");
         }
-        fprintf(stderr, "" "
-");
+        fprintf(stderr, "\n");
     } else {
-        fprintf(stderr, "[!] PC 不在 payload 内（可能在探针自身或客户机代码）" "
-");
+        fprintf(stderr, "[!] PC 不在 payload 内（可能在探针自身或客户机代码）\n");
     }
     _exit(99);
 }
@@ -85,14 +81,12 @@ static unsigned char *read_file(const char *p, long *n) {
 
 int main(int argc, char **argv) {
     if (argc < 7) {
-        fprintf(stderr, "usage: payload_probe_linux <payload.bin> <va> <thunkOff> <vm_runOff> <vm_entryOff> <arg>..." "
-");
+        fprintf(stderr, "usage: payload_probe_linux <payload.bin> <va> <thunkOff> <vm_runOff> <vm_entryOff> <arg>...\n");
         return 2;
     }
     long n = 0;
     unsigned char *payload = read_file(argv[1], &n);
-    if (!payload) { fprintf(stderr, "[!] cannot read %s" "
-", argv[1]); return 2; }
+    if (!payload) { fprintf(stderr, "[!] cannot read %s\n", argv[1]); return 2; }
     unsigned long long va = strtoull(argv[2], NULL, 0);
     unsigned long long thunkOff = strtoull(argv[3], NULL, 0);
     const char *names[2] = {"vm_run", "vm_entry"};
@@ -107,8 +101,7 @@ int main(int argc, char **argv) {
     void *mem = mmap((void *)(uintptr_t)va, (size_t)n, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (mem == MAP_FAILED) {
-        fprintf(stderr, "[!] mmap(0x%llX, %ld) 失败（VMBASE 会不准）" "
-", va, n);
+        fprintf(stderr, "[!] mmap(0x%llX, %ld) 失败（VMBASE 会不准）\n", va, n);
         return 2;
     }
     memcpy(mem, payload, (size_t)n);
@@ -124,13 +117,11 @@ int main(int argc, char **argv) {
     sigaction(SIGBUS, &sa, NULL);
 
     void *thunk = (unsigned char *)mem + thunkOff;
-    printf("payload @ %p (va=0x%llX, %ld bytes), thunk @ %p" "
-", mem, va, n, thunk);
+    printf("payload @ %p (va=0x%llX, %ld bytes), thunk @ %p\n", mem, va, n, thunk);
     for (int i = 6; i < argc; i++) {
         unsigned long long arg = strtoull(argv[i], NULL, 0);
         unsigned long long got = call_thunk(thunk, arg);
-        printf("  checkKey(%llu) = %llu" "
-", arg, got);
+        printf("  checkKey(%llu) = %llu\n", arg, got);
     }
     return 0;
 }
