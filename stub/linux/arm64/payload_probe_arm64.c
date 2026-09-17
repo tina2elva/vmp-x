@@ -27,9 +27,10 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     if (hdr[0] == 0x564D52494E473031ULL) {
         unsigned long long cnt = hdr[1];
         unsigned long long *ring = hdr + 2;
+        fprintf(stderr, "[!] 环形缓冲:");
         for (unsigned long long k = (cnt > 12 ? cnt - 12 : 0); k < cnt; k++) {
             unsigned long long *e = ring + (k % 16) * 2;
-            fprintf(stderr, "[!]   pc=0x%llX op=0x%llX", e[0], e[1]);
+            fprintf(stderr, " pc=0x%llX/op=0x%llX", e[0], e[1]); /* 同一行：CI 注解只保留前 12 条 [!] 行 */
         }
     } else {
         fprintf(stderr, "[!]   环形缓冲 magic 不对（hdr[0]=0x%llX）", hdr[0]);
