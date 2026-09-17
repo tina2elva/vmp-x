@@ -46,9 +46,13 @@ func FindFunction(path string, f *pe.File, name string) (*Found, error) {
 		// 没有 COFF 符号表是**常态**：wheel 装出来的 .pyd、strip 过的 DLL 都这样。
 		// 退回两条正统来源：导出表定位（例如 PyInit_xxx）、.pdata 给精确边界，
 		// 再退到「同节内下一个导出」或节尾。
-		rva, ok := exportRVA(df, name)
+		// 优先级：MAP（构建时产物，名字最全）→ 导出表（运行期可见的那个）→ 报错。
+		rva, ok := mapRVA(name)
 		if !ok {
-			return nil, fmt.Errorf("找不到符号 %q（该 PE 有 %d 个符号，导出表里也没有这个名字）", name, len(df.Symbols))
+			rva, ok = exportRVA(df, name)
+		}
+		if !ok {
+			return nil, fmt.Errorf("找不到符号 %q（该 PE 有 %d 个符号；MAP 与导出表里都没有这个名字，可用 -map 指定 MAP）", name, len(df.Symbols))
 		}
 		// 边界取「所有可用上界里最小的那个」：
 		//   · .pdata 里同起点的那条（精确）；

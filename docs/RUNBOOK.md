@@ -108,6 +108,47 @@ LD_LIBRARY_PATH=build ./build/dlhost build/libtarget.vmp.so      # 原生 vs 被
 
 注意：`.so` 的注入走「覆盖段」路径（不新增 W+X），细节见 `docs/DESIGN.md`；
 本机（Windows）无法执行这一步，所以它属于「需要 CI」一栏。
+## 4.5 Python 扩展（.pyd）—— 已实测通过
+
+`.pyd` 就是标准 PE DLL，python 侧没有额外格式要求；难点在**发布形态**：
+
+- wheel 装出来的扩展没有 COFF 符号表（`该 PE 有 0 个符号`）；
+- 唯一的导出常常是一枚几字节的 CFG 跳转桩（`jmp [rip+...]`，末尾不是 RET，我们会保守拒绝），
+  真正干活的是 `.text` 里的内部函数。
+
+所以这条路的做法是：**用构建时留下的 `.map` 按名字定位内部函数**，边界用 `.pdata` 的
+`RUNTIME_FUNCTION`（精确）。一条命令即可（脚本会顺手做行为验证）：
+
+```powershell
+powershell -NoProfile -File tools/e2e_pyd.ps1 `
+  -Pyd <dir>\example.cp313-win_amd64.pyd `
+  -Map <dir>\example.map `
+  -Func __pyx_pf_7example_2fibonacci `
+  -Python C:\TaijiControl\WinPy313\python\python.exe `
+  -Expr "print('fib(10)=', example.fibonacci(10))"
+```
+
+脚本做三件事：`vmpack -map ... -func <名字>` 打包 → 打印结构（描述符/ thunk / 入口补丁）→
+把原生与打包后的 pyd 分别放进两个临时目录，用**同一个 Python 3.13 片段**各跑一遍并比对输出。
+
+实测（2026-09，`example.cp313-win_amd64.pyd` 47616 字节）：
+
+```
+coverage: 函数 131，整段可翻译 98 (74.8%)；指令 7088，可翻译 7027 (99.1%)
+__pyx_pf_7example_2fibonacci: RVA=0x13A0 native=851B -> 310 IR -> 2223B bytecode
+入口补丁 E9 9B 3C 02 00（jmp 0x180025040，正好是报告里的 thunk）
+原生  fib(10)=55  fib(15)=610  greet=Hello, vmp!
+打包后 fib(10)=55  fib(15)=610  greet=Hello, vmp!   → 一致
+```
+
+也就是说：**Python 层的 `fibonacci()` 调用现在走 VM 执行，结果不变**。
+
+注意事项：
+
+- `.map` 的 `Publics by Value` 一节里第三列是 VA（含 Preferred load address），减去它即 RVA；
+- 打包后 `.pyd` 会多出 `.vmp` / `.vmpb` / `.vmpc` 三个节（stub、blob 的 .bss、描述符与字节码），体积会明显变大；
+- 只保护 `-func` 点名的函数，其余（含那个 CFG 桩）保持原样；
+- 目标机器上的 Python 版本必须匹配 pyd 的 ABI 标签（`cp313` → 3.13）。
 ## 5. 排错（三条"沉默的坑"，都是踩过的）
 
 1. **构建失败被吞掉**：`vmpbuild` 或 `gcc` 失败时，脚本若继续就会拿**旧产物**去测，

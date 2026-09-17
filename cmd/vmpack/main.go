@@ -53,6 +53,7 @@ func main() {
 	manPath := flag.String("manifest", "build/vm_interp.json", "blob manifest 路径")
 	noEncrypt := flag.Bool("no-encrypt", false, "不加密字节码（调试用；默认加密）")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
+	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
 	section := flag.String("section", ".vmp", "注入节名（仅 PE 使用）")
 	verbose := flag.Bool("v", false, "打印 IR 详情")
@@ -172,6 +173,13 @@ func main() {
 	}
 	fmt.Printf("[*] 目标架构: %s", arch)
 	fmt.Println()
+
+	if *mapPath != "" {
+		if err := scan.LoadMapFile(*mapPath); err != nil {
+			fatalf("读 MAP 失败: %v", err)
+		}
+		fmt.Println("[*] 已载入 MAP：按名字定位函数")
+	}
 
 	var res *inject.Result
 	if isELF {
