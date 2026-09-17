@@ -107,14 +107,6 @@ print("MISMATCH 明文字节码(%d): %s" % (len(code), code.hex()))
 for pc in (0, 9, 0xF, 0x18, 0x23, 0x29):
     if pc < len(code):
         print("MISMATCH   pc=0x%X op=0x%02X = %s" % (pc, code[pc], inv.get(code[pc], "?")))
-PY' 2>/dev/null || true
-import json
-m = json.load(open("build/vm_interp_arm64.json"))
-print("[*] manifest 顶层键:", list(m.keys()))
-for k in ("opcodes", "opcodeValues", "opcodeMap", "symbols"):
-    if k in m and isinstance(m[k], dict):
-        items = list(m[k].items())[:8]
-        print("[*] %s 样例: %s" % (k, items))
 PY
         # 直接把明文字节码打出来：环形缓冲给的是 pc（指令起始偏移），对着字节看第 6 条
         off=$(grep -o '"codeRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
