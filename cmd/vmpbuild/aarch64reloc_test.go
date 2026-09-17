@@ -68,9 +68,9 @@ func TestAArch64RelocPatches(t *testing.T) {
 		target int
 		want   string
 	}{
-		{0x12345ABC, "add x0, x0, #0xabc"},
-		{0x1000, "add x0, x0, #0x0"},
-		{0x1FFF, "add x0, x0, #0xfff"},
+		{0x12345ABC, "ADD X0, X0, #0xabc"},
+		{0x1000, "ADD X0, X0, #0x0"},
+		{0x1FFF, "ADD X0, X0, #0xfff"},
 	}
 	for _, c := range addCases {
 		got := patchAArch64AddLo12(addX0, c.target)
