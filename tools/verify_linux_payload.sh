@@ -51,7 +51,15 @@ for a in 0 1 10 255 12345 1000000; do
     pout=$(./build/payload_probe_linux build/linux_payload.bin "$va" "$thunk_off" "$vm_run_off" "$vm_entry_off" "$a") || prc=$?
     if [ "$prc" -ne 0 ]; then
         echo "  [FAIL] 探针在 check-key($a) 上异常退出：rc=$prc（139=SIGSEGV / 132=SIGILL）"
-        printf '%s' "$pout" | head -n 5 | sed 's/^/         /'
+        printf '%s' "$pout" | head -n 6 | sed 's/^/         /'
+        # 关键：只反汇编探针报的那个故障偏移附近（±0x40），否则会被无关代码淹掉
+        foff=$(printf '%s' "$pout" | grep -o 'FAULTOFF=0x[0-9A-Fa-f]*' | head -n1 | cut -d= -f2)
+        if [ -n "$foff" ] && command -v objdump >/dev/null 2>&1 && [ "$fail" -eq 0 ]; then
+            lo=$(printf '0x%X' $((foff - 0x40)))
+            hi=$(printf '0x%X' $((foff + 0x40)))
+            echo "         --- blob 反汇编 $lo .. $hi （故障偏移 $foff）---"
+            objdump -D -b binary -m i386:x86-64 --adjust-vma=0 --start-address=$lo --stop-address=$hi build/vm_interp_linux.bin 2>/dev/null | sed 's/^/         /'
+        fi
         fail=$((fail+1))
         continue
     fi
@@ -62,12 +70,6 @@ for a in 0 1 10 255 12345 1000000; do
         fail=$((fail+1)); echo "  [FAIL] check-key($a): native=$want payload=$got"
     fi
 done
-if [ "$fail" -ne 0 ] && command -v objdump >/dev/null 2>&1; then
-    echo ""
-    echo "[*] 反汇编 blob 里故障附近的窗口（探针报的是 blob 内偏移，例如 0xCBF）："
-    objdump -D -b binary -m i386:x86-64 --adjust-vma=0 \
-        --start-address=0xC00 --stop-address=0xE40 build/vm_interp_linux.bin 2>/dev/null | tail -n 60
-fi
 echo ""
 echo "payload probe: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
