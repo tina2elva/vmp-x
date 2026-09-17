@@ -67,6 +67,21 @@ if [ -n "$OBJDUMP" ] && command -v "$OBJDUMP" >/dev/null 2>&1; then
         echo "[!]   补丁 rva=0x$(printf '%x' $rva): $line"
     done
 fi
+# payload 探针：把注入段按原始 VA 映射后直接调 thunk —— 用于区分「payload 自身」与「入口/加载」。
+if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
+    if $CC -O1 -o build/payload_probe_arm64 stub/linux/arm64/payload_probe_arm64.c 2>build/probe_cc.log; then
+        sec_rva=$(grep -o '"sectionRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
+        sec_sz=$(grep -o '"sectionSize": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
+        thunk_rva=$(grep -o '"thunkRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
+        va=$((0x400000 + sec_rva)); thunk_off=$((thunk_rva - sec_rva))
+        echo "[*] payload 探针：payloadVA=0x$(printf %x $va) thunkOff=0x$(printf %x $thunk_off)"
+        ./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin >/dev/null 2>&1 || true
+        probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" 0 1 10 255 2>&1) || true
+        echo "[!] payload 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
+    else
+        echo "[!] payload 探针编译失败: $(tail -n 2 build/probe_cc.log | tr '\n' '|')"
+    fi
+fi
 echo "[*] running native vs protected under $QEMU..."
 # 注意：脚本是 set -e。qemu 里客户机崩溃时命令替换会直接终止脚本（上一轮 CI 就只留下
 # "qemu: uncaught target signal 11" 而没有我们的诊断输出），所以统一用 "cmd || rc=$?"。
