@@ -394,7 +394,11 @@ static void vm_bc_enter(void) {
 }
 static void vm_bc_leave(void) { __atomic_store_n(&vm_bc_lock, 0u, __ATOMIC_RELEASE); }
 
-static int vm_run_inner(vm_ctx_t *vm); /* 前向声明：外层 vm_run 要调用它 */
+/* 前向声明：外层 vm_run 要调用它。
+ * rsp_limit 是"客户机模拟栈的下界"（进入时的模拟 RSP - VM_MARGIN）。
+ * 诊断用：客户机压栈越过它就会踩坏宿主栈帧（在 Go 的 goroutine 栈上尤其致命），
+ * 与其让它把控制流搞坏、再表现为"跳进 .bss"，不如当场返回一个可辨认的错误码。 */
+static int vm_run_inner(vm_ctx_t *vm, u64 rsp_limit);
 
 static u8 vm_bc_cache[VM_BC_CACHE_SLOTS][VM_SCRATCH_SIZE];
 static const void *vm_bc_key[VM_BC_CACHE_SLOTS];
@@ -503,7 +507,8 @@ int vm_run(vm_ctx_t *vm) {
             vm->codeLen = d->codeLen;
         }
     }
-    int rc = vm_run_inner(vm);
+    u64 rsp_limit = vm->regs[VRSP] - (u64)VM_MARGIN; /* 客户机栈下界（诊断用，见 vm_run_inner 注释） */
+    int rc = vm_run_inner(vm, rsp_limit);
     if (slot >= 0) {
         /* 原子递减：别的线程可能正在临界区里检查"这个槽有没有人在用" */
         __atomic_fetch_sub(&vm_bc_inuse[slot], 1u, __ATOMIC_RELEASE);
@@ -602,8 +607,13 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
 
 
 
-static int vm_run_inner(vm_ctx_t *vm) {
+static int vm_run_inner(vm_ctx_t *vm, u64 rsp_limit) {
     for (;;) {
+        /* 诊断用（见 vm_run_inner 的注释）：客户机压栈越过给它的栈下界时当场返回 99。
+         * 这样 Linux 上那个"跳进 .bss"就能被区分成"客户机踩穿了自己的栈"或"另有原因"。 */
+        if (vm->regs[VRSP] < rsp_limit) {
+            return 99;
+        }
         if (vm->pc >= vm->codeLen) return 1;
         const u8 *c = vm->code;
         u32 pc = vm->pc;
