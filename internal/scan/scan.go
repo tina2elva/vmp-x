@@ -43,7 +43,40 @@ func FindFunction(path string, f *pe.File, name string) (*Found, error) {
 		}
 	}
 	if target == nil {
-		return nil, fmt.Errorf("找不到符号 %q（该 PE 有 %d 个符号）", name, len(df.Symbols))
+		// 没有 COFF 符号表是**常态**：wheel 装出来的 .pyd、strip 过的 DLL 都这样。
+		// 退回两条正统来源：导出表定位（例如 PyInit_xxx）、.pdata 给精确边界，
+		// 再退到「同节内下一个导出」或节尾。
+		rva, ok := exportRVA(f, name)
+		if !ok {
+			return nil, fmt.Errorf("找不到符号 %q（该 PE 有 %d 个符号，导出表里也没有这个名字）", name, len(df.Symbols))
+		}
+		end := uint32(0)
+		if _, e, ok2 := pdataEnd(f, rva); ok2 {
+			end = e
+		} else if e2, ok3 := nextExportEnd(f, rva); ok3 {
+			end = e2
+		} else if si, ok4 := sectionOfRVA(f, rva); ok4 {
+			end = sectionEndOf(f, si)
+		}
+		if end <= rva {
+			return nil, fmt.Errorf("导出 %q（RVA 0x%X）找不到可用边界", name, rva)
+		}
+		code, cerr := readCode(f, rva, end)
+		if cerr != nil {
+			return nil, cerr
+		}
+		var trimmed []byte
+		var n int
+		var terr error
+		if f.Machine == peMachineARM64 {
+			trimmed, n, terr = trimTrailingPaddingARM64(rva, code)
+		} else {
+			trimmed, n, terr = TrimTrailingPadding(f.ImageBase, rva, code)
+		}
+		if terr != nil {
+			return nil, terr
+		}
+		return &Found{Name: name, RVA: rva, End: rva + uint32(len(trimmed)), Code: trimmed, InstrNum: n}, nil
 	}
 	secIdx := int(target.SectionNumber) - 1
 	if secIdx < 0 || secIdx >= len(f.Sections) {
