@@ -38,20 +38,20 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     _exit(97);
 }
 
-static unsigned long long call_thunk(void *thunk, unsigned long long arg) {
-    unsigned long long ret = 0;
+/* 调用被保护函数：必须和**入口补丁**完全同构 ——
+ *   补丁: mov x16, x30 ; b thunk        （把调用方返回地址挪进 x16，然后尾跳）
+ *   这里: mov x16, x30 ; mov x9, thunk ; mov x0, arg ; br x9
+ * 为什么不能用 blr：blr 会把 thunk+4 写进 x30，而被保护函数最终是用 x16（=调用方 LR）返回的，
+ * 于是控制流会直接回到调用方、跳过本函数自己的收尾；之前那几次 arm64 探针崩溃
+ * （以及据此推出的"SP/x19 被破坏"）其实都是这个假现场造成的。
+ * 用 naked + 尾跳就没有自己的栈帧要收尾，语义与补丁路径一致。 */
+__attribute__((naked, noinline)) static unsigned long long call_thunk(void *thunk, unsigned long long arg) {
     __asm__ volatile(
-        "mov x0, %[arg]\n\t"
-        "mov x9, %[th]\n\t"
-        "blr x9\n\t"
-        "mov %[ret], x0\n\t"
-        : [ret] "=r"(ret)
-        : [arg] "r"(arg), [th] "r"(thunk)
-        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
-          "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x30", "memory");
-    return ret;
+        "mov x16, x30\n\t"
+        "mov x9, x0\n\t"
+        "mov x0, x1\n\t"
+        "br x9\n\t");
 }
-
 int main(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr, "usage: payload_probe_arm64 <payload.bin> <va> <thunkOff> <arg>...");
