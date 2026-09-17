@@ -436,6 +436,9 @@ u64 vm_tmp[3];
  * 这不是假设：第一版带初始化器时本机 E2E 立刻从 146/146 掉成 protected 全空。
  * 所以 magic 在记录时再写。 */
 u64 vm_ring_hdr[2]; /* [0]=magic, [1]=已记录条数（.bss） */
+/* 客户机入口/出口的关键状态（诊断用，非 static 以便进 manifest 符号表）：
+ * arm64 宿主上被保护函数返回值恒定，需要确认"参数有没有到达客户机、客户机最后算出了什么"。 */
+u64 vm_diag[8];
 u64 vm_ring[16][2]; /* {pc, op}（.bss） */
 
 static int vm_bc_lookup(const void *desc) {
@@ -521,7 +524,15 @@ int vm_run(vm_ctx_t *vm) {
         }
     }
     u64 rsp_start = vm->regs[VRSP]; /* 诊断用：客户机栈起点，见 vm_run_inner 注释 */
+    vm_diag[0] = vm->regs[0];          /* 入口 X0（客户机参数） */
+    vm_diag[1] = rsp_start;            /* 入口模拟 SP */
+    vm_diag[2] = (u64)(unsigned long)vm->code; /* 明文/密文字节码指针（freestanding，别用 uintptr_t） */
+    vm_diag[3] = vm->codeLen;
     int rc = vm_run_inner(vm, rsp_start);
+    vm_diag[4] = vm->regs[0];          /* 出口 X0（返回值） */
+    vm_diag[5] = vm->regs[VRSP];
+    vm_diag[6] = vm->pc;
+    vm_diag[7] = (u64)(u32)rc;
     if (slot >= 0) {
         /* 原子递减：别的线程可能正在临界区里检查"这个槽有没有人在用" */
         __atomic_fetch_sub(&vm_bc_inuse[slot], 1u, __ATOMIC_RELEASE);

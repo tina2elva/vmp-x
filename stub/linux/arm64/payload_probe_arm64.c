@@ -80,6 +80,8 @@ int main(int argc, char **argv) {
     memcpy(mem, payload, (size_t)n);
     g_payload = (unsigned char *)mem;
     if (argc > 4) g_ring_off = strtoul(argv[4], NULL, 0);
+    unsigned long diag_off = 0;
+    if (argc > 5) diag_off = strtoul(argv[5], NULL, 0);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = fault_handler;
@@ -88,9 +90,17 @@ int main(int argc, char **argv) {
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     void *thunk = (unsigned char *)mem + thunkOff;
-    for (int i = 5; i < argc; i++) {
+    for (int i = 6; i < argc; i++) {
         unsigned long long a = strtoull(argv[i], NULL, 0);
         printf("  check_key(%llu) = %llu\n", a, call_thunk(thunk, a));
+    }
+    if (diag_off) {
+        /* 解释器在 .bss 里留下的客户机入口/出口状态（vm_diag 符号）：
+         * [0] 入口 X0  [1] 入口模拟 SP  [2] 字节码指针  [3] codeLen
+         * [4] 出口 X0 [5] 出口模拟 SP  [6] pc         [7] rc */
+        unsigned long long *d = (unsigned long long *)(g_payload + diag_off);
+        printf("MISMATCH vm_diag: inX0=%llu inSP=0x%llX code=0x%llX len=%llu outX0=%llu outSP=0x%llX pc=%llu rc=%llu\n",
+               d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
     }
     return 0;
 }
