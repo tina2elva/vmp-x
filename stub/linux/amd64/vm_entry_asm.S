@@ -73,10 +73,8 @@ VM_ENTRY_SYMBOL:
     movq    %r14, VM_CTX_R14(%rsp)
     movq    %r15, VM_CTX_R15(%rsp)
 
-    /* ---- 模拟 RSP：指向客户机自己的栈（.bss 里的 vm_guest_stack）----
-     * 不再指向宿主 RSP 之下：宿主可能是 8KB 的 goroutine 栈，容不下 12.7KB 的偏移。
-     * 栈顶取 64KB-64，保证 16 字节对齐；客户机从这里往下长。 */
-    leaq    vm_guest_stack+65536-64(%rip), %rax
+    /* ---- 模拟 RSP：放在 vm_run 栈帧之下 ---- */
+    leaq    -(8 + VM_MARGIN)(%rsp), %rax
     movq    %rax, VM_CTX_RSP(%rsp)
 
     /* ---- 从栈上反推描述符（必须在填完 ctx 之后：此时可以随便用寄存器） ----

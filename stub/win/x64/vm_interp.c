@@ -415,12 +415,6 @@ u8 vm_xmm[256]; /* 16 × 16 字节；非 static 是为了让符号表里能看�
 /* [0] = 借用的通用寄存器保存位；[8..24) = 16 字节构建缓冲（洗牌/字节移位用）。
  * 非 static，同上：需要出现在符号表里。 */
 u64 vm_tmp[3];
-/* 客户机自己的栈：64KB，放在 .bss 里，**与宿主栈深度解耦**。
- * 为什么需要它：原先模拟 RSP = 宿主 RSP - (FRAME + EXTRA + MARGIN) ≈ 宿主之下 12.7KB，
- * 而 Go 程序的 goroutine 栈初始只有 8KB → 客户机一压栈就越过栈底，
- * runtime 直接 "split stack overflow"（CI 的 linux-amd64 差分用例即此）。
- * 非 static：入口 stub 要用符号引用它（和 vm_tmp / vm_xmm 同理）。 */
-u8 vm_guest_stack[64 * 1024] __attribute__((aligned(16)));
 
 static int vm_bc_lookup(const void *desc) {
     for (int i = 0; i < VM_BC_CACHE_SLOTS; i++) {
