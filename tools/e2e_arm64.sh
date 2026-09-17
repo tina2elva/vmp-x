@@ -103,6 +103,8 @@ code_rva = pl.get("codeRVA", 0)
 code_len = pl.get("bytecodeBytes") or pl.get("bytecodeSize") or 0
 data = open("build/arm64_payload.bin", "rb").read()
 code = data[code_rva:code_rva + code_len]
+print("MISMATCH placement 全量:", pl)
+print("MISMATCH payload 文件大小:", len(data), " codeRVA=", code_rva, " code_len=", code_len)
 print("MISMATCH 明文字节码(%d): %s" % (len(code), code.hex()))
 for pc in (0, 9, 0xF, 0x18, 0x23, 0x29):
     if pc < len(code):
