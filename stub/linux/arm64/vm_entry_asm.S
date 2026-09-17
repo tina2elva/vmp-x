@@ -84,31 +84,25 @@ VM_ENTRY_SYMBOL:
 
     /* ---- 调用 vm_run(ctx) ---- */
     mov     x0, sp
-    mov     x19, sp          /* 诊断：把 SP 留下来，返回后强制还原 */
     bl      vm_run
 
-    /* 诊断/加固：AArch64 里 SP 是 callee-saved，正常不该被改；但 CI 现场显示
-     * vm_run 返回后的第一条指令（ldr x10, [sp]）就 SIGSEGV —— 像是 SP 被破坏了。
-     * 这里无条件还原一次：如果还原后就不崩，就证明问题在"谁改了 SP"。 */
-    mov     sp, x19
+    /* ---- 返回：X0..X30 全部从 **ctx** 还原，且顺序有讲究 ----
+     * x0..x30 每一个都是客户机寄存器，所以：
+     *   1) 所有需要临时寄存器的活（NZCV 还原、帧回收）必须在还原**之前**做完；
+     *   2) 返回值 x0 必须在**最后**取，之后不能再碰任何 GPR。
+     * 之前用 x10 暂存返回值，结果还原循环里 r=10 的那次 ldr 把它冲掉 —— arm64 上
+     * "返回值恒定 4294967168" 就是它；VM 内部其实算对了（vm_diag: outX0=2012 与 native 一致）。
+     * 帧回收也不再借寄存器：4688 = 0xFF0 + 0x260，两次 add 都在 imm12 范围内。 */
+    ldr     w9, [sp, #VM_CTX_FLAGS]
+    rbit    w9, w9                 /* VM 位序在 bit0..3；rbit 恰好把它们送到 31..28 */
+    msr     nzcv, x9
 
-    /* ---- 返回：X0..X30 全部从 **ctx** 还原 ----
-     * 为什么不是从 VM_SAVE_* 区：那块区域本文件**从来没有写过**（只在开头写了 VM_SAVE_LR /
-     * VM_SAVE_GUEST_LR 两格），照它还原等于把 X1..X29 填成栈上的垃圾 —— 客户机返回后
-     * 调用方（例如目标自己的 _start 附近）立刻崩。而且 ctx 才是权威：客户机执行过程中
-     * 可能改过这些寄存器（包括 X30，例如一条被翻译的 bl）。
-     * X0 先用 x10 暂存，因为最后要用 x0 传返回值。 */
-    ldr     x10, [sp, #VM_CTX_OFF_REGS]
     .irp r, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
         ldr     x\r, [sp, #(VM_CTX_OFF_REGS + 8*\r)]
     .endr
 
-    /* ---- 标志位还原：VM 位序 → NZCV ---- */
-    ldr     w9, [sp, #VM_CTX_FLAGS]
-    lsl     w9, w9, #28
-    msr     nzcv, x9
+    ldr     x0, [sp, #VM_CTX_OFF_REGS]
 
-    mov     x9, #VM_FRAME_SIZE
-    add     sp, sp, x9
-    mov     x0, x10
+    add     sp, sp, #0xFF0
+    add     sp, sp, #0x260
     ret
