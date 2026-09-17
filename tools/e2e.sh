@@ -11,6 +11,21 @@
 # builder and the PC-relative relocation logic). A mingw cross compiler is only used
 # as a fallback, so a CI log always states which compiler produced the blob.
 set -euo pipefail
+
+
+# --- 失败时把日志尾部打成 GitHub 注解 -------------------------------------
+# 为什么需要它：仓库的原始日志需要鉴权才能下载，而注解可以在运行页/API 上匿名读到。
+# 这样我（或者任何 reviewer）不用登录就能看到"为什么红"。
+mkdir -p build
+exec > >(tee build/e2e_run.log) 2>&1
+on_err() {
+    rc=$?
+    msg=$(tail -n 20 build/e2e_run.log 2>/dev/null | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+    echo "::error title=$(basename "$0") failed (exit $rc)::$msg"
+    exit $rc
+}
+trap on_err ERR
+
 cd "$(dirname "$0")/.."
 mkdir -p build
 

@@ -9,9 +9,6 @@ jobs:
   # ---------------------------------------------------------------- Windows/amd64（本机已验证的那一套）
   windows-amd64:
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -22,26 +19,36 @@ jobs:
         with:
           msystem: UCRT64
           install: mingw-w64-ucrt-x86_64-gcc
-      - name: 把 msys2 UCRT64 工具链接进 PATH
-        # 关键：E2E 脚本直接调用 gcc/objdump/ld，而 setup-msys2 默认只在它的 shell 里可见。
-        run: |
-          "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "C:\msys64\usr\bin"    | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "C:\msys64\ucrt64\bin\gcc.exe" --version | Select-Object -First 1
       - name: Go 门禁
+        shell: pwsh
         run: |
           go build ./...
           go test ./...
           gofmt -l .
           go vet ./...
+      # 下面几步用 msys2 的 shell：这样 gcc/objdump/ld 一定在 PATH 上
+      # （上一次失败就是因为 setup-msys2 的工具不在 PowerShell 的 PATH 里）。
+      # 脚本本身是 .ps1，所以在 msys2 bash 里显式调 powershell。
       - name: 真机 E2E（x86-64，146 例）
-        run: powershell -NoProfile -File tools/e2e.ps1
+        shell: msys2 {0}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e.ps1
       - name: 真机 E2E（DLL，3 例）
-        run: powershell -NoProfile -File tools/e2e_dll.ps1
+        shell: msys2 {0}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_dll.ps1
       - name: ARM64 客户机语义差分（宿主仍是 x86-64）
-        # 这两条测试在 Windows 上本机已通过；放在这里而不是 Linux，
-        # 因为 harness（stub/win/x64/blob_probe.c）依赖 <windows.h>。
-        run: powershell -NoProfile -File tools/e2e_arm64guest.ps1
+        shell: msys2 {0}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_arm64guest.ps1
+      - name: Linux 载荷（在 Windows 上执行注入后的 ELF 载荷）
+        shell: msys2 {0}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_linux_payload.ps1
 
   # ---------------------------------------------------------------- Linux/amd64
   linux-amd64:
