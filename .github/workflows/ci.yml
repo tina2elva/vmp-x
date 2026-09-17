@@ -231,19 +231,26 @@ jobs:
       - name: build an arm64 PE target (freestanding; no Windows SDK required)
         run: |
           sudo apt-get install -y -qq lld >/dev/null
-          clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib \
-            -fuse-ld=lld -Wl,-e,entry -Wl,-subsystem:console -g \
-            -o build/target_arm64.exe testdata/arm64/target_win.c
+          if ! clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib \
+              -fuse-ld=lld -Wl,-e,entry -Wl,-subsystem=console -g \
+              -o build/target_arm64.exe testdata/arm64/target_win.c > build/pe_step.log 2>&1; then
+            tail -n 20 build/pe_step.log
+            echo "::error title=arm64 PE target build::$(tail -n 12 build/pe_step.log | sed -e 's/%/%25/g' | tr '\n' '|')"
+            exit 1
+          fi
           ls -l build/target_arm64.exe
       - name: pack Windows/arm64 (structure check)
         run: |
-          set -e
-          ./build/vmpack -exe build/target_arm64.exe -func check_key -func sum_to \
-            -blob build/vm_interp_win_arm64.bin -manifest build/vm_interp_win_arm64.json \
-            -out build/target_arm64.vmp -report build/target_arm64_vmp.json 2>&1 | tail -n 12
+          if ! ./build/vmpack -exe build/target_arm64.exe -func check_key -func sum_to \
+              -blob build/vm_interp_win_arm64.bin -manifest build/vm_interp_win_arm64.json \
+              -out build/target_arm64.vmp -report build/target_arm64_vmp.json > build/pack_step.log 2>&1; then
+            tail -n 20 build/pack_step.log
+            echo "::error title=Windows/arm64 pack::$(tail -n 12 build/pack_step.log | sed -e 's/%/%25/g' | tr '\n' '|')"
+            exit 1
+          fi
+          tail -n 12 build/pack_step.log
           grep -o '"entryPatch":"[^"]*"' build/target_arm64_vmp.json | head -n 2
-          # AArch64 的入口补丁必须是 8 字节 mov x16,x30 ; b thunk（F0 03 1E AA = mov x16,x30）
-          grep -q 'F0 03 1E AA' build/target_arm64_vmp.json || { echo "::error::ARM64 入口补丁不是 mov x16,x30;b thunk"; exit 1; }
+          grep -q 'F0 03 1E AA' build/target_arm64_vmp.json || { echo "::error title=arm64 entry patch::入口补丁不是 mov x16,x30;b thunk"; exit 1; }
           echo "[+] Windows/arm64 打包结构检查通过"
 
   # ---------------------------------------------------------------- Windows/arm64: 原生 arm64 Windows 上真跑
@@ -268,19 +275,25 @@ jobs:
       - name: build blob + target + pack
         shell: pwsh
         run: |
-          go build -o build/vmpbuild.exe ./cmd/vmpbuild
-          go build -o build/vmpack.exe ./cmd/vmpack
+          $ErrorActionPreference = "Continue"
+          go build -o build/vmpbuild.exe ./cmd/vmpbuild; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go build -o build/vmpack.exe ./cmd/vmpack; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $od = (Get-Command llvm-objdump -ErrorAction SilentlyContinue).Source
           if (-not $od) { $od = "objdump" }
-          ./build/vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64.bin `
-            -manifest build/vm_interp_win_arm64.json -entry vm_entry -guest arm64 -merge go `
-            -cc clang -objdump $od
-          if (-not (Test-Path build/vm_interp_win_arm64.bin)) { Write-Host "::error::blob build produced no output"; exit 1 }
-          clang -O1 -fno-tree-vectorize -nostdlib -Wl,-e,entry -Wl,-subsystem:console -g `
-            -o build/target_arm64.exe testdata/arm64/target_win.c
-          ./build/vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to `
-            -blob build/vm_interp_win_arm64.bin -manifest build/vm_interp_win_arm64.json `
-            -out build/target_arm64.vmp -report build/target_arm64_vmp.json
+          $steps = @(
+            ,@("./build/vmpbuild.exe", "-src", "stub/win/arm64", "-out", "build/vm_interp_win_arm64.bin", "-manifest", "build/vm_interp_win_arm64.json", "-entry", "vm_entry", "-guest", "arm64", "-merge", "go", "-cc", "clang", "-objdump", $od)
+            ,@("clang", "-O1", "-fno-tree-vectorize", "-nostdlib", "-Wl,-e,entry", "-Wl,-subsystem=console", "-g", "-o", "build/target_arm64.exe", "testdata/arm64/target_win.c")
+            ,@("./build/vmpack.exe", "-exe", "build/target_arm64.exe", "-func", "check_key", "-func", "sum_to", "-blob", "build/vm_interp_win_arm64.bin", "-manifest", "build/vm_interp_win_arm64.json", "-out", "build/target_arm64.vmp", "-report", "build/target_arm64_vmp.json")
+          )
+          foreach ($s in $steps) {
+            & $s[0] $s[1..($s.Length - 1)] 2>&1 | Tee-Object -FilePath build/step.log
+            if ($LASTEXITCODE -ne 0) {
+              $tail = (Get-Content build/step.log -Tail 14) -join "%0A"
+              Write-Host "::error title=$($s[0]) exit $LASTEXITCODE::$tail"
+              exit $LASTEXITCODE
+            }
+          }
+          Get-Item build/vm_interp_win_arm64.bin, build/target_arm64.exe, build/target_arm64.vmp | ForEach-Object { "$($_.Name): $($_.Length) bytes" }
       - name: run native vs protected
         shell: pwsh
         run: |
