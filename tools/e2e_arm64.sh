@@ -55,6 +55,7 @@ echo "[*] building the linux/arm64 blob (built-in merger)..."
 echo "[*] packing check_key / sum_to..."
 ./build/vmpack -exe build/arm64_target -func check_key -func sum_to \
     -blob build/vm_interp_arm64.bin -manifest build/vm_interp_arm64.json \
+    -dumpbytecode build/bcdump \
     -out build/arm64_target.vmp -report build/arm64_vmp.json
 
 # 入口补丁检查：在打包产物里反汇编被保护函数开头，确认 8 字节补丁真的写进去了
@@ -101,8 +102,14 @@ print("MISMATCH placement 字段:", list(pl.keys()))
 print("MISMATCH maxStubStackFrame =", m.get("maxStubStackFrame"), " margin =", m.get("margin"), " frameSkew =", m.get("frameSkew"))
 code_rva = pl.get("codeRVA", 0) - rep.get("sectionRVA", 0)   # codeRVA 是目标 RVA；payload 内的偏移要减去 sectionRVA
 code_len = pl.get("bytecodeBytes") or pl.get("bytecodeSize") or 0
-data = open("build/arm64_payload.bin", "rb").read()
-code = data[code_rva:code_rva + code_len]
+import glob
+code = b""
+for _f in sorted(glob.glob("build/bcdump/bytecode_*.bin")):
+    _b = open(_f, "rb").read()
+    if len(_b) == code_len:
+        code = _b
+        print("MISMATCH 明文来源:", _f)
+        break
 print("MISMATCH placement 全量:", pl)
 print("MISMATCH payload 文件大小:", len(data), " codeRVA=", code_rva, " code_len=", code_len)
 print("MISMATCH 明文字节码(%d): %s" % (len(code), code.hex()))
