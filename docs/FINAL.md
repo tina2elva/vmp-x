@@ -142,6 +142,35 @@ x87 与浮点转换扩展、AES-NI、AVX/VEX、REP 字符串、`SYSCALL`、以�
 6. ELF 目标里的 `SHT_NOBITS`（.bss）读取报错、`vm_entry` 偏移为 0 被误判为坏值。
 7. **重叠 `PT_LOAD` 的映射顺序**：内核按程序头表顺序 mmap，重叠区间上后者覆盖前者 —— 可写覆盖段若排在 payload 段之前，`.bss` 会被 RX 映射盖回只读，解释器写解密缓存即 `SIGSEGV/SEGV_ACCERR`（PE 侧不暴露）。这是 `linux-amd64` 长期红着的真根因。
 
+
+## 9. 最终判定（第 108 轮：CI 全矩阵实跑后的结论）
+
+| 作业 | 结论 |
+|---|---|
+| `windows-amd64` | **success**（持续）：146 例 x86-64 E2E、3 例 DLL、ARM64 客户机差分、Linux 载荷在本机执行 —— 全部在 runner 上通过 |
+| `linux-amd64` | **success**：blob 构建 ✓、打包 ✓、readelf 无 W+X 断言 ✓、payload 探针 ✓、差分 E2E ✓。长期红着的根因是**重叠 PT_LOAD 的映射顺序**（可写 .bss 覆盖段被 payload 的 RX 映射盖回只读 → SEGV_ACCERR） |
+| `linux-arm64` | blob 构建 ✓（含 `-mno-outline-atomics`、共享头 `-I` 路径、aarch64 保存布局常量）、AArch64 打包 ✓（8 字节 `mov x16,x30 ; b thunk`，已用反汇编核实）、**qemu 能执行** ✓；修掉两个宿主 stub bug（寄存器还原、标志位换算）后不再崩溃，但**每个被保护函数返回 0**，尚未算对 |
+| `windows-arm64-blob` | **外部缺口**：runner 镜像里没有能产出 aarch64 COFF 的编译器，作业按设计显式失败（不是回归） |
+
+### 对原目标 ⑤（arm64 执行验证 + CI 实跑）的判定
+
+- **已达成**：CI 矩阵**真实实跑**且四个作业的结论都可匿名阅读；ARM64 **客户机**语义链由真实差分验证并纳入本机门禁；
+  ARM64 **宿主** blob 从「从未构建」推进到「能构建、能打包、能被 qemu 执行」；x86-64 的 ELF 路径（此前在 Linux 上从未真正执行过）**已全绿**——
+  包括独立的 payload 探针与端到端差分；
+- **未达成**：ARM64 宿主 blob 的执行仍未算对（返回 0，正在用 payload 探针二分）；`windows-arm64-blob` 受限于镜像里没有 aarch64 COFF 编译器；
+- **结论**：⑤ 从「受环境所限」推进到「可在 CI 上闭环验证」，只剩一个运行期缺陷与一个外部工具链缺口。
+
+### 这条路上修掉的真缺陷（累计 8 条）
+
+1. ELF 的 PC 相对重定位多加了 4 字节（COFF 需要、ELF 不需要）—— Linux 侧 SIGILL 的真根因；
+2. AArch64 宿主 blob 的两处编译问题（`VM_SAVE_*` 常量守卫、共享头 `-I` 路径）；
+3. aarch64 的 `__aarch64_swp4_acq` 助手缺失（`-mno-outline-atomics`）；
+4. AArch64 的 ADRP/ADD 重定位从未支持；
+5. 内置合并器把 AArch64 映射符号 `$x` 当重复定义；同一份 `.c` 被编两次导致全局符号重复；
+6. ELF 目标里的 `SHT_NOBITS`（.bss）读取报错、`vm_entry` 偏移为 0 被误判；
+7. **重叠 `PT_LOAD` 的映射顺序**（可写覆盖段必须排在 payload 段之后）—— linux-amd64 长期红着的真根因；
+8. **arm64 入口 stub 的两处**：从一块从未写过的保存区还原 X1..X29；标志位换算 `lsr #28` / 多余的 `rbit`。
+
 ## 7. 文档索引
 
 - `README.md`：项目说明、快速开始、验证矩阵、限制清单；
