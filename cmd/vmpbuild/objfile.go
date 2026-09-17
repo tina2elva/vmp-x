@@ -129,16 +129,20 @@ func readCOFFObject(path string) (*objFile, error) {
 			rel := objReloc{SecIdx: i, Off: uint64(r.VirtualAddress), TargetSec: sym, SymName: name, RawType: uint32(r.Type), Addend: addend}
 			if out.IsARM64 {
 				// ARM64 COFF：只接受 26 位分支（BL/B），其余一律失败
-				if r.Type == coffRelARM64Branch26 {
-					// COFF 没有 RELA：加数藏在字段里。但 AArch64 的这个字段**是一条指令**（例如
-					// 0x94000000 = bl 的编码），真正的加数是它的 imm26：有符号、单位 4 字节。
-					// 之前把整条指令字当加数加进目标地址，合并时报「分支超出 ±128MB」——
-					// Windows/arm64 的 blob 就死在 .text+0x10C（目标符号 vm_run，诊断里 addend
-					// 正是 0x94000000 的有符号值 -1811939328）。
-					imm := int64(int32(uint32(addend)<<6) >> 6)
-					rel.Addend = imm * 4
+				// COFF 没有 RELA：加数都藏在**字段**里。而 AArch64 的这些字段是**指令**，
+				// 必须按各自的编码把「隐式加数」解出来，否则合并后地址就是错的
+				// （BRANCH26 一度直接把 0x94000000 当加数，报「分支超出 ±128MB」）。
+				switch r.Type {
+				case coffRelARM64Branch26: // bl / b：imm26，有符号、单位 4 字节
+					rel.Addend = decodeBranch26Addend(uint32(addend))
 					rel.Kind = relAArch64Branch26
-				} else {
+				case coffRelARM64PageBaseRel21: // adrp：page(S+A) - page(P)
+					rel.Addend = decodeADRPStoredAddend(uint32(addend))
+					rel.Kind = relAArch64ADRPrelPGHi21
+				case coffRelARM64PageOffset12A: // add x, x, #:lo12:sym（未缩放 imm12）
+					rel.Addend = decodeAddLo12StoredAddend(uint32(addend))
+					rel.Kind = relAArch64AddAbsLo12
+				default:
 					rel.Kind = relUnsupported
 				}
 				out.Relocs = append(out.Relocs, rel)
@@ -171,8 +175,10 @@ const (
 	R_X86_64_PLT32 = 4
 
 	/* COFF（Windows 对象文件）*/
-	coffMachineARM64     = 0xAA64
-	coffRelARM64Branch26 = 3 /* IMAGE_REL_ARM64_BRANCH26 */
+	coffMachineARM64          = 0xAA64
+	coffRelARM64Branch26      = 3 /* IMAGE_REL_ARM64_BRANCH26  : bl/b */
+	coffRelARM64PageBaseRel21 = 4 /* IMAGE_REL_ARM64_PAGEBASE_REL21 : adrp */
+	coffRelARM64PageOffset12A = 6 /* IMAGE_REL_ARM64_PAGEOFFSET_12A : add x, x, #:lo12:sym */
 
 	/* AArch64（ELF for the ARM 64-bit Architecture）*/
 	R_AARCH64_CALL26           = 283
@@ -261,6 +267,25 @@ func readELFObject(path string) (*objFile, error) {
 		}
 	}
 	return out, nil
+}
+
+// ---- AArch64 隐式加数的解码（COFF 字段是一条指令）----
+
+// decodeBranch26Addend：imm26，有符号，单位 4 字节
+func decodeBranch26Addend(insn uint32) int64 {
+	return int64(int32(insn<<6)>>6) * 4
+}
+
+// decodeADRPStoredAddend：immhi(23:5):immlo(30:29) 组成的 21 位有符号页数，左移 12
+func decodeADRPStoredAddend(insn uint32) int64 {
+	v := int32(((insn>>5)&0x7FFFF)<<2 | ((insn >> 29) & 3))
+	v = v << 11 >> 11 // 21 位符号扩展
+	return int64(v) << 12
+}
+
+// decodeAddLo12StoredAddend：ADD (immediate) 的 imm12（21:10，未缩放）
+func decodeAddLo12StoredAddend(insn uint32) int64 {
+	return int64((insn >> 10) & 0xFFF)
 }
 
 func makeELFReloc(out *objFile, target int, rOff, info uint64, addend int64, implicit bool) objReloc {
