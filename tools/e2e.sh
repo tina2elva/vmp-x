@@ -118,6 +118,13 @@ if command -v objdump >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
     done
 fi
 
+# 打包后把程序头打出来：注入段是 RX，blob 的 .bss（解密缓存）靠一个**重叠的 RW** LOAD 覆盖。
+# 覆盖段缺失/尺寸不对时，内核会把 .bss 留在只读 RX 映射里 → VM 第一次写缓存就 SIGSEGV，
+# 而 Windows 的 PE 路径没有这种映射检查，所以这个 bug 只在 Linux 上现形。
+if command -v readelf >/dev/null 2>&1; then
+    echo "[*] 打包后程序头（只看 LOAD/NOTE）:"
+    readelf -lW build/linux_target.vmp | grep -E "LOAD|NOTE" | sed "s/^/    /"
+fi
 echo "[*] differential test (native vs protected)..."
 for a in 0 1 10 255 12345 1000000 4294967295; do
     run_case check-key "$a"
