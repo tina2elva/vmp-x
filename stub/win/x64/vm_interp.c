@@ -380,7 +380,7 @@ static int cond_holds(vm_ctx_t *vm, u32 cond) {
  *   - 前提是注入段**可写**（PE 的 .vmp 加了 ScnMemWrite、ELF 的新 PT_LOAD 加了 PF_W）。
  */
 #ifndef VM_BC_CACHE_SLOTS
-#define VM_BC_CACHE_SLOTS 4
+#define VM_BC_CACHE_SLOTS 16 /* 每个槽 4KB（.bss 里 64KB）：并发线程 + 嵌套调用都够用 */
 #endif
 
 /* 并发保护：槽位分配与回收必须互斥，否则两个线程可能拿到同一个槽，
@@ -401,6 +401,11 @@ static const void *vm_bc_key[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_inuse[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_tick[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_clock = 0;
+
+/* 注意：这里曾经有一份"兜底缓冲池"（缓存槽全忙时用独占的一份）。
+ * 二分实验证明它是错的：并发线程 + 嵌套调用会把它耗尽，于是返回错误码、客户机算出错值
+ * （CI 的 mt 用例：4 线程 × 嵌套，200 次里错 24 次）。而缓存槽本身就会在并发调用间**共享**
+ * 同一份明文（只读 + 引用计数），所以"池"本来就是多余概念 —— 直接给足缓存槽即可。 */
 
 /* XMM 寄存器堆：x86-64 里 XMM0-15 是**调用者保存**（volatile），
  * 所以被保护函数不需要从宿主那里复制进来/送回去——只要有一块私有内存当寄存器堆即可。
@@ -477,15 +482,12 @@ int vm_run(vm_ctx_t *vm) {
                 aad[4] = (u8)(d->reserved1); aad[5] = (u8)(d->reserved1 >> 8);
                 aad[6] = (u8)(d->reserved1 >> 16); aad[7] = (u8)(d->reserved1 >> 24);
                 int c = vm_bc_acquire();
-                if (!vm->scratch && c < 0) {
+                if (c < 0 || (u32)d->codeLen > (u32)VM_SCRATCH_SIZE) {
+                    /* 槽全忙（并发 + 嵌套超过槽数）：宁可直接失败，也不要用错的值继续跑 */
                     vm_bc_leave();
                     return 2;
                 }
-                if (c < 0 && vm->scratchLen < d->codeLen) {
-                    vm_bc_leave();
-                    return 2;
-                }
-                dst = (c >= 0) ? vm_bc_cache[c] : vm->scratch;
+                dst = vm_bc_cache[c];
                 if (!vm_aead_open_aad(key, d->nonce, aad, 8, ct, d->encLen, d->tag, dst)) {
                     vm_bc_leave();
                     return 3;

@@ -82,9 +82,6 @@ vm_entry:
     testq   %r11, %r11
     jne     1f
     /* 不是 thunk 调用：没有描述符，code 由调用方（如测试宿主）直接给出 */
-    leaq    VM_SCRATCH_OFF(%rsp), %rax
-    movq    %rax, VM_CTX_SCRATCH(%rsp)
-    movl    $VM_SCRATCH_SIZE, VM_CTX_SCRATCHLEN(%rsp)
     jmp     2f
 1:
     movl    4(%r11), %eax
@@ -102,9 +99,6 @@ vm_entry:
 
     /* ---- 加密支持：描述符指针 + 帧内的解密缓冲 ---- */
     movq    %r11, VM_CTX_DESC(%rsp)
-    leaq    VM_SCRATCH_OFF(%rsp), %rax
-    movq    %rax, VM_CTX_SCRATCH(%rsp)
-    movl    $VM_SCRATCH_SIZE, VM_CTX_SCRATCHLEN(%rsp)
 
 2:
     /* ---- 其余状态清零 ---- */
