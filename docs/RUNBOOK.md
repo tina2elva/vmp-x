@@ -146,6 +146,6 @@ git push -u origin main
 | Linux/arm64 的 `tools/e2e_arm64.sh`（交叉编译 + qemu） | **CI 已跑到执行**：blob 构建 ✓、AArch64 打包 ✓（补丁是 8 字节 `mov x16,x30 ; b thunk`）、qemu 首次执行 → **段错误**（尚未定位） |
 | └ Linux/arm64 的已知缺口 | 该目标 ELF 只有 3 个 phdr，NOTE 槽位要留给覆盖段，缺少第二个空槽 → payload 段**退回 RWX**（代码里明确 `[warn]`，不是静默降级） |
 | （第 96/97 轮更新）`windows-amd64` | **runner 上无失败步骤**：帧 640 + margin 3KB + 16 个缓存槽的配置下，146 例 E2E 全部通过。此前 runner 上失败的是 `mt(0)`（多线程），真因是「兜底缓冲池」在 4 线程 × 嵌套下被耗尽 —— 已删除该池（见 STATUS 289/290） |
-| （第 96/97 轮更新）`linux-amd64` | 打包 ✓、无 W+X ✓；运行期是**确定性**损坏，且**已证明与栈深度无关**：把总深度从 7824 收到 3728（低于 CI 现场 goroutine 栈的 4KB）后，失败地址逐字节不变（`unexpected fault address 0x599240`） |
+| （第 96–102 轮更新）`linux-amd64` | 打包 ✓、无 W+X ✓、payload 探针 ✓、**入口补丁已验证正确**；运行期仍是**确定性**损坏（`unexpected fault address 0x599240`，落在 payload 的 RW 页里 → 是**取指**到不可执行页）。已逐条排除：栈深度（7824→3728 地址不变）、客户机压栈越界（探针 99 未命中）、弹出过多（97 未命中）、未知操作码（98 未命中）、补丁写错（本机读文件验证 OK）。剩余方向：宿主栈被写坏或解释器自身的间接转移 |
 | （第 96/97 轮更新）`linux-arm64` | 已有指令级现场：`qemu-aarch64 -d in_asm,cpu` 显示 `PC=0x4001e4 / X30=0x4001f4 / IN: _start`，rc=139 —— 崩溃在目标自身代码路径上 |
 | Windows/arm64 blob 构建 | **需要外部工具链**：runner 镜像里没有能产出 aarch64 COFF 的编译器（作业按设计显式失败，`continue-on-error`） |
