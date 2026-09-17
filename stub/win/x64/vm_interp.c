@@ -539,7 +539,14 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
                 case KF_DIV: *(float *)pdst = a / b; break;
                 case KF_MIN: *(float *)pdst = a < b ? a : b; break;
                 case KF_MAX: *(float *)pdst = a > b ? a : b; break;
+#if defined(__x86_64__) || defined(_M_X64)
                 case KF_SQRT: { float sr; __asm__ __volatile__("sqrtss %1, %0" : "=x"(sr) : "x"(a)); *(float *)pdst = sr; break; }
+#else
+                /* 非 x86 宿主：sqrtss 是 x86 助记符，汇编不过去（CI 的 linux-arm64 作业实测就卡在这）。
+                 * 而且这条路径在 arm64 客户机上根本不会被发射（KF_SQRT 只由 x64 lifter 产生），
+                 * 所以这里保持"传值不计算"即可，不引入 aarch64 内联汇编。 */
+                case KF_SQRT: *(float *)pdst = a; break;
+#endif
                 case KF_CVTSI2F: { u64 iv = 0; u32 k; for (k = 0; k < 8; k++) iv |= (u64)((const u8 *)pa)[k] << (8 * k); *(float *)pdst = (float)(i64)iv; break; }
                 case KF_CVTTF2SI: *(i64 *)pdst = (i64)a; break; /* 结果写成整数，调用方再搬进寄存器 */
                 case KF_UCOMI: {
@@ -561,7 +568,11 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
                 case KF_DIV: *(double *)pdst = a / b; break;
                 case KF_MIN: *(double *)pdst = a < b ? a : b; break;
                 case KF_MAX: *(double *)pdst = a > b ? a : b; break;
+#if defined(__x86_64__) || defined(_M_X64)
                 case KF_SQRT: { double sr; __asm__ __volatile__("sqrtsd %1, %0" : "=x"(sr) : "x"(a)); *(double *)pdst = sr; break; }
+#else
+                case KF_SQRT: *(double *)pdst = a; break;
+#endif
                 case KF_CVTSI2F: { u64 iv = 0; u32 k; for (k = 0; k < 8; k++) iv |= (u64)((const u8 *)pa)[k] << (8 * k); *(double *)pdst = (double)(i64)iv; break; }
                 case KF_CVTTF2SI: {
                     /* x86 的 CVTTSD2SI：超出范围给 0x8000000000000000（不定值），且不抛异常 */
