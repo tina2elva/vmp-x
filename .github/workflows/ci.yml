@@ -308,3 +308,6 @@ jobs:
           }
           Write-Host "::notice title=Windows/arm64 OK::native=$nrc protected=$prc"
           Write-Host "[+] Windows/arm64 end-to-end: outputs match"
+          # 关键：GitHub 的 pwsh 包装器最后会 `exit $LASTEXITCODE`，而这里 $LASTEXITCODE 还是
+          # 被保护程序自己的退出码（非 0）——不显式清零，比较通过了步骤也会被判失败。
+          $global:LASTEXITCODE = 0
