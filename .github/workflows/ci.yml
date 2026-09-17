@@ -119,6 +119,18 @@ jobs:
           go test ./...
           gofmt -l .
           go vet ./...
+      - name: payload probe (payload mapped at its original VA, on Linux)
+        run: |
+          mkdir -p build
+          set +e
+          bash tools/verify_linux_payload.sh > build/ci_step.log 2>&1
+          rc=$?
+          tail -n 40 build/ci_step.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=verify_linux_payload.sh (exit $rc)::$msg"
+          fi
+          exit $rc
       - name: ELF end-to-end (readelf must show no W+X)
         run: |
           mkdir -p build
