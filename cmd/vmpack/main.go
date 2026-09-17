@@ -52,6 +52,7 @@ func main() {
 	blobPath := flag.String("blob", "build/vm_interp.bin", "解释器 blob 路径")
 	manPath := flag.String("manifest", "build/vm_interp.json", "blob manifest 路径")
 	noEncrypt := flag.Bool("no-encrypt", false, "不加密字节码（调试用；默认加密）")
+	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
 	section := flag.String("section", ".vmp", "注入节名（仅 PE 使用）")
 	verbose := flag.Bool("v", false, "打印 IR 详情")
@@ -97,6 +98,7 @@ func main() {
 	}
 
 	// 字节码加密（M2.2）：用 blob 的主密钥逐函数密封。密钥来自 manifest（vmpbuild 生成）。
+	dumpSeq := 0
 	var enc inject.EncryptFunc
 	if !*noEncrypt && man.Key != "" {
 		key, err := hex.DecodeString(man.Key)
@@ -110,6 +112,13 @@ func main() {
 			var nonce [12]byte
 			if _, err := rand.Read(nonce[:]); err != nil {
 				return nil, nonce, [16]byte{}, err
+			}
+			if *dumpBytecode != "" {
+				// 诊断用：把**明文**字节码单独存一份。payload 里放的是密文，				// 从 payload 直接读出来的字节不是指令流（我曾因此得出过错误结论）。
+				_ = os.MkdirAll(*dumpBytecode, 0o755)
+				name := fmt.Sprintf("%s/bytecode_%02d.bin", *dumpBytecode, dumpSeq)
+				dumpSeq++
+				_ = os.WriteFile(name, plain, 0o644)
 			}
 			sealed := aead.Seal(nil, nonce[:], plain, aad)
 			var tag [16]byte
