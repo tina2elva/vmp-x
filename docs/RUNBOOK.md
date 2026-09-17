@@ -140,4 +140,5 @@ git push -u origin main
 |---|---|
 | Windows/amd64 真机 E2E（146 用例）、DLL E2E（3 用例）、Go 单测、差分测试 | **本机已验证** |
 | ELF 去 RWX 断言、PIE（两个加载地址）、明文缓存线程安全（多线程原子计数 80000） | **本机已验证** |
-| Linux/amd64 `tools/e2e.sh`、Linux/arm64 qemu E2E、Windows/arm64 blob 构建 | **需要 CI/真机** |
+| Linux/amd64 **注入载荷**在 Windows 上执行（`tools/verify_linux_payload.ps1`：ET_EXEC 6/6、PIE 两个装载地址一致） | **本机已验证** |
+| Linux 加载器映射并跳转、`tools/e2e.sh`、Linux/arm64 qemu E2E、Windows/arm64 blob 构建 | **需要 CI/真机** |

@@ -13,15 +13,15 @@
 powershell -NoProfile -File tools/gates.ps1
 ```
 
-最近一次实测：**6 条门禁全部通过**（gofmt / go vet / go test / x86-64 E2E 146 例 / DLL E2E 3 例 / ARM64 客户机差分）。
+最近一次实测：**7 条门禁全部通过**（gofmt / go vet / go test / x86-64 E2E 146 例 / DLL E2E 3 例 / ARM64 客户机差分 / Linux 载荷在本机执行）。
 
 ## 1. 目标对照表
 
 | # | 目标 | 状态 | 证据 |
 |---|---|---|---|
 | ① | 量化覆盖率并据此扩展指令子集 | **达成** | 见 §2：x86-64（函数级 87.7~91.4%、指令级 99.5~99.6%）与 **ARM64（指令级 88.7%、函数级 4.4%）** 都有第一手实测 |
-| ② | ELF 侧去掉 RWX（重叠 PT_LOAD） | **达成（本机）** | 注入改为 RX/RW/RX 三段；`tools/e2e.sh` 用 readelf 断言无 W+X；PIE 两个装载地址下结果一致 |
-| ③ | 支持 PIE / 共享库 | **部分达成** | PIE(ET_DYN) 本机已验证（两个装载地址）；Windows DLL 保护 + 宿主调用 3/3；ELF 共享库定位路径已打通（`.dynsym` 回退 + 单测），**运行时 `dlopen` 未验证**（需 Linux） |
+| ② | ELF 侧去掉 RWX（重叠 PT_LOAD） | **达成（本机）** | 注入改为 RX/RW/RX 三段；`tools/e2e.sh` 用 readelf 断言无 W+X。注入后的**载荷**在 Windows 上被映射到 ELF 原始 VA 执行通过（ET_EXEC 6/6；PIE 在**两个装载地址**下结果一致）——「Linux 加载器映射并跳转」那一步仍需 CI |
+| ③ | 支持 PIE / 共享库 | **部分达成** | PIE(ET_DYN) 的**载荷**在本地验证（两个装载地址下结果一致，加载器仍待 CI）；Windows DLL 保护 + 宿主调用 3/3；ELF 共享库定位路径已打通（`.dynsym` 回退 + 单测），**运行时 `dlopen` 未验证**（需 Linux） |
 | ④ | 明文缓存线程安全 | **达成（本机）** | 缓存按描述符指针键控 + 自旋锁；多线程用例双端一致 |
 | ⑤ | arm64 执行验证 + CI 实跑 | **部分达成** | **ARM64 客户机语义链已真实验证并纳入门禁**（见 §3）；ARM64 *宿主* blob 构建、Linux/arm64 qemu 端到端、CI 实跑**需要 CI** |
 

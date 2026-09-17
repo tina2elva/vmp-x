@@ -35,6 +35,9 @@ Step "e2e.ps1 (x86-64)"  { & powershell -NoProfile -File (Join-Path $PSScriptRoo
 Step "e2e_dll.ps1"       { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_dll.ps1") }
 # ARM64 客户机语义（宿主仍是 x86-64）：单独脚本 + 子进程调用，退出码语义干净
 Step "arm64-guest differential" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_arm64guest.ps1") }
+# Linux/amd64 注入载荷：在 Windows 上把载荷映射到 ELF 原始 VA 并调用 thunk（ET_EXEC + PIE 两个地址）。
+# 剩下"Linux 加载器把段映射好并把控制权交给改写后的入口"这一步只能由 tools/e2e.sh 在真 Linux 上验证。
+Step "linux payload (executed on Windows)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "verify_linux_payload.ps1") }
 
 Write-Host ""
 Write-Host "==== local gates ===="
