@@ -631,8 +631,15 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
 
 
 
+/* 一次调用的指令预算（诊断用）：超了就以 96 返回。
+ * 为什么需要：arm64 上带循环的 sum_to 在探针里"永不返回"，我们需要它快速返回、
+ * 并把环形缓冲（最近执行的 pc/op）留下来，才能看出是哪条分支没让 pc 前进。 */
+#define VM_STEP_BUDGET 20000000u
+
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
+    u32 steps = 0;
     for (;;) {
+        if (++steps > VM_STEP_BUDGET) return 96;
         /* 诊断用（见 vm_run_inner 的注释）：客户机压栈越过给它的栈下界时当场返回 99。
          * 这样 Linux 上那个"跳进 .bss"就能被区分成"客户机踩穿了自己的栈"或"另有原因"。 */
 #ifndef VM_GUEST_ARM64

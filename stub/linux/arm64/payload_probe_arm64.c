@@ -94,6 +94,18 @@ int main(int argc, char **argv) {
         unsigned long long a = strtoull(argv[i], NULL, 0);
         printf("  check_key(%llu) = %llu\n", a, call_thunk(thunk, a));
     }
+    if (g_ring_off) {
+        unsigned long long *rh = (unsigned long long *)(g_payload + g_ring_off);
+        if (rh[0] == 0x564D52494E473031ULL) {
+            unsigned long long cnt = rh[1];
+            printf("MISMATCH 环形缓冲(末12条):");
+            for (unsigned long long k = (cnt > 12 ? cnt - 12 : 0); k < cnt; k++) {
+                unsigned long long *e = (unsigned long long *)(g_payload + g_ring_off) + 2 + (k % 16) * 2;
+                printf(" pc=0x%llX/op=0x%llX", e[0], e[1]);
+            }
+            printf("\n");
+        }
+    }
     if (diag_off) {
         /* 解释器在 .bss 里留下的客户机入口/出口状态（vm_diag 符号）：
          * [0] 入口 X0  [1] 入口模拟 SP  [2] 字节码指针  [3] codeLen
