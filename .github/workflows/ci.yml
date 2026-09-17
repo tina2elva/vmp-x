@@ -120,7 +120,17 @@ jobs:
           gofmt -l .
           go vet ./...
       - name: ELF end-to-end (readelf must show no W+X)
-        run: bash tools/e2e.sh
+        run: |
+          mkdir -p build
+          set +e
+          bash tools/e2e.sh > build/ci_step.log 2>&1
+          rc=$?
+          tail -n 40 build/ci_step.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=bash tools/e2e.sh (exit $rc)::$msg"
+          fi
+          exit $rc
 
   # ---------------------------------------------------------------- Linux/arm64 (qemu-user)
   linux-arm64:
@@ -136,8 +146,16 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
       - name: Linux/arm64 end-to-end (qemu-aarch64)
         run: |
-          CC=aarch64-linux-gnu-gcc OBJDUMP=aarch64-linux-gnu-objdump QEMU=qemu-aarch64 \
-            bash tools/e2e_arm64.sh
+          mkdir -p build
+          set +e
+          CC=aarch64-linux-gnu-gcc OBJDUMP=aarch64-linux-gnu-objdump QEMU=qemu-aarch64 bash tools/e2e_arm64.sh > build/ci_step.log 2>&1
+          rc=$?
+          tail -n 40 build/ci_step.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=CC=aarch64-linux-gnu-gcc OBJDUMP=aarch64-linux-gnu-objdump QEMU=qemu-aarch64 bash tools/e2e_arm64.sh (exit $rc)::$msg"
+          fi
+          exit $rc
 
   # ---------------------------------------------------------------- Windows/arm64: blob build only
   # Needs a compiler that emits aarch64 COFF; apt does not have one by default, so this job is
