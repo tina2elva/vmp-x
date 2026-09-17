@@ -41,10 +41,6 @@
 /* ---- 栈余量与 skew ---- */
 #define VM_MARGIN       0x2000 /* 8KB：守卫要求 margin > 解释器最大帧 + 512（aarch64 上已能测出 4688），
                                    * 8KB 有充裕余量；再大只是白占宿主栈（宿主栈通常 MB 级，改了也不影响语义）。 */
-                                  * 于是 margin > maxFrame+512 的检查形同虚设。
-                                  * 若解释器真实帧大于 margin，客户机的模拟栈就会与解释器自己的帧重叠 ——
-                                  * 现象正好是"vm_run 返回后第一条 ldr [sp] 就 SIGSEGV"。
-                                  * arm64 目标跑在大栈上，放宽 margin 没有 x86-Go 那种 goroutine 限制。 */
 /* BL 不压栈（返回地址在 LR 里），因此没有 x86 那种"返回地址额外 8 字节" */
 #define VM_FRAME_SKEW_EXTRA 0
 #define VM_FRAME_SKEW   (VM_FRAME_SIZE + VM_FRAME_SKEW_EXTRA + VM_MARGIN)
