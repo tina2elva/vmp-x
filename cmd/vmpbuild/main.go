@@ -589,7 +589,10 @@ func readABIConstants(src string) (frameSize, margin, skewExtra int, err error) 
 func measureMaxFrame(objdump, obj string, verbose bool) (int, error) {
 	out, err := exec.Command(objdump, "-d", obj).CombinedOutput()
 	if err != nil {
-		return 0, fmt.Errorf("objdump 失败: %w", err)
+		// 不能因为量不到就把构建掐死：Windows/arm64 原生 runner 上没有 GNU objdump。
+		// 但也不能静默 —— 用 [!] 打出来（CI 的注解通道会带上它），并让保守的 margin 兜底。
+		fmt.Printf("[!] objdump 不可用（%v）：VM_MARGIN 的守卫这次跑不了，按 0 处理，请确认 margin 足够大\n", err)
+		return 0, nil
 	}
 	cur := ""
 	max := 0

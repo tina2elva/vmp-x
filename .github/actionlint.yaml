@@ -1,0 +1,6 @@
+# actionlint 的 runner 标签表里还没有 windows-11-arm（GitHub 的原生 arm64 Windows 镜像），
+# 这里显式登记，避免 actionlint 把它当成未知标签。若该标签对仓库不可用，作业会直接失败，
+# 报的就是 "label is not supported"，那时按已知缺口记录即可。
+self-hosted-runner:
+  labels:
+    - windows-11-arm
