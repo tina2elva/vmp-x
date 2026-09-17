@@ -636,7 +636,6 @@ func measureMaxFrame(objdump, obj string, verbose bool) (int, error) {
 		fmt.Printf("[warn] 未能从 %s 量到任何栈帧（maxStubStackFrame=0）：VM_MARGIN 的守卫将失去意义，请检查 objdump 语法\n", obj)
 	}
 	return max, nil
-	return max, nil
 }
 
 // buildBlob 按顺序拼接需要保留的节，并记录每个节在 blob 中的偏移
