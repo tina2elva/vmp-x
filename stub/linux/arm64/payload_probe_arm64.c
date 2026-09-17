@@ -12,6 +12,30 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/mman.h>
+#include <signal.h>
+#include <ucontext.h>
+
+static unsigned char *g_payload;
+static unsigned long g_ring_off;
+
+/* 崩溃时把解释器留在 .bss 里的「最近 16 条 (pc, op)」环形缓冲打出来（magic=VMRING01），
+ * 这样「客户机是在哪条字节码上跳飞」就不需要猜了。 */
+static void fault_handler(int sig, siginfo_t *si, void *uc) {
+    (void)si; (void)uc;
+    fprintf(stderr, "[!] signal %d；环形缓冲在 payload+0x%lX", sig, g_ring_off);
+    unsigned long long *hdr = (unsigned long long *)(g_payload + g_ring_off);
+    if (hdr[0] == 0x564D52494E473031ULL) {
+        unsigned long long cnt = hdr[1];
+        unsigned long long *ring = hdr + 2;
+        for (unsigned long long k = (cnt > 12 ? cnt - 12 : 0); k < cnt; k++) {
+            unsigned long long *e = ring + (k % 16) * 2;
+            fprintf(stderr, "[!]   pc=0x%llX op=0x%llX", e[0], e[1]);
+        }
+    } else {
+        fprintf(stderr, "[!]   环形缓冲 magic 不对（hdr[0]=0x%llX）", hdr[0]);
+    }
+    _exit(97);
+}
 
 static unsigned long long call_thunk(void *thunk, unsigned long long arg) {
     unsigned long long ret = 0;
@@ -53,8 +77,17 @@ int main(int argc, char **argv) {
     if (mem == MAP_FAILED) { fprintf(stderr, "[!] mmap failed"); return 2; }
     fprintf(stderr, "[*] payload 映射在 0x%llX（原 VA 0x%llX，仅作参考）", mapAt, va);
     memcpy(mem, payload, (size_t)n);
+    g_payload = (unsigned char *)mem;
+    if (argc > 4) g_ring_off = strtoul(argv[4], NULL, 0);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
     void *thunk = (unsigned char *)mem + thunkOff;
-    for (int i = 4; i < argc; i++) {
+    for (int i = 5; i < argc; i++) {
         unsigned long long a = strtoull(argv[i], NULL, 0);
         printf("  check_key(%llu) = %llu\n", a, call_thunk(thunk, a));
     }
