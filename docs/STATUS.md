@@ -952,6 +952,30 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 > `vmpbuild` 目前不检查「blob 里是否出现可写的非 .bss 数据」。上一轮环形缓冲带初始化器落进 `.data`，
 > 立刻把本机 E2E 打成 protected 全空 —— 与本次根因同一类（权限归属）。建议：blob 出现 `.data` 就失败，
 > 或把 RW 覆盖段扩到包含 `.data`。
+>
+> ## 第一〇四/一〇五轮：linux-arm64 从「段错误」推进到「不崩但全 0」
+>
+> ### 304. 修掉的两个 arm64 宿主 bug
+> 1. **入口 stub 的寄存器还原**：prologue 只写了 VM_SAVE_LR / VM_SAVE_GUEST_LR 两格，
+>    epilogue 却从 `VM_SAVE_BASE + 8*(r-1)` 还原 X1..X29 —— 那块区域从未被写过，
+>    于是客户机返回时 X1..X29 全是垃圾，调用方（目标自己的 _start 附近）立刻崩
+>    （现场 PC=0x4001e4 / X30=0x4001f4 / rc=139 完全吻合）。改为从 **ctx** 还原 X1..X30。
+>    效果：`protected rc=0` —— **不再崩了**。
+> 2. **标志位换算**：进入用 `lsr #28`（应为 `and #0xF`）、还原多了一次 `rbit`（应直接 msr）。
+>
+> ### 305. 当前症状（精确）
+> ```
+> [!] native   = 213|206|143|2012|86342|6999829|0|28|500500
+> [!] protected= 0|0|0|0|0|0|0|0|0
+> [!] arm64 end-to-end: MISMATCH (native rc=0, protected rc=0)
+> ```
+> rc=0 且每个被保护函数都返回 0 —— 说明 VM 跑完了但「没算」（rc=0 对应命中 OP_RET）。
+> 已排除：描述符布局（x64/arm64 两个 vm_desc_t 字段一致）、清单/opcode map 用错（e2e_arm64.sh 用的是
+> vm_interp_arm64.json）、AEAD 失败（那会是 rc=3）、lifter 产出为空（vmpack 日志显示 6 IR / 42B、8 IR / 54B）。
+>
+> ### 306. 下一步（明确）
+> 给 arm64 也做一份 payload 探针（用 CI 里的 aarch64-linux-gnu-gcc 编、qemu 跑），
+> 把「payload 自身」与「入口/加载」分开 —— x86-64 正是靠这个探针把范围收窄到了映射顺序。
 
 
 
