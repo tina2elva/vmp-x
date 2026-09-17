@@ -354,6 +354,16 @@ func generateKeyFile(tmp string) (string, string, error) {
 	return p, fmt.Sprintf("%x", key), nil
 }
 
+// appendUnique 只在列表里还没有这个名字时才追加（BLOB.sources 与内置追加可能重叠）。
+func appendUnique(list []string, name string) []string {
+	for _, s := range list {
+		if s == name {
+			return list
+		}
+	}
+	return append(list, name)
+}
+
 func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, verbose bool) ([]string, error) {
 	// 把整个 stageRoot（默认 stub/）树按原样拷进 ASCII 临时目录。
 	// 这样平台目录之间可以互相引用（例如 Linux 复用 win/x64 的 vm_interp.c），
@@ -407,11 +417,14 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	if err != nil {
 		return nil, err
 	}
-	// 加密支持：解释器固定编进 vm_crypto.c；密钥用 -include 注入（见下）
-	sources = append(sources, "win/x64/vm_crypto.c")
+	// 加密支持：解释器固定编进 vm_crypto.c；密钥用 -include 注入（见下）。
+	// 注意：这两个文件可能**已经**写在 BLOB.sources 里 —— 重复追加会被编译两次，
+	// 于是同名全局符号在两个目标文件里各定义一次，合并时报"全局符号重复"
+	// （CI 的 linux-arm64 作业就死在 arm64_mask_w 上）。所以按名字去重。
+	sources = appendUnique(sources, "win/x64/vm_crypto.c")
 	if guest == "arm64" {
 		// ARM64 客户机：标志位/条件码语义来自 stub/arm64 的独立模块
-		sources = append(sources, "arm64/guest_semantics_arm64.c")
+		sources = appendUnique(sources, "arm64/guest_semantics_arm64.c")
 	}
 
 	var objs []string
