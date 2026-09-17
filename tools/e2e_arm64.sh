@@ -91,6 +91,20 @@ except Exception as ex:
     print("decode failed: %s" % ex)
 PY
         echo "[*] 操作码解码: $(tr '\n' ' ' < build/opnames.txt)"
+        python3 - <<'PY' 2>/dev/null || true
+import json
+m = json.load(open("build/vm_interp_arm64.json"))
+print("[*] manifest 顶层键:", list(m.keys()))
+for k in ("opcodes", "opcodeValues", "opcodeMap", "symbols"):
+    if k in m and isinstance(m[k], dict):
+        items = list(m[k].items())[:8]
+        print("[*] %s 样例: %s" % (k, items))
+PY
+        # 直接把明文字节码打出来：环形缓冲给的是 pc（指令起始偏移），对着字节看第 6 条
+        off=$(grep -o '"codeRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
+        if [ -n "$off" ] && [ -f build/arm64_payload.bin ]; then
+            od -An -tx1 -j "$off" -N 48 build/arm64_payload.bin 2>/dev/null | tr -s ' ' | sed 's/^/[!] 字节码: /'
+        fi
         probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" 0 1 10 255 2>&1) || true
         echo "[!] payload 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
         # 探针崩了的话，用 qemu 的指令级日志再看一次，打印尾部 —— 定位炸在哪条 arm64 指令
