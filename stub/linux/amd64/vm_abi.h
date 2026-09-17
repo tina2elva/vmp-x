@@ -93,7 +93,7 @@
  * "runtime: split stack overflow"（CI 的 linux-amd64 差分用例即此）。
  * 单纯调小 VM_MARGIN 不行：vmpbuild 会拒绝 margin < 解释器最大帧(4544)+512。
  * 真正的修法是让客户机用自己的栈（放在 blob 的 .bss 里、宿主 RSP 无关），见 docs/STATUS.md。 */
-#define VM_MARGIN       0x1C00 /* 7KB：总深度 640+16+7168 = 7824 < 8KB，同时给客户机留 7KB 自己的栈 */
+#define VM_MARGIN       0xC00 /* 3KB：CI 里 Go 的 goroutine 栈只有 4KB（日志 stack=[0xc000078000,0xc000079000]），总深度必须 < 4KB */
 
 #define VM_FRAME_SKEW_EXTRA 16 /* thunk 用 call 压入返回地址带来的额外 8 字节（另有 8 字节见 vm_entry） */
 #define VM_FRAME_SKEW   (VM_FRAME_SIZE + VM_FRAME_SKEW_EXTRA + VM_MARGIN)

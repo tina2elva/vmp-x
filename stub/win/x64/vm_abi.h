@@ -98,7 +98,7 @@
 #define VM_SAVE_TOP     (VM_SAVE_XMM5 + 16) /* 最后一个保存槽的结束偏移 */
 
 /* ---- vm_run 及其调用者可用的栈余量（模拟栈在其下方） ---- */
-#define VM_MARGIN       0x1C00 /* 7KB：总深度 640+16+7168 = 7824 < 8KB，同时给客户机留 7KB 自己的栈 */
+#define VM_MARGIN       0xC00 /* 3KB：CI 里 Go 的 goroutine 栈只有 4KB（日志 stack=[0xc000078000,0xc000079000]），总深度必须 < 4KB */
 
 /* ---- 模拟 RSP 与原生 RSP 的差值（lifter 用） ---- */
 #define VM_FRAME_SKEW_EXTRA 16 /* thunk 用 call 压入返回地址带来的额外 8 字节（另有 8 字节见 vm_entry） */
