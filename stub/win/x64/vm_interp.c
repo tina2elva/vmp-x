@@ -431,8 +431,12 @@ u64 vm_tmp[3];
  * 目的：Linux 上"跳进 payload 的 .bss"这类跑飞，寄存器/栈记账都已排除，
  * 需要一个"跑飞前执行了什么"的现场。进程崩溃后进程内不便打印，
  * 但 core dump 里包含 payload 的这些页 —— 用 magic 一搜就能把这段读出来。 */
-u64 vm_ring_hdr[2] = { 0x564D52494E473031ULL /* "VMRING01" */, 0 }; /* [1] = 已记录条数 */
-u64 vm_ring[16][2]; /* {pc, op} */
+/* 注意：**不要给这两个数组初始化器** —— 有初始化器就会落进 .data，
+ * 而注入段里只有 .bss 那一截被映射成可写（.data 在 RX 区）→ 解释器一写就 SIGSEGV。
+ * 这不是假设：第一版带初始化器时本机 E2E 立刻从 146/146 掉成 protected 全空。
+ * 所以 magic 在记录时再写。 */
+u64 vm_ring_hdr[2]; /* [0]=magic, [1]=已记录条数（.bss） */
+u64 vm_ring[16][2]; /* {pc, op}（.bss） */
 
 static int vm_bc_lookup(const void *desc) {
     for (int i = 0; i < VM_BC_CACHE_SLOTS; i++) {
@@ -639,6 +643,7 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             u32 k = (u32)(vm_ring_hdr[1] & 15);
             vm_ring[k][0] = pc;
             vm_ring[k][1] = op;
+            vm_ring_hdr[0] = 0x564D52494E473031ULL; /* "VMRING01"：运行时写，避免落进 .data */
             vm_ring_hdr[1]++;
         }
 
