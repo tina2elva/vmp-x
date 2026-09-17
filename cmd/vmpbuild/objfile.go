@@ -187,7 +187,15 @@ func readELFObject(path string) (*objFile, error) {
 	for i, s := range f.Sections {
 		data, derr := s.Data()
 		if derr != nil {
-			return nil, derr
+			// 未初始化数据（.bss，SHT_NOBITS）：Go 的 debug/elf 在这里会直接报
+			// "unexpected read from SHT_NOBITS section"。blob 是**按字节拷贝**的映像，
+			// 这类节的正确内容就是全零，补零即可（COFF 侧一直这么做；ELF 侧漏了，
+			// 于是 Linux 上用宿主 gcc 走 ELF 目标这条路一直失败，CI 首次真跑才暴露）。
+			if s.Type == elf.SHT_NOBITS {
+				data = make([]byte, s.Size)
+			} else {
+				return nil, derr
+			}
 		}
 		out.Sections = append(out.Sections, objSection{Name: s.Name, Data: data, Index: i})
 	}
