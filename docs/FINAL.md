@@ -120,7 +120,7 @@ x87 与浮点转换扩展、AES-NI、AVX/VEX、REP 字符串、`SYSCALL`、以�
 | 作业 | 结论 |
 |---|---|
 | `windows-amd64` | **success**（runner 上无失败步骤）：146 例 x86-64 E2E、3 例 DLL、ARM64 客户机差分、Linux 载荷 —— 全部在 runner 上通过。第 96 轮修掉了 runner 上唯一失败项 `mt`（并发用例）的真因：多余的「兜底缓冲池」在 4 线程 × 嵌套下被耗尽 |
-| `linux-amd64` | 打包 ✓、**无 W+X** ✓、payload 探针 ✓、入口补丁已验证正确；差分用例尚未全绿。故障是**取指**到 payload 的 RW 页（`0x599240`），已排除：栈深度、压栈越界、弹出过多、未知操作码、补丁错误。剩余方向：宿主栈被写坏 / 解释器自身的间接转移（下一步用「跑飞前最后若干条 (pc, op)」定位） |
+| `linux-amd64` | **全绿**（CI `failedSteps=[]`）：打包 ✓、**无 W+X** ✓、payload 探针 ✓、差分 E2E ✓。根因（重叠 PT_LOAD 的映射顺序导致 `.bss` 被 RX 覆盖）已修 |
 | `linux-arm64` | blob 构建 ✓、AArch64 打包 ✓（8 字节 `mov x16,x30 ; b thunk`）、**qemu 首次真正执行** → 段错误（未定位）；另有 payload 段退回 RWX 的缺口 |
 | `windows-arm64-blob` | 需要能产出 aarch64 COFF 的编译器，runner 镜像没有 —— 外部缺口（作业显式失败） |
 
@@ -140,6 +140,7 @@ x87 与浮点转换扩展、AES-NI、AVX/VEX、REP 字符串、`SYSCALL`、以�
 4. AArch64 的 ADRP/ADD 重定位从未支持；
 5. 内置合并器把 AArch64 映射符号 `$x` 当重复定义；同一个 `.c` 被编译两次导致全局符号重复；
 6. ELF 目标里的 `SHT_NOBITS`（.bss）读取报错、`vm_entry` 偏移为 0 被误判为坏值。
+7. **重叠 `PT_LOAD` 的映射顺序**：内核按程序头表顺序 mmap，重叠区间上后者覆盖前者 —— 可写覆盖段若排在 payload 段之前，`.bss` 会被 RX 映射盖回只读，解释器写解密缓存即 `SIGSEGV/SEGV_ACCERR`（PE 侧不暴露）。这是 `linux-amd64` 长期红着的真根因。
 
 ## 7. 文档索引
 

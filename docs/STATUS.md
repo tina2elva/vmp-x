@@ -927,6 +927,31 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 > （当前 margin 3KB）。第 92 轮试过“给客户机一块自己的栈”，但因为切断了“调用方帧仍在宿主栈上”
 > 的语义，framed / calls_protected 立刻回归。真正的解应当是**按 disp 的正负分开映射**：
 > 自己的帧（disp<0）用客户机私有栈，调用方帧（disp>=0）仍指宿主栈。
+>
+> ## 第一〇三轮：**linux-amd64 修好了** —— 根因是重叠 PT_LOAD 的映射顺序
+>
+> ### 300. 决定性线索
+> 把跑飞关键字加进 CI 注解抓取后露出：
+> `[signal SIGSEGV: segmentation violation code=0x2 addr=0x599360 pc=0x585d0e]`
+> code=0x2 = SEGV_ACCERR（地址已映射、权限不允许）；addr 落在 `.bss` 的 RW 覆盖段内，pc 在解释器写解密缓存的代码里。
+> 也就是「往本该可写的那一页写」被内核拒绝。
+>
+> ### 301. 根因与修法
+> 内核按**程序头表顺序**依次 mmap 各 PT_LOAD，**重叠区间上后面的映射覆盖前面的**。
+> 实测：payload 复用 PT_NOTE（索引 1），可写覆盖段落到更低的索引 0（可丢弃的 PT_PHDR），
+> 于是 payload 段后映射、把 RW 覆盖段盖回 RX → `.bss` 只读 → 解释器第一次写缓存即 SIGSEGV。
+> PE 侧按节合并、写标志生效，所以该问题只在 ELF 上现形。
+> 修法：`inject/elf.go` 在添加覆盖段后，若其索引小于 payload 段则交换两者（新增 `load/elf.SwapPhdrs`）。
+> 本地验证：打包后顺序变为 `idx=0 va=0x585000 RX` / `idx=1 va=0x589000 RW`；E2E 146/146、DLL 3/3。
+>
+> ### 302. CI 判决：**linux-amd64 全绿**
+> `linux-amd64: failedSteps=[]` —— 打包、无 W+X、payload 探针、差分 E2E 全部通过。
+> 四个作业现在：windows-amd64 ✓、linux-amd64 ✓、linux-arm64 ✗（qemu 段错误）、windows-arm64-blob ✗（外部工具链）。
+>
+> ### 303. 同类缺口（建议加构建期检查）
+> `vmpbuild` 目前不检查「blob 里是否出现可写的非 .bss 数据」。上一轮环形缓冲带初始化器落进 `.data`，
+> 立刻把本机 E2E 打成 protected 全空 —— 与本次根因同一类（权限归属）。建议：blob 出现 `.data` 就失败，
+> 或把 RW 覆盖段扩到包含 `.data`。
 
 
 
