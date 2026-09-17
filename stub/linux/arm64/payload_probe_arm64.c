@@ -43,9 +43,16 @@ int main(int argc, char **argv) {
 
     unsigned long long va = strtoull(argv[2], NULL, 0);
     unsigned long long thunkOff = strtoull(argv[3], NULL, 0);
-    void *mem = mmap((void *)(uintptr_t)va, (size_t)n, PROT_READ | PROT_WRITE | PROT_EXEC,
+    /* 不要用 ELF 里的原 VA：这个探针自己是静态链接的 aarch64 程序，而 arm64 目标很小、
+     * payload 的 VA 可能只有 0x401000 —— MAP_FIXED 会把探针自己的映像盖掉，
+     * 于是"payload 崩了"其实是探针被自己覆盖（第一次的结果正是 SIGILL）。
+     * payload 是位置无关的（描述符靠 X30 反推、VBASE 运行期算），所以换一块高位内存即可。 */
+    (void)va;
+    unsigned long long mapAt = 0x200000000ULL;
+    void *mem = mmap((void *)(uintptr_t)mapAt, (size_t)n, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (mem == MAP_FAILED) { fprintf(stderr, "[!] mmap failed"); return 2; }
+    fprintf(stderr, "[*] payload 映射在 0x%llX（原 VA 0x%llX，仅作参考）", mapAt, va);
     memcpy(mem, payload, (size_t)n);
     void *thunk = (unsigned char *)mem + thunkOff;
     for (int i = 4; i < argc; i++) {
