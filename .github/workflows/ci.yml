@@ -241,6 +241,7 @@ jobs:
           ls -l build/target_arm64.exe
       - name: pack Windows/arm64 (structure check)
         run: |
+          go build -o build/vmpack ./cmd/vmpack
           if ! ./build/vmpack -exe build/target_arm64.exe -func check_key -func sum_to \
               -blob build/vm_interp_win_arm64.bin -manifest build/vm_interp_win_arm64.json \
               -out build/target_arm64.vmp -report build/target_arm64_vmp.json > build/pack_step.log 2>&1; then
@@ -282,7 +283,7 @@ jobs:
           if (-not $od) { $od = "objdump" }
           $steps = @(
             ,@("./build/vmpbuild.exe", "-src", "stub/win/arm64", "-out", "build/vm_interp_win_arm64.bin", "-manifest", "build/vm_interp_win_arm64.json", "-entry", "vm_entry", "-guest", "arm64", "-merge", "go", "-cc", "clang", "-objdump", $od)
-            ,@("clang", "-O1", "-fno-tree-vectorize", "-nostdlib", "-Wl,-e,entry", "-Wl,-subsystem=console", "-g", "-o", "build/target_arm64.exe", "testdata/arm64/target_win.c")
+            ,@("clang", "--target=aarch64-w64-windows-gnu", "-fuse-ld=lld", "-O1", "-fno-tree-vectorize", "-nostdlib", "-Wl,-e,entry", "-Wl,-subsystem=console", "-g", "-o", "build/target_arm64.exe", "testdata/arm64/target_win.c")
             ,@("./build/vmpack.exe", "-exe", "build/target_arm64.exe", "-func", "check_key", "-func", "sum_to", "-blob", "build/vm_interp_win_arm64.bin", "-manifest", "build/vm_interp_win_arm64.json", "-out", "build/target_arm64.vmp", "-report", "build/target_arm64_vmp.json")
           )
           foreach ($s in $steps) {
