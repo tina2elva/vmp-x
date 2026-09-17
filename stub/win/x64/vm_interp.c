@@ -30,7 +30,11 @@ VM_STATIC_ASSERT(__builtin_offsetof(vm_ctx_t, codeLen) == VM_CTX_CODELEN, ctx_co
 VM_STATIC_ASSERT(__builtin_offsetof(vm_ctx_t, code) == VM_CTX_CODE, ctx_code);
 #endif
 VM_STATIC_ASSERT((VM_FRAME_SIZE % 16) == 0, frame_align);
+/* 这两个常量只存在于 x86-64 宿主的 vm_abi.h 里：aarch64 宿主的入口 stub 保存布局完全不同，
+ * 所以这条断言只在 x86 宿主上成立（CI 的 linux-arm64 作业曾因此编译失败）。 */
+#ifdef VM_SAVE_R15
 VM_STATIC_ASSERT(VM_SAVE_R15 + 8 == VM_SAVE_RCX, saves_fit);
+#endif
 VM_STATIC_ASSERT(VM_SAVE_TOP <= VM_FRAME_SIZE - 8, save_top_fit);
 VM_STATIC_ASSERT(sizeof(vm_desc_t) == VM_DESC_SIZE, desc_size);
 

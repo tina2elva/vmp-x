@@ -427,6 +427,9 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 			"-include", filepath.Join(platformDir, "vm_abi.h"),
 			"-include", opcodeValuesPath,
 			"-include", keyPath)
+		// 共享头文件（vm_types.h / vm_opcodes.h）住在 win/x64 下：任何平台目录都要能包含到它，
+		// 否则 linux/arm64 这类平台的 guest_semantics_arm64.h 会找不到 vm_types.h（CI 实测过）。
+		args = append(args, "-I", filepath.Join(tmp, "win", "x64"))
 		if guest == "arm64" {
 			// ARM64 客户机：语义模块在 arm64/ 下，它自己又 include vm_types.h
 			args = append(args,
