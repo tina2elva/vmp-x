@@ -57,16 +57,27 @@ echo "[*] packing check_key / sum_to..."
     -out build/arm64_target.vmp -report build/arm64_vmp.json
 
 echo "[*] running native vs protected under $QEMU..."
-native=$($QEMU ./build/arm64_target)
-protected=$($QEMU ./build/arm64_target.vmp)
-echo "--- native ---"
+# 注意：脚本是 set -e。qemu 里客户机崩溃时命令替换会直接终止脚本（上一轮 CI 就只留下
+# "qemu: uncaught target signal 11" 而没有我们的诊断输出），所以统一用 "cmd || rc=$?"。
+nrc=0
+native=$($QEMU ./build/arm64_target 2>&1) || nrc=$?
+prc=0
+protected=$($QEMU ./build/arm64_target.vmp 2>&1) || prc=$?
+echo "--- native (rc=$nrc) ---"
 echo "$native"
-echo "--- protected ---"
+echo "--- protected (rc=$prc) ---"
 echo "$protected"
-if [ "$native" = "$protected" ] && [ -n "$native" ]; then
+if [ "$native" = "$protected" ] && [ -n "$native" ] && [ "$nrc" -eq 0 ] && [ "$prc" -eq 0 ]; then
     echo "[+] arm64 end-to-end: outputs match"
 else
-    echo "[!] arm64 end-to-end: MISMATCH"
+    echo "[!] arm64 end-to-end: MISMATCH (native rc=$nrc, protected rc=$prc)"
+    # 失败时用 qemu 的指令级日志重跑一次，打印尾部 —— 用来定位"炸在哪条 arm64 指令"
+    # （对应 x86 侧用 objdump 反汇编故障偏移附近的做法）。
+    set +e
+    $QEMU -d in_asm,cpu -D build/qemu_arm64.log ./build/arm64_target.vmp >/dev/null 2>&1
+    set -e
+    echo "[*] qemu 指令日志尾部（共 $(wc -l < build/qemu_arm64.log 2>/dev/null || echo 0) 行）:"
+    tail -n 70 build/qemu_arm64.log 2>/dev/null | sed 's/^/    /'
     exit 1
 fi
 ok=1
