@@ -596,6 +596,11 @@ func measureMaxFrame(objdump, obj string, verbose bool) (int, error) {
 	// AArch64：帧分配是 `sub sp, sp, #imm` 或前索引 `str/stp ...[sp, #-imm]!`
 	reSubA64 := regexp.MustCompile("sub\\s+sp,\\s+sp,\\s+#0x([0-9a-f]+)")
 	rePreA64 := regexp.MustCompile("\\[sp,\\s+#-0x([0-9a-f]+)\\]!")
+	// AArch64 的大帧：`mov x9, #N` 之后 `sub sp, sp, x9`（stub 就是这样分配 4688 字节帧的，
+	// 因为 4688 超过 sub 的 imm12 范围）。之前的模式只认 `sub sp, sp, #imm`，于是量出来 0。
+	reMovA64 := regexp.MustCompile("mov\\s+x[0-9]+,\\s+#0x([0-9a-f]+)")
+	reSubReg := regexp.MustCompile("sub\\s+sp,\\s+sp,\\s+x[0-9]+")
+	pendingA64 := ""
 	for _, line := range strings.Split(string(out), "\n") {
 		if m := reFn.FindStringSubmatch(line); m != nil {
 			cur = m[1]
@@ -615,10 +620,22 @@ func measureMaxFrame(objdump, obj string, verbose bool) (int, error) {
 		if m := reSubA64.FindStringSubmatch(line); m != nil {
 			record(m[1])
 		}
+		if m := reMovA64.FindStringSubmatch(line); m != nil {
+			pendingA64 = m[1]
+		}
+		if pendingA64 != "" && reSubReg.MatchString(line) {
+			record(pendingA64)
+			pendingA64 = ""
+		}
 		if m := rePreA64.FindStringSubmatch(line); m != nil {
 			record(m[1])
 		}
 	}
+	if max == 0 {
+		// 测量失效必须吵出来：这个值决定 margin 是否够用，静默为 0 会让守卫形同虚设（曾经的假绿）。
+		fmt.Printf("[warn] 未能从 %s 量到任何栈帧（maxStubStackFrame=0）：VM_MARGIN 的守卫将失去意义，请检查 objdump 语法\n", obj)
+	}
+	return max, nil
 	return max, nil
 }
 
