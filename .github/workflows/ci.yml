@@ -204,7 +204,7 @@ jobs:
         run: |
           clang --version | head -n 1
           clang -dumpmachine || true
-          command -v llvm-objdump || true
+          command -v objdump || true
       - name: build Windows/arm64 blob
         run: |
           set -e
@@ -215,7 +215,7 @@ jobs:
           set +e
           ./build/vmpbuild -src stub/win/arm64 -out build/vm_interp_win_arm64.bin \
             -manifest build/vm_interp_win_arm64.json -entry vm_entry -guest arm64 -merge go \
-            -cc "$PWD/build/clang-a64w" -objdump llvm-objdump > build/ci_step.log 2>&1
+            -cc "$PWD/build/clang-a64w" -objdump objdump > build/ci_step.log 2>&1
           rc=$?
           tail -n 25 build/ci_step.log
           if [ $rc -ne 0 ]; then
