@@ -427,6 +427,13 @@ u8 vm_xmm[256]; /* 16 × 16 字节；非 static 是为了让符号表里能看�
  * 非 static，同上：需要出现在符号表里。 */
 u64 vm_tmp[3];
 
+/* 现场记录（诊断用）：最近 16 条 (pc, op) + 一个 magic，放在 .bss 里。
+ * 目的：Linux 上"跳进 payload 的 .bss"这类跑飞，寄存器/栈记账都已排除，
+ * 需要一个"跑飞前执行了什么"的现场。进程崩溃后进程内不便打印，
+ * 但 core dump 里包含 payload 的这些页 —— 用 magic 一搜就能把这段读出来。 */
+u64 vm_ring_hdr[2] = { 0x564D52494E473031ULL /* "VMRING01" */, 0 }; /* [1] = 已记录条数 */
+u64 vm_ring[16][2]; /* {pc, op} */
+
 static int vm_bc_lookup(const void *desc) {
     for (int i = 0; i < VM_BC_CACHE_SLOTS; i++) {
         if (vm_bc_key[i] == desc) {
@@ -627,6 +634,13 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         const u8 *c = vm->code;
         u32 pc = vm->pc;
         u8 op = c[pc];
+        /* 现场记录（见 vm_ring_hdr 的注释）：只记环形缓冲，不影响语义 */
+        {
+            u32 k = (u32)(vm_ring_hdr[1] & 15);
+            vm_ring[k][0] = pc;
+            vm_ring[k][1] = op;
+            vm_ring_hdr[1]++;
+        }
 
         switch (op) {
         case OP_HALT: return 1;

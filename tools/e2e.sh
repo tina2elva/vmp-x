@@ -131,6 +131,29 @@ if command -v readelf >/dev/null 2>&1; then
     echo "    payloadRVA=$rva payloadSize=$sz -> payloadVA=0x$(printf '%x' $((0x400000 + rva)))"
     echo "    bssOff=$boff bssSize=$bsz -> bss 在 payload 内的区间 [0x$(printf '%x' $boff), 0x$(printf '%x' $((boff + bsz))))"
 fi
+# 跑飞现场：解释器在 .bss 里维护「最近 16 条 (pc, op)」环形缓冲（带 VMRING01 magic）。
+# 进程崩溃后没法从进程内打印，但 core dump 里有这些页 —— 用 magic 搜出来即可。
+echo "[*] core_pattern: $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+( ulimit -c unlimited; GOTRACEBACK=crash ./build/linux_target.vmp check-key 0 >/dev/null 2>&1 ) || true
+for cf in core core.*; do
+    [ -f "$cf" ] || continue
+    echo "[*] core: $cf ($(stat -c %s "$cf" 2>/dev/null) 字节)，搜 VMRING01..."
+    python3 - "$cf" <<'PY' || true
+import sys
+b = open(sys.argv[1], "rb").read()
+i = b.find(b"VMRING01")
+if i < 0:
+    print("    没找到 VMRING01（core 可能被 core_pattern 处理掉了）")
+else:
+    cnt = int.from_bytes(b[i+8:i+16], "little")
+    print("    找到环形缓冲（记录 %d 条），最近若干条 (pc, op)：" % cnt)
+    for k in range(cnt - 12, cnt):
+        j = i + 16 + (k % 16) * 16
+        pc, op = int.from_bytes(b[j:j+8], "little"), int.from_bytes(b[j+8:j+16], "little")
+        print("      pc=0x%X op=0x%X" % (pc, op))
+PY
+    break
+done
 echo "[*] differential test (native vs protected)..."
 for a in 0 1 10 255 12345 1000000 4294967295; do
     run_case check-key "$a"
