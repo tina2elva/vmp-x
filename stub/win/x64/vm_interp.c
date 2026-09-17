@@ -529,7 +529,7 @@ int vm_run(vm_ctx_t *vm) {
     vm_diag[2] = (u64)(unsigned long)vm->code; /* 明文/密文字节码指针（freestanding，别用 uintptr_t） */
     vm_diag[3] = vm->codeLen;
     if (vm->code) {
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 8; i++) { /* 前 64 字节：字节码都不超过这个长度，够看清循环与分支 */
             u64 w = 0;
             for (int j = 0; j < 8; j++) w |= (u64)vm->code[i * 8 + j] << (8 * j);
             vm_diag[8 + i] = w;
