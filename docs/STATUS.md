@@ -1116,6 +1116,37 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 > |   | 「no aarch64-w64-mingw32-gcc available: Windows/arm64 blob build is still unverified (known gap, not a regression)」 |
 >
 > 本机：go build / go vet / go test / gofmt 全绿、x86-64 E2E 146/146、arm64 客户机差分 OK。
+>
+> ## Windows/arm64 端到端打通（五作业全绿，含原生 arm64 Windows 真跑）
+>
+> ### 325. 三个提交解决的三件事
+> 1. **合并器补齐 AArch64 COFF 重定位**：`BRANCH26`（加数要从 imm26 解码，之前把整条指令字
+>    `0x94000000` 当加数 → 分支越界）、`PAGEBASE_REL21`(adrp)、`PAGEOFFSET_12A`(add lo12)、
+>    `PAGEOFFSET_12L`(ldr/str lo12，按访问宽度缩放，不对齐就报错)。blob 从此能在 CI 真正产出。
+> 2. **`vmpack` 放开 PE/arm64**：按 Machine=0xAA64 选 AArch64 lifter（与 packELF 同构），
+>    不再只认 AMD64。入口补丁的 8 字节 `mov x16,x30 ; b thunk` 早已实现且有单测。
+> 3. **`scan` 的 PE 函数边界**：原来一律用 x86-64 解码器裁剪并找 RET，arm64 机器码一条都解不出来，
+>    报的是「无法用任何符号基准约定确定 check_key」。改为按 Machine 分派：arm64 走保守裁剪
+>    （跳过零填充，要求最后一条是 ret/br x30），符号类型的两种 COFF 约定都接受。
+>
+> ### 326. CI 结果（提交 05c211f）
+> | 作业 | 结果 |
+> |---|---|
+> | windows-amd64 | success |
+> | linux-amd64 | success |
+> | linux-arm64 | success |
+> | windows-arm64-blob | **success**（clang 的 aarch64-w64-windows-gnu 目标 + 内置合并器产出 arm64 COFF blob；并完成 arm64 PE 目标的打包结构检查） |
+> | windows-arm64-run | **success**（GitHub 的 windows-11-arm 原生 arm64 Windows：编 blob、编 PE 目标、打包，然后真跑比对） |
+>
+> 关键证据：原生与打包后跑出**同一个退出码** `native=654184885 protected=654184885`
+> （entry 把 check_key(10)/check_key(255)/sum_to(7)/sum_to(1000) 混合成一个 30 位退出码，
+> 任一项算错都会变）。
+>
+> ### 327. 过程中的两个自身教训（都留了防护）
+> - 我给 PE 目标写 `sum_to` 时，clang -O1 把求和折成闭式 `n*(n+1)/2`（UMULH + EXTR，不在 lifter 子集内）：
+>   先试倒计数写法仍被折，最后用 `optnone` 逼出真正的循环 —— 这也正好是我们想验证的带循环被保护函数。
+> - pwsh 包装器结尾会 `exit $LASTEXITCODE`，被保护程序自己的退出码（非 0）把「比较已通过」的步骤判成失败：
+>   步骤末尾显式清零。第一次看这个红叉时，注解里其实已经写着两个数相等。
 
 
 
