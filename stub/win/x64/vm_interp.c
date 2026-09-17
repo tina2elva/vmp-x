@@ -613,9 +613,13 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
     for (;;) {
         /* 诊断用（见 vm_run_inner 的注释）：客户机压栈越过给它的栈下界时当场返回 99。
          * 这样 Linux 上那个"跳进 .bss"就能被区分成"客户机踩穿了自己的栈"或"另有原因"。 */
+#ifndef VM_GUEST_ARM64
+        /* 只对 x86-64 客户机生效：ARM64 客户机的 SP 用法与 VM_MARGIN（宿主侧常量）不是一个口径，
+         * 直接套用会让 arm64 客户机差分误报（CI 上确实被它抓到过一次）。 */
         if (rsp_start - vm->regs[VRSP] > (u64)VM_MARGIN) {
             return 99;
         }
+#endif
         if (vm->pc >= vm->codeLen) return 1;
         const u8 *c = vm->code;
         u32 pc = vm->pc;
