@@ -84,7 +84,11 @@ run_case() {
     fn="$1"
     arg="$2"
     n=$(./build/linux_target "$fn" "$arg" 2>/dev/null || echo "<crash>")
-    v=$(./build/linux_target.vmp "$fn" "$arg" 2>/dev/null || echo "<crash>")
+    # 被保护程序的退出码要单独捕获：139=SIGSEGV、132=SIGILL、134=SIGABRT、136=SIGFPE。
+    # 只打印 "<crash>" 的话，CI 注解里看不出是段错误还是非法指令（排查时这是关键信息）。
+    v=$(./build/linux_target.vmp "$fn" "$arg" 2>/dev/null)
+    vrc=$?
+    if [ $vrc -ne 0 ]; then v="<crash rc=$vrc>"; fi
     if [ "$n" = "$v" ] && [ -n "$n" ]; then
         pass=$((pass + 1))
         echo "  [OK  ] $fn($arg): native=$n protected=$v"

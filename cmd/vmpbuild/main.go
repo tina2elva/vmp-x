@@ -411,6 +411,13 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	if isX86Host {
 		common = append(common, "-mno-red-zone")
 	}
+	// aarch64 上 gcc 默认开启 outline-atomics：__atomic_*（缓存锁、in-use 计数、以及 OP_ATOMIC）
+	// 会变成对 libgcc 助手（例如 __aarch64_swp4_acq）的调用，而我们的 blob 是 freestanding、
+	// 不带 libgcc —— CI 的 linux-arm64 作业报的就是这个符号。
+	// -mno-outline-atomics 让它改成内联的 LL/SC 循环，语义不变。
+	if strings.Contains(machine, "aarch64") || strings.Contains(machine, "arm64") {
+		common = append(common, "-mno-outline-atomics")
+	}
 
 	// 只编译 BLOB.sources 里显式列出的文件（测试/工具程序不能被链进 blob）
 	sources, err := readSourceList(src)
