@@ -111,7 +111,7 @@ for _f in sorted(glob.glob("build/bcdump/bytecode_*.bin")):
         print("MISMATCH 明文来源:", _f)
         break
 print("MISMATCH placement 全量:", pl)
-print("MISMATCH payload 文件大小:", len(data), " codeRVA=", code_rva, " code_len=", code_len)
+print("MISMATCH 明文字节码长度:", len(code))
 print("MISMATCH 明文字节码(%d): %s" % (len(code), code.hex()))
 for pc in (0, 9, 0xF, 0x18, 0x23, 0x29):
     if pc < len(code):
