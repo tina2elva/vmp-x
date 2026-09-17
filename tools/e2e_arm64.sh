@@ -79,6 +79,18 @@ if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
         extract_out=$(./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin 2>&1) || echo "[!] extractpayload 失败: $(printf '%s' "$extract_out" | tr '\n' '|')"
         ring_off=$(grep -o '"vm_ring_hdr": *[0-9]*' build/vm_interp_arm64.json | head -n1 | sed 's/.*: *//')
         echo "[*] vm_ring_hdr 偏移: ${ring_off:-未知}"
+        python3 - <<'PY' > build/opnames.txt 2>/dev/null || true
+import json
+try:
+    m = json.load(open("build/vm_interp_arm64.json"))
+    op = m.get("opcodes") or m.get("opcodeValues") or {}
+    inv = {v: k for k, v in op.items()} if isinstance(op, dict) else {}
+    for v in (0x69, 0x73, 0xA3, 0xFC):
+        print("0x%X=%s" % (v, inv.get(v, "?")))
+except Exception as ex:
+    print("decode failed: %s" % ex)
+PY
+        echo "[*] 操作码解码: $(tr '\n' ' ' < build/opnames.txt)"
         probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" 0 1 10 255 2>&1) || true
         echo "[!] payload 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
         # 探针崩了的话，用 qemu 的指令级日志再看一次，打印尾部 —— 定位炸在哪条 arm64 指令
