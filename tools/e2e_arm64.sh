@@ -82,14 +82,16 @@ if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
         ./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin >build/extract.log 2>&1 || echo "[!] extractpayload 失败: $(tail -n1 build/extract.log)"
         ring_off=$(grep -o '"vm_ring_hdr": *[0-9]*' build/vm_interp_arm64.json | head -n1 | sed 's/.*: *//' || true)
         diag_off=$(grep -o '"vm_diag": *[0-9]*' build/vm_interp_arm64.json | head -n1 | sed 's/.*: *//' || true)
-        probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" "${diag_off:-0}" 0 1 10 255 2>&1) || true
+        probe_out=$(timeout 60 $QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" "${diag_off:-0}" 0 1 10 255 2>&1) || true
         echo "MISMATCH 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
         # 再探一次第二个被保护函数 sum_to（带循环，能区分"叶子函数对"与"循环/分支也對"）
         thunk2_rva=$(grep -o '"thunkRVA": *[0-9]*' build/arm64_vmp.json | sed -n 2p | sed 's/.*: *//' || true)
         if [ -n "$thunk2_rva" ]; then
             thunk_off2=$(( thunk2_rva - ${sec_rva:-0} ))
-            probe2=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off2)" "${ring_off:-0}" "${diag_off:-0}" 1 7 1000 2>&1) || true
+            probe2=$(timeout 60 $QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off2)" "${ring_off:-0}" "${diag_off:-0}" 1 7 1000 2>&1) || true
             echo "MISMATCH 探针结果(sum_to): $(printf '%s' "$probe2" | tr '\n' '|')"
+            # 探针超时通常意味着客户机里的循环没有终止 —— 这本身就是要查的现象
+            if printf '%s' "$probe2" | grep -q '^$'; then echo "[!] sum_to 探针无输出（可能超时：客户机循环未终止）"; fi
         fi
         python3 - <<'PY' 2>/dev/null || true
 import json, glob
@@ -108,7 +110,7 @@ print("MISMATCH 解码: len=%d maxFrame=%s margin=%s %s" % (len(code), m.get("ma
 PY
         if printf '%s' "$probe_out" | grep -q "signal"; then
             set +e
-            $QEMU -d in_asm,cpu -D build/qemu_probe.log ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" "${diag_off:-0}" 0 >/dev/null 2>&1
+            timeout 180 $QEMU -d in_asm,cpu -D build/qemu_probe.log ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" "${diag_off:-0}" 0 >/dev/null 2>&1
             set -e
             ln=$(grep -n 'IN: ' build/qemu_probe.log 2>/dev/null | tail -n1 | cut -d: -f1 || true)
             if [ -n "$ln" ]; then
