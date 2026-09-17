@@ -1,21 +1,13 @@
 # gates.ps1 - run every local (Windows/amd64) gate in one shot.
 #
-#   powershell -NoProfile -File tools/gates.ps1      (Windows PowerShell 5.1)
-#   pwsh        -NoProfile -File tools/gates.ps1      (PowerShell 7, if installed)
+#   powershell -NoProfile -File tools/gates.ps1
 #
-# This is the single command to run before claiming anything about the PoC.
-# It checks exit codes everywhere on purpose: several incidents in this project
-# were caused by a silently failing step being papered over by a stale artifact
-# (see docs/RUNBOOK.md section 5).
-#
-# 注意（踩过的坑）：一开始我在步骤脚本块里写 exit 0 / exit 1，结果 exit 会**终止整个
-# PowerShell 进程**——脚本跑完第一步就以 0 退出了，是典型的"假绿"。现在步骤只设置
-# $script:stepCode，由 Step 统一汇总。
+# NOTE: this file is deliberately ASCII-only. Windows PowerShell 5.1 reads .ps1 as ANSI
+# unless it has a BOM, so non-ASCII bytes (e.g. Chinese comments) can swallow a following
+# line and turn a Step call into part of a comment -- a gate that silently never runs.
+# That is exactly what happened here before (the linux-payload step disappeared).
 Set-Location (Join-Path $PSScriptRoot "..")
 $script:results = @()
-
-# 说明：E2E 步骤用**子进程**跑（powershell -NoProfile -File ...），因为脚本里的 exit
-# 只有在子进程里才会变成我们可以检查的退出码；顺带避开"上一轮原生命令的 LASTEXITCODE 残留"。
 
 function Step {
     param([string]$Name, [scriptblock]$Body)
@@ -33,10 +25,7 @@ Step "go vet ./..."      { go vet ./... }
 Step "go test ./..."     { go test ./... }
 Step "e2e.ps1 (x86-64)"  { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e.ps1") }
 Step "e2e_dll.ps1"       { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_dll.ps1") }
-# ARM64 客户机语义（宿主仍是 x86-64）：单独脚本 + 子进程调用，退出码语义干净
 Step "arm64-guest differential" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_arm64guest.ps1") }
-# Linux/amd64 注入载荷：在 Windows 上把载荷映射到 ELF 原始 VA 并调用 thunk（ET_EXEC + PIE 两个地址）。
-# 剩下"Linux 加载器把段映射好并把控制权交给改写后的入口"这一步只能由 tools/e2e.sh 在真 Linux 上验证。
 Step "linux payload (executed on Windows)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "verify_linux_payload.ps1") }
 
 Write-Host ""
