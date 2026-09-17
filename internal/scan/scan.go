@@ -46,17 +46,31 @@ func FindFunction(path string, f *pe.File, name string) (*Found, error) {
 		// 没有 COFF 符号表是**常态**：wheel 装出来的 .pyd、strip 过的 DLL 都这样。
 		// 退回两条正统来源：导出表定位（例如 PyInit_xxx）、.pdata 给精确边界，
 		// 再退到「同节内下一个导出」或节尾。
-		rva, ok := exportRVA(f, name)
+		rva, ok := exportRVA(df, name)
 		if !ok {
 			return nil, fmt.Errorf("找不到符号 %q（该 PE 有 %d 个符号，导出表里也没有这个名字）", name, len(df.Symbols))
 		}
+		// 边界取「所有可用上界里最小的那个」：
+		//   · .pdata 里同起点的那条（精确）；
+		//   · 否则 .pdata 里下一个函数的起点（叶子函数常常没有自己的条目）；
+		//   · 再否则下一个导出；最后才退到节尾。
 		end := uint32(0)
-		if _, e, ok2 := pdataEnd(f, rva); ok2 {
-			end = e
-		} else if e2, ok3 := nextExportEnd(f, rva); ok3 {
-			end = e2
-		} else if si, ok4 := sectionOfRVA(f, rva); ok4 {
-			end = sectionEndOf(f, si)
+		take := func(v uint32) {
+			if v > rva && (end == 0 || v < end) {
+				end = v
+			}
+		}
+		if _, e, ok2 := pdataEnd(df, rva); ok2 {
+			take(e)
+		}
+		if e2, ok3 := pdataNextBegin(df, rva); ok3 {
+			take(e2)
+		}
+		if e3, ok4 := nextExportEnd(df, rva); ok4 {
+			take(e3)
+		}
+		if si, ok5 := sectionOfRVA(f, rva); ok5 {
+			take(sectionEndOf(f, si))
 		}
 		if end <= rva {
 			return nil, fmt.Errorf("导出 %q（RVA 0x%X）找不到可用边界", name, rva)
@@ -269,4 +283,52 @@ func IsPadding(ins x64dec.Insn) bool {
 		return ok1 && ok2 && a == b
 	}
 	return false
+}
+
+// ---- 供「没有符号表」那条通路使用的三个小助手（用我们的 PE 加载器读字节）----
+
+// sectionOfRVA 返回包含该 RVA 的节下标。
+func sectionOfRVA(f *pe.File, rva uint32) (int, bool) {
+	for i := range f.Sections {
+		s := &f.Sections[i]
+		end := s.VirtualAddress + s.VirtualSize
+		if s.VirtualSize == 0 {
+			end = s.VirtualAddress + s.SizeOfRawData
+		}
+		if rva >= s.VirtualAddress && rva < end {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// sectionEndOf 返回该节的结束 RVA。
+func sectionEndOf(f *pe.File, i int) uint32 {
+	s := &f.Sections[i]
+	if s.VirtualSize == 0 {
+		return s.VirtualAddress + s.SizeOfRawData
+	}
+	return s.VirtualAddress + s.VirtualSize
+}
+
+// readCode 按 RVA 区间取代码字节（走节表的 PointerToRawData）。
+func readCode(f *pe.File, rva, end uint32) ([]byte, error) {
+	for i := range f.Sections {
+		s := &f.Sections[i]
+		secEnd := s.VirtualAddress + s.VirtualSize
+		if s.VirtualSize == 0 {
+			secEnd = s.VirtualAddress + s.SizeOfRawData
+		}
+		if rva >= s.VirtualAddress && rva < secEnd {
+			lo := rva - s.VirtualAddress
+			hi := end - s.VirtualAddress
+			if int(s.PointerToRawData+hi) > len(f.Data) {
+				return nil, fmt.Errorf("函数 0x%X..0x%X 越过文件末尾", rva, end)
+			}
+			b := make([]byte, hi-lo)
+			copy(b, f.Data[s.PointerToRawData+lo:s.PointerToRawData+hi])
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("RVA 0x%X 不在任何节内", rva)
 }

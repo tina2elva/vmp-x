@@ -2,108 +2,133 @@ package scan
 
 // PE 目录解析：给「没有 COFF 符号表」的真实二进制用。
 //
-// 典型场景就是 wheel 安装的 .pyd：文件是标准 DLL，但符号表被 strip 掉了，
+// 典型场景就是 wheel 装出来的 .pyd：文件是标准 DLL，但符号表被 strip 掉了。
 // scan 原来只认 COFF 符号，于是报「找不到符号 X（该 PE 有 0 个符号）」。
 // 这里补两条正统来源：
-//   · 导出表（IMAGE_DIRECTORY_ENTRY_EXPORT）—— 能定位被导出的函数，例如 PyInit_xxx；
-//   · 异常目录（IMAGE_DIRECTORY_ENTRY_EXCEPTION，即 .pdata 的 RUNTIME_FUNCTION）——
-//     x64 上给的是每个函数的**精确起止 RVA**，比「下一个符号」可靠得多。
-
+//   - 导出表（IMAGE_DIRECTORY_ENTRY_EXPORT）：定位被导出的函数，例如 PyInit_xxx；
+//   - 异常目录（IMAGE_DIRECTORY_ENTRY_EXCEPTION，即 .pdata 的 RUNTIME_FUNCTION）：
+//     x64 上给出每个函数的精确起止 RVA，比「下一个符号」可靠得多。
+//
+// 数据目录一律交给 debug/pe 解析：我自己按可选头偏移算过一次、算错 4 字节，
+// 现象是所有字段整体错位，很难查。
 import (
 	"encoding/binary"
-	"fmt"
 
-	"github.com/vmpx/vmp-x/internal/load/pe"
+	dbgpe "debug/pe"
 )
 
-// peDataDir 读 PE 可选头里的第 idx 个数据目录（返回 RVA 与大小）。
-func peDataDir(f *pe.File, idx int) (uint32, uint32, bool) {
-	d := f.Data
-	if len(d) < 0x40 {
-		return 0, 0, false
+// peDataDir 取第 idx 个数据目录（RVA 与大小）。
+func peDataDir(df *dbgpe.File, idx int) (uint32, uint32, bool) {
+	switch oh := df.OptionalHeader.(type) {
+	case *dbgpe.OptionalHeader64:
+		if idx < len(oh.DataDirectory) && oh.DataDirectory[idx].VirtualAddress != 0 {
+			return oh.DataDirectory[idx].VirtualAddress, oh.DataDirectory[idx].Size, true
+		}
+	case *dbgpe.OptionalHeader32:
+		if idx < len(oh.DataDirectory) && oh.DataDirectory[idx].VirtualAddress != 0 {
+			return oh.DataDirectory[idx].VirtualAddress, oh.DataDirectory[idx].Size, true
+		}
 	}
-	peOff := int(binary.LittleEndian.Uint32(d[0x3C:]))
-	if peOff+24 > len(d) || string(d[peOff:peOff+4]) != "PE\x00\x00" {
-		return 0, 0, false
+	return 0, 0, false
+}
+
+// secFor 找到包含 rva 的节，返回节数据与节内偏移。
+func secFor(df *dbgpe.File, rva uint32) ([]byte, int, bool) {
+	for _, s := range df.Sections {
+		end := s.VirtualAddress + s.VirtualSize
+		if s.VirtualSize == 0 {
+			end = s.VirtualAddress + s.Size
+		}
+		if rva >= s.VirtualAddress && rva < end {
+			b, err := s.Data()
+			if err != nil {
+				return nil, 0, false
+			}
+			return b, int(rva - s.VirtualAddress), true
+		}
 	}
-	optOff := peOff + 24
-	if optOff+2 > len(d) {
-		return 0, 0, false
+	return nil, 0, false
+}
+
+// u32at 读节内偏移处的 32 位小端值。
+func u32at(sec []byte, off int) (uint32, bool) {
+	if off < 0 || off+4 > len(sec) {
+		return 0, false
 	}
-	ddOff := optOff + 112 // PE32+：DataDirectory 在可选头 +112；PE32 是 +96
-	if binary.LittleEndian.Uint16(d[optOff:]) == 0x10b {
-		ddOff = optOff + 96
-	}
-	if ddOff+8*idx+8 > len(d) {
-		return 0, 0, false
-	}
-	rva := binary.LittleEndian.Uint32(d[ddOff+8*idx:])
-	size := binary.LittleEndian.Uint32(d[ddOff+8*idx+4:])
-	if rva == 0 {
-		return 0, 0, false
-	}
-	return rva, size, true
+	return binary.LittleEndian.Uint32(sec[off:]), true
 }
 
 // exportRVA 在导出表里按名字找函数 RVA。
-func exportRVA(f *pe.File, name string) (uint32, bool) {
-	dirRVA, _, ok := peDataDir(f, 0)
+// IMAGE_EXPORT_DIRECTORY：+0x0C Name、+0x10 Base、+0x14 NumberOfFunctions、
+// +0x18 NumberOfNames、+0x1C AddressOfFunctions、+0x20 AddressOfNames、+0x24 AddressOfNameOrdinals。
+// （最初写成 +0x18 起，整体多 4 字节 —— 实测这个 .pyd 的目录原始字节才发现。）
+func exportRVA(df *dbgpe.File, name string) (uint32, bool) {
+	dirRVA, _, ok := peDataDir(df, 0)
 	if !ok {
 		return 0, false
 	}
-	off, err := f.RVAtoOffset(dirRVA)
-	if err != nil || off+40 > len(f.Data) {
+	sec, off, ok := secFor(df, dirRVA)
+	if !ok || off+40 > len(sec) {
 		return 0, false
 	}
-	d := f.Data
-	nFuncs := binary.LittleEndian.Uint32(d[off+0x18:])
-	nNames := binary.LittleEndian.Uint32(d[off+0x1C:])
-	funcsOff, e1 := f.RVAtoOffset(binary.LittleEndian.Uint32(d[off+0x20:]))
-	namesOff, e2 := f.RVAtoOffset(binary.LittleEndian.Uint32(d[off+0x24:]))
-	ordsOff, e3 := f.RVAtoOffset(binary.LittleEndian.Uint32(d[off+0x28:]))
-	if e1 != nil || e2 != nil || e3 != nil {
-		return 0, false
-	}
+	nFuncs, _ := u32at(sec, off+0x14)
+	nNames, _ := u32at(sec, off+0x18)
+	funcsRVA, _ := u32at(sec, off+0x1C)
+	namesRVA, _ := u32at(sec, off+0x20)
+	ordsRVA, _ := u32at(sec, off+0x24)
 	for i := uint32(0); i < nNames; i++ {
-		if namesOff+int(4*i)+4 > len(d) || ordsOff+int(2*i)+2 > len(d) {
+		nsec, no, ok := secFor(df, namesRVA+4*i)
+		if !ok {
 			return 0, false
 		}
-		so, err := f.RVAtoOffset(binary.LittleEndian.Uint32(d[namesOff+int(4*i):]))
-		if err != nil || so >= len(d) {
+		nr, ok := u32at(nsec, no)
+		if !ok {
+			return 0, false
+		}
+		ssec, so, ok := secFor(df, nr)
+		if !ok || so >= len(ssec) {
 			continue
 		}
 		end := so
-		for end < len(d) && d[end] != 0 {
+		for end < len(ssec) && ssec[end] != 0 {
 			end++
 		}
-		if string(d[so:end]) != name {
+		if string(ssec[so:end]) != name {
 			continue
 		}
-		ord := uint32(binary.LittleEndian.Uint16(d[ordsOff+int(2*i):]))
-		if ord >= nFuncs || funcsOff+int(4*ord)+4 > len(d) {
+		osec, oo, ok := secFor(df, ordsRVA+2*i)
+		if !ok || oo+2 > len(osec) {
 			return 0, false
 		}
-		return binary.LittleEndian.Uint32(d[funcsOff+int(4*ord):]), true
+		ord := uint32(binary.LittleEndian.Uint16(osec[oo:]))
+		if ord >= nFuncs {
+			return 0, false
+		}
+		fsec, fo, ok := secFor(df, funcsRVA+4*ord)
+		if !ok {
+			return 0, false
+		}
+		return u32at(fsec, fo)
 	}
 	return 0, false
 }
 
-// pdataEnd 用 .pdata 的 RUNTIME_FUNCTION 找函数精确起止（x64 的异常目录）。
-func pdataEnd(f *pe.File, rva uint32) (uint32, uint32, bool) {
-	dirRVA, dirSize, ok := peDataDir(f, 3)
+// pdataEnd 用 .pdata 的 RUNTIME_FUNCTION 找函数精确起止（x64 异常目录）。
+func pdataEnd(df *dbgpe.File, rva uint32) (uint32, uint32, bool) {
+	dirRVA, dirSize, ok := peDataDir(df, 3)
 	if !ok || dirSize < 12 {
 		return 0, 0, false
 	}
-	off, err := f.RVAtoOffset(dirRVA)
-	if err != nil {
+	sec, off, ok := secFor(df, dirRVA)
+	if !ok {
 		return 0, 0, false
 	}
 	for i := uint32(0); i+12 <= dirSize; i += 12 {
-		if off+int(i)+12 > len(f.Data) {
+		beg, ok1 := u32at(sec, off+int(i))
+		end, ok2 := u32at(sec, off+int(i)+4)
+		if !ok1 || !ok2 {
 			break
 		}
-		beg := binary.LittleEndian.Uint32(f.Data[off+int(i):])
-		end := binary.LittleEndian.Uint32(f.Data[off+int(i)+4:])
 		if beg == rva && end > beg {
 			return beg, end, true
 		}
@@ -111,28 +136,28 @@ func pdataEnd(f *pe.File, rva uint32) (uint32, uint32, bool) {
 	return 0, 0, false
 }
 
-// nextExportEnd：没有 .pdata 时的退路 —— 用同节内下一个更大的导出 RVA 当边界。
-func nextExportEnd(f *pe.File, rva uint32) (uint32, bool) {
-	dirRVA, _, ok := peDataDir(f, 0)
+// nextExportEnd：没有 .pdata 时的退路 —— 同节内下一个更大的导出 RVA。
+func nextExportEnd(df *dbgpe.File, rva uint32) (uint32, bool) {
+	dirRVA, _, ok := peDataDir(df, 0)
 	if !ok {
 		return 0, false
 	}
-	off, err := f.RVAtoOffset(dirRVA)
-	if err != nil || off+40 > len(f.Data) {
+	sec, off, ok := secFor(df, dirRVA)
+	if !ok || off+40 > len(sec) {
 		return 0, false
 	}
-	d := f.Data
-	nFuncs := binary.LittleEndian.Uint32(d[off+0x18:])
-	funcsOff, err := f.RVAtoOffset(binary.LittleEndian.Uint32(d[off+0x20:]))
-	if err != nil {
-		return 0, false
-	}
+	nFuncs, _ := u32at(sec, off+0x14)
+	funcsRVA, _ := u32at(sec, off+0x1C)
 	best := uint32(0)
 	for i := uint32(0); i < nFuncs; i++ {
-		if funcsOff+int(4*i)+4 > len(d) {
+		fsec, fo, ok := secFor(df, funcsRVA+4*i)
+		if !ok {
 			break
 		}
-		v := binary.LittleEndian.Uint32(d[funcsOff+int(4*i):])
+		v, ok := u32at(fsec, fo)
+		if !ok {
+			break
+		}
 		if v > rva && (best == 0 || v < best) {
 			best = v
 		}
@@ -143,48 +168,29 @@ func nextExportEnd(f *pe.File, rva uint32) (uint32, bool) {
 	return best, true
 }
 
-// readCode 按 RVA 区间从文件里取代码字节（走节的 PointerToRawData）。
-func readCode(f *pe.File, rva, end uint32) ([]byte, error) {
-	for i := range f.Sections {
-		s := &f.Sections[i]
-		secEnd := s.VirtualAddress + s.VirtualSize
-		if s.VirtualSize == 0 {
-			secEnd = s.VirtualAddress + s.SizeOfRawData
+// pdataNextBegin 返回 .pdata 里比 rva 大的最近一个函数起点，用作上界。
+// 有些函数（叶子函数）没有自己的 RUNTIME_FUNCTION，但下一个函数的起点依然可用。
+func pdataNextBegin(df *dbgpe.File, rva uint32) (uint32, bool) {
+	dirRVA, dirSize, ok := peDataDir(df, 3)
+	if !ok || dirSize < 12 {
+		return 0, false
+	}
+	sec, off, ok := secFor(df, dirRVA)
+	if !ok {
+		return 0, false
+	}
+	best := uint32(0)
+	for i := uint32(0); i+12 <= dirSize; i += 12 {
+		beg, ok1 := u32at(sec, off+int(i))
+		if !ok1 {
+			break
 		}
-		if rva >= s.VirtualAddress && rva < secEnd {
-			lo := rva - s.VirtualAddress
-			hi := end - s.VirtualAddress
-			if int(s.PointerToRawData+hi) > len(f.Data) {
-				return nil, fmt.Errorf("函数 0x%X..0x%X 越过文件末尾", rva, end)
-			}
-			b := make([]byte, hi-lo)
-			copy(b, f.Data[s.PointerToRawData+lo:s.PointerToRawData+hi])
-			return b, nil
+		if beg > rva && (best == 0 || beg < best) {
+			best = beg
 		}
 	}
-	return nil, fmt.Errorf("RVA 0x%X 不在任何节内", rva)
-}
-
-// sectionOfRVA 返回包含该 RVA 的节下标。
-func sectionOfRVA(f *pe.File, rva uint32) (int, bool) {
-	for i := range f.Sections {
-		s := &f.Sections[i]
-		end := s.VirtualAddress + s.VirtualSize
-		if s.VirtualSize == 0 {
-			end = s.VirtualAddress + s.SizeOfRawData
-		}
-		if rva >= s.VirtualAddress && rva < end {
-			return i, true
-		}
+	if best == 0 {
+		return 0, false
 	}
-	return 0, false
-}
-
-// sectionEndOf 返回该节的结束 RVA。
-func sectionEndOf(f *pe.File, i int) uint32 {
-	s := &f.Sections[i]
-	if s.VirtualSize == 0 {
-		return s.VirtualAddress + s.SizeOfRawData
-	}
-	return s.VirtualAddress + s.VirtualSize
+	return best, true
 }
