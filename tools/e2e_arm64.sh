@@ -84,6 +84,13 @@ if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
         diag_off=$(grep -o '"vm_diag": *[0-9]*' build/vm_interp_arm64.json | head -n1 | sed 's/.*: *//' || true)
         probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" "${diag_off:-0}" 0 1 10 255 2>&1) || true
         echo "MISMATCH 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
+        # 再探一次第二个被保护函数 sum_to（带循环，能区分"叶子函数对"与"循环/分支也對"）
+        thunk2_rva=$(grep -o '"thunkRVA": *[0-9]*' build/arm64_vmp.json | sed -n 2p | sed 's/.*: *//' || true)
+        if [ -n "$thunk2_rva" ]; then
+            thunk_off2=$(( thunk2_rva - ${sec_rva:-0} ))
+            probe2=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off2)" "${ring_off:-0}" "${diag_off:-0}" 1 7 1000 2>&1) || true
+            echo "MISMATCH 探针结果(sum_to): $(printf '%s' "$probe2" | tr '\n' '|')"
+        fi
         python3 - <<'PY' 2>/dev/null || true
 import json, glob
 m = json.load(open("build/vm_interp_arm64.json"))
