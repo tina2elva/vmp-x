@@ -12,7 +12,10 @@ __attribute__((noinline)) u64 check_key(u64 x) {
     return ((x * 7) + 42) ^ 0xFFu;
 }
 
-__attribute__((noinline)) u64 sum_to(u64 n) {
+__attribute__((noinline, optnone)) u64 sum_to(u64 n) {
+    /* optnone：clang -O1 会把求和直接折成 n*(n+1)/2，于是生成 UMULH + EXTR ——不属于
+     * lifter 的子集。optnone 逼它老老实实生成循环（栈上读写 + subs/b.ne），正好是
+     * 我们想验证的"带循环的被保护函数"。 */
     u64 s = 0;
     /* 倒计数写法：语义与 for (i=1;i<=n;i++) 完全相同，但**不会**让 clang 去算循环次数。
      * clang -O1 对 `i <= n` 这种形式会做强度削减，生成 UMULH + EXTR 的倒数序列，
