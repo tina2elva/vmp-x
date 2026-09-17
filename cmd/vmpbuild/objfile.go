@@ -128,10 +128,18 @@ func readCOFFObject(path string) (*objFile, error) {
 			}
 			rel := objReloc{SecIdx: i, Off: uint64(r.VirtualAddress), TargetSec: sym, SymName: name, RawType: uint32(r.Type), Addend: addend}
 			if out.IsARM64 {
-				// ARM64 COFF：只接受 26 位分支（BL/B），其余一律失败
-				if r.Type == coffRelARM64Branch26 {
-					rel.Kind = relAArch64Branch26
-				} else {
+			// ARM64 COFF：只接受 26 位分支（BL/B），其余一律失败
+			if r.Type == coffRelARM64Branch26 {
+				// COFF 没有 RELA：加数藏在字段里。但 AArch64 的这个字段**是一条指令**（例如
+				// 0x94000000 = bl 的编码），真正的加数是它的 imm26：有符号、单位 4 字节。
+				// 之前直接把整条指令字当加数加进目标地址，于是合并时报「分支超出 ±128MB」——
+				// Windows/arm64 的 blob 就死在 .text+0x10C（目标符号 vm_run）。
+				imm := int64(int32(uint32(addend)<<6) >> 6)
+				rel.Addend = imm * 4
+				rel.Kind = relAArch64Branch26
+			} else {
+				rel.Kind = relUnsupported
+			}
 					rel.Kind = relUnsupported
 				}
 				out.Relocs = append(out.Relocs, rel)
