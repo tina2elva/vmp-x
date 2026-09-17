@@ -745,5 +745,40 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 > 因此**不能把目标标记为完成**；按目标工具策略记为 **blocked**，并把上面这条具体条件写进 blocked_reason。
 > 后续闭环路径：把仓库推到 GitHub 启用 \`ci.yml\`，或在一台 Linux/arm64 机器上按 \`docs/RUNBOOK.md\` 跑第 2–4 节，
 > 把输出贴回来即可继续。
+>
+> ## 第九十一轮：ELF 重定位修好之后，linux-amd64 的问题变成了"宿主栈深度"
+>
+> ### 278. 修复生效：PC 相对重定位不再多 +4
+> 上一轮找到并修掉的根因（ELF 的 `call/jmp` 被写偏 4 字节）已经生效：差分用例的失败形态**完全变了** ——
+> 从"SIGILL、PC 落在指令中间"变成 Go runtime 报栈错误。也就是说**保护后的程序已经在正常执行 Go 代码**了。
+>
+> ### 279. 新暴露的问题：模拟栈在宿主 RSP 之下，装不进 goroutine 栈
+> CI 原文：
+> \`\`\`\`
+> [FAIL] sum-to(9999): native=49995000 (rc=0) protected=runtime: newstack sp=0xc000077c60 stack=[0xc000078000,0xc000079000] (rc=2)
+> runtime: split stack overflow: 0xc000077c60 < 0xc000078000
+> fatal error: runtime: split stack overflow
+> \`\`\`\`
+> 几何关系：模拟栈在宿主 RSP 之下 \`VM_FRAME_SIZE(4544) + 16 + VM_MARGIN(8192) ≈ 12.7KB\` 处；
+> 而 Go 程序的 goroutine 栈初始只有 **8KB** → 客户机一压栈就越过栈底。
+> （Windows 一直没暴露，是因为那边跑在主线程的大栈上。）
+> **调小 VM_MARGIN 不是出路**：\`vmpbuild\` 有检查 \`margin > 解释器最大帧(4544) + 512\`，
+> 所以总深度必然 ≥9.6KB；我试了 0x800，构建当场拒绝，已回退。
+>
+> ### 280. 真正的修法（下一轮做，方案已定）
+> 让**客户机使用自己的栈**：在 blob 的 \`.bss\` 里放一块客户机栈，入口 stub 把模拟 RSP 指向它，
+> 而不是指向宿主 RSP 之下。这样：
+> - 与宿主栈深度解耦（goroutine 8KB 也没问题）；
+> - \`FrameSkew\` 对**自己的帧**（disp < 0）退化为 0，对**调用方帧**（disp > 0，例如栈上传参）需要另行处理 ——
+>   当前 E2E 的两个目标函数都用寄存器传参，所以先按"客户机栈 + 记录这个限制"来做，并在 FINAL.md 写明。
+>
+> ### 281. 当前四个作业
+> | 作业 | 状态 |
+> |---|---|
+> | windows-amd64 | **success**（持续） |
+> | linux-amd64 | 打包 ✓、无 W+X ✓、PC 相对重定位已修；剩余问题是宿主栈深度（本轮定位） |
+> | linux-arm64 | blob 构建 ✓、AArch64 打包 ✓、qemu 首次执行 segfault；另有 payload 段退回 RWX 的缺口 |
+> | windows-arm64-blob | 外部工具链缺口 |
+
 
 
