@@ -42,7 +42,7 @@ jobs:
           if ($rc -ne 0) {
             # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
             # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
-            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked|LOAD |payloadVA=|bss 在 payload" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
             $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
             $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""
@@ -65,7 +65,7 @@ jobs:
           if ($rc -ne 0) {
             # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
             # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
-            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked|LOAD |payloadVA=|bss 在 payload" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
             $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
             $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""
@@ -88,7 +88,7 @@ jobs:
           if ($rc -ne 0) {
             # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
             # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
-            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked|LOAD |payloadVA=|bss 在 payload" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
             $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
             $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""
@@ -111,7 +111,7 @@ jobs:
           if ($rc -ne 0) {
             # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
             # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
-            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked|LOAD |payloadVA=|bss 在 payload" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
             $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
             $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""
@@ -143,7 +143,7 @@ jobs:
           rc=$?
           tail -n 40 build/ci_step.log
           if [ $rc -ne 0 ]; then
-            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]|LOAD |payloadVA=|bss 在 payload' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=verify_linux_payload.sh (exit $rc)::$msg"
           fi
           exit $rc
@@ -155,7 +155,7 @@ jobs:
           rc=$?
           tail -n 40 build/ci_step.log
           if [ $rc -ne 0 ]; then
-            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]|LOAD |payloadVA=|bss 在 payload' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=bash tools/e2e.sh (exit $rc)::$msg"
           fi
           exit $rc
@@ -180,7 +180,7 @@ jobs:
           rc=$?
           tail -n 40 build/ci_step.log
           if [ $rc -ne 0 ]; then
-            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]|LOAD |payloadVA=|bss 在 payload' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=CC=aarch64-linux-gnu-gcc OBJDUMP=aarch64-linux-gnu-objdump QEMU=qemu-aarch64 bash tools/e2e_arm64.sh (exit $rc)::$msg"
           fi
           exit $rc

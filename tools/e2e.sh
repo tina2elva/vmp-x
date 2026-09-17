@@ -124,6 +124,12 @@ fi
 if command -v readelf >/dev/null 2>&1; then
     echo "[*] 打包后程序头（只看 LOAD/NOTE）:"
     readelf -lW build/linux_target.vmp | grep -E "LOAD|NOTE" | sed "s/^/    /"
+    rva=$(grep -o "\"sectionRVA\": *[0-9]*" build/linux_vmp.json | head -n1 | sed "s/.*: *//")
+    sz=$(grep -o "\"sectionSize\": *[0-9]*" build/linux_vmp.json | head -n1 | sed "s/.*: *//")
+    boff=$(grep -o "\"bssOff\": *[0-9]*" build/vm_interp_linux.json | head -n1 | sed "s/.*: *//")
+    bsz=$(grep -o "\"bssSize\": *[0-9]*" build/vm_interp_linux.json | head -n1 | sed "s/.*: *//")
+    echo "    payloadRVA=$rva payloadSize=$sz -> payloadVA=0x$(printf '%x' $((0x400000 + rva)))"
+    echo "    bssOff=$boff bssSize=$bsz -> bss 在 payload 内的区间 [0x$(printf '%x' $boff), 0x$(printf '%x' $((boff + bsz))))"
 fi
 echo "[*] differential test (native vs protected)..."
 for a in 0 1 10 255 12345 1000000 4294967295; do
