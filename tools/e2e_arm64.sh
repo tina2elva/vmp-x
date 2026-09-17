@@ -97,16 +97,16 @@ m = json.load(open("build/vm_interp_arm64.json"))
 inv = {v: k for k, v in m["opcodeMap"].items()}
 rep = json.load(open("build/arm64_vmp.json"))
 pl = rep["placements"][0]
-print("[!] placement 字段:", list(pl.keys()))
-print("[!] maxStubStackFrame =", m.get("maxStubStackFrame"), " margin =", m.get("margin"), " frameSkew =", m.get("frameSkew"))
+print("MISMATCH placement 字段:", list(pl.keys()))
+print("MISMATCH maxStubStackFrame =", m.get("maxStubStackFrame"), " margin =", m.get("margin"), " frameSkew =", m.get("frameSkew"))
 code_rva = pl.get("codeRVA", 0)
 code_len = pl.get("bytecodeSize") or pl.get("codeLen") or pl.get("BytecodeSize") or 0
 data = open("build/arm64_payload.bin", "rb").read()
 code = data[code_rva:code_rva + code_len]
-print("[!] 明文字节码(%d): %s" % (len(code), code.hex()))
+print("MISMATCH 明文字节码(%d): %s" % (len(code), code.hex()))
 for pc in (0, 9, 0xF, 0x18, 0x23, 0x29):
     if pc < len(code):
-        print("[!]   pc=0x%X op=0x%02X = %s" % (pc, code[pc], inv.get(code[pc], "?")))
+        print("MISMATCH   pc=0x%X op=0x%02X = %s" % (pc, code[pc], inv.get(code[pc], "?")))
 PY' 2>/dev/null || true
 import json
 m = json.load(open("build/vm_interp_arm64.json"))
