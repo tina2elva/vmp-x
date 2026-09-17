@@ -33,22 +33,58 @@ jobs:
         shell: msys2 {0}
         run: |
           cd "$GITHUB_WORKSPACE"
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e.ps1
+          mkdir -p build
+          set +e
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e.ps1 > build/ci_step.log 2>&1
+          rc=$?
+          tail -n 40 build/ci_step.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=真机 E2E（x86-64，146 例） (exit $rc)::$msg"
+          fi
+          exit $rc
       - name: 真机 E2E（DLL，3 例）
         shell: msys2 {0}
         run: |
           cd "$GITHUB_WORKSPACE"
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_dll.ps1
+          mkdir -p build
+          set +e
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_dll.ps1 > build/ci_step.log 2>&1
+          rc=$?
+          tail -n 40 build/ci_step.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=真机 E2E（DLL，3 例） (exit $rc)::$msg"
+          fi
+          exit $rc
       - name: ARM64 客户机语义差分（宿主仍是 x86-64）
         shell: msys2 {0}
         run: |
           cd "$GITHUB_WORKSPACE"
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_arm64guest.ps1
+          mkdir -p build
+          set +e
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_arm64guest.ps1 > build/ci_step.log 2>&1
+          rc=$?
+          tail -n 40 build/ci_step.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=ARM64 客户机语义差分（宿主仍是 x86-64） (exit $rc)::$msg"
+          fi
+          exit $rc
       - name: Linux 载荷（在 Windows 上执行注入后的 ELF 载荷）
         shell: msys2 {0}
         run: |
           cd "$GITHUB_WORKSPACE"
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_linux_payload.ps1
+          mkdir -p build
+          set +e
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_linux_payload.ps1 > build/ci_step.log 2>&1
+          rc=$?
+          tail -n 40 build/ci_step.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=Linux 载荷（在 Windows 上执行注入后的 ELF 载荷） (exit $rc)::$msg"
+          fi
+          exit $rc
 
   # ---------------------------------------------------------------- Linux/amd64
   linux-amd64:
