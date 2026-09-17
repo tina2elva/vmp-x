@@ -84,7 +84,13 @@ VM_ENTRY_SYMBOL:
 
     /* ---- 调用 vm_run(ctx) ---- */
     mov     x0, sp
+    mov     x19, sp          /* 诊断：把 SP 留下来，返回后强制还原 */
     bl      vm_run
+
+    /* 诊断/加固：AArch64 里 SP 是 callee-saved，正常不该被改；但 CI 现场显示
+     * vm_run 返回后的第一条指令（ldr x10, [sp]）就 SIGSEGV —— 像是 SP 被破坏了。
+     * 这里无条件还原一次：如果还原后就不崩，就证明问题在"谁改了 SP"。 */
+    mov     sp, x19
 
     /* ---- 返回：X0..X30 全部从 **ctx** 还原 ----
      * 为什么不是从 VM_SAVE_* 区：那块区域本文件**从来没有写过**（只在开头写了 VM_SAVE_LR /
