@@ -65,7 +65,7 @@ if [ -n "$OBJDUMP" ] && command -v "$OBJDUMP" >/dev/null 2>&1; then
         va=$((0x400000 + rva))
         start=$(printf '0x%x' "$va"); end=$(printf '0x%x' $((va + 8)))
         line=$($OBJDUMP -d --start-address=$start --stop-address=$end build/arm64_target.vmp 2>/dev/null | grep -E '^\s+[0-9a-f]+:' | head -n 2 | tr '\n' ';')
-        echo "[!]   补丁 rva=0x$(printf '%x' $rva): $line"
+        echo "[*]   补丁 rva=0x$(printf '%x' $rva): $line"
     done
 fi
 # payload 探针：把注入段按原始 VA 映射后直接调 thunk —— 用于区分「payload 自身」与「入口/加载」。
