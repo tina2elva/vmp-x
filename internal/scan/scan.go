@@ -9,6 +9,7 @@ package scan
 
 import (
 	dbgpe "debug/pe"
+	"encoding/binary"
 	"fmt"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -93,9 +94,9 @@ func FindFunction(path string, f *pe.File, name string) (*Found, error) {
 			if s.SectionNumber != target.SectionNumber {
 				continue
 			}
-			// mingw 的符号表里还散落着 .text 之类的节符号（type=0），
-			// 把它们当边界会截断函数。
-			if s.Type&0x20 == 0 {
+			// mingw 的符号表里还散落着 .text 之类的节符号（type=0），把它们当边界会截断函数。
+			// 函数类型的约定有两种：mingw 放低位 0x20，lld-link 放高位 0x2000 —— 都接受。
+			if s.Type&0x20 == 0 && s.Type&0x2000 == 0 {
 				continue
 			}
 			if v, ok := convert(uint32(s.Value), c); ok {
@@ -130,7 +131,14 @@ func FindFunction(path string, f *pe.File, name string) (*Found, error) {
 		}
 		raw := make([]byte, hi-lo)
 		copy(raw, f.Data[sec.PointerToRawData+lo:sec.PointerToRawData+hi])
-		trimmed, n, terr := TrimTrailingPadding(f.ImageBase, rva, raw)
+		var trimmed []byte
+		var n int
+		var terr error
+		if f.Machine == peMachineARM64 {
+			trimmed, n, terr = trimTrailingPaddingARM64(rva, raw)
+		} else {
+			trimmed, n, terr = TrimTrailingPadding(f.ImageBase, rva, raw)
+		}
 		if terr != nil {
 			lastErr = terr
 			continue
@@ -141,6 +149,36 @@ func FindFunction(path string, f *pe.File, name string) (*Found, error) {
 		return nil, fmt.Errorf("无法用任何符号基准约定确定 %s 的边界（最后一次错误: %v）", name, lastErr)
 	}
 	return nil, fmt.Errorf("符号 %q 的值 0x%X 无法映射到节 %s (0x%X-0x%X) 内", name, target.Value, sec.Name, sec.VirtualAddress, secEnd)
+}
+
+// peMachineARM64 是 COFF 的 ARM64 Machine（0xAA64）。
+const peMachineARM64 = 0xAA64
+
+// trimTrailingPaddingARM64：AArch64 的尾部裁剪。
+// 这里不能借用 x86 的解码器（那正是 Windows/arm64 打包时卡住的地方：
+// arm64 的机器码用 x64dec 一条都解不出来，于是"无法用任何符号基准约定确定"）。
+// 做法足够保守：从尾部跳过 0 填充，要求最后一条真实指令是 ret / br x30，否则报错。
+func trimTrailingPaddingARM64(rva uint32, code []byte) ([]byte, int, error) {
+	const (
+		retX30 = 0xD65F03C0 // ret
+		brX30  = 0xD61F03C0 // br x30
+	)
+	if len(code) < 4 {
+		return nil, 0, fmt.Errorf("0x%X 处没有可解码的指令", rva)
+	}
+	n := len(code) &^ 3
+	for n >= 4 {
+		w := binary.LittleEndian.Uint32(code[n-4:])
+		if w == 0 { // 尾部填充
+			n -= 4
+			continue
+		}
+		if w == retX30 || w == brX30 {
+			return code[:n], n / 4, nil
+		}
+		return nil, 0, fmt.Errorf("0x%X 处最后一条指令不是 ret/br x30（0x%08X）", rva+uint32(n-4), w)
+	}
+	return nil, 0, fmt.Errorf("0x%X 处的代码全是填充", rva)
 }
 
 // TrimTrailingPadding 解码并在尾部裁掉填充，要求最后一条真实指令是 RET
