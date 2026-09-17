@@ -5,11 +5,33 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 )
 
 // buildBlobObj 组装单目标 blob。
 // 顺序很重要：**.bss 必须最后**——注入时它会被单独映射成"可写区"，
 // 因此它必须是 blob 结尾的一段连续区间（其余部分按 RX 映射）。
+// wantSection 判断某个节名是否要进 blob。
+// 除了精确名字，还必须接受 gcc 生成的子节：ELF 会把 8 字节常量放进 .rodata.cst8、
+// 把冷代码放进 .text.unlikely —— 不合并它们，重定位检查就会报"引用了 blob 之外的节"
+// （CI 的 linux-amd64 作业实测就是死在 .rodata.cst8 上）。
+func wantSection(name string) bool {
+	switch name {
+	case ".text", ".rdata", ".rodata", ".data", ".bss":
+		return true
+	}
+	for _, p := range []string{".text.", ".rodata.", ".rdata.", ".data.", ".bss."} {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isMappingSymbol 过滤 AArch64 的映射符号（$x/$d/$t）：它们不是真符号，
+// 多个目标文件里同名，内置合并器会误判成"重复定义"（CI 的 linux-arm64 作业实测）。
+func isMappingSymbol(name string) bool { return strings.HasPrefix(name, "$") }
+
 func buildBlobObj(obj *objFile) ([]sectInfo, []byte, map[int]int, error) {
 	// .rdata 是 mingw/COFF 的只读数据节名，.rodata 是 ELF 的
 	want := []string{".text", ".rdata", ".rodata", ".data", ".bss"}
@@ -20,7 +42,7 @@ func buildBlobObj(obj *objFile) ([]sectInfo, []byte, map[int]int, error) {
 	)
 	for _, name := range want {
 		for _, s := range obj.Sections {
-			if s.Name != name || len(s.Data) == 0 {
+			if len(s.Data) == 0 || !wantSection(s.Name) || (s.Name != name && !strings.HasPrefix(s.Name, name+".")) {
 				continue
 			}
 			// .bss 会被注入器单独映射成一个 RW 段，而 PE/ELF 的段起点必须落在**节对齐**
@@ -137,7 +159,7 @@ func buildBlobMulti(objs []*objFile) (*mergedBlob, error) {
 	for oi, o := range objs {
 		for _, name := range want {
 			for _, s := range o.Sections {
-				if s.Name != name || len(s.Data) == 0 {
+				if len(s.Data) == 0 || !wantSection(s.Name) || (s.Name != name && !strings.HasPrefix(s.Name, name+".")) {
 					continue
 				}
 				step := 16
@@ -171,7 +193,7 @@ func buildBlobMulti(objs []*objFile) (*mergedBlob, error) {
 				continue // 该节没进 blob（例如调试节）
 			}
 			// 跳过节符号（COFF 里每个对象都有一个与节同名的符号）与无名符号（ELF 的 STT_SECTION）
-			if s.Name == "" || (s.Sec < len(o.Sections) && s.Name == o.Sections[s.Sec].Name) {
+			if s.Name == "" || isMappingSymbol(s.Name) || (s.Sec < len(o.Sections) && s.Name == o.Sections[s.Sec].Name) {
 				continue
 			}
 			off := base + int(s.Value)
