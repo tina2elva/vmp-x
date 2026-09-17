@@ -69,62 +69,44 @@ if [ -n "$OBJDUMP" ] && command -v "$OBJDUMP" >/dev/null 2>&1; then
         echo "[*]   补丁 rva=0x$(printf '%x' $rva): $line"
     done
 fi
-# payload 探针：把注入段按原始 VA 映射后直接调 thunk —— 用于区分「payload 自身」与「入口/加载」。
+# payload 探针：把注入段按原始 VA 映射后直接调 thunk（与入口补丁同构的尾跳）——
+# 用来区分「payload 自身」与「入口/加载」。所有取数都带 || true：脚本是 set -e + pipefail，
+# 任何一次 grep 落空都会直接终止脚本，把后面的关键输出（探针数值）全部吞掉 —— 那个坑我踩过。
 if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
     if $CC -O1 -static -no-pie -Wl,-Ttext-segment=0x100000000 -o build/payload_probe_arm64 stub/linux/arm64/payload_probe_arm64.c 2>build/probe_cc.log; then
-        sec_rva=$(grep -o '"sectionRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
-        sec_sz=$(grep -o '"sectionSize": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
-        thunk_rva=$(grep -o '"thunkRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
-        va=$((0x400000 + sec_rva)); thunk_off=$((thunk_rva - sec_rva))
+        sec_rva=$(grep -o '"sectionRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//' || true)
+        sec_sz=$(grep -o '"sectionSize": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//' || true)
+        thunk_rva=$(grep -o '"thunkRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//' || true)
+        va=$((0x400000 + ${sec_rva:-0})); thunk_off=$(( ${thunk_rva:-0} - ${sec_rva:-0} ))
         echo "[*] payload 探针：payloadVA=0x$(printf %x $va) thunkOff=0x$(printf %x $thunk_off)"
-        extract_out=$(./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin 2>&1) || echo "[!] extractpayload 失败: $(printf '%s' "$extract_out" | tr '\n' '|')"
-        ring_off=$(grep -o '"vm_ring_hdr": *[0-9]*' build/vm_interp_arm64.json | head -n1 | sed 's/.*: *//')
-        echo "[*] vm_ring_hdr 偏移: ${ring_off:-未知}"
-        python3 - <<'PY' > build/opnames.txt 2>/dev/null || true
-import json
-try:
-    m = json.load(open("build/vm_interp_arm64.json"))
-    op = m.get("opcodes") or m.get("opcodeValues") or {}
-    inv = {v: k for k, v in op.items()} if isinstance(op, dict) else {}
-    for v in (0x69, 0x73, 0xA3, 0xFC):
-        print("0x%X=%s" % (v, inv.get(v, "?")))
-except Exception as ex:
-    print("decode failed: %s" % ex)
-PY
-        echo "[*] 操作码解码: $(tr '\n' ' ' < build/opnames.txt)"
+        ./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin >build/extract.log 2>&1 || echo "[!] extractpayload 失败: $(tail -n1 build/extract.log)"
+        ring_off=$(grep -o '"vm_ring_hdr": *[0-9]*' build/vm_interp_arm64.json | head -n1 | sed 's/.*: *//' || true)
+        probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" 0 1 10 255 2>&1) || true
+        echo "MISMATCH 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
         python3 - <<'PY' 2>/dev/null || true
 import json, glob
 m = json.load(open("build/vm_interp_arm64.json"))
 inv = {v: k for k, v in m["opcodeMap"].items()}
 rep = json.load(open("build/arm64_vmp.json"))
-pl = rep["placements"][0]
-want = pl.get("bytecodeBytes", 0)
+want = rep["placements"][0].get("bytecodeBytes", 0)
 code = b""
-for _f in sorted(glob.glob("build/bcdump/bytecode_*.bin")):
-    _b = open(_f, "rb").read()
-    if len(_b) == want:
-        code = _b
+for f in sorted(glob.glob("build/bcdump/bytecode_*.bin")):
+    b = open(f, "rb").read()
+    if len(b) == want:
+        code = b
         break
-names = " ".join("0x%X=%s" % (code[_p], inv.get(code[_p], "?")) for _p in (0, 9, 0xF, 0x18, 0x23, 0x29) if _p < len(code))
+names = " ".join("0x%X=%s" % (code[p], inv.get(code[p], "?")) for p in (0, 9, 0xF, 0x18, 0x23, 0x29) if p < len(code))
 print("MISMATCH 解码: len=%d maxFrame=%s margin=%s %s" % (len(code), m.get("maxStubStackFrame"), m.get("margin"), names))
 PY
-        # 直接把明文字节码打出来：环形缓冲给的是 pc（指令起始偏移），对着字节看第 6 条
-        off=$(grep -o '"codeRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
-        if [ -n "$off" ] && [ -f build/arm64_payload.bin ]; then
-            od -An -tx1 -j "$off" -N 48 build/arm64_payload.bin 2>/dev/null | tr -s ' ' | sed 's/^/[!] 字节码: /'
-        fi
-        probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" 0 1 10 255 2>&1) || true
-        echo "MISMATCH 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
-        # 探针崩了的话，用 qemu 的指令级日志再看一次，打印尾部 —— 定位炸在哪条 arm64 指令
         if printf '%s' "$probe_out" | grep -q "signal"; then
             set +e
             $QEMU -d in_asm,cpu -D build/qemu_probe.log ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" 0 >/dev/null 2>&1
             set -e
-            echo "[!] 探针现场（qemu 指令日志尾部 $(wc -l < build/qemu_probe.log 2>/dev/null || echo 0) 行）:"
-            # 只打最后几条指令，并压成单行 —— 注解只保留前 12 条 [!] 行，多行会被截掉
-            ln=$(grep -n 'IN: ' build/qemu_probe.log 2>/dev/null | tail -n1 | cut -d: -f1)
-            from=$((ln > 14 ? ln - 14 : 1))
-            echo "[!] 探针最后指令（含前几个块）: $(sed -n "${from},$((ln + 4))p" build/qemu_probe.log 2>/dev/null | tr '\n' '|')"
+            ln=$(grep -n 'IN: ' build/qemu_probe.log 2>/dev/null | tail -n1 | cut -d: -f1 || true)
+            if [ -n "$ln" ]; then
+                from=$((ln > 14 ? ln - 14 : 1))
+                echo "[!] 探针最后指令: $(sed -n "${from},$((ln + 4))p" build/qemu_probe.log 2>/dev/null | tr '\n' '|' || true)"
+            fi
         fi
     else
         echo "[!] payload 探针编译失败: $(tail -n 2 build/probe_cc.log | tr '\n' '|')"
