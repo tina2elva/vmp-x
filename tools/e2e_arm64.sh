@@ -100,7 +100,7 @@ pl = rep["placements"][0]
 print("MISMATCH placement 字段:", list(pl.keys()))
 print("MISMATCH maxStubStackFrame =", m.get("maxStubStackFrame"), " margin =", m.get("margin"), " frameSkew =", m.get("frameSkew"))
 code_rva = pl.get("codeRVA", 0)
-code_len = pl.get("bytecodeSize") or pl.get("codeLen") or pl.get("BytecodeSize") or 0
+code_len = pl.get("bytecodeBytes") or pl.get("bytecodeSize") or 0
 data = open("build/arm64_payload.bin", "rb").read()
 code = data[code_rva:code_rva + code_len]
 print("MISMATCH 明文字节码(%d): %s" % (len(code), code.hex()))
