@@ -31,7 +31,8 @@ const (
 	PF_R         = 4
 	PageAlign    = 0x1000
 
-	EM_X86_64 = 62
+	EM_X86_64  = 62
+	EM_AARCH64 = 183
 )
 
 // Program 一个程序头
@@ -49,8 +50,9 @@ type Program struct {
 
 // File 内存中的 ELF 镜像
 type File struct {
-	Data  []byte
-	Entry uint64
+	Data    []byte
+	Entry   uint64
+	Machine uint16 // e_machine（EM_X86_64=62 / EM_AARCH64=183）
 	// EType 是 e_type（2=ET_EXEC，3=ET_DYN/PIE）
 	EType uint16
 
@@ -90,9 +92,12 @@ func Parse(data []byte) (*File, error) {
 	if data[5] != 1 {
 		return nil, fmt.Errorf("只支持小端 ELF（data=%d）", data[5])
 	}
-	f := &File{Data: data}
-	if mach := u16(data, 18); mach != EM_X86_64 {
-		return nil, fmt.Errorf("目前只支持 EM_X86_64，该文件 machine=%d", mach)
+	f := &File{Data: data, Machine: u16(data, 18)}
+	// x86-64 与 AArch64 都接受：AArch64 的载荷侧（BL thunk + 8 字节入口补丁）早有实现与单测，
+	// 之前只是打包器一直只挑 x86-64 lifter，所以在 CI 上表现为"只支持 EM_X86_64"。
+	mach := u16(data, 18)
+	if mach != EM_X86_64 && mach != EM_AARCH64 {
+		return nil, fmt.Errorf("目前只支持 EM_X86_64 / EM_AARCH64，该文件 machine=%d", mach)
 	}
 	// ET_EXEC(2) 与 ET_DYN(3, PIE/共享库) 都接受：
 	// payload 段、thunk(E8 rel32)、描述符 selfRVA 全都是**相对**的，
@@ -355,8 +360,12 @@ func (f *File) Save(path string) error {
 
 // Summary 可读摘要
 func (f *File) Summary() string {
-	s := fmt.Sprintf("ELF64 x86-64 exec, entry=0x%X, imageBase=0x%X, phnum=%d",
-		f.Entry, f.ImageBase(), len(f.Progs))
+	arch := "x86-64"
+	if f.Machine == EM_AARCH64 {
+		arch = "arm64"
+	}
+	s := fmt.Sprintf("ELF64 %s exec, entry=0x%X, imageBase=0x%X, phnum=%d",
+		arch, f.Entry, f.ImageBase(), len(f.Progs))
 	for i, p := range f.Progs {
 		name := "?"
 		switch p.Type {

@@ -18,7 +18,10 @@ import (
 	"os"
 	"strings"
 
+	arm64dec "github.com/vmpx/vmp-x/internal/decode/arm64"
 	"github.com/vmpx/vmp-x/internal/inject"
+	"github.com/vmpx/vmp-x/internal/ir"
+	arm64lift "github.com/vmpx/vmp-x/internal/lift/arm64"
 	"github.com/vmpx/vmp-x/internal/lift/x64"
 	elfload "github.com/vmpx/vmp-x/internal/load/elf"
 	"github.com/vmpx/vmp-x/internal/load/pe"
@@ -191,8 +194,28 @@ func sizeOf(p string) int64 {
 	return st.Size()
 }
 
-// liftAll 对所有目标函数做 lift + codegen（与容器无关）
-func liftAll(lifter *x64.Lifter, names []string, find func(string) (*scan.Found, error), opcodeMap *vm.OpcodeMap, verbose bool) ([]inject.FuncSpec, error) {
+// liftIface 抽象 lifter：x86-64 与 AArch64 各有一套 API（后者要先解码再 Lift），
+// 这里只要求"给我一个函数名和它的字节，返回 IR"。
+type liftIface interface {
+	LiftFunc(name string, code []byte, rva uint32) (*ir.Func, error)
+}
+
+// a64Adapter 让 AArch64 lifter 满足 liftIface。
+// AArch64 是定长 4 字节指令：先整体解码（decode/arm64），再交给 lifter.Lift。
+type a64Adapter struct{ l *arm64lift.Lifter }
+
+func (a a64Adapter) LiftFunc(name string, code []byte, rva uint32) (*ir.Func, error) {
+	insns, err := arm64dec.DecodeRange(code, uint64(rva), 0)
+	if err != nil && len(insns) == 0 {
+		return nil, err
+	}
+	fn := &ir.Func{Name: name, RVA: rva, Size: len(code)}
+	a.l.Lift(fn, insns)
+	return fn, nil
+}
+
+// liftAll 对所有目标函数做 lift + codegen（与容器/架构无关）
+func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, error), opcodeMap *vm.OpcodeMap, verbose bool) ([]inject.FuncSpec, error) {
 	var specs []inject.FuncSpec
 	for _, name := range names {
 		found, err := find(name)
@@ -293,23 +316,33 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew, bssOff, bssS
 	fmt.Printf("[*] 目标: %s", f.Summary())
 	fmt.Println()
 
-	lifter := x64.NewLifter(imageBase)
-	lifter.SetFrameSkew(int64(frameSkew))
-	// SIMD：XMM 寄存器堆同上（ELF 里 payload 的 VA 由 NextVA 决定，也是确定的）
-	if xmmOff > 0 {
-		lifter.SetXMMArea(uint32(f.NextVA()-imageBase) + uint32(xmmOff))
-	}
-	if tmpOff > 0 {
-		lifter.SetScratchArea(uint32(f.NextVA()-imageBase) + uint32(tmpOff))
-	}
-	// 跳转表需要按 RVA 读镜像（ELF：RVA + imageBase → VA）
-	lifter.SetImageReader(func(rva uint32, n int) []byte {
-		b, err := f.ReadVA(imageBase+uint64(rva), n)
-		if err != nil {
-			return nil
+	// 按目标架构选 lifter：x86-64 走原来的路径，AArch64 走自己的 lifter（同样吃 frameSkew）。
+	var lifter liftIface
+	if f.Machine == elfload.EM_AARCH64 {
+		fmt.Printf("[*] 目标架构: arm64（AArch64 lifter）")
+		fmt.Println()
+		a64 := &arm64lift.Lifter{ImageBase: imageBase, FrameSkew: uint64(frameSkew)}
+		lifter = a64Adapter{a64}
+	} else {
+		lx := x64.NewLifter(imageBase)
+		lx.SetFrameSkew(int64(frameSkew))
+		// SIMD：XMM 寄存器堆同上（ELF 里 payload 的 VA 由 NextVA 决定，也是确定的）
+		if xmmOff > 0 {
+			lx.SetXMMArea(uint32(f.NextVA()-imageBase) + uint32(xmmOff))
 		}
-		return b
-	})
+		if tmpOff > 0 {
+			lx.SetScratchArea(uint32(f.NextVA()-imageBase) + uint32(tmpOff))
+		}
+		// 跳转表需要按 RVA 读镜像（ELF：RVA + imageBase → VA）
+		lx.SetImageReader(func(rva uint32, n int) []byte {
+			b, err := f.ReadVA(imageBase+uint64(rva), n)
+			if err != nil {
+				return nil
+			}
+			return b
+		})
+		lifter = lx
+	}
 	specs, err := liftAll(lifter, funcs, func(n string) (*scan.Found, error) {
 		return scan.FindFunctionELF(exe, imageBase, n)
 	}, opcodeMap, verbose)
