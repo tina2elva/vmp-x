@@ -25,6 +25,7 @@ const (
 	relAArch64Branch26      // 26 位 PC 相对分支（BL/B），字段低 26 位存 imm26（以 4 字节为单位）
 	relAArch64ADRPrelPGHi21 // ADRP：页相对的高 21 位，位域 immlo(30:29) + immhi(23:5)
 	relAArch64AddAbsLo12    // ADD (immediate)：绝对地址的低 12 位，位域 21:10
+	relAArch64LDSTLo12      // LDR/STR (imm12)：低 12 位，按访问宽度（size 位 31:30）缩放
 	relUnsupported
 )
 
@@ -142,6 +143,9 @@ func readCOFFObject(path string) (*objFile, error) {
 				case coffRelARM64PageOffset12A: // add x, x, #:lo12:sym（未缩放 imm12）
 					rel.Addend = decodeAddLo12StoredAddend(uint32(addend))
 					rel.Kind = relAArch64AddAbsLo12
+				case coffRelARM64PageOffset12L: // ldr/str x, [x, #:lo12:sym]（按宽度缩放）
+					rel.Addend = decodeLDSTLo12StoredAddend(uint32(addend))
+					rel.Kind = relAArch64LDSTLo12
 				default:
 					rel.Kind = relUnsupported
 				}
@@ -179,6 +183,7 @@ const (
 	coffRelARM64Branch26      = 3 /* IMAGE_REL_ARM64_BRANCH26  : bl/b */
 	coffRelARM64PageBaseRel21 = 4 /* IMAGE_REL_ARM64_PAGEBASE_REL21 : adrp */
 	coffRelARM64PageOffset12A = 6 /* IMAGE_REL_ARM64_PAGEOFFSET_12A : add x, x, #:lo12:sym */
+	coffRelARM64PageOffset12L = 7 /* IMAGE_REL_ARM64_PAGEOFFSET_12L : ldr/str x, [x, #:lo12:sym]（按宽度缩放） */
 
 	/* AArch64（ELF for the ARM 64-bit Architecture）*/
 	R_AARCH64_CALL26           = 283
@@ -286,6 +291,28 @@ func decodeADRPStoredAddend(insn uint32) int64 {
 // decodeAddLo12StoredAddend：ADD (immediate) 的 imm12（21:10，未缩放）
 func decodeAddLo12StoredAddend(insn uint32) int64 {
 	return int64((insn >> 10) & 0xFFF)
+}
+
+// decodeLDSTLo12StoredAddend：LDR/STR 的 imm12（21:10）**按访问宽度缩放**，
+// 宽度由指令的 size 位（31:30）给出（0=1B,1=2B,2=4B,3=8B）。
+func decodeLDSTLo12StoredAddend(insn uint32) int64 {
+	return int64((insn>>10)&0xFFF) << ((insn >> 30) & 3)
+}
+
+// patchAArch64LDSTLo12：把绝对地址的低 12 位写进 LDR/STR 的 imm12（除以访问宽度）。
+func patchAArch64LDSTLo12(insn uint32, target int) (uint32, error) {
+	// load/store (immediate) 的编码：位 29:27 = 111、位 25:24 = 01（0xF9400020 这类 ldr 满足）
+	if (insn>>27)&7 != 7 || (insn>>24)&3 != 1 {
+		return 0, fmt.Errorf("PAGEOFFSET_12L 用在非 load/store 指令上（insn=0x%08X）", insn)
+	}
+	scale := (insn >> 30) & 3
+	lo := uint32(target) & 0xFFF
+	if lo&((1<<scale)-1) != 0 {
+		return 0, fmt.Errorf("PAGEOFFSET_12L 目标 0x%X 不是 %d 字节对齐", target, 1<<scale)
+	}
+	insn &^= uint32(0xFFF) << 10
+	insn |= (lo >> scale) << 10
+	return insn, nil
 }
 
 func makeELFReloc(out *objFile, target int, rOff, info uint64, addend int64, implicit bool) objReloc {

@@ -292,6 +292,12 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 				binary.LittleEndian.PutUint32(m.Data[field:], insn)
 			case relAArch64AddAbsLo12:
 				binary.LittleEndian.PutUint32(m.Data[field:], patchAArch64AddLo12(binary.LittleEndian.Uint32(m.Data[field:]), target))
+			case relAArch64LDSTLo12:
+				insn, err := patchAArch64LDSTLo12(binary.LittleEndian.Uint32(m.Data[field:]), target)
+				if err != nil {
+					return 0, fmt.Errorf("%s+0x%X: %w", o.Sections[r.SecIdx].Name, r.Off, err)
+				}
+				binary.LittleEndian.PutUint32(m.Data[field:], insn)
 			default:
 				return 0, fmt.Errorf("%s+0x%X: 不支持的重定位类型 0x%X（绝对引用必须失败）", o.Sections[r.SecIdx].Name, r.Off, r.RawType)
 			}
