@@ -40,7 +40,11 @@ jobs:
           & powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e.ps1 *>&1 | Tee-Object -FilePath $log
           $rc = $LASTEXITCODE
           if ($rc -ne 0) {
-            $msg = ((Get-Content $log -Tail 25) -join "%0A") -replace "%", "%25"
+            # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
+            # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
+            $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""
             Write-Host "::error title=E2E x86-64 (146 cases) (exit $rc)::$msg"
             exit $rc
@@ -59,7 +63,11 @@ jobs:
           & powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_dll.ps1 *>&1 | Tee-Object -FilePath $log
           $rc = $LASTEXITCODE
           if ($rc -ne 0) {
-            $msg = ((Get-Content $log -Tail 25) -join "%0A") -replace "%", "%25"
+            # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
+            # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
+            $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""
             Write-Host "::error title=E2E DLL (3 cases) (exit $rc)::$msg"
             exit $rc
@@ -78,7 +86,11 @@ jobs:
           & powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_arm64guest.ps1 *>&1 | Tee-Object -FilePath $log
           $rc = $LASTEXITCODE
           if ($rc -ne 0) {
-            $msg = ((Get-Content $log -Tail 25) -join "%0A") -replace "%", "%25"
+            # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
+            # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
+            $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""
             Write-Host "::error title=ARM64 guest differential (host is still x86-64) (exit $rc)::$msg"
             exit $rc
@@ -97,7 +109,11 @@ jobs:
           & powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_linux_payload.ps1 *>&1 | Tee-Object -FilePath $log
           $rc = $LASTEXITCODE
           if ($rc -ne 0) {
-            $msg = ((Get-Content $log -Tail 25) -join "%0A") -replace "%", "%25"
+            # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
+            # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
+            $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""
             Write-Host "::error title=Linux payload executed on Windows (exit $rc)::$msg"
             exit $rc
@@ -127,7 +143,7 @@ jobs:
           rc=$?
           tail -n 40 build/ci_step.log
           if [ $rc -ne 0 ]; then
-            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=verify_linux_payload.sh (exit $rc)::$msg"
           fi
           exit $rc
@@ -139,7 +155,7 @@ jobs:
           rc=$?
           tail -n 40 build/ci_step.log
           if [ $rc -ne 0 ]; then
-            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=bash tools/e2e.sh (exit $rc)::$msg"
           fi
           exit $rc
@@ -164,7 +180,7 @@ jobs:
           rc=$?
           tail -n 40 build/ci_step.log
           if [ $rc -ne 0 ]; then
-            msg=$(tail -n 25 build/ci_step.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            msg=$( (grep -E '\[FAIL\]|MISMATCH|<crash|fatal error|panicked|\[!\]' build/ci_step.log | head -n 12; tail -n 4 build/ci_step.log) | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=CC=aarch64-linux-gnu-gcc OBJDUMP=aarch64-linux-gnu-objdump QEMU=qemu-aarch64 bash tools/e2e_arm64.sh (exit $rc)::$msg"
           fi
           exit $rc
