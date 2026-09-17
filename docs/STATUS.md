@@ -874,6 +874,33 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 > | linux-amd64 | 打包 ✓、无 W+X ✓；运行期确定性损坏，且**已证明与栈深度无关** |
 > | linux-arm64 | blob ✓、打包 ✓、qemu 执行崩溃（现在有 PC/寄存器现场） |
 > | windows-arm64-blob | 缺 aarch64 COFF 编译器（外部缺口） |
+>
+> ## 第九十八/九十九轮：linux-amd64 的故障性质被算术定死（**不是权限问题**）
+>
+> ### 294. 拿到的硬数据（CI 注解）
+> ```
+> LOAD  0x225000 0x589000 0x589000 0x11000 0x11000 RW  0x1000   ← .bss 覆盖段（RW）
+> LOAD  0x221000 0x585000 0x585000 0x15100 0x15100 R E 0x1000   ← payload（RX）
+> payloadVA=0x585000 payloadSize=86272
+> bssOff=16384 bssSize=69632 → bss 区间 [0x4000, 0x15000) → VA [0x589000, 0x59A000)
+> [FAIL] protected=unexpected fault address 0x599240
+> ```
+> **算术**：0x599240 落在 [0x589000, 0x59A000) 内 → 它在那个 **RW** 覆盖段里，**是可写的**。
+> 所以「内核把 .bss 留在只读 RX 映射里」这个假设**被推翻**（本地 dump 也证实覆盖段存在且尺寸正确：
+> `LOAD RW off=0x225000 va=0x589000 filesz=0x11000 memsz=0x11000`）。
+>
+> ### 295. 剩下唯一的解释：**执行**了不可执行的页
+> 覆盖段是 RW（**没有 X**），payload 段是 RX。0x599240 在覆盖段内 → 一旦 CPU 去**取指**就 SIGSEGV，
+> 而 Go 的 signal handler 正是报「unexpected fault address <该地址>」。
+> 结论：**VM 跳进了 payload 的 .bss** —— 控制流被破坏，不是数据写权限问题。
+>
+> ### 296. 两条执行路径的差异指向「入口路径」
+> 同一个 payload：**探针直接调 thunk 是好的**（CI 的 payload probe 步骤一直通过），
+> **经入口补丁进入就崩**（差分用例全红）。两者只差「谁调用 thunk、在什么栈上、寄存器状态如何」。
+> 下一步：① 确认打包文件里 5 字节补丁确实是 E9 到 thunk（e2e.sh 已有 objdump 检查）；
+> ② 在 Linux 侧捕获信号并打印 VM 状态（模拟 PC / 当前操作码 / 模拟 RSP），看是从哪条指令跳进 .bss 的；
+> ③ 重点看「嵌套调用 + 宿主 Go 栈」这一组合（探针走进程主栈，目标走 goroutine 栈）。
+
 
 
 
