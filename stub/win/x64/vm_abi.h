@@ -94,11 +94,11 @@
 /* 解密缓冲放在帧内：每次调用都有自己的副本 → 嵌套调用/递归不会互相覆盖。 */
 #define VM_SCRATCH_OFF  448
 #define VM_SCRATCH_SIZE 4096
-#define VM_FRAME_SIZE   640 /* 解密缓冲已搬到 .bss 的池里：帧只需覆盖保存槽（VM_SAVE_TOP≈576） */
+#define VM_FRAME_SIZE   4544 /* = VM_SCRATCH_OFF + VM_SCRATCH_SIZE，≡ 0 (mod 16) */
 #define VM_SAVE_TOP     (VM_SAVE_XMM5 + 16) /* 最后一个保存槽的结束偏移 */
 
 /* ---- vm_run 及其调用者可用的栈余量（模拟栈在其下方） ---- */
-#define VM_MARGIN       0x1C00 /* 7KB：总深度 640+16+7168 = 7824 < 8KB，同时给客户机留 7KB 自己的栈 */
+#define VM_MARGIN       0x2000 /* 8KB */
 
 /* ---- 模拟 RSP 与原生 RSP 的差值（lifter 用） ---- */
 #define VM_FRAME_SKEW_EXTRA 16 /* thunk 用 call 压入返回地址带来的额外 8 字节（另有 8 字节见 vm_entry） */
