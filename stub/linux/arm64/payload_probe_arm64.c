@@ -47,8 +47,7 @@ int main(int argc, char **argv) {
      * payload 的 VA 可能只有 0x401000 —— MAP_FIXED 会把探针自己的映像盖掉，
      * 于是"payload 崩了"其实是探针被自己覆盖（第一次的结果正是 SIGILL）。
      * payload 是位置无关的（描述符靠 X30 反推、VBASE 运行期算），所以换一块高位内存即可。 */
-    (void)va;
-    unsigned long long mapAt = 0x200000000ULL;
+    unsigned long long mapAt = va; /* 必须用原 VA：VBASE = 描述符地址 - selfRVA，换地址会算出错误的模块基址 */
     void *mem = mmap((void *)(uintptr_t)mapAt, (size_t)n, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (mem == MAP_FAILED) { fprintf(stderr, "[!] mmap failed"); return 2; }

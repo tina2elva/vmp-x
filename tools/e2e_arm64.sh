@@ -70,7 +70,7 @@ if [ -n "$OBJDUMP" ] && command -v "$OBJDUMP" >/dev/null 2>&1; then
 fi
 # payload 探针：把注入段按原始 VA 映射后直接调 thunk —— 用于区分「payload 自身」与「入口/加载」。
 if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
-    if $CC -O1 -static -o build/payload_probe_arm64 stub/linux/arm64/payload_probe_arm64.c 2>build/probe_cc.log; then
+    if $CC -O1 -static-pie -o build/payload_probe_arm64 stub/linux/arm64/payload_probe_arm64.c 2>build/probe_cc.log; then
         sec_rva=$(grep -o '"sectionRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
         sec_sz=$(grep -o '"sectionSize": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
         thunk_rva=$(grep -o '"thunkRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
