@@ -55,12 +55,9 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
 static unsigned long long call_thunk(void *thunk, unsigned long long arg) {
     unsigned long long ret = 0;
     __asm__ volatile(
-        "movq %[thunk], %%rcx
-"
-        "movq %[arg], %%rax
-"
-        "call *%%rcx
-"
+        "movq %[thunk], %%rcx\n"
+        "movq %[arg], %%rax\n"
+        "call *%%rcx\n"
         : "=a"(ret)
         : [thunk] "r"(thunk), [arg] "r"(arg)
         : "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory");
