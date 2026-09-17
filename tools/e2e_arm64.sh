@@ -40,6 +40,7 @@ QEMU=${QEMU:-qemu-aarch64}
 echo "[*] building tools..."
 go build -o build/vmpbuild ./cmd/vmpbuild
 go build -o build/vmpack ./cmd/vmpack
+go build -o build/extractpayload ./cmd/extractpayload
 
 echo "[*] cross-compiling the aarch64 target..."
 $CC -O1 -fno-tree-vectorize -fno-unwind-tables -fno-asynchronous-unwind-tables \
@@ -75,7 +76,7 @@ if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
         thunk_rva=$(grep -o '"thunkRVA": *[0-9]*' build/arm64_vmp.json | head -n1 | sed 's/.*: *//')
         va=$((0x400000 + sec_rva)); thunk_off=$((thunk_rva - sec_rva))
         echo "[*] payload 探针：payloadVA=0x$(printf %x $va) thunkOff=0x$(printf %x $thunk_off)"
-        ./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin >/dev/null 2>&1 || true
+        extract_out=$(./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin 2>&1) || echo "[!] extractpayload 失败: $(printf '%s' "$extract_out" | tr '\n' '|')"
         probe_out=$($QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" 0 1 10 255 2>&1) || true
         echo "[!] payload 探针结果: $(printf '%s' "$probe_out" | tr '\n' '|')"
     else
