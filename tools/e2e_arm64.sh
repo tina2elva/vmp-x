@@ -71,6 +71,9 @@ if [ "$native" = "$protected" ] && [ -n "$native" ] && [ "$nrc" -eq 0 ] && [ "$p
     echo "[+] arm64 end-to-end: outputs match"
 else
     echo "[!] arm64 end-to-end: MISMATCH (native rc=$nrc, protected rc=$prc)"
+    # 单行输出，前缀 [!] 以便被 CI 注解抓取（多行现场容易被截断丢掉）
+    echo "[!] native   = $(printf '%s' "$native" | tr '\n' '|')"
+    echo "[!] protected= $(printf '%s' "$protected" | tr '\n' '|')"
     # 失败时用 qemu 的指令级日志重跑一次，打印尾部 —— 用来定位"炸在哪条 arm64 指令"
     # （对应 x86 侧用 objdump 反汇编故障偏移附近的做法）。
     set +e
