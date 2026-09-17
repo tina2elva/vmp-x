@@ -14,8 +14,12 @@ __attribute__((noinline)) u64 check_key(u64 x) {
 
 __attribute__((noinline)) u64 sum_to(u64 n) {
     u64 s = 0;
-    for (u64 i = 1; i <= n; i++) {
-        s += i;
+    /* 倒计数写法：语义与 for (i=1;i<=n;i++) 完全相同，但**不会**让 clang 去算循环次数。
+     * clang -O1 对 `i <= n` 这种形式会做强度削减，生成 UMULH + EXTR 的倒数序列，
+     * 而 lifter 的子集里没有 UMULH/EXTR（CI 就是这么报的）。 */
+    while (n != 0) {
+        s += n;
+        n--;
     }
     return s;
 }
