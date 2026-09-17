@@ -198,7 +198,13 @@ func buildBlobMulti(objs []*objFile) (*mergedBlob, error) {
 			}
 			off := base + int(s.Value)
 			if prev, dup := m.symOff[s.Name]; dup && prev != off {
-				return nil, fmt.Errorf("符号 %q 被重复定义（0x%X / 0x%X）", s.Name, prev, off)
+				// 同名不同址：只有**全局符号**才是真冲突（例如两个目标文件各定义一个函数）。
+				// 局部符号（static）不能跨目标文件引用，多个文件重名是合法的 —— 之前这里一律报错，
+				// CI 的 linux-arm64 作业就死在 guest_semantics_arm64.c 里的局部名 "nz" 上。
+				if s.Binding != 0 {
+					return nil, fmt.Errorf("全局符号 %q 被重复定义（0x%X / 0x%X）", s.Name, prev, off)
+				}
+				continue
 			}
 			m.symOff[s.Name] = off
 		}

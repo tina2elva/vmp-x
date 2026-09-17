@@ -33,9 +33,10 @@ type objSection struct {
 }
 
 type objSymbol struct {
-	Name  string
-	Sec   int // -1 = 未定义
-	Value uint64
+	Name    string
+	Sec     int // -1 = 未定义
+	Value   uint64
+	Binding int // 0 = 局部（static），1 = 全局/弱：只有全局符号参与跨目标文件的合并
 }
 
 type objReloc struct {
@@ -99,7 +100,12 @@ func readCOFFObject(path string) (*objFile, error) {
 		if c.SectionNumber <= 0 {
 			sec = -1
 		}
-		out.Symbols = append(out.Symbols, objSymbol{Name: name, Sec: sec, Value: uint64(c.Value)})
+		// COFF：StorageClass 2 = external（全局），3 = static（局部）
+		binding := 0
+		if c.StorageClass == 2 {
+			binding = 1
+		}
+		out.Symbols = append(out.Symbols, objSymbol{Name: name, Sec: sec, Value: uint64(c.Value), Binding: binding})
 	}
 	for i, s := range f.Sections {
 		for _, r := range s.Relocs {
@@ -213,7 +219,11 @@ func readELFObject(path string) (*objFile, error) {
 		if s.Section != elf.SHN_UNDEF && s.Section < elf.SHN_LORESERVE {
 			sec = int(s.Section)
 		}
-		out.Symbols = append(out.Symbols, objSymbol{Name: s.Name, Sec: sec, Value: s.Value})
+		binding := 0
+		if elf.ST_BIND(s.Info) == elf.STB_GLOBAL || elf.ST_BIND(s.Info) == elf.STB_WEAK {
+			binding = 1
+		}
+		out.Symbols = append(out.Symbols, objSymbol{Name: s.Name, Sec: sec, Value: s.Value, Binding: binding})
 	}
 
 	// 重定位节：SHT_RELA（带显式加数）与 SHT_REL（加数在字段里）
@@ -246,7 +256,11 @@ func readELFObject(path string) (*objFile, error) {
 
 func makeELFReloc(out *objFile, target int, rOff, info uint64, addend int64, implicit bool) objReloc {
 	// AArch64 与 x86-64 的重定位编号空间不同，按 e_machine 分派
-	symIdx := int(info >> 32)
+	// Go 的 debug/elf Symbols() **省略了索引 0 的 null 符号**（文档明确写了
+	// "an externally supplied index x corresponds to symtab[x-1]"），而重定位里的符号索引
+	// 是按含 null 符号的原始表编号的 —— 不减 1 就会整体错位（Windows 走 COFF 不受影响，
+	// 所以这条 ELF 路径到 CI 第一次真跑才暴露）。
+	symIdx := int(info>>32) - 1
 	typ := uint32(info & 0xFFFFFFFF)
 	rel := objReloc{SecIdx: target, Off: rOff, TargetSec: -1, RawType: typ, Addend: addend}
 	if symIdx < len(out.Symbols) {
