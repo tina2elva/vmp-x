@@ -38,6 +38,7 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
             if (off >= g_syms[i].off) { who = g_syms[i].name; base = g_syms[i].off; }
         }
         fprintf(stderr, "[!] PC 在 payload 内: %s+0x%lX\n", who, off - base);
+        fprintf(stderr, "[!] FAULTOFF=0x%lX\n", off);
         fprintf(stderr, "[!] 该处字节(前后各若干):");
         long start = (long)off - 8;
         for (long p = start; p < start + 24; p++) {

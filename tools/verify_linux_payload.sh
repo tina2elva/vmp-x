@@ -62,6 +62,12 @@ for a in 0 1 10 255 12345 1000000; do
         fail=$((fail+1)); echo "  [FAIL] check-key($a): native=$want payload=$got"
     fi
 done
+if [ "$fail" -ne 0 ] && command -v objdump >/dev/null 2>&1; then
+    echo ""
+    echo "[*] 反汇编 blob 里故障附近的窗口（探针报的是 blob 内偏移，例如 0xCBF）："
+    objdump -D -b binary -m i386:x86-64 --adjust-vma=0 \
+        --start-address=0xC00 --stop-address=0xE40 build/vm_interp_linux.bin 2>/dev/null | tail -n 60
+fi
 echo ""
 echo "payload probe: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
