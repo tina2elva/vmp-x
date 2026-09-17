@@ -101,6 +101,3 @@ VM_ENTRY_SYMBOL:
     add     sp, sp, x9
     mov     x0, x10
     ret
-
-/* 明确声明"不需要可执行栈"：否则 ld 会警告 missing .note.GNU-stack。 */
-.section .note.GNU-stack,"",@progbits
