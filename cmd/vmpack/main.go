@@ -276,37 +276,49 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 func packPE(exe, outPath string, stub []byte, entryOff, frameSkew, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
-	if f.Machine != pe.MachineAMD64 {
-		fatalf("目前只支持 x86-64 PE，该文件 Machine=0x%X", f.Machine)
+	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
+		fatalf("只支持 x86-64 / arm64 的 PE，该文件 Machine=0x%X", f.Machine)
 	}
 	fmt.Printf("[*] 目标: %s", f.Summary())
 
-	lifter := x64.NewLifter(f.ImageBase)
-	lifter.SetFrameSkew(int64(frameSkew))
-	// SIMD：XMM 寄存器堆在 blob 的 .bss 里，符号表给出它在 blob 内的偏移；
-	// 目标镜像里的 RVA = 预测的 payload RVA + 该偏移（Apply 用同一个 NextRVA 计算，是确定的）。
-	// SIMD：XMM 寄存器堆在 blob 的 .bss 里，符号表给出它在 blob 内的偏移；
-	// 目标镜像里的 RVA = 预测的 payload RVA + 该偏移（Apply 用同一个 NextRVA 计算，是确定的）。
-	//
-	// **当前默认关闭**：SIMD 位搬运的语义已在参考 VM 里逐字节验证通过
-	// （见 internal/lift/x64/simd_test.go），但在真实 blob 上运行会访问违例，原因未定位。
-	// 与其带着崩的路径，不如保持"SIMD 一律拒绝"（fail-fast），等定位后再打开。
-	if xmmOff > 0 {
-		xr := f.NextRVA() + uint32(xmmOff)
-		fmt.Printf("[*] XMM 寄存器堆: blob off=0x%X → 镜像 RVA=0x%X\n", xmmOff, xr)
-		lifter.SetXMMArea(xr)
-	}
-	if tmpOff > 0 {
-		lifter.SetScratchArea(f.NextRVA() + uint32(tmpOff))
-	}
-	// 跳转表需要按 RVA 读镜像（PE：RVA→文件偏移）
-	lifter.SetImageReader(func(rva uint32, n int) []byte {
+	// 按目标架构选 lifter（与 packELF 同构）：arm64 的 PE 用 AArch64 lifter，同样吃 frameSkew。
+	// 此前这里只认 AMD64 并直接 fatal —— 这就是 Windows/arm64 端到端缺的那一半。
+	readRVA := func(rva uint32, n int) []byte {
 		off, err := f.RVAtoOffset(rva)
 		if err != nil || off < 0 || off+n > len(f.Data) {
 			return nil
 		}
 		return f.Data[off : off+n]
-	})
+	}
+	var lifter liftIface
+	if f.Machine == pe.MachineARM64 {
+		fmt.Printf("[*] 目标架构: arm64（AArch64 lifter）")
+		fmt.Println()
+		a64 := &arm64lift.Lifter{ImageBase: f.ImageBase, FrameSkew: uint64(frameSkew)}
+		lifter = a64Adapter{a64}
+	} else {
+		lx := x64.NewLifter(f.ImageBase)
+		lx.SetFrameSkew(int64(frameSkew))
+		// SIMD：XMM 寄存器堆在 blob 的 .bss 里，符号表给出它在 blob 内的偏移；
+		// 目标镜像里的 RVA = 预测的 payload RVA + 该偏移（Apply 用同一个 NextRVA 计算，是确定的）。
+		//
+		// **当前默认关闭**：SIMD 位搬运的语义已在参考 VM 里逐字节验证通过
+		// （见 internal/lift/x64/simd_test.go），但在真实 blob 上运行会访问违例，原因未定位。
+		// 与其带着崩的路径，不如保持"SIMD 一律拒绝"（fail-fast），等定位后再打开。
+		if xmmOff > 0 {
+			xr := f.NextRVA() + uint32(xmmOff)
+			fmt.Printf("[*] XMM 寄存器堆: blob off=0x%X → 镜像 RVA=0x%X", xmmOff, xr)
+			fmt.Println()
+			lx.SetXMMArea(xr)
+		}
+		if tmpOff > 0 {
+			lx.SetScratchArea(f.NextRVA() + uint32(tmpOff))
+		}
+		// 跳转表需要按 RVA 读镜像（PE：RVA→文件偏移）
+		lx.SetImageReader(readRVA)
+		lifter = lx
+	}
+	_ = readRVA
 	specs, err := liftAll(lifter, funcs, func(n string) (*scan.Found, error) {
 		return scan.FindFunction(exe, f, n)
 	}, opcodeMap, verbose)
