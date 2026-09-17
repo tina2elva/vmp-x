@@ -10,7 +10,7 @@
 | Windows/amd64 | **Windows PowerShell 5.1 或 PowerShell 7**（本机只有 5.1，所有脚本都兼容两者）+ msys2 UCRT64 的 `gcc``objdump``ld`（或等价的 MinGW-w64 工具链）+ PowerShell 7 |
 | Linux/amd64 | `gcc``binutils``readelf` |
 | Linux/arm64 | `aarch64-linux-gnu-gcc``aarch64-linux-gnu-objdump``qemu-user` |
-| Windows/arm64 | 只有 **blob 构建**这一步（用 aarch64 交叉工具链产出 COFF 目标文件） |
+| Windows/arm64 | **已全绿**：CI 用 clang 的 `aarch64-w64-windows-gnu` 目标产出 arm64 COFF blob 并在 `windows-11-arm` 原生 arm64 Windows 上**真跑**（native 与打包后退出码一致）。本机只需 Go + clang（可选） |
 
 ## 1. Windows / amd64（本机已验证）
 
@@ -51,7 +51,21 @@ CC=aarch64-linux-gnu-gcc OBJDUMP=aarch64-linux-gnu-objdump QEMU=qemu-aarch64 \
 → 用 AArch64 的 4 字节 `BL` 跳板 + 4 字节 `B` 入口改写打包 → 在 qemu 下比对原生与被保护输出。
 qemu-user 走的是正常 `execve` 装载路径，所以**内核/加载器把控制权交给改写后入口**这件事也被覆盖。
 
-## 4. Windows / arm64（只验证 blob 构建）
+## 4. Windows / arm64（CI 上已完成构建 + 真跑）
+
+本机没有 aarch64 的 Windows 工具链，所以这一段完全交给 CI（两个作业）：
+
+- `windows-arm64-blob`（ubuntu-latest）：`sudo apt-get install -y llvm lld` 后，用
+  `clang --target=aarch64-w64-windows-gnu` 编 blob（合并走内置合并器 `-merge go`，不需要 ld），
+  再用同一个 clang 编一个 **freestanding 的 arm64 PE 目标**并打包，校验入口补丁是 8 字节
+  `mov x16,x30 ; b thunk`（报告 JSON 里 `F0 03 1E AA`）。
+- `windows-arm64-run`（`windows-11-arm`，GitHub 的原生 arm64 Windows）：编 blob → 编 PE 目标 → 打包 →
+  **native 与打包后各跑一次**，比对退出码（目标把被保护函数的返回值混合成一个 30 位退出码，
+  任一项算错都会变）。最近一次结果：`native=654184885 protected=654184885`。
+
+被保护函数在 arm64 上用 clang 编时注意两点（都踩过）：`sum_to` 会被折成闭式 `n*(n+1)/2`
+（生成 UMULH/EXTR，不在 lifter 子集内），需要 `__attribute__((optnone))` 逼出真正的循环；
+pwsh 包装器结尾 `exit $LASTEXITCODE`，跑完被保护程序后要把 `$LASTEXITCODE` 清零。
 
 ```powershell
 go build -o build/vmpbuild.exe ./cmd/vmpbuild
