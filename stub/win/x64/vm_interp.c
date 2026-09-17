@@ -617,7 +617,10 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         /* 只对 x86-64 客户机生效：ARM64 客户机的 SP 用法与 VM_MARGIN（宿主侧常量）不是一个口径，
          * 直接套用会让 arm64 客户机差分误报（CI 上确实被它抓到过一次）。 */
         if (rsp_start - vm->regs[VRSP] > (u64)VM_MARGIN) {
-            return 99;
+            return 99; /* 压栈越过给它的栈下界 */
+        }
+        if (vm->regs[VRSP] > rsp_start) {
+            return 97; /* 弹出过多：SP 高过进入值（返回地址会取错，进而跳到任意地址） */
         }
 #endif
         if (vm->pc >= vm->codeLen) return 1;
@@ -944,7 +947,7 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         default:
-            return 1; /* 未知操作码：失败而不是猜 */
+            return 98; /* 未知操作码：失败而不是猜（用 98 与 OP_HALT 的正常返回 1 区分开，便于 CI 判读） */
         }
     }
 }
