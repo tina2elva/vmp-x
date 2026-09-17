@@ -976,6 +976,33 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 > ### 306. 下一步（明确）
 > 给 arm64 也做一份 payload 探针（用 CI 里的 aarch64-linux-gnu-gcc 编、qemu 跑），
 > 把「payload 自身」与「入口/加载」分开 —— x86-64 正是靠这个探针把范围收窄到了映射顺序。
+>
+> ## 第一〇九～一一五轮：arm64 的三个真 bug + 一个假绿
+>
+> ### 307. 修掉的三个真 bug
+> 1. **入口 stub 从未写过的保存区**：prologue 只写了 VM_SAVE_LR / VM_SAVE_GUEST_LR,
+>    epilogue 却按 VM_SAVE_BASE + 8*(r-1) 还原 X1..X29 → 客户机返回时全是垃圾，
+>    调用方（目标自己的 _start 附近）立刻崩（现场 PC=0x4001e4 / X30=0x4001f4 / rc=139 完全吻合）。
+>    改为从 **ctx** 还原 X1..X30。修后：不再崩（rc=0）。
+> 2. **标志位换算**：进入用 `lsr #28`（应为 `and #0xF`）、还原多了一次 `rbit`。
+> 3. **VM_FRAME_SKEW_EXTRA 被兼容分支误改**：`vmpbuild` 用 `== 0` 判断「宏缺失」，
+>    把 arm64 显式写的 0 也改成 16 → lifter 对客户机 `[sp+disp]`（disp>=0，调用方帧）整体偏 16 字节。
+>    CI 日志 `FRAME_SKEW=70240 = 4688+16+65536` 是铁证；修后为 70224。
+>
+> ### 308. 一个假绿（必须写进收尾报告）
+> manifest 的 `maxStubStackFrame = 0` —— `vmpbuild` 的 `measureMaxFrame` 只认 x86 的 `sub rsp` 语法，
+> 对 aarch64 目标**量不到任何帧**，于是 `margin > 最大帧 + 512` 这条守卫**静默通过**。
+> 已确认（读 manifest 即可观察）；修法应当是「测量失败即报错」，而不是让检查形同虚设。
+>
+> ### 309. 我自己的两次工具自伤（都花掉一个 CI 周期）
+> - 替换 margin 时只换掉多行注释的第一行，留下四行悬空注释 → 汇编报 `junk at end of line`；
+> - 改 heredoc 时留下 9 行残骸（`PY' 2>/dev/null || true` + 旧 python 主体）→ heredoc 未终止，
+>   旧 python 被当成 shell 执行，`set -e` 直接终止脚本 → arm64 一直在探针之前就失败。
+>
+> ### 310. 当前 arm64 状态
+> 故障可复现地落在 `check_key` 字节码的第 6 条（pc=0x29，字节码共 42 字节）；
+> 指令级现场显示崩溃前控制流在**解释器**里、之后出现在 **stub 的收尾序列**（野跳）。
+> 诊断通道（`MISMATCH` 前缀 + 环形缓冲 + qemu 指令日志）现已全线打通，下一轮直接读语义操作码。
 
 
 
