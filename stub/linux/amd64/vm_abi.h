@@ -84,7 +84,7 @@
 /* 解密缓冲放在帧内：每次调用都有自己的副本 → 嵌套调用/递归不会互相覆盖。 */
 #define VM_SCRATCH_OFF  448
 #define VM_SCRATCH_SIZE 4096
-#define VM_FRAME_SIZE   4544 /* = VM_SCRATCH_OFF + VM_SCRATCH_SIZE，≡ 0 (mod 16)（解释器里有静态断言要求） */
+#define VM_FRAME_SIZE   640 /* 解密缓冲已搬到 .bss 的池里：帧只需覆盖保存槽（VM_SAVE_TOP≈576） */
 #define VM_SAVE_TOP     (VM_SAVE_XMM15 + 16) /* 最后一个保存槽的结束偏移 */
 
 /* ---- vm_run 及其调用者可用的栈余量（模拟栈在其下方） ---- */
@@ -93,7 +93,7 @@
  * "runtime: split stack overflow"（CI 的 linux-amd64 差分用例即此）。
  * 单纯调小 VM_MARGIN 不行：vmpbuild 会拒绝 margin < 解释器最大帧(4544)+512。
  * 真正的修法是让客户机用自己的栈（放在 blob 的 .bss 里、宿主 RSP 无关），见 docs/STATUS.md。 */
-#define VM_MARGIN       0x2000 /* 8KB */
+#define VM_MARGIN       0x1C00 /* 7KB：总深度 640+16+7168 = 7824 < 8KB，同时给客户机留 7KB 自己的栈 */
 
 #define VM_FRAME_SKEW_EXTRA 16 /* thunk 用 call 压入返回地址带来的额外 8 字节（另有 8 字节见 vm_entry） */
 #define VM_FRAME_SKEW   (VM_FRAME_SIZE + VM_FRAME_SKEW_EXTRA + VM_MARGIN)
