@@ -298,11 +298,13 @@ jobs:
       - name: run native vs protected
         shell: pwsh
         run: |
-          & .\build\target_arm64.exe; $nrc = $LASTEXITCODE
-          & .\build\target_arm64.vmp; $prc = $LASTEXITCODE
-          Write-Host "native rc=$nrc  protected rc=$prc"
+          $nrc = 0; & .\build\target_arm64.exe; $nrc = $LASTEXITCODE
+          $prc = 0; & .\build\target_arm64.vmp; $prc = $LASTEXITCODE
+          $nc = ('0x{0:X8}' -f [uint32]$nrc); $pc = ('0x{0:X8}' -f [uint32]$prc)
+          Write-Host "native rc=$nrc ($nc)  protected rc=$prc ($pc)"
           if ($nrc -ne $prc) {
-            Write-Host "::error::Windows/arm64 端到端不一致：native=$nrc protected=$prc"
+            Write-Host "::error title=Windows/arm64 mismatch::native=$nrc ($nc) protected=$prc ($pc)"
             exit 1
           }
+          Write-Host "::notice title=Windows/arm64 OK::native=$nrc protected=$prc"
           Write-Host "[+] Windows/arm64 end-to-end: outputs match"
