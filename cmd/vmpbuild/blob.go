@@ -122,6 +122,14 @@ func applyRelocsObj(obj *objFile, blob []byte, secBlobOff map[int]int, verbose b
 			insn := binary.LittleEndian.Uint32(blob[field:])
 			insn = (insn &^ 0x03FFFFFF) | (uint32(imm) & 0x03FFFFFF)
 			binary.LittleEndian.PutUint32(blob[field:], insn)
+		case relAArch64ADRPrelPGHi21:
+			insn, err := patchAArch64ADRP(binary.LittleEndian.Uint32(blob[field:]), target, field)
+			if err != nil {
+				return 0, fmt.Errorf("%s+0x%X: %w", secName, r.Off, err)
+			}
+			binary.LittleEndian.PutUint32(blob[field:], insn)
+		case relAArch64AddAbsLo12:
+			binary.LittleEndian.PutUint32(blob[field:], patchAArch64AddLo12(binary.LittleEndian.Uint32(blob[field:]), target))
 		case relAbsolute32, relAbsolute64:
 			return 0, fmt.Errorf("%s+0x%X: 出现绝对重定位 (type 0x%X) — 拒绝注入（stub 必须位置无关）",
 				secName, r.Off, r.RawType)
@@ -264,6 +272,14 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 				insn := binary.LittleEndian.Uint32(m.Data[field:])
 				insn = (insn &^ 0x03FFFFFF) | (uint32(imm) & 0x03FFFFFF)
 				binary.LittleEndian.PutUint32(m.Data[field:], insn)
+			case relAArch64ADRPrelPGHi21:
+				insn, err := patchAArch64ADRP(binary.LittleEndian.Uint32(m.Data[field:]), target, field)
+				if err != nil {
+					return 0, fmt.Errorf("%s+0x%X: %w", o.Sections[r.SecIdx].Name, r.Off, err)
+				}
+				binary.LittleEndian.PutUint32(m.Data[field:], insn)
+			case relAArch64AddAbsLo12:
+				binary.LittleEndian.PutUint32(m.Data[field:], patchAArch64AddLo12(binary.LittleEndian.Uint32(m.Data[field:]), target))
 			default:
 				return 0, fmt.Errorf("%s+0x%X: 不支持的重定位类型 0x%X（绝对引用必须失败）", o.Sections[r.SecIdx].Name, r.Off, r.RawType)
 			}
@@ -273,4 +289,26 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 		}
 	}
 	return total, nil
+}
+
+// patchAArch64ADRP 把 ADRP 的页相对立即数写进指令：
+//
+//	imm = page(S+A) - page(P)，编码为 immlo(30:29) = imm[13:12]、immhi(23:5) = imm[32:14]
+func patchAArch64ADRP(insn uint32, target, field int) (uint32, error) {
+	imm := int64(target&^0xFFF) - int64(field&^0xFFF)
+	if imm < -(1<<32) || imm > (1<<32) {
+		return 0, fmt.Errorf("ADRP 目标超出 ±4GB（目标 0x%X）", int64(target))
+	}
+	immPage := uint32(imm>>12) & 0x1FFFFF
+	insn &^= (uint32(3) << 29) | (uint32(0x7FFFF) << 5)
+	insn |= (immPage & 3) << 29
+	insn |= ((immPage >> 2) & 0x7FFFF) << 5
+	return insn, nil
+}
+
+// patchAArch64AddLo12 把绝对地址的低 12 位写进 ADD (immediate)：位域 21:10
+func patchAArch64AddLo12(insn uint32, target int) uint32 {
+	insn &^= uint32(0xFFF) << 10
+	insn |= (uint32(target) & 0xFFF) << 10
+	return insn
 }

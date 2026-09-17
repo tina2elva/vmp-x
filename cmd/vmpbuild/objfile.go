@@ -22,7 +22,9 @@ const (
 	relPCRel32 relKind = iota
 	relAbsolute32
 	relAbsolute64
-	relAArch64Branch26 // 26 位 PC 相对分支（BL/B），字段低 26 位存 imm26（以 4 字节为单位）
+	relAArch64Branch26      // 26 位 PC 相对分支（BL/B），字段低 26 位存 imm26（以 4 字节为单位）
+	relAArch64ADRPrelPGHi21 // ADRP：页相对的高 21 位，位域 immlo(30:29) + immhi(23:5)
+	relAArch64AddAbsLo12    // ADD (immediate)：绝对地址的低 12 位，位域 21:10
 	relUnsupported
 )
 
@@ -280,8 +282,13 @@ func makeELFReloc(out *objFile, target int, rOff, info uint64, addend int64, imp
 		switch typ {
 		case R_AARCH64_CALL26, R_AARCH64_JUMP26:
 			rel.Kind = relAArch64Branch26
-		case R_AARCH64_ADR_PREL_PG_HI21, R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_ADR_GOT_PAGE, R_AARCH64_LD64_GOT_LO12_NC:
-			// adrp/add 与 GOT 访问：本 stub 不使用（入口只靠 LR 反推描述符），出现即失败
+		case R_AARCH64_ADR_PREL_PG_HI21:
+			// aarch64 编译器用 ADRP 页相对方式取全局地址（CI 的 linux-arm64 作业就是死在这里）。
+			rel.Kind = relAArch64ADRPrelPGHi21
+		case R_AARCH64_ADD_ABS_LO12_NC:
+			rel.Kind = relAArch64AddAbsLo12
+		case R_AARCH64_ADR_GOT_PAGE, R_AARCH64_LD64_GOT_LO12_NC:
+			// GOT 访问：blob 是自包含的，没有 GOT —— 出现即失败（而不是猜）
 			rel.Kind = relUnsupported
 		default:
 			rel.Kind = relUnsupported
