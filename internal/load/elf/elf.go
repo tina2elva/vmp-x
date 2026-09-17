@@ -342,6 +342,20 @@ func (f *File) AddOverlayLoadSegment(va uint64, fileOff int64, size uint64, flag
 	return nil
 }
 
+// SwapPhdrs 交换程序头表里的两项。
+// 为什么需要它：内核按**表顺序**依次 mmap 各个 PT_LOAD，重叠区间上**后面的映射覆盖前面的**。
+// 覆盖段（RW，给 .bss）必须排在 payload 段（RX）**之后**，否则 RX 会把 RW 覆盖掉，
+// 于是解释器写解密缓存就 SIGSEGV（SEGV_ACCERR，Linux 上实测如此；PE 侧按节合并且写标志生效，
+// 所以这个顺序问题只在 ELF 上现形）。
+func (f *File) SwapPhdrs(i, j int) {
+	if i == j || i < 0 || j < 0 || i >= len(f.Progs) || j >= len(f.Progs) {
+		return
+	}
+	f.Progs[i], f.Progs[j] = f.Progs[j], f.Progs[i]
+	writePhdr(f.Data, int(f.Phoff)+i*PhdrSize, f.Progs[i])
+	writePhdr(f.Data, int(f.Phoff)+j*PhdrSize, f.Progs[j])
+}
+
 func writePhdr(data []byte, off int, p Program) {
 	binary.LittleEndian.PutUint32(data[off:], p.Type)
 	binary.LittleEndian.PutUint32(data[off+4:], p.Flags)
