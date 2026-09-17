@@ -86,7 +86,8 @@ if [ -n "$CC" ] && [ -f stub/linux/arm64/payload_probe_arm64.c ]; then
             set -e
             echo "[!] 探针现场（qemu 指令日志尾部 $(wc -l < build/qemu_probe.log 2>/dev/null || echo 0) 行）:"
             # 只打最后几条指令，并压成单行 —— 注解只保留前 12 条 [!] 行，多行会被截掉
-            echo "[!] 探针最后几条指令: $(tail -n 6 build/qemu_probe.log 2>/dev/null | tr '\n' '|')"
+            ln=$(grep -n 'IN: ' build/qemu_probe.log 2>/dev/null | tail -n1 | cut -d: -f1)
+            echo "[!] 探针最后指令: $(sed -n "${ln},$((ln + 4))p" build/qemu_probe.log 2>/dev/null | tr '\n' '|')"
         fi
     else
         echo "[!] payload 探针编译失败: $(tail -n 2 build/probe_cc.log | tr '\n' '|')"
