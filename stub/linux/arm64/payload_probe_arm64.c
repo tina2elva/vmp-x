@@ -113,6 +113,7 @@ int main(int argc, char **argv) {
         unsigned long long *d = (unsigned long long *)(g_payload + diag_off);
         printf("MISMATCH vm_diag: inX0=%llu inSP=0x%llX code=0x%llX len=%llu outX0=%llu outSP=0x%llX pc=%llu rc=%llu\n",
                d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+        printf("MISMATCH 明文前24字节: %016llX %016llX %016llX\n", d[8], d[9], d[10]);
     }
     return 0;
 }

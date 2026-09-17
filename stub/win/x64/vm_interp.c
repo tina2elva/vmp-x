@@ -438,7 +438,7 @@ u64 vm_tmp[3];
 u64 vm_ring_hdr[2]; /* [0]=magic, [1]=已记录条数（.bss） */
 /* 客户机入口/出口的关键状态（诊断用，非 static 以便进 manifest 符号表）：
  * arm64 宿主上被保护函数返回值恒定，需要确认"参数有没有到达客户机、客户机最后算出了什么"。 */
-u64 vm_diag[8];
+u64 vm_diag[16]; /* [0..7] 见下；[8..10] = 解密后字节码前 24 字节（诊断用） */
 u64 vm_ring[16][2]; /* {pc, op}（.bss） */
 
 static int vm_bc_lookup(const void *desc) {
@@ -528,6 +528,13 @@ int vm_run(vm_ctx_t *vm) {
     vm_diag[1] = rsp_start;            /* 入口模拟 SP */
     vm_diag[2] = (u64)(unsigned long)vm->code; /* 明文/密文字节码指针（freestanding，别用 uintptr_t） */
     vm_diag[3] = vm->codeLen;
+    if (vm->code) {
+        for (int i = 0; i < 3; i++) {
+            u64 w = 0;
+            for (int j = 0; j < 8; j++) w |= (u64)vm->code[i * 8 + j] << (8 * j);
+            vm_diag[8 + i] = w;
+        }
+    }
     int rc = vm_run_inner(vm, rsp_start);
     vm_diag[4] = vm->regs[0];          /* 出口 X0（返回值） */
     vm_diag[5] = vm->regs[VRSP];
