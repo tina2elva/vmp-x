@@ -105,6 +105,19 @@ run_case() {
     fi
 }
 
+# 运行前先确认"入口补丁真的写进文件了"：如果没写，崩溃就与解释器无关，
+# 而是补丁/写回这一环；如果写了，问题才在运行期（CI 上这条路径本机跑不到）。
+if command -v objdump >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
+    echo "[*] 检查入口补丁（用 objdump 反汇编被保护后的文件）..."
+    for rva in $(grep -o '"funcRVA": *[0-9]*' build/linux_vmp.json | sed 's/.*: *//' | head -n 2); do
+        va=$((0x400000 + rva))
+        hexva=$(printf '0x%x' "$va")
+        hexend=$(printf '0x%x' $((va + 16)))
+        first=$(objdump -d --start-address=$hexva --stop-address=$hexend build/linux_target.vmp 2>/dev/null | grep -E '^\s+[0-9a-f]+:' | head -n 1)
+        echo "    RVA=0x$(printf '%x' "$rva") -> $first"
+    done
+fi
+
 echo "[*] differential test (native vs protected)..."
 for a in 0 1 10 255 12345 1000000 4294967295; do
     run_case check-key "$a"

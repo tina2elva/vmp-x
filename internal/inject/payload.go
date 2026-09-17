@@ -111,7 +111,10 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 	if len(opt.Stub) == 0 {
 		return nil, fmt.Errorf("解释器 blob 为空")
 	}
-	if opt.StubEntry <= 0 || opt.StubEntry >= len(opt.Stub) {
+	// 注意用 < 0：内置合并器（-merge go）会把 vm_entry 所在节放在最前面，此时它正好是 0 ——
+	// 用 <= 0 会把合法的 blob 判成坏 blob（CI 的 linux-arm64 就报 "vm_entry 偏移 0x0 超出 blob"）。
+	// "符号是否存在"由调用方查 manifest 的 symbols 表决定。
+	if opt.StubEntry < 0 || opt.StubEntry >= len(opt.Stub) {
 		return nil, fmt.Errorf("vm_entry 偏移 0x%X 超出 blob (%d 字节)", opt.StubEntry, len(opt.Stub))
 	}
 	if len(opt.Funcs) == 0 {
