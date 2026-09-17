@@ -402,6 +402,30 @@ static u32 vm_bc_inuse[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_tick[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_clock = 0;
 
+/* 解密兜底缓冲池：缓存槽全忙（并发线程 / 深嵌套）时用。
+ * 为什么是"池"而不是一份共享缓冲：先前那份放在入口栈帧里（每次调用一份，天然安全），
+ * 但它占 4KB，使"模拟栈相对宿主 RSP 的总深度"达 12.7KB，装不进 Go 的 8KB goroutine 栈。
+ * 搬到 .bss 后必须自己保证并发安全 —— 用与缓存同样的"取用/归还"模式，
+ * 每个正在执行的调用独占一个槽，跑完归还。 */
+#define VM_SCRATCH_SLOTS 4
+/* 非 static：入口 stub 要用符号引用它（和 vm_tmp / vm_xmm 同理） */
+u8 vm_scratch_pool[VM_SCRATCH_SLOTS][VM_SCRATCH_SIZE] __attribute__((aligned(16)));
+static u32 vm_scratch_inuse[VM_SCRATCH_SLOTS];
+
+/* 必须在 vm_bc_lock 里调用 */
+static int vm_scratch_acquire(void) {
+    for (int i = 0; i < VM_SCRATCH_SLOTS; i++) {
+        if (vm_scratch_inuse[i] == 0) {
+            vm_scratch_inuse[i] = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+static void vm_scratch_release(int i) {
+    if (i >= 0) __atomic_store_n(&vm_scratch_inuse[i], 0u, __ATOMIC_RELEASE);
+}
+
 /* XMM 寄存器堆：x86-64 里 XMM0-15 是**调用者保存**（volatile），
  * 所以被保护函数不需要从宿主那里复制进来/送回去——只要有一块私有内存当寄存器堆即可。
  * 放在 blob 的 .bss 里（注入器已经为 .bss 准备了可写区间），偏移由 vmpbuild 通过符号表导出，
@@ -455,6 +479,7 @@ static int vm_bc_acquire(void) {
 
 int vm_run(vm_ctx_t *vm) {
     int slot = -1;
+    int sslot = -1; /* 兜底池里的槽位（-1 = 没用） */
     /* 加密支持：先查明文缓存；未命中则验签+解密到缓存槽（全忙则解到帧内缓冲）。
      * 验签失败返回 3，绝不执行未经验证的字节码。 */
     if (vm->desc) {
@@ -477,15 +502,15 @@ int vm_run(vm_ctx_t *vm) {
                 aad[4] = (u8)(d->reserved1); aad[5] = (u8)(d->reserved1 >> 8);
                 aad[6] = (u8)(d->reserved1 >> 16); aad[7] = (u8)(d->reserved1 >> 24);
                 int c = vm_bc_acquire();
-                if (!vm->scratch && c < 0) {
-                    vm_bc_leave();
-                    return 2;
+                if (c < 0) {
+                    /* 缓存槽忙：从兜底池里独占一个槽（并发/嵌套都靠它保证互不覆盖） */
+                    sslot = vm_scratch_acquire();
+                    if (sslot < 0 || (u32)d->codeLen > (u32)VM_SCRATCH_SIZE) {
+                        vm_bc_leave();
+                        return 2;
+                    }
                 }
-                if (c < 0 && vm->scratchLen < d->codeLen) {
-                    vm_bc_leave();
-                    return 2;
-                }
-                dst = (c >= 0) ? vm_bc_cache[c] : vm->scratch;
+                dst = (c >= 0) ? vm_bc_cache[c] : vm_scratch_pool[sslot];
                 if (!vm_aead_open_aad(key, d->nonce, aad, 8, ct, d->encLen, d->tag, dst)) {
                     vm_bc_leave();
                     return 3;
@@ -502,6 +527,9 @@ int vm_run(vm_ctx_t *vm) {
         }
     }
     int rc = vm_run_inner(vm);
+    if (sslot >= 0) {
+        vm_scratch_release(sslot); /* 池槽：跑完归还（与缓存槽同一套语义） */
+    }
     if (slot >= 0) {
         /* 原子递减：别的线程可能正在临界区里检查"这个槽有没有人在用" */
         __atomic_fetch_sub(&vm_bc_inuse[slot], 1u, __ATOMIC_RELEASE);

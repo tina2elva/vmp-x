@@ -98,7 +98,7 @@ VM_ENTRY_SYMBOL:
 
     /* ---- 加密支持：描述符指针 + 帧内的解密缓冲 ---- */
     movq    %r11, VM_CTX_DESC(%rsp)
-    leaq    VM_SCRATCH_OFF(%rsp), %rax
+    leaq    vm_scratch_pool(%rip), %rax
     movq    %rax, VM_CTX_SCRATCH(%rsp)
     movl    $VM_SCRATCH_SIZE, VM_CTX_SCRATCHLEN(%rsp)
 
