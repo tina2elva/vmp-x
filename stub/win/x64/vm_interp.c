@@ -616,9 +616,18 @@ int vm_run(vm_ctx_t *vm) {
             }
 #endif /* VM_INVM_PATCHCHECK */
             if (d->encLen < d->codeLen) return 2;
+#ifndef VM_RELEASE
+            vm_last_pc = 0xAA000005u; /* 补丁校验通过 */
+#endif
             u8 *dst = 0;
+#ifndef VM_RELEASE
+            vm_last_pc = 0xAA000006u; /* 即将进缓存临界区 */
+#endif
             vm_bc_enter();
             slot = vm_bc_lookup(vm->desc);
+#ifndef VM_RELEASE
+            vm_last_pc = 0xAA000007u; /* 缓存查找完成 */
+#endif
             if (slot >= 0) {
                 vm_bc_inuse[slot]++;
                 dst = vm_bc_cache[slot];

@@ -985,7 +985,11 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 				l.rbpKnown = false
 			}
 		case dst != ir.RSP && src == ir.RSP:
-			// mov reg, rsp：同上，常量偏移（入口 RSP）可以照搬修正规则，值即宿主侧地址。
+			// mov reg, rsp：放行，寄存器拿到的是模拟栈那一侧的值（= 当前 guest RSP）。
+			// 这对"存一下、最后 mov rsp,reg 还原"的用法（greet 就是）是正确的；
+			// 但如果该寄存器随后被用来访问**调用方帧**（正偏移），就会差一个 FrameSkew ——
+			// 实测 add_dly 的函数体正是这样（崩溃点在 numpy 里，VM 侧一切正常）。
+			// 彻底修法是把这类寄存器纳入与 rbpEff 同类的**别名跟踪**，见 docs/STATUS.md。
 			clobber(dst)
 		default:
 			clobber(dst)
