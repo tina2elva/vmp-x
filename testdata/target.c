@@ -320,6 +320,23 @@ __attribute__((noinline)) long calls_protected(long x) {
 
 /* 带栈帧的函数：volatile 局部强制占用栈槽（eff < 0），
  * 第 5 个参数 e 位于调用方栈帧（eff >= 0）——两者都依赖 FRAME_SKEW 修正正确。 */
+/* 针对性压测：framed 内部有 movdqu（会碰共享 XMM 寄存器堆），多线程密集调用最容易放大共享状态竞争。 */
+__attribute__((noinline)) long framed(long a, long b, long c, long d, long e);
+static volatile LONG g_framed_bad = 0;
+static DWORD WINAPI framed_mt_worker(LPVOID p) {
+    long seed = (long)(long long)p;
+    for (int i = 0; i < 300000; i++) {
+        long x = seed + (i & 0xFF);
+        long want = x + (x + 1) + (x + 2) + (x + 3) + (x + 4);
+        long got = framed(x, x + 1, x + 2, x + 3, x + 4);
+        if (got != want) {
+            InterlockedIncrement(&g_framed_bad);
+            if (g_framed_bad > 5) return 0;
+        }
+    }
+    return 0;
+}
+
 __attribute__((noinline)) long framed(long a, long b, long c, long d, long e) {
     volatile long acc = a + b;
     acc += c + d;
@@ -403,6 +420,14 @@ static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
 int main(int argc, char **argv) {
     AddVectoredExceptionHandler(1, vmp_veh);   /* 更早、更广：CI 上那个 AV 只有它能抓到 */
     SetUnhandledExceptionFilter(vmp_crash_filter);
+    if (argc >= 2 && strcmp(argv[1], "framed_mt") == 0) {
+        enum { NT = 8 };
+        HANDLE th[NT];
+        for (int i = 0; i < NT; i++) th[i] = CreateThread(NULL, 0, framed_mt_worker, (LPVOID)(long long)(i + 1), 0, NULL);
+        for (int i = 0; i < NT; i++) { WaitForSingleObject(th[i], INFINITE); CloseHandle(th[i]); }
+        printf("framed_mt bad=%ld\n", (long)g_framed_bad);
+        return g_framed_bad ? 1 : 0;
+    }
     if (argc >= 2 && strcmp(argv[1], "crash_test") == 0) { /* 自检用：故意解引用空指针 */
         volatile int *nullp = (volatile int *)0;
         *nullp = 1;

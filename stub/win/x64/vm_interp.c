@@ -387,7 +387,9 @@ static int cond_holds(vm_ctx_t *vm, u32 cond) {
  *   - 前提是注入段**可写**（PE 的 .vmp 加了 ScnMemWrite、ELF 的新 PT_LOAD 加了 PF_W）。
  */
 #ifndef VM_BC_CACHE_SLOTS
-#define VM_BC_CACHE_SLOTS 16
+#define VM_BC_CACHE_SLOTS 32 /* 32 > E2E 一次保护的 25 个函数：16 个槽时，25 个不同描述符必然触发淘汰，
+                               * 多线程 + 嵌套调用下 vm_bc_acquire 会返回 -1，而那条路径把错误码当函数返回值交回客户机
+                               * （与"字节码超槽"同一类静默失败）。槽数给够是从根上消掉这条路径。 */
 /* 每个缓存槽的容量。原来是 4KB，但实测有真实函数（__pyx_pf_7example_8add_dly）的字节码有 7313 字节，
  * 超限后 vm_run 会直接 return 2 —— 而调用方拿到的是"返回值"，于是把垃圾交给下一层，最后崩在 numpy 里。
  * 这种**静默失败**最危险，所以：① 槽放大到 16KB；② 打包端按这个常量做硬校验（见 vm_bc_slot_size）。 */
