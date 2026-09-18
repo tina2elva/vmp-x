@@ -684,6 +684,16 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第二十八轮：针对 linux-arm64 的绝对重定位做两件事（-fPIC + 更完整的报错）
+>
+> 合并器的 aarch64 重定位分支只认 BRANCH26 / ADRP_PREL_PG_HI21 / ADD_ABS_LO12，其余一律拒绝
+> （这是"stub 必须位置无关"的设计）。CI 报的是 `type 0x1`，但 0x1 在不同格式/架构下含义不同，
+> 现有信息不足以判断来源。于是：
+> 1) 把这条报错补全为 `type / format / sym / targetSec / addend` —— 下一次 CI 就能直接告诉我是哪个符号；
+> 2) 给 aarch64 的 blob 编译加 `-fPIC`：非 PIC 代码会经字面量池产生绝对重定位，按位置无关编可避免。
+>
+> 本地：go build/vet/test 全绿；E2E 146/146（PE 路径不受影响）。
+>
 > ## 第二十七轮：CI 从 5 红变 4 绿，只剩 linux-arm64 一步
 >
 > ### 380. CI 现状（2967f973）

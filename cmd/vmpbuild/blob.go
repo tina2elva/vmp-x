@@ -141,7 +141,10 @@ func applyRelocsObj(obj *objFile, blob []byte, secBlobOff map[int]int, verbose b
 			return 0, fmt.Errorf("%s+0x%X: 出现绝对重定位 (type 0x%X) — 拒绝注入（stub 必须位置无关）",
 				secName, r.Off, r.RawType)
 		default:
-			return 0, fmt.Errorf("%s+0x%X: 不支持的重定位类型 0x%X", secName, r.Off, r.RawType)
+			// 把符号名与目标节也打出来：这条路径只有 aarch64 工具链会走到，本地无法复现，
+			// 出错信息必须一次给足，否则只能靠反复推 CI 猜。
+			return 0, fmt.Errorf("%s+0x%X: 不支持的重定位类型 0x%X (format=%s sym=%q targetSec=%d addend=%d)",
+				secName, r.Off, r.RawType, obj.Format, r.SymName, r.TargetSec, r.Addend)
 		}
 		if verbose {
 			fmt.Printf("    [reloc] %s+0x%X type=0x%X sym=%s(+0x%X) addend=%d -> target=0x%X",
