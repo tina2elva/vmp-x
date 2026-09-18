@@ -487,6 +487,26 @@ int vm_run(vm_ctx_t *vm) {
     if (vm->desc) {
         const vm_desc_t *d = (const vm_desc_t *)vm->desc;
         if (d->flags & VM_DESC_FLAG_ENC) {
+            /* (c) 防回填完整性校验：入口补丁的字节 + 构建密钥做 FNV-1a，与描述符里的值比对。
+             * 静态分析报告里那条绕过 —— 按函数尾声把被覆盖的 5 字节推回来 —— 会撞在这里。
+             * 地址全部相对描述符算（base = d - selfRVA），因此与 ASLR 无关。 */
+            {
+                u32 plen = (d->flags >> 8) & 0xFFu;
+                if (plen) {
+                    const u8 *base = (const u8 *)d - d->selfRVA;
+                    const u8 *pb = base + d->reserved1;
+                    u32 want;
+                    u8 key[32] = VM_KEY_BYTES;
+                    u32 h = 2166136261u;
+                    u32 i;
+                    for (i = 0; i < 8; i++) { h ^= (u32)key[i]; h *= 16777619u; }
+                    for (i = 0; i < plen; i++) { h ^= (u32)pb[i]; h *= 16777619u; }
+                    want = (u32)rd32((const u8 *)d + 60);
+                    if (h != want) {
+                        __builtin_trap(); /* 被篡改：直接崩，不给"还原后继续跑"的机会 */
+                    }
+                }
+            }
             if (d->encLen < d->codeLen) return 2;
             u8 *dst = 0;
             vm_bc_enter();

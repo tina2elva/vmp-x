@@ -49,6 +49,9 @@ type Options struct {
 	// DescMagic：写进描述符的魔数。0 表示用默认常量；release 构建由 vmpack 从 manifest 传入
 	// 每次构建不同的随机值，避免产物里留下固定 4 字节特征。
 	DescMagic uint32
+	// PatchKey：入口补丁完整性校验用的密钥前缀（通常取 blob 主密钥前 8 字节）。
+	// 全 0 表示不启用校验（例如 -no-encrypt 的调试构建）。
+	PatchKey [8]byte
 	// Verbose：打印注入过程的细节。
 	Verbose bool
 	// Arch 目标架构："x86-64"（默认）或 "arm64"。
@@ -233,6 +236,21 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			patch = make([]byte, 5)
 			patch[0] = 0xE9
 			binary.LittleEndian.PutUint32(patch[1:], uint32(int32(rel)))
+		}
+
+		// (c) 防回填完整性校验：把入口补丁字节的密钥校验值写进描述符
+		// （flags 的 bit8..15 = 补丁长度，pad[0..3] = FNV-1a(key[0:8] ++ patch)）。
+		// 运行期由解释器用**实时读到的**入口字节重算，不一致直接崩 —— 堵住"按尾声补回 5 字节"。
+		if opt.Encrypt != nil && opt.PatchKey != ([8]byte{}) {
+			binary.LittleEndian.PutUint32(data[d+20:], binary.LittleEndian.Uint32(data[d+20:])|uint32(len(patch)&0xFF)<<8)
+			h := uint32(2166136261)
+			for _, b := range opt.PatchKey {
+				h = (h ^ uint32(b)) * 16777619
+			}
+			for _, b := range patch {
+				h = (h ^ uint32(b)) * 16777619
+			}
+			binary.LittleEndian.PutUint32(data[d+60:], h)
 		}
 
 		pl.Placements = append(pl.Placements, Placement{

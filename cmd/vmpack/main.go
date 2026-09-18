@@ -102,6 +102,7 @@ func main() {
 
 	// 字节码加密（M2.2）：用 blob 的主密钥逐函数密封。密钥来自 manifest（vmpbuild 生成）。
 	dumpSeq := 0
+	var patchKey [8]byte
 	var enc inject.EncryptFunc
 	if !*noEncrypt && man.Key != "" {
 		key, err := hex.DecodeString(man.Key)
@@ -128,6 +129,7 @@ func main() {
 			copy(tag[:], sealed[len(sealed)-16:])
 			return sealed[:len(sealed)-16], nonce, tag, nil
 		}
+		copy(patchKey[:], key[:8])
 		fmt.Printf("[*] 字节码加密: ChaCha20-Poly1305（%d 字节密钥，来自 blob manifest）", len(key))
 		fmt.Println()
 	}
@@ -185,9 +187,9 @@ func main() {
 
 	var res *inject.Result
 	if isELF {
-		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
+		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
 	} else {
-		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
+		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
 	for _, p := range res.Placements {
@@ -283,7 +285,7 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 	return specs, nil
 }
 
-func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
+func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
 	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
@@ -334,7 +336,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	}, opcodeMap, verbose)
 	must(err)
 
-	res, err := inject.Apply(f, inject.Options{SectionName: section, Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize})
+	res, err := inject.Apply(f, inject.Options{SectionName: section, Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize})
 	must(err)
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新节 %s: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",
@@ -346,7 +348,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	return res
 }
 
-func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
+func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
 	f, err := elfload.Open(exe)
 	must(err)
 	imageBase := f.ImageBase()
@@ -385,7 +387,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 	}, opcodeMap, verbose)
 	must(err)
 
-	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize})
+	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize})
 	must(err)
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新 PT_LOAD: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",
