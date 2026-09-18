@@ -272,6 +272,8 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		// （flags 的 bit8..15 = 补丁长度，pad[0..3] = FNV-1a(key[0:8] ++ patch)）。
 		// 运行期由解释器用**实时读到的**入口字节重算，不一致直接崩 —— 堵住"按尾声补回 5 字节"。
 		if opt.Encrypt != nil && opt.PatchKey != ([8]byte{}) {
+			// 补丁位置写成「相对描述符的偏移」，运行期据此直接定位（跨 PE/ELF 一致）。
+			binary.LittleEndian.PutUint32(data[d+28:], uint32(int32(fn.RVA)-int32(baseRVA+uint32(d))))
 			binary.LittleEndian.PutUint32(data[d+20:], binary.LittleEndian.Uint32(data[d+20:])|uint32(len(patch)&0xFF)<<8)
 			h := uint32(2166136261)
 			for _, b := range opt.PatchKey {
