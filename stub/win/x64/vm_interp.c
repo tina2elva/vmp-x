@@ -529,6 +529,9 @@ u64 vm_call_diff_off;
 u64 vm_call_diff_before;
 u64 vm_call_diff_after;
 u64 vm_call_diffs;
+/* 最近 8 次 CALLN/CALLR 的 (目标, 调用后的 RAX) —— 用来看"某次间接调用到底返回了什么"。 */
+u64 vm_call_ring[16]; /* 8 组 (target, rax) */
+u32 vm_call_ring_n;
 #endif
 
 /* 解释器的**私有客户机栈**：
@@ -1197,6 +1200,11 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
 #endif
             vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
                                 vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+#ifndef VM_RELEASE
+            vm_call_ring[(vm_call_ring_n & 7u) * 2u] = addr;
+            vm_call_ring[(vm_call_ring_n & 7u) * 2u + 1u] = vm->regs[VRAX];
+            vm_call_ring_n++;
+#endif
             vm->pc = pc + 9;
             break;
         }
@@ -1213,6 +1221,11 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             fnr_t fn = (fnr_t)addr;
             vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
                                 vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+#ifndef VM_RELEASE
+            vm_call_ring[(vm_call_ring_n & 7u) * 2u] = addr | 0x8000000000000000ull;
+            vm_call_ring[(vm_call_ring_n & 7u) * 2u + 1u] = vm->regs[VRAX];
+            vm_call_ring_n++;
+#endif
             vm->pc = pc + 2;
             break;
         }

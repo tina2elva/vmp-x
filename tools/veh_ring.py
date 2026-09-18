@@ -126,6 +126,13 @@ def handler(info):
         hlog('VEH handler failed: %r' % (e,))
     except Exception:
         pass
+  if CFG.get('once'):
+    try:
+      sys.stdout.flush()
+      sys.stderr.flush()
+    except Exception:
+      pass
+    os._exit(3)   # --once：打印完立刻结束，避免异常反复触发刷屏（CI 上就吃过这个亏）
   return 0  # EXCEPTION_CONTINUE_SEARCH
 
 
@@ -139,6 +146,7 @@ def main():
     ap.add_argument('--ring-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--probe-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--probe2-rva', type=lambda s: int(s, 0), default=None)
+    ap.add_argument('--once', action='store_true', help='只报告第一次异常，然后立即结束进程')
     ap.add_argument('--read-rva', action='append', default=[], help='name=0xRVA[:u32|u64]，崩溃时打印该处内存')
     ap.add_argument('--dump-rva', action='append', default=[], help='name=0xRVA:count，崩溃时按 u64 打印 count 个值')
     a = ap.parse_args()
@@ -150,6 +158,7 @@ def main():
     CFG['reads'] = [x.split('=') for x in a.read_rva]
     CFG['dumps'] = [x.split('=') for x in a.dump_rva]
     CFG['module_name'] = a.module_name
+    CFG['once'] = a.once
     proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.POINTER(EXCEPTION_POINTERS))
     global HANDLER
     HANDLER = proto(handler)  # 必须留引用：临时对象会被回收，回调就变成野指针
