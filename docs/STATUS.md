@@ -684,6 +684,11 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ### 429. 补：Linux 侧的 bash 夹具同样要补映射
+> 本地 `.ps1` 通了但 CI 的 `linux-amd64` 仍红 —— 因为 CI 跑的是 `tools/verify_linux_payload.sh`（另一个实现），
+> 它同样只映射 payload。已给 `payload_probe_linux.c` 加上"非数字参数=补丁文件"的处理（mmap 目标页后写入），
+> 并在 `.sh` 里传 `-patchout` / 补丁文件。这条只能靠 CI 验证（本地没有 Linux 头文件）。
+>
 > ## 新目标 第 6 轮：ELF 也开上了**运行期补丁校验**（台账项关闭）
 >
 > ### 427. 做法：让夹具把"目标入口页"补上

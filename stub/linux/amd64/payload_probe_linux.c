@@ -77,6 +77,45 @@ static unsigned char *read_file(const char *p, long *n) {
     return b;
 }
 
+/* 可选：最后一个非数字参数是补丁文件，每行 "<相对 payload 起点的偏移> <hex 字节>"。
+ * 运行期补丁校验要读目标函数入口那几个字节；探针只映射 payload 段，目标页不在映射里，
+ * 于是校验会失败并被 ud2 打死。把补丁字节补到对应地址，探针环境才与真实镜像等价。 */
+static void apply_patch_file(void *mem, long n, unsigned long long va, const char *path) {
+    FILE *f = fopen(path, "r");
+    char line[512];
+    if (!f) { fprintf(stderr, "[!] cannot read patch file %s\n", path); _exit(2); }
+    while (fgets(line, sizeof(line), f)) {
+        char *sp = strchr(line, ' ');
+        unsigned char bytes[64];
+        int len = 0;
+        long off;
+        unsigned char *dst;
+        if (!sp) continue;
+        *sp = 0;
+        off = strtol(line, NULL, 10);
+        sp++;
+        while (*sp && *sp != '\n' && *sp != '\r' && len < (int)sizeof(bytes)) {
+            unsigned int v;
+            if (sscanf(sp, "%2x", &v) != 1) break;
+            bytes[len++] = (unsigned char)v;
+            sp += 2;
+        }
+        if (len <= 0) continue;
+        if (off < 0 || (unsigned long long)off + (unsigned long long)len > (unsigned long long)n) {
+            unsigned long long addr = va + (unsigned long long)off;
+            unsigned long long page = addr & ~0xFFFULL;
+            void *p = mmap((void *)(uintptr_t)page, 0x1000, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (p == MAP_FAILED) { fprintf(stderr, "[!] mmap patch page 0x%llX failed\n", page); _exit(2); }
+            dst = (unsigned char *)(uintptr_t)addr;
+        } else {
+            dst = (unsigned char *)mem + off;
+        }
+        memcpy(dst, bytes, (size_t)len);
+        printf("patch %d bytes -> %p (off %ld)\n", len, (void *)dst, off);
+    }
+    fclose(f);
+}
 int main(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr, "usage: payload_probe_linux <payload.bin> <va> <thunkOff> <vm_runOff> <vm_entryOff> <arg>...\n");
@@ -114,10 +153,19 @@ int main(int argc, char **argv) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
 
+    /* 非数字参数视为补丁文件（可多个） */
+    for (int i = 6; i < argc; i++) {
+        if (!(argv[i][0] >= '0' && argv[i][0] <= '9') && argv[i][0] != '-') {
+            apply_patch_file(mem, n, va, argv[i]);
+        }
+    }
+
     void *thunk = (unsigned char *)mem + thunkOff;
     printf("payload @ %p (va=0x%llX, %ld bytes), thunk @ %p\n", mem, va, n, thunk);
     for (int i = 6; i < argc; i++) {
-        unsigned long long arg = strtoull(argv[i], NULL, 0);
+        unsigned long long arg;
+        if (!(argv[i][0] >= '0' && argv[i][0] <= '9') && argv[i][0] != '-') continue; /* 补丁文件名 */
+        arg = strtoull(argv[i], NULL, 0);
         unsigned long long got = call_thunk(thunk, arg);
         printf("  checkKey(%llu) = %llu\n", arg, got);
     }
