@@ -143,6 +143,31 @@ __pyx_pf_7example_2fibonacci: RVA=0x13A0 native=851B -> 310 IR -> 2223B bytecode
 
 也就是说：**Python 层的 `fibonacci()` 调用现在走 VM 执行，结果不变**。
 
+### 多函数保护（第 8 轮实测）
+
+一次保护多个函数：把 `-func` 重复即可（一个函数一份描述符/thunk/字节码槽，独立加密、独立校验）：
+
+```powershell
+powershell -NoProfile -File tools/e2e_pyd.ps1 -Pyd <pyd> -Map <map> \
+  -Func __pyx_pf_7example_n -Func __pyx_pf_7example_2fibonacci \
+  -Func __pyx_pymod_create -Func __pyx_bisect_code_objects \
+  -Expr "print('fib(10)=', example.fibonacci(10)); print('n.shape=', example.n().shape)"
+```
+
+`example.cp313-win_amd64.pyd` 里 `.map` 能命名的 14 个函数实测：
+
+| 结果 | 数量 | 说明 |
+|---|---|---|
+| 能翻译且**运行正确** | **4** | `__pyx_pf_7example_n` / `__pyx_pf_7example_2fibonacci` / `__pyx_pymod_create` / `__pyx_bisect_code_objects` |
+| 能翻译但**运行崩溃** | **2** | `__pyx_pf_7example_6current_time_str`、`__pyx_pw_7example_9add_dly`（单独打包、单独调用同样崩，不是多函数相互影响） |
+| 翻译阶段就拒绝 | 8 | 6 个「函数末尾不是 RET」（尾声是间接尾调用/跳转桩）、1 个「1/125 条指令无法翻译」、1 个「+0x0 是 JMP」 |
+
+多函数产物的结构复测（4 个函数）：补丁 4 条全部落在我们的新节（`0x1010/0x13A0/0x2BC0/0x6450`），
+`.pdata` 里 4 条记录全部清除，回填尝试（一次补回 4 处原始字节）被加载期校验拒绝，行为与原生完全一致。
+
+**结论（重要）**：能翻译不等于能跑对。扩大保护面会立刻暴露解释器在个别函数上的运行时缺陷 ——
+这也是 (f) 这一条的价值：把覆盖口径从「翻译成功率」改成「翻译 + 运行都成功」。
+
 注意事项：
 
 - `.map` 的 `Publics by Value` 一节里第三列是 VA（含 Preferred load address），减去它即 RVA；
