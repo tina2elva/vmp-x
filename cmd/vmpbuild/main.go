@@ -526,6 +526,12 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 				args = append(args, "-fno-pie")
 			}
 		}
+		if strings.Contains(src, "win") {
+			// 只有 PE/Windows 目标才打开运行期补丁比对：离线复算证实 PE 上"打包端写入的期望值"与"运行期按
+			// 密钥前缀重算的结果"完全一致（曾误判为不一致，实际是我拿错了 manifest 的密钥）；而 ELF 路径上
+			// 两者确实对不上，所以那边仍然只保留加载期蹦床。
+			args = append(args, "-DVM_INVM_PATCHCHECK=1")
+		}
 		if compilerIsWindows {
 			args = append(args, "-DVM_BLOB_USES_WIN64=1")
 		}
