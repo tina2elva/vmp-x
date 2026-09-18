@@ -54,6 +54,10 @@ type Options struct {
 	EntryHook bool
 	// VerifyFn：vm_verify_table 在 blob 内的偏移（manifest 的 symbols 里查）。
 	VerifyFn int
+	// ScratchOff/ScratchLen：blob 里"纯暂存"区间（解释器的解密缓存）——它在被写之前不会被读，
+	// 所以打包时可以用密钥派生的伪随机字节填满：`.vmpb` 不再是"全 0 的可疑段"。
+	ScratchOff int
+	ScratchLen int
 	// EntryRVA：目标原本的入口点 RVA（蹦床校验完要跳回去）。
 	EntryRVA uint32
 	// PatchKey：入口补丁完整性校验用的密钥前缀（通常取 blob 主密钥前 8 字节）。
@@ -185,6 +189,20 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		codeOffs[i] = len(data)
 		data = append(data, body...)
 		align(16)
+	}
+
+	// (e) .vmpb 反特征：把"纯暂存"区填成密钥派生的伪随机字节（xorshift，够用且零成本）。
+	if opt.ScratchOff > 0 && opt.ScratchLen > 0 && opt.ScratchOff+opt.ScratchLen <= len(data) {
+		var s uint64 = 0x9E3779B97F4A7C15
+		for _, b := range opt.PatchKey {
+			s = s*6364136223846793005 + uint64(b) + 1442695040888963407
+		}
+		for i := opt.ScratchOff; i < opt.ScratchOff+opt.ScratchLen; i++ {
+			s ^= s << 13
+			s ^= s >> 7
+			s ^= s << 17
+			data[i] = byte(s)
+		}
 	}
 
 	var placements []Placement

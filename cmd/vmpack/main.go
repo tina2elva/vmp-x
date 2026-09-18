@@ -185,15 +185,27 @@ func main() {
 		fmt.Println("[*] 已载入 MAP：按名字定位函数")
 	}
 
+	scratchOff, hasCache := man.Symbols["vm_bc_cache"]
+	scratchEnd, hasLock := man.Symbols["vm_bc_lock"]
+	scratchLen := 0
+	if hasCache && hasLock && scratchEnd > scratchOff {
+		scratchLen = scratchEnd - scratchOff
+	}
 	var res *inject.Result
 	if isELF {
-		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
+		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
 	} else {
+		scratchOff, hasCache := man.Symbols["vm_bc_cache"]
+		scratchEnd, hasLock := man.Symbols["vm_bc_lock"]
+		scratchLen := 0
+		if hasCache && hasLock && scratchEnd > scratchOff {
+			scratchLen = scratchEnd - scratchOff
+		}
 		verifyFn, hasVerify := man.Symbols["vm_verify_table"]
 		if !hasVerify {
 			verifyFn = -1
 		}
-		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFn, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
+		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFn, scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
 	for _, p := range res.Placements {
@@ -289,7 +301,7 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 	return specs, nil
 }
 
-func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn int, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
+func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
 	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
@@ -342,7 +354,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 
 	entryRVA, _ := inject.EntryRVA(f)
 	res, err := inject.Apply(f, inject.Options{SectionName: section, Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
-		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize,
+		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
 		EntryHook: patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0,
 		VerifyFn:  verifyFn,
 		EntryRVA:  entryRVA})
@@ -357,7 +369,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	return res
 }
 
-func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
+func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
 	f, err := elfload.Open(exe)
 	must(err)
 	imageBase := f.ImageBase()
