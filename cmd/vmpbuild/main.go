@@ -431,6 +431,10 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		// 把浮点写回加进来会让 gcc 对**整个函数**启用更激进的别名假设，
 		// 结果连不执行浮点的函数都算错（实测就是这么来的）。
 		"-fno-strict-aliasing",
+		// Windows 栈是按需增长加哨兵页：一次跨过 4KB 以上的栈访问会跳过哨兵页直接失败。
+		// 现象就是本项目的 current_time_str：0xC0000005，把 margin 调小又变成 0xC0000409 快速失败，
+		// 且与线程栈大小无关（64MB 栈线程里照样失败）。gcc 的 -fstack-clash-protection 会逐页探测，正是解法。
+		"-fstack-clash-protection",
 		"-Wall", "-Wextra",
 	}
 	if isX86Host {
