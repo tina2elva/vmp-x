@@ -552,6 +552,9 @@ static void vm_selfcheck(void) {
     if (h != vm_self_hash) __builtin_trap();
 }
 
+/* 解释器的**私有客户机栈**（见 vm_run 里的说明）。 */
+static u8 vm_guest_stack[256 * 1024];
+
 #if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
 static int vm_debugger_present(void) {
     const u8 *peb;
@@ -570,6 +573,15 @@ static void vm_antidebug(void) { }
 int vm_run(vm_ctx_t *vm) {
     vm_antidebug();
     vm_selfcheck();
+    if (vm->desc) {
+        /* 客户机栈改用**私有缓冲**：原来 guest SP = host_sp - VM_MARGIN，VM 里发起的原生调用
+         * （Cython/numpy）的帧从 host_sp 往下长，超过 margin 就压到 guest 栈上（实测一次 CALLN
+         * 改掉 guest 栈顶 32 个 qword 里的 31 个）。切到私有缓冲后两者彻底不重叠。
+         * 只在有描述符（= 走入口桩进来）时做：测试宿主自己摆好了模拟栈，不能动。 */
+        /* 注意：Windows 上 unsigned long 是 **32 位**，(u64)(unsigned long)ptr 会把地址截断 ——
+         * 我第一版就栽在这里：guest SP 变成 0x4E54A00，接着第一条 push 写到 0x4E549F8 直接违例。 */
+        vm->regs[VRSP] = ((u64)(unsigned long long)vm_guest_stack + sizeof(vm_guest_stack)) & ~(u64)15;
+    }
     int slot = -1;
 #ifndef VM_RELEASE
     vm_last_pc = 0xAA000001u; /* 已进入 vm_run */
@@ -660,7 +672,7 @@ int vm_run(vm_ctx_t *vm) {
 #ifndef VM_RELEASE /* release 构建不带任何诊断状态：少一份明文、少一族特征 */
     vm_diag[0] = vm->regs[0];          /* 入口 X0（客户机参数） */
     vm_diag[1] = rsp_start;            /* 入口模拟 SP */
-    vm_diag[2] = (u64)(unsigned long)vm->code; /* 明文/密文字节码指针（freestanding，别用 uintptr_t） */
+    vm_diag[2] = (u64)(unsigned long long)vm->code; /* 明文/密文字节码指针（Windows 的 unsigned long 是 32 位，会截断） */
     vm_diag[3] = vm->codeLen;
     if (vm->code) {
         for (int i = 0; i < 8; i++) { /* 前 64 字节：字节码都不超过这个长度，够看清循环与分支 */
