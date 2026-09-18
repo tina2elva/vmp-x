@@ -122,7 +122,26 @@ def main():
     print('    protected %s -> remaining unwind records: %d %s' %
           (['0x%X' % x for x in prot], len(found), '' if not found else str([hex(f) for f in found])))
 
-    print('[5] rollback attempt (restore overwritten bytes, then run)')
+    print('[5] printable strings in our sections')
+    import re as _re
+    strings = []
+    for s in ours:
+        body = d[s['roff']:s['roff'] + s['rsz']]
+        for m in _re.finditer(rb'[ -~]{6,}', body):
+            wr = m.group().decode('ascii')
+            strings.append(wr)
+    interesting = [x for x in strings if not x.startswith('    ')]
+    print('    runs>=6: %d (in our sections); sample: %s' %
+          (len(strings), '; '.join(interesting[:8])[:160] if interesting else '-'))
+
+    print('[6] crypto constant signatures')
+    canon = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]  # ChaCha sigma
+    hits = [hex(w) for w in canon if struct.pack('<I', w) in d]
+    print('    ChaCha sigma words present: %s' % (hits if hits else 'NONE'))
+    print('    Poly1305 mask 0x3ffffff : %s' %
+          ('PRESENT' if struct.pack('<I', 0x3FFFFFF) in d else 'NONE'))
+
+    print('[7] rollback attempt (restore overwritten bytes, then run)')
     if not (a.orig and prot):
         print('    skipped (need --orig and --report)')
     else:

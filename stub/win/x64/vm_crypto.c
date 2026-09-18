@@ -22,7 +22,18 @@ static u32 load32le(const u8 *p) {
 
 static void chacha20_block(const u8 key[32], u32 counter, const u8 nonce[12], u8 out[64]) {
     u32 st[16];
+#if defined(VM_SIGMA_MASK)
+    /* sigma 常量按构建随机化：存的字是 (规范值 ^ 主密钥前 4 字节)，掩码在**运行期**从 key 取。
+     * 关键点：掩码必须是运行期的 —— 如果两边都是编译期常量，编译器会把异或折回规范值，
+     * 静态分析照样一眼认出 ChaCha（我第一次就是这么写的，实测规范字仍在 blob 里）。 */
+    u32 sm = load32le(key);
+    st[0] = VM_SIGMA_OBF0 ^ sm;
+    st[1] = VM_SIGMA_OBF1 ^ sm;
+    st[2] = VM_SIGMA_OBF2 ^ sm;
+    st[3] = VM_SIGMA_OBF3 ^ sm;
+#else
     st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574;
+#endif
     for (int i = 0; i < 8; i++) st[4 + i] = load32le(key + 4 * i);
     st[12] = counter;
     for (int i = 0; i < 3; i++) st[13 + i] = load32le(nonce + 4 * i);

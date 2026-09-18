@@ -364,6 +364,13 @@ func generateKeyFile(tmp string) (string, string, error) {
 		fmt.Fprintf(&sb, "0x%02X", b)
 	}
 	sb.WriteString("}" + nl)
+	// ChaCha 的 sigma 常量按**本次构建**随机化：规范值就是那 16 个 ASCII 字节，
+	// 静态分析一眼就能认出用的是哪种流密码。这里存 (规范值 ^ mask)，mask 只存在于本次构建。
+	sigmaMask := uint32(key[0]) | uint32(key[1])<<8 | uint32(key[2])<<16 | uint32(key[3])<<24
+	sb.WriteString(fmt.Sprintf("#define VM_SIGMA_MASK 0x%08Xu"+nl, sigmaMask))
+	for i, w := range []uint32{0x61707865, 0x3320646e, 0x79622d32, 0x6b206574} {
+		sb.WriteString(fmt.Sprintf("#define VM_SIGMA_OBF%d 0x%08Xu"+nl, i, w^sigmaMask))
+	}
 	sb.WriteString("#endif" + nl)
 	p := filepath.Join(outDir, "vm_crypto_key.h")
 	if err := os.WriteFile(p, []byte(sb.String()), 0o644); err != nil {
