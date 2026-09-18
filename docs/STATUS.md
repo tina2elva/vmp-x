@@ -684,6 +684,28 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第三十八轮（收尾）：CI 回到 5/5 全绿，且 **ELF 入口挂钩已被运行时验证**
+>
+> ```
+> sha=3960ac97  →  linux-amd64 ✓  linux-arm64 ✓  windows-amd64 ✓  windows-arm64-blob ✓  windows-arm64-run ✓
+> ```
+> 关键意义：`linux-amd64` 作业会**原生运行**打包后的 ELF —— 它通过，说明第 37 轮实现的
+> SysV 校验蹦床（push rdx / mov r12,rsp / and rsp,-16 / lea rdi,[表] / call 校验 / jmp 原入口）
+> **在真实 Linux 上确实工作**，也就是 (c) 在 ELF 上的加载期拦截点成立。
+>
+> ### 398. 本轮修掉的两个 CI 阻塞（都不是功能问题，而是"平台分支/可见性"这类细节）
+> 1. `vm_selfcheck` 被反调试的 `#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)` 挡住 →
+>    只有 win/x64 会编进这段代码，其他平台 `vm_run` 里调用它就成了未定义符号（四个 job 全红）；
+>    本地门禁只编 win/x64，所以一直绿 —— 教训：**跨平台构建只能靠 CI**。
+> 2. `vm_entry` 在 linux/amd64 上走了 GOT（`R_X86_64_REX_GOTPCRELX`）：PIE 默认下编译器认为它可被抢占；
+>    加 `__attribute__((visibility("hidden")))` 后回到 PC 相对引用。
+>    本地那条"linux/amd64"其实是用 **mingw（Windows ABI）** 编的，不产生 GOT 重定位 —— 所以同样只能在 CI 里暴露。
+>
+> ### 399. 逐项复核目标清单时发现 (a) 还没做完
+> 检查产物节名：`.text/.rdata/.data/.pdata/.rsrc/.reloc` **加上固定的 `.vmp/.vmpb/.vmpc`** ——
+> 也就是说 **段名随机化从未实现**（它明确写在目标 (a) 里）。这本身就是一处明显特征（三个 `.vmp*` 节名）。
+> 因此目标**保持 active**，下一轮先补这一项。
+>
 > ## 第三十八轮（续）：linux-amd64 剩下的那条 —— vm_entry 走了 GOT
 >
 > CI 注解：`[!] .text+0xCEE: 不支持的重定位类型 0x2A (format=elf sym="vm_entry" addend=-4)`，
