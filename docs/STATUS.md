@@ -684,6 +684,24 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第二十七轮：CI 从 5 红变 4 绿，只剩 linux-arm64 一步
+>
+> ### 380. CI 现状（2967f973）
+> linux-amd64 ✓（payload probe、ELF E2E 都绿）、windows-amd64 ✓（E2E 146、DLL 3、arm64 guest 差分、Linux payload）、
+> windows-arm64-blob ✓、windows-arm64-run ✓、**linux-arm64 ✗**。
+>
+> ### 381. 唯一残留：arm64 的 GNU 工具链产生了绝对重定位
+> CI 注解给出确切错误：`[!] .text+0x854: 不支持的重定位类型 0x1`（R_AARCH64_ABS64）。
+> 也就是说合并器在 aarch64 上遇到绝对重定位就拒绝（与"stub 必须位置无关"一致），
+> 但 aarch64-linux-gnu-gcc 默认编出的这段代码带了绝对重定位。下一步：给 aarch64 的 blob 编译加位置无关选项，
+> 或在合并器里支持这一种重定位（x64 路径已有处理）。
+> 本地没有 aarch64 交叉工具链，用 clang --target=aarch64-linux-gnu 试编时又卡在 GNU as 语法差异上，暂时无法本地复现。
+>
+> ### 382. 遗留：运行期补丁校验的哈希对不上（已默认关闭）
+> 离线复算发现：PE 与 ELF 上，描述符 pad 里的期望值都不等于「manifest 密钥前 8 字节 + 入口补丁字节」的 FNV，
+> 而运行期用编译进 blob 的 VM_KEY_BYTES 前缀重算 —— 两边不一致。因为 (c) 的实际防线是加载期入口蹦床
+> （PE 已验证能拒绝回填），我把这段比对改成 #ifdef VM_INVM_PATCHCHECK、默认不编译，并把这个不一致记在这里待查。
+>
 > ## 第二十六轮：修掉两个让 CI 长期变红的原因
 >
 > ### 377. (c) 的运行期比对默认关闭（这是 ELF/arm64 三个红步骤的根因）
