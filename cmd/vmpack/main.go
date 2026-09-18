@@ -212,6 +212,7 @@ func main() {
 			verifyFn = -1
 		}
 		*section = sectionNamesFor(*section)
+		bytecodeLimitFlag = bytecodeLimit(man.Symbols, stub)
 		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFn, scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
@@ -309,6 +310,11 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 			return nil, err
 		}
 		gen.Code = mapped
+		if bytecodeLimitFlag > 0 && len(gen.Code) > bytecodeLimitFlag {
+			return nil, fmt.Errorf("%s: 生成的字节码 %d 字节超过解释器缓存槽上限 %d —— 超限时 vm_run 会返回错误码，"+
+				"而调用方会把那个返回值当成函数结果（静默算错，实测表现为崩在第三方库里）。"+
+				"修法：调大 stub 里的 VM_BC_SLOT_SIZE 后重编 blob", name, len(gen.Code), bytecodeLimitFlag)
+		}
 		fmt.Printf("    %s: RVA=0x%X native=%dB -> %d IR -> %dB bytecode",
 			name, found.RVA, len(found.Code), len(irFunc.Insns), len(gen.Code))
 		fmt.Println()
@@ -451,6 +457,19 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 }
 
 // sectionNames：本次打包实际使用的三个节名（main 里决定，packPE 里读取）。
+// bytecodeLimitFlag：解释器缓存槽容量上限（从 blob 的 vm_bc_slot_size 常量读出）。
+// 超限时 vm_run 会返回错误码，而调用方会把返回值当函数结果 —— 静默算错，必须在打包期拦住。
+var bytecodeLimitFlag int
+
+// bytecodeLimit 从 blob 里读 vm_bc_slot_size：它是个 const，值就写在 blob 的 .rdata 里。
+func bytecodeLimit(syms map[string]int, stub []byte) int {
+	off, ok := syms["vm_bc_slot_size"]
+	if !ok || off+8 > len(stub) {
+		return 0 // 老 blob：取不到就不检查
+	}
+	return int(binary.LittleEndian.Uint64(stub[off:]))
+}
+
 var sectionNames [3]string
 
 // sectionNamesFor：用户显式给了 -section 就用它（并按老规矩 +b/+c 派生）；

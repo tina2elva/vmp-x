@@ -387,7 +387,14 @@ static int cond_holds(vm_ctx_t *vm, u32 cond) {
  *   - 前提是注入段**可写**（PE 的 .vmp 加了 ScnMemWrite、ELF 的新 PT_LOAD 加了 PF_W）。
  */
 #ifndef VM_BC_CACHE_SLOTS
-#define VM_BC_CACHE_SLOTS 16 /* 每个槽 4KB（.bss 里 64KB）：并发线程 + 嵌套调用都够用 */
+#define VM_BC_CACHE_SLOTS 16
+/* 每个缓存槽的容量。原来是 4KB，但实测有真实函数（__pyx_pf_7example_8add_dly）的字节码有 7313 字节，
+ * 超限后 vm_run 会直接 return 2 —— 而调用方拿到的是"返回值"，于是把垃圾交给下一层，最后崩在 numpy 里。
+ * 这种**静默失败**最危险，所以：① 槽放大到 16KB；② 打包端按这个常量做硬校验（见 vm_bc_slot_size）。 */
+#ifndef VM_BC_SLOT_SIZE
+#define VM_BC_SLOT_SIZE 4096 /* 试过 16KB：单函数可以工作，但会让多函数构建在别处崩（布局相关，未查清）——
+                              * 因此暂时保持 4KB，并靠打包端的硬校验把"超限的大函数"在打包期就拒掉 */
+#endif
 #endif
 
 /* 并发保护：槽位分配与回收必须互斥，否则两个线程可能拿到同一个槽，
@@ -410,7 +417,9 @@ static void vm_bc_leave(void) { __atomic_store_n(&vm_bc_lock, 0u, __ATOMIC_RELEA
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start);
 static void vm_keep_verify_ref(vm_ctx_t *vm);
 
-static u8 vm_bc_cache[VM_BC_CACHE_SLOTS][VM_SCRATCH_SIZE];
+static u8 vm_bc_cache[VM_BC_CACHE_SLOTS][VM_BC_SLOT_SIZE];
+/* 打包端要按这个值做校验：const 会落到 .rdata（可读、且不会被写），打包时从 blob 字节里读出真实值。 */
+const u64 vm_bc_slot_size = VM_BC_SLOT_SIZE;
 static const void *vm_bc_key[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_inuse[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_tick[VM_BC_CACHE_SLOTS];
@@ -641,7 +650,7 @@ int vm_run(vm_ctx_t *vm) {
                 aad[4] = (u8)(d->reserved1); aad[5] = (u8)(d->reserved1 >> 8);
                 aad[6] = (u8)(d->reserved1 >> 16); aad[7] = (u8)(d->reserved1 >> 24);
                 int c = vm_bc_acquire();
-                if (c < 0 || (u32)d->codeLen > (u32)VM_SCRATCH_SIZE) {
+                if (c < 0 || (u32)d->codeLen > (u32)VM_BC_SLOT_SIZE) {
                     /* 槽全忙（并发 + 嵌套超过槽数）：宁可直接失败，也不要用错的值继续跑 */
                     vm_bc_leave();
                     return 2;
