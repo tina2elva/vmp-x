@@ -358,7 +358,30 @@ static DWORD WINAPI mt_worker(LPVOID p) {
     return 0;
 }
 
+/* 崩溃自证：CI 上 mt 偶发崩溃时，注解里只有"protected 为空"，看不到崩在哪。
+ * 这里装一个顶层异常过滤器，把异常码、故障地址、所属模块和模块内偏移打到 stderr ---
+ * E2E 的失败诊断会抓 stderr，于是 CI 注解里就能带上崩溃地址，便于映射回 blob 符号。 */
+static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
+    void *addr = (void *)ep->ExceptionRecord->ExceptionAddress;
+    HMODULE mod = NULL;
+    fprintf(stderr, "CRASH code=0x%08lX addr=%p", (unsigned long)ep->ExceptionRecord->ExceptionCode, addr);
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &mod) && mod) {
+        fprintf(stderr, " module=%p rva=0x%llX", (void *)mod,
+                (unsigned long long)((unsigned char *)addr - (unsigned char *)mod));
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int main(int argc, char **argv) {
+    SetUnhandledExceptionFilter(vmp_crash_filter);
+    if (argc >= 2 && strcmp(argv[1], "crash_test") == 0) { /* 自检用：故意解引用空指针 */
+        volatile int *nullp = (volatile int *)0;
+        *nullp = 1;
+        return 0;
+    }
     if (argc >= 2 && strcmp(argv[1], "mt") == 0) {
         enum { NT = 4 };
         HANDLE th[NT];
