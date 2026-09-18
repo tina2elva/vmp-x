@@ -285,9 +285,11 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[!] %s: %v", name, err)
 			fmt.Fprintln(os.Stderr)
-			for _, u := range irFunc.Unsupported {
-				fmt.Fprintf(os.Stderr, "      %s", u)
-				fmt.Fprintln(os.Stderr)
+			if irFunc != nil { // 出错时 lifter 可能返回 nil，直接解引用会 panic（CI 上真的发生过）
+				for _, u := range irFunc.Unsupported {
+					fmt.Fprintf(os.Stderr, "      %s", u)
+					fmt.Fprintln(os.Stderr)
+				}
 			}
 			os.Exit(1)
 		}

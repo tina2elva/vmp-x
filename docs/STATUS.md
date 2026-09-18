@@ -684,6 +684,17 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ### 461. 我引入的 arm64 回归：ELF 裁剪器用错了架构
+> `linux-arm64` 连续两次红，报 `[!] sum_to: 代码长度 29 不是 4 的倍数（A64 定长）` 并 panic。根因：
+> `internal/scan/elf.go` 里给"符号带 Size"的分支**一律调用 x86-64 的 `TrimTrailingPadding`**，与目标架构无关。
+> 以前它必然失败（arm64 字节里解不出 x86 的 RET）→ 走 fallback 用**未裁剪**的整段（天然 4 的倍数）→ 一直是对的；
+> 我把 x86 裁剪器的"末尾必须是 RET"放宽成"RET 或直接 JMP"之后，它在 arm64 字节上也能"成功"了，
+> 于是裁出 29 字节这种非 4 倍数长度 → aarch64 lifter 拒绝。
+> 修法：按 `df.FileHeader.Machine == elf.EM_AARCH64` 选 `trimTrailingPaddingARM64`（定长裁剪），x86-64 才用 `TrimTrailingPadding`；
+> 两处（带 Size 与不带 Size 的分支）都改。顺带修掉错误路径里的 panic：lifter 出错时可能返回 nil，`irFunc.Unsupported` 直接解引用就崩
+> （CI 的堆栈里就是 `main.liftAll` → `main.go:288`）。
+> 本地门禁 8/8（含 linux/amd64 载荷差分）；arm64 只能靠 CI 验证。
+>
 > ## 新目标（覆盖口径）第 9 轮：**单函数翻译 11/11**，端到端 10/11
 >
 > ### 458. 新能力：常量偏移的"栈地址物化"

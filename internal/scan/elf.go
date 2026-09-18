@@ -48,8 +48,20 @@ func FindFunctionELF(path string, imageBase uint64, name string) (*Found, error)
 		if err != nil {
 			return nil, err
 		}
-		// 去掉尾部对齐填充（函数之间常有 nop）
-		if trimmed, n, terr := TrimTrailingPadding(imageBase, rva, code); terr == nil && len(trimmed) >= 5 {
+		// 去掉尾部对齐填充（函数之间常有 nop）。**必须按架构选裁剪器**：
+		// 原先一律用 x86-64 的那个，在 arm64 上会把随机字节当成 RET/JMP 解码成功，
+		// 裁出 29 这种非 4 倍数长度（aarch64 lifter 随即报“代码长度不是 4 的倍数”）。
+		var trimmed []byte
+		var n int
+		var terr error
+		minLen := 5
+		if df.FileHeader.Machine == elf.EM_AARCH64 {
+			trimmed, n, terr = trimTrailingPaddingARM64(rva, code)
+			minLen = 4
+		} else {
+			trimmed, n, terr = TrimTrailingPadding(imageBase, rva, code)
+		}
+		if terr == nil && len(trimmed) >= minLen {
 			return &Found{Name: name, RVA: rva, End: rva + uint32(len(trimmed)), Code: trimmed, InstrNum: n}, nil
 		}
 		return &Found{Name: name, RVA: rva, End: rva + uint32(len(code)), Code: code}, nil
