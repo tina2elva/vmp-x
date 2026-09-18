@@ -684,6 +684,26 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第二十二轮：开始 (g) —— 反调试代码落地（行为验证还没通过，如实记录）
+>
+> ### 367. 实现
+> 在 vm_run 入口与 vm_verify_table 里调用 vm_antidebug()：直接读 PEB（x64 上 gs:[0x60] = PEB，
+> PEB+0x02 = BeingDebugged），命中就 __builtin_trap()（非法指令，进程立即死）。
+> 用 #ifdef VM_BLOB_USES_WIN64 保护（该宏由 vmpbuild 在编译器目标是 Windows 时定义，已核实会出现在编译命令里）；
+> 不依赖任何导入 —— blob 是 freestanding 的，调不到 IsDebuggerPresent。
+>
+> ### 368. 验证结果（还没通过）
+> · 代码确实进了 release blob：blob 里能找到 gs 段前缀指令与 ud2；
+> · 但行为测试失败：用 tools/antidebug_test.py 把 PEB.BeingDebugged 置 1（WriteProcessMemory 写回并读回确认是 1）
+>   之后，被保护函数**仍然正常返回 55**，没有触发 trap。
+> 也就是说"检测→拒绝"这条链路还没打通：要么读到的 BeingDebugged 不是我们写的那个位置，
+> 要么 vm_antidebug 的调用被优化/走了 #else 分支（非 release blob 里没找到 gs 前缀指令，这两件事互相矛盾，需要下一轮查清）。
+>
+> ### 369. 顺带修掉的一个真问题：vm_verify_table 曾经丢失
+> 本轮发现 stub/win/x64/vm_interp.c 里 **vm_verify_table 与 vm_keep_verify_ref 的定义都不见了**（早期文件事故留下的），
+> 而 Go 侧门禁只跑 go build/test、**不会编译 blob**，所以一直没被发现 —— 之前打包用的是旧 blob，才让 (c) 的复测依然显示 refused。
+> 现已补回定义并重建（manifest 里 vm_verify_table=9234）；教训：**门禁必须包含"能构建 blob"**，已列入 tools/gates.ps1 的待办。
+>
 > ## 第二十一轮：用「寄存器写入者表」追到坏值的来源是一处栈槽
 >
 > ### 364. 探针：每个 guest 寄存器最后被哪条 pc 改的
