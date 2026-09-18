@@ -31,12 +31,14 @@ import (
 )
 
 type stubManifest struct {
-	EntryOff  int            `json:"entryOff"`
-	BSSOff    int            `json:"bssOff"`
-	BSSSize   int            `json:"bssSize"`
-	Key       string         `json:"key"`
-	BlobSize  int            `json:"blobSize"`
-	FrameSkew int            `json:"frameSkew"`
+	EntryOff  int    `json:"entryOff"`
+	BSSOff    int    `json:"bssOff"`
+	BSSSize   int    `json:"bssSize"`
+	Key       string `json:"key"`
+	BlobSize  int    `json:"blobSize"`
+	FrameSkew int    `json:"frameSkew"`
+	// DescMagic：blob 期望的描述符魔数（release 构建每次不同，见 vmpbuild -release）。
+	DescMagic uint32         `json:"descMagic"`
 	Symbols   map[string]int `json:"symbols"`
 	OpcodeMap map[string]int `json:"opcodeMap"` // 本 blob 的操作码编码（M2 起每 blob 随机）
 }
@@ -183,9 +185,9 @@ func main() {
 
 	var res *inject.Result
 	if isELF {
-		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
+		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
 	} else {
-		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
+		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
 	for _, p := range res.Placements {
@@ -281,7 +283,7 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 	return specs, nil
 }
 
-func packPE(exe, outPath string, stub []byte, entryOff, frameSkew, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
+func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
 	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
@@ -332,7 +334,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew, bssOff, bssSi
 	}, opcodeMap, verbose)
 	must(err)
 
-	res, err := inject.Apply(f, inject.Options{SectionName: section, Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, BSSOff: bssOff, BSSSize: bssSize})
+	res, err := inject.Apply(f, inject.Options{SectionName: section, Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, BSSOff: bssOff, BSSSize: bssSize})
 	must(err)
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新节 %s: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",
@@ -344,7 +346,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew, bssOff, bssSi
 	return res
 }
 
-func packELF(exe, outPath string, stub []byte, entryOff, frameSkew, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
+func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
 	f, err := elfload.Open(exe)
 	must(err)
 	imageBase := f.ImageBase()
@@ -383,7 +385,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew, bssOff, bssS
 	}, opcodeMap, verbose)
 	must(err)
 
-	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, BSSOff: bssOff, BSSSize: bssSize})
+	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, BSSOff: bssOff, BSSSize: bssSize})
 	must(err)
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新 PT_LOAD: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",

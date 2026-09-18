@@ -46,6 +46,9 @@ type Options struct {
 	// 它必须被单独映射成一个 **RW** 段，其余部分按 RX 映射（代码段不该可写）。
 	BSSOff  int
 	BSSSize int
+	// DescMagic：写进描述符的魔数。0 表示用默认常量；release 构建由 vmpack 从 manifest 传入
+	// 每次构建不同的随机值，避免产物里留下固定 4 字节特征。
+	DescMagic uint32
 	// Arch 目标架构："x86-64"（默认）或 "arm64"。
 	// 影响两处**架构相关**的编码：thunk 的调用指令（E8 rel32 / BL imm26）
 	// 与函数入口补丁（E9 rel32 / B imm26）。
@@ -173,7 +176,11 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 	for i, fn := range opt.Funcs {
 		d, t, c := slots[i].descOff, slots[i].thunkOff, codeOffs[i]
 
-		binary.LittleEndian.PutUint32(data[d+0:], descMagic)
+		var magic uint32 = descMagic
+		if opt.DescMagic != 0 {
+			magic = opt.DescMagic
+		}
+		binary.LittleEndian.PutUint32(data[d+0:], magic)
 		binary.LittleEndian.PutUint32(data[d+4:], baseRVA+uint32(d))     // selfRVA（模块基址 = 描述符地址 - selfRVA）
 		binary.LittleEndian.PutUint32(data[d+8:], uint32(c-d))           // codeRVA（相对描述符）
 		binary.LittleEndian.PutUint32(data[d+12:], uint32(len(fn.Code))) // codeLen（明文长度）

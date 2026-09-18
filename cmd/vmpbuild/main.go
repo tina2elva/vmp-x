@@ -94,6 +94,13 @@ func main() {
 	verbose := flag.Bool("v", false, "打印符号与重定位详情")
 	flag.Parse()
 
+	// release 构建：必须在这里就定下来 —— compile() 在下面几步内就会被调用，
+	// 之前放在 measureMaxFrame 旁边导致 -DVM_RELEASE 根本没进编译（.text 反而更大）。
+	if *release {
+		releaseBuild = true
+		releaseMagic = rand.Uint32()
+	}
+
 	tmp, err := os.MkdirTemp(*tmpRoot, "vmpbuild-")
 	must(err)
 	if !*keep {
@@ -158,10 +165,6 @@ func main() {
 	// 多目标直拼时 objPath 只是第一个对象，栈帧要**在所有对象上取最大**
 	maxFrame := 0
 	for _, p := range objs {
-		if *release {
-			releaseBuild = true
-			releaseMagic = rand.Uint32()
-		}
 		f, err := measureMaxFrame(*objdump, p, *verbose)
 		must(err)
 		if f > maxFrame {
@@ -464,7 +467,17 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		objName := strings.ReplaceAll(srcName, "/", "_") + ".o"
 		// -include 强制先包含平台的 vm_abi.h：
 		// 同一个 vm_interp.c 因此可以用不同 ABI 头编译（Windows / Linux）。
+		// 描述符魔数走一个生成头：C 与 .S 都要拿到**同一个**值（release 每次构建随机）。
+		// 只靠 -D 曾经在汇编这一侧不生效，现象是 release 产物里 stub 校验的仍是默认魔数、
+		// 描述符却是随机值 → 校验失败 → 按"没有描述符"走 → 空指针访问违例。
+		descHdr := filepath.Join(tmp, "desc_magic.h")
+		if _, err := os.Stat(descHdr); err != nil {
+			if werr := os.WriteFile(descHdr, []byte(fmt.Sprintf("#ifndef VM_DESC_MAGIC\n#define VM_DESC_MAGIC 0x%Xu\n#endif\n", releaseMagic)), 0o644); werr != nil {
+				return nil, werr
+			}
+		}
 		args := append(append([]string{}, common...),
+			"-include", descHdr,
 			"-include", filepath.Join(platformDir, "vm_abi.h"),
 			"-include", opcodeValuesPath,
 			"-include", keyPath)
