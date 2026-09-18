@@ -59,6 +59,7 @@ func main() {
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
 	section := flag.String("section", ".vmp", "注入节名（仅 PE 使用）")
 	verbose := flag.Bool("v", false, "打印 IR 详情")
+	keepSelfChecksFlag = flag.Bool("keep-selfchecks", false, "保留运行期自校验调用（默认丢弃；仅用于对照实验）")
 	var funcs multiFlag
 	flag.Var(&funcs, "func", "要保护的函数名（可重复）")
 	flag.Parse()
@@ -258,7 +259,7 @@ func (a a64Adapter) LiftFunc(name string, code []byte, rva uint32) (*ir.Func, er
 }
 
 // liftAll 对所有目标函数做 lift + codegen（与容器/架构无关）
-func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, error), opcodeMap *vm.OpcodeMap, verbose bool) ([]inject.FuncSpec, error) {
+func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, error), opcodeMap *vm.OpcodeMap, verbose bool, bytesAt func(rva uint32, n int) ([]byte, bool), keepSelfChecks bool) ([]inject.FuncSpec, error) {
 	var specs []inject.FuncSpec
 	for _, name := range names {
 		found, err := find(name)
@@ -274,6 +275,12 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 				fmt.Fprintln(os.Stderr)
 			}
 			os.Exit(1)
+		}
+		if !keepSelfChecks && bytesAt != nil {
+			if n := dropRuntimeSelfChecks(irFunc, bytesAt); n > 0 {
+				fmt.Printf("    %s: 丢弃 %d 条运行期自校验调用（VM 内无意义，且会冲掉 guest 寄存器）", name, n)
+				fmt.Println()
+			}
 		}
 		gen, err := vm.Generate(irFunc)
 		if err != nil {
@@ -349,7 +356,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	_ = readRVA
 	specs, err := liftAll(lifter, funcs, func(n string) (*scan.Found, error) {
 		return scan.FindFunction(exe, f, n)
-	}, opcodeMap, verbose)
+	}, opcodeMap, verbose, func(rva uint32, n int) ([]byte, bool) { return peRvaBytes(f.Data, rva, n) }, keepSelfChecksFlag != nil && *keepSelfChecksFlag)
 	must(err)
 
 	entryRVA, _ := inject.EntryRVA(f)
@@ -405,7 +412,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 	}
 	specs, err := liftAll(lifter, funcs, func(n string) (*scan.Found, error) {
 		return scan.FindFunctionELF(exe, imageBase, n)
-	}, opcodeMap, verbose)
+	}, opcodeMap, verbose, nil, keepSelfChecksFlag != nil && *keepSelfChecksFlag)
 	must(err)
 
 	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize})
@@ -417,7 +424,93 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 	return res
 }
 
+// keepSelfChecksFlag：由 main 里 flag.Parse 设定，packPE/packELF 里读取。
+var keepSelfChecksFlag *bool
+
 func reportOrDevNull(p string) string { return p }
+
+// isSecurityCookieCheck 判定目标是不是 MSVC 的 __security_check_cookie：
+// 入口字节形如 48 3B 0D xx xx xx xx 75 01 C3（cmp rcx,[rip+disp] / jne +1 / ret）。
+// 为什么必须识别它：它是编译器内建，调用方默认它**不修改 RAX**（实现里只有 cmp/jne/ret），
+// 而我们的 CALLN 会无条件把 guest 的 RAX 覆盖成返回值 —— 实测导致被保护函数返回垃圾指针并崩溃。
+// 实测的两种形态（微软 CRT）：
+//
+//	48 3B 0D xx xx xx xx 75 01 C3          （简单版：不等就直接跳到报告函数）
+//	48 3B 0D xx xx xx xx 75 10 48 C1 C1 .. （带 cookie 解密分支）
+//
+// 所以判定条件放宽为：cmp rcx,[rip+disp] + 紧跟 jne，且后续 24 字节内出现 ror/rol rcx 与 ret。
+func isSecurityCookieCheck(code []byte) bool {
+	if len(code) < 16 {
+		return false
+	}
+	if !(code[0] == 0x48 && code[1] == 0x3B && code[2] == 0x0D && code[7] == 0x75) {
+		return false
+	}
+	tail := code[8:min(len(code), 32)]
+	sawRot, sawRet := false, false
+	for i := 0; i+2 < len(tail); i++ {
+		if tail[i] == 0x48 && tail[i+1] == 0xC1 && (tail[i+2] == 0xC1 || tail[i+2] == 0xC9) {
+			sawRot = true
+		}
+		if tail[i] == 0xC3 {
+			sawRet = true
+		}
+	}
+	return sawRot && sawRet
+}
+
+// dropRuntimeSelfChecks 在 IR 上删掉这类调用，返回删除条数。
+func dropRuntimeSelfChecks(fn *ir.Func, bytesAt func(rva uint32, n int) ([]byte, bool)) int {
+	out := fn.Insns[:0]
+	dropped := 0
+	for _, in := range fn.Insns {
+		if in.Op == ir.CallN {
+			if b, ok := bytesAt(uint32(in.Imm), 48); ok && isSecurityCookieCheck(b) {
+				dropped++
+				continue
+			}
+		}
+		out = append(out, in)
+	}
+	fn.Insns = out
+	return dropped
+}
+
+// peRvaBytes 取 PE 镜像里 RVA 处的 n 个字节（用于识别被调函数的入口模式）。
+func peRvaBytes(d []byte, rva uint32, n int) ([]byte, bool) {
+	if len(d) < 0x40 {
+		return nil, false
+	}
+	peOff := int(binary.LittleEndian.Uint32(d[0x3C:]))
+	if peOff+24 > len(d) || peOff < 0 {
+		return nil, false
+	}
+	nsec := int(binary.LittleEndian.Uint16(d[peOff+6:]))
+	optSize := int(binary.LittleEndian.Uint16(d[peOff+20:]))
+	base := peOff + 24 + optSize
+	for i := 0; i < nsec; i++ {
+		o := base + i*40
+		if o+40 > len(d) {
+			break
+		}
+		vsize := binary.LittleEndian.Uint32(d[o+8:])
+		va := binary.LittleEndian.Uint32(d[o+12:])
+		rsize := binary.LittleEndian.Uint32(d[o+16:])
+		roff := binary.LittleEndian.Uint32(d[o+20:])
+		span := vsize
+		if rsize > span {
+			span = rsize
+		}
+		if rva >= va && rva < va+span {
+			off := roff + (rva - va)
+			if int(off)+n > len(d) {
+				return nil, false
+			}
+			return d[off : int(off)+n], true
+		}
+	}
+	return nil, false
+}
 
 func must(err error) {
 	if err != nil {

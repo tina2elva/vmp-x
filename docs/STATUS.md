@@ -684,6 +684,28 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第十八轮：修复 —— 打包端丢弃运行期自校验调用（current_time_str 恢复正常，覆盖率 4/14 → 5/14）
+>
+> ### 356. 实现（cmd/vmpack）
+> · isSecurityCookieCheck：按被调目标入口字节识别 MSVC 的 __security_check_cookie，
+>   实测两种形态：`48 3B 0D disp32 75 01 C3` 与 `48 3B 0D disp32 75 10 48 C1 C1 ..`，
+>   判定条件是 cmp rcx,[rip+disp] + 紧跟 jne，且后续 32 字节内同时出现 ror/rol rcx 与 ret；
+> · dropRuntimeSelfChecks：顺序扫 IR，把这类 CallN 删掉（peRvaBytes 负责 RVA→字节）；
+> · 开关 -keep-selfchecks 保留旧行为，用于 A/B 对照。
+> （踩坑：判定函数要求至少 16 字节，而读取只取了 12 字节 → 恒为 false，白跑一轮；现取 48 字节。）
+>
+> ### 357. A/B 复测（同一个函数、同一份 blob）
+> ```
+> drop（默认）：285 IR / 2050B  → exit=0  time_len=19     ✓
+> keep（-keep-selfchecks）：286 IR / 2059B → exit=-1073741819 ✗
+> ```
+> `__pyx_pw_7example_9add_dly` 也丢掉了 1 条（151→150 IR），但**仍然崩** → 它还有第二个原因，留待下一轮。
+>
+> ### 358. 5 函数产物复测
+> n / 2fibonacci / 6current_time_str / pymod_create / bisect_code_objects 一起保护：
+> fib(10)=55、fib(15)=610、n.shape=(10,)、greet 正常、time_len=19，exit=0；
+> 门禁：E2E 146/146、DLL E2E 3/3、go build/vet/test 全绿。覆盖率口径下 (f) 从 4/14 提到 **5/14**。
+>
 > ## 第十七轮：cookie 校验其实是**通过**的 —— 真正的毛病是 CALLN 把 guest 的 RAX 冲掉了
 >
 > ### 353. 加参数探针（guest RCX / guest RSP / 调用目标 / pc）
