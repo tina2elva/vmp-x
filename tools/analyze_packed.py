@@ -71,6 +71,11 @@ def main():
     ap.add_argument('--label', default='')
     a = ap.parse_args()
 
+    rep_early = None
+    if a.report and os.path.exists(a.report):
+        rep_early = json.load(open(a.report))
+    sec_names = (rep_early or {}).get('sectionNames') or []
+
     d = open(a.packed, 'rb').read()
     pe = parse_pe(d)
     print('== %s ==' % (a.label or os.path.basename(a.packed)))
@@ -90,7 +95,7 @@ def main():
 
     print('[3] trampoline scan (E9 rel32)')
     text = next((s for s in pe['secs'] if s['name'] == '.text'), None)
-    ours = [s for s in pe['secs'] if s['name'].startswith('.vmp')]
+    ours = [s for s in pe['secs'] if s['name'] in sec_names] if sec_names else [s for s in pe['secs'] if s['name'].startswith('.vmp')]
     real, raw = [], 0
     if text:
         blob = d[text['roff']:text['roff'] + text['rsz']]
@@ -204,7 +209,7 @@ def main():
     print()
 
     print('[10] interpreter/stub code tamper (flip one .vmp code byte, then run)')
-    vmp = next((s for s in pe['secs'] if s['name'] == '.vmp'), None)
+    vmp = next((s for s in pe['secs'] if s['name'] in sec_names), None) if sec_names else next((s for s in pe['secs'] if s['name'] == '.vmp'), None)
     if not (vmp and a.packed.endswith('.pyd')):
         print('    skipped (need a .vmp section and a .pyd)')
     else:
@@ -213,6 +218,15 @@ def main():
         d5[off5] ^= 0xFF
         r5 = run_packed(a, d5, 'vmpk_codetamper_')
         print('    %s' % r5)
+    print()
+
+    print('[11] section names (must not be a fixed .vmp* signature)')
+    if sec_names:
+        print('    our sections: %s' % ', '.join(sec_names))
+        bad = [n for n in sec_names if n.startswith('.vmp')]
+        print('    fixed .vmp* names: %s' % (bad if bad else 'none'))
+    else:
+        print('    (no sectionNames in report; pass --report)')
     print()
 
 
@@ -232,6 +246,16 @@ def run_packed(a, data, prefix):
     if r.returncode != 0:
         return 'refused/crashed  exit=%d  %s' % (r.returncode, last[:90])
     return 'runs but wrong?  exit=0  %s' % last[:90]
+
+
+    print('[11] section names (must not be a fixed .vmp* signature)')
+    if sec_names:
+        print('    our sections: %s' % ', '.join(sec_names))
+        bad = [n for n in sec_names if n.startswith('.vmp')]
+        print('    fixed .vmp* names: %s' % (bad if bad else 'none'))
+    else:
+        print('    (no sectionNames in report; pass --report)')
+    print()
 
 
 if __name__ == '__main__':

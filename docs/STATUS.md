@@ -684,6 +684,22 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第三十九轮：补上 (a) 的最后一块 —— **段名随机化**
+>
+> ### 400. 改动
+> · `inject.Options` 增加 `SectionNameB/C`（原来是用 base+"b"/"c" 派生 —— 派生本身就是特征）；
+> · `cmd/vmpack` 默认（未显式给 `-section`）为每次打包生成**三个互不相关**的随机节名（`.` + 7 位小写字母数字）；
+> · `Result.SectionNames` 写进报告，分析脚本据此定位我们的节（不再靠 `.vmp*` 前缀）。
+>
+> ### 401. 复测数字
+> ```
+> 第一次打包：.nz0fvho  .kjn5pv3  .zv9jgfk
+> 第二次打包：.vfph0d6  .jtia368  .iwix1zm        ← 两次完全不同，且都不是 .vmp*
+> analyze_packed [11]: our sections: .nz0fvho, .kjn5pv3, .zv9jgfk / fixed .vmp* names: none
+> ```
+> 其余检查全部保持：[2] 魔数无、[3] E9 补丁指向我们的节、[4] .pdata 记录 0、[6] ChaCha sigma 无、
+> [7]/[8]/[9]/[10] 四类篡改全部 refused。
+>
 > ## 第三十八轮（收尾）：CI 回到 5/5 全绿，且 **ELF 入口挂钩已被运行时验证**
 >
 > ```

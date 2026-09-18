@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/big"
 	"os"
 	"strings"
 
@@ -57,7 +58,7 @@ func main() {
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
-	section := flag.String("section", ".vmp", "注入节名（仅 PE 使用）")
+	section := flag.String("section", "", "注入节名（仅 PE；留空则每次构建随机生成三个互不相关的名字）")
 	verbose := flag.Bool("v", false, "打印 IR 详情")
 	keepSelfChecksFlag = flag.Bool("keep-selfchecks", false, "保留运行期自校验调用（默认丢弃；仅用于对照实验）")
 	var funcs multiFlag
@@ -210,6 +211,7 @@ func main() {
 		if !hasVerify {
 			verifyFn = -1
 		}
+		*section = sectionNamesFor(*section)
 		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFn, scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
@@ -364,7 +366,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	must(err)
 
 	entryRVA, _ := inject.EntryRVA(f)
-	res, err := inject.Apply(f, inject.Options{SectionName: section, Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
+	res, err := inject.Apply(f, inject.Options{SectionName: section, SectionNameB: sectionNames[1], SectionNameC: sectionNames[2], Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
 		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
 		EntryHook: patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0,
 		VerifyFn:  verifyFn,
@@ -435,6 +437,43 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 		res.SectionRVA, res.SectionSize, res.StubEntryRVA)
 	fmt.Println()
 	return res
+}
+
+// sectionNames：本次打包实际使用的三个节名（main 里决定，packPE 里读取）。
+var sectionNames [3]string
+
+// sectionNamesFor：用户显式给了 -section 就用它（并按老规矩 +b/+c 派生）；
+// 否则生成三个**互不相关**的随机名 —— 固定/派生节名本身就是可识别特征。
+func sectionNamesFor(base string) string {
+	if base != "" {
+		sectionNames = [3]string{base, base + "b", base + "c"}
+		return base
+	}
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	mk := func() string {
+		b := make([]byte, 7)
+		for i := range b {
+			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
+			b[i] = alphabet[n.Int64()]
+		}
+		return "." + string(b)
+	}
+	for i := 0; i < 3; i++ {
+		for {
+			n := mk()
+			dup := false
+			for j := 0; j < i; j++ {
+				if sectionNames[j] == n {
+					dup = true
+				}
+			}
+			if !dup {
+				sectionNames[i] = n
+				break
+			}
+		}
+	}
+	return sectionNames[0]
 }
 
 // keepSelfChecksFlag：由 main 里 flag.Parse 设定，packPE/packELF 里读取。

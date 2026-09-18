@@ -48,6 +48,14 @@ func Apply(f *pe.File, opt Options) (*Result, error) {
 	if bssOff < 0 || bssSize < 0 || bssOff+bssSize > len(pl.Data) {
 		bssOff, bssSize = len(pl.Data), 0 // 没有可写区间：单段搞定
 	}
+	nameB := opt.SectionNameB
+	if nameB == "" {
+		nameB = opt.SectionName + "b"
+	}
+	nameC := opt.SectionNameC
+	if nameC == "" {
+		nameC = opt.SectionName + "c"
+	}
 	sec, err := f.AddSection(opt.SectionName, pl.Data[:bssOff], pe.ScnCntCode|pe.ScnMemExecute|pe.ScnMemRead)
 	if err != nil {
 		return nil, err
@@ -56,7 +64,7 @@ func Apply(f *pe.File, opt Options) (*Result, error) {
 		return nil, fmt.Errorf("节 RVA 与预估不一致（预估 0x%X，实际 0x%X）", base, sec.VirtualAddress)
 	}
 	if bssSize > 0 {
-		rwSec, err := f.AddSection(opt.SectionName+"b", pl.Data[bssOff:bssOff+bssSize], pe.ScnCntInitData|pe.ScnMemRead|pe.ScnMemWrite)
+		rwSec, err := f.AddSection(nameB, pl.Data[bssOff:bssOff+bssSize], pe.ScnCntInitData|pe.ScnMemRead|pe.ScnMemWrite)
 		if err != nil {
 			return nil, err
 		}
@@ -64,7 +72,7 @@ func Apply(f *pe.File, opt Options) (*Result, error) {
 			return nil, fmt.Errorf("可写段 RVA 与 blob 布局不一致（期望 0x%X，实际 0x%X）", want, rwSec.VirtualAddress)
 		}
 		if rest := pl.Data[bssOff+bssSize:]; len(rest) > 0 {
-			cxSec, err := f.AddSection(opt.SectionName+"c", rest, pe.ScnCntCode|pe.ScnMemExecute|pe.ScnMemRead)
+			cxSec, err := f.AddSection(nameC, rest, pe.ScnCntCode|pe.ScnMemExecute|pe.ScnMemRead)
 			if err != nil {
 				return nil, err
 			}
@@ -82,7 +90,7 @@ func Apply(f *pe.File, opt Options) (*Result, error) {
 		}
 	}
 
-	return &Result{
+	return &Result{SectionNames: []string{opt.SectionName, nameB, nameC},
 		SectionRVA:   sec.VirtualAddress,
 		SectionSize:  bssOff, // 第一段（R+X）的长度；后面还有可能的 RW/RX 段
 		StubEntryRVA: sec.VirtualAddress + uint32(opt.StubEntry),

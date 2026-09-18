@@ -37,9 +37,13 @@ type EncryptFunc func(plain []byte, aad []byte) (ct []byte, nonce [12]byte, tag 
 // Options 注入参数
 type Options struct {
 	SectionName string
-	Stub        []byte
-	StubEntry   int // vm_entry 在 stub 内的偏移
-	Funcs       []FuncSpec
+	// SectionNameB / SectionNameC：可写段与描述符段的名字。留空时由 SectionName 派生（+b/+c）——
+	// 那种派生本身是可识别特征，所以打包端默认会给三个**互不相关**的随机名（见 cmd/vmpack）。
+	SectionNameB string
+	SectionNameC string
+	Stub         []byte
+	StubEntry    int // vm_entry 在 stub 内的偏移
+	Funcs        []FuncSpec
 	// Encrypt 非 nil 时启用 AEAD：解释器在 vm_run 入口验签并解密到帧内缓冲。
 	Encrypt EncryptFunc
 	// BSSOff/BSSSize 描述 blob 里"可写数据"（.bss）的区间：
@@ -125,6 +129,8 @@ type Payload struct {
 
 // Result 注入结果
 type Result struct {
+	// SectionNames：本次注入实际使用的节名（打包端默认随机生成，分析脚本据此定位我们的节）。
+	SectionNames []string    `json:"sectionNames"`
 	SectionRVA   uint32      `json:"sectionRVA"`
 	SectionSize  int         `json:"sectionSize"`
 	StubEntryRVA uint32      `json:"stubEntryRVA"`
