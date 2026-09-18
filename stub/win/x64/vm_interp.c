@@ -46,19 +46,6 @@ extern u64 vm_last_pc;
 extern u64 vm_last_call; /* 最后一次本机调用的目标 */
 extern u64 vm_last_call_rcx; /* 发起该调用时的 guest RCX（第一个参数） */
 extern u64 vm_last_call_sp;  /* 发起该调用时的 guest RSP */
-extern u64 vm_last_store_pc;   /* 最后一次 guest STORE 的 pc */
-extern u64 vm_last_store_base; /* 其基址寄存器的值 */
-extern u64 vm_last_store_addr; /* 它算出来的最终地址 */
-extern u64 vm_last_call_pc;    /* 最后一次本机调用的 pc */
-extern u64 vm_last_call_ret;   /* 该调用的返回值（RAX） */
-extern u64 vm_pc_ring[32];     /* 最近 32 条指令的 pc（崩溃时用它还原现场） */
-extern u32 vm_pc_ring_i;
-extern u64 vm_regs_snap[64];  /* 崩溃点那条 STORE 执行时的 guest 寄存器快照 */
-extern u32 vm_regs_n;
-extern u64 vm_reg_writer;      /* 最后一次改变 reg1 的指令 pc（用来追坏指针的来源） */
-extern u64 vm_r1_prev;
-extern u64 vm_writer_tab[64];  /* 每个 guest 寄存器最后是被哪条 pc 改的 */
-extern u64 vm_regs_prev[64];
 #endif
 u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
@@ -501,7 +488,29 @@ static int vm_bc_acquire(void) {
 
 /* ---------------- 主循环入口 ---------------- */
 
+/* ---- (g) 反调试 ----
+ * 直接读 PEB，不依赖任何导入（blob 是 freestanding，没有导入表）：
+ *   x64 上 gs:[0x60] 就是 PEB；PEB+0x02 = BeingDebugged。
+ * 命中就 __builtin_trap()（非法指令，进程立即死）—— 是拒绝执行，不是悄悄继续。
+ * vm_peb_seen 只用于自证这段代码确实跑过（volatile 防止被优化掉）。 */
+#ifdef VM_BLOB_USES_WIN64
+volatile u64 vm_peb_seen;
+static int vm_debugger_present(void) {
+    const u8 *peb;
+    __asm__ volatile("movq %%gs:0x60, %0" : "=r"(peb));
+    vm_peb_seen = (u64)peb;
+    if (!peb) return 0;
+    return *(const u8 *)(peb + 0x02) ? 1 : 0;
+}
+static void vm_antidebug(void) {
+    if (vm_debugger_present()) __builtin_trap();
+}
+#else
+static void vm_antidebug(void) { }
+#endif
+
 int vm_run(vm_ctx_t *vm) {
+    vm_antidebug();
     int slot = -1;
 #ifndef VM_RELEASE
     vm_last_pc = 0xAA000001u; /* 已进入 vm_run */
@@ -713,19 +722,6 @@ u64 vm_last_pc;
 u64 vm_last_call;
 u64 vm_last_call_rcx;
 u64 vm_last_call_sp;
-u64 vm_last_store_pc;
-u64 vm_last_store_base;
-u64 vm_last_store_addr;
-u64 vm_last_call_pc;
-u64 vm_last_call_ret;
-u64 vm_pc_ring[32];
-u32 vm_pc_ring_i;
-u64 vm_regs_snap[64];
-u32 vm_regs_n;
-u64 vm_reg_writer;
-u64 vm_r1_prev;
-u64 vm_writer_tab[64];
-u64 vm_regs_prev[64];
 #endif
 
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
@@ -753,21 +749,6 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         u8 op = c[pc];
 #ifndef VM_RELEASE
         vm_last_pc = (u64)pc | ((u64)op << 32);
-        vm_pc_ring[vm_pc_ring_i & 31u] = pc;
-        vm_pc_ring_i++;
-        if (vm->regs[1] != vm_r1_prev) {
-            vm_reg_writer = pc; /* reg1 变了：记下是哪条指令改的 */
-            vm_r1_prev = vm->regs[1];
-        }
-        {
-            u32 ri;
-            for (ri = 0; ri < 64u; ri++) {
-                if (vm->regs[ri] != vm_regs_prev[ri]) {
-                    vm_writer_tab[ri] = pc; /* 上一条指令改了 ri */
-                    vm_regs_prev[ri] = vm->regs[ri];
-                }
-            }
-        }
 #endif
 #ifndef VM_RELEASE
         /* 现场记录（见 vm_ring_hdr 的注释）：只记环形缓冲，不影响语义 */
@@ -914,16 +895,6 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             if (idx != VM_NO_REG)
                 addr += vm->regs[idx & VM_REG_MASK] * (u64)scale;
             u64 v = vm->regs[src];
-#ifndef VM_RELEASE
-            vm_last_store_pc = pc;
-            vm_last_store_base = vm->regs[base];
-            vm_last_store_addr = addr;
-            {
-                u32 ri;
-                for (ri = 0; ri < 64u; ri++) vm_regs_snap[ri] = vm->regs[ri];
-                vm_regs_n = 64u;
-            }
-#endif
             switch (width) {
             case 8:  *(volatile u8 *)addr = (u8)v; break;
             case 16: *(volatile u16 *)addr = (u16)v; break;
@@ -1092,15 +1063,11 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_last_call = addr; /* 探针：最后一次 CALLN 的目标 */
             vm_last_call_rcx = vm->regs[VRCX];
             vm_last_call_sp = vm->regs[VRSP];
-            vm_last_call_pc = pc;
 #endif
             typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fn_t fn = (fn_t)addr;
             vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
                                 vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
-#ifndef VM_RELEASE
-            vm_last_call_ret = vm->regs[VRAX];
-#endif
             vm->pc = pc + 9;
             break;
         }

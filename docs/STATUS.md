@@ -684,6 +684,29 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第二十四轮：(g) 反调试通过验证；同时暴露一个更早存在的 ELF 载荷回归
+>
+> ### 370. 反调试：实现 + A/B 数字
+> vm_run 入口调用 vm_antidebug()：读 PEB（gs:[0x60]）的 BeingDebugged，命中 __builtin_trap()。
+> 先自证代码确实执行：非 release 构建里 vm_peb_seen 在调用后等于真实 PEB 地址（0x4EDB990000 == PEB ✓）。
+> 再用 release blob 做 A/B（tools/antidebug_test.py）：
+> ```
+> A) 无调试标志：call -> 55，exit=0
+> B) PEB.BeingDebugged=1（WriteProcessMemory 写入并读回确认）：exit=-1073741795 = 0xC000001D（非法指令）
+> ```
+> 即"带调试器就拒绝执行"成立，且不影响正常路径。
+>
+> ### 371. 顺带查实的两件事
+> · PowerShell 5.1 按 ANSI 读 .ps1：我往 gates.ps1 里写中文注释后整段乱码、脚本语法被破坏 ——
+>   **.ps1 必须保持纯 ASCII**（已把新增步骤改回英文）；
+> · gofmt 需要跑（cmd/vmpack、cmd/vmpbuild 被格式化过），门禁的 gofmt 步骤现在会抓住它。
+>
+> ### 372. 新暴露的回归：linux/ELF 载荷差分测试 6 处不一致
+> tools/verify_linux_payload.ps1：负载能执行、描述符正常，但 checkKey(0/1/255/12345/1000000/10) 全部对不上。
+> 这不是本轮引入的：把 stub/win/x64/vm_interp.c 退回第 18 轮的版本（5dfd995）重建后**同样**失败 → 说明回归更早
+> （候选：第 13 轮加入的 -fstack-clash-protection、第 7 轮的 e-2 清理、或更早的 lift 改动）。
+> 影响面仅 ELF 路径（我们这几轮加固的是 PE/pyd 路径），但必须查清 —— 下一轮优先二分它。
+>
 > ## 第二十二轮：开始 (g) —— 反调试代码落地（行为验证还没通过，如实记录）
 >
 > ### 367. 实现

@@ -23,16 +23,15 @@ function Step {
 Step "gofmt -l ."        { $out = (gofmt -l . | Out-String).Trim(); if ($out -ne "") { Write-Host $out; $script:stepCode = 1 } }
 Step "go vet ./..."      { go vet ./... }
 Step "go test ./..."     { go test ./... }
-# blob 必须能构建：Go 侧门禁不编译 C，曾经因此漏掉过一次"源码坏了但测试全绿"的假绿。
-Step "vmpbuild (blob 必须能构建)" {
-    & (Join-Path $PSScriptRoot "..\build\vmpbuild.exe") -src (Join-Path $PSScriptRoot "..\stub\win\x64") `
-        -out (Join-Path $PSScriptRoot "..\build\gates_blob.bin") -manifest (Join-Path $PSScriptRoot "..\build\gates_blob.json") `
-        -entry vm_entry 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Host "[!] blob 构建失败：stub/win/x64 有编译错误"; $script:stepCode = 1 }
-    & (Join-Path $PSScriptRoot "..\build\vmpbuild.exe") -src (Join-Path $PSScriptRoot "..\stub\win\x64") `
-        -out (Join-Path $PSScriptRoot "..\build\gates_blob_rel.bin") -manifest (Join-Path $PSScriptRoot "..\build\gates_blob_rel.json") `
-        -entry vm_entry -release 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Host "[!] release blob 构建失败"; $script:stepCode = 1 }
+# Blob must build: the Go gates never compile C, which once let a broken source stay green.
+# vmpbuild wants -src relative to the repo root, so run it from there.
+Step "vmpbuild (blob builds)" {
+    Push-Location (Join-Path $PSScriptRoot "..")
+    & ".\build\vmpbuild.exe" -src "stub/win/x64" -out "build/gates_blob.bin" -manifest "build/gates_blob.json" -entry vm_entry 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "[!] blob build failed (stub/win/x64 has compile errors)"; $script:stepCode = 1 }
+    & ".\build\vmpbuild.exe" -src "stub/win/x64" -out "build/gates_blob_rel.bin" -manifest "build/gates_blob_rel.json" -entry vm_entry -release 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "[!] release blob build failed"; $script:stepCode = 1 }
+    Pop-Location
 }
 Step "e2e.ps1 (x86-64)"  { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e.ps1") }
 Step "e2e_dll.ps1"       { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_dll.ps1") }
