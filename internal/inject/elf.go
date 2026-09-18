@@ -38,6 +38,14 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		}
 	}
 
+	// (c) 加载期校验：把 ELF 入口点（e_entry）改成 payload 里的校验蹦床，它验完再跳到原入口。
+	// 这条路径不依赖"运行期读目标字节"（那个做法在 ELF 上会出问题，见 STATUS 第 392 条）。
+	if pl.EntryHookRVA != 0 {
+		if err := f.SetEntry(imageBase + uint64(pl.EntryHookRVA)); err != nil {
+			return nil, fmt.Errorf("改写 ELF 入口点失败: %w", err)
+		}
+	}
+
 	newVA, payloadOff, err := f.AddLoadSegmentFromNote(pl.Data)
 	if err != nil {
 		return nil, err

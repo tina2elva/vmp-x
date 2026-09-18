@@ -194,7 +194,11 @@ func main() {
 	}
 	var res *inject.Result
 	if isELF {
-		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
+		verifyFnELF, hasVerifyELF := man.Symbols["vm_verify_table"]
+		if !hasVerifyELF {
+			verifyFnELF = -1
+		}
+		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFnELF, scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
 	} else {
 		scratchOff, hasCache := man.Symbols["vm_bc_cache"]
 		scratchEnd, hasLock := man.Symbols["vm_bc_lock"]
@@ -376,7 +380,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	return res
 }
 
-func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
+func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
 	f, err := elfload.Open(exe)
 	must(err)
 	imageBase := f.ImageBase()
@@ -415,7 +419,16 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 	}, opcodeMap, verbose, nil, keepSelfChecksFlag != nil && *keepSelfChecksFlag)
 	must(err)
 
-	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize})
+	entryRVA := uint32(0)
+	if f.Entry > imageBase && f.Entry-imageBase <= 0xFFFFFFFF {
+		entryRVA = uint32(f.Entry - imageBase)
+	}
+	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
+		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize,
+		EntryHook:     patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0 && f.Machine == elfload.EM_X86_64,
+		EntryHookSysV: true,
+		VerifyFn:      verifyFn,
+		EntryRVA:      entryRVA})
 	must(err)
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新 PT_LOAD: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",

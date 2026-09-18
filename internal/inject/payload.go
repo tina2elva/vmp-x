@@ -58,6 +58,9 @@ type Options struct {
 	// 所以打包时可以用密钥派生的伪随机字节填满：`.vmpb` 不再是"全 0 的可疑段"。
 	ScratchOff int
 	ScratchLen int
+	// EntryHookSysV：蹦床按 System V（ELF）调用约定生成；否则按 Win64（PE）。
+	// 两者差别：第一个参数寄存器（rdi vs rcx）、是否需要保存/恢复 rd x、以及栈对齐方式。
+	EntryHookSysV bool
 	// EntryRVA：目标原本的入口点 RVA（蹦床校验完要跳回去）。
 	EntryRVA uint32
 	// PatchKey：入口补丁完整性校验用的密钥前缀（通常取 blob 主密钥前 8 字节）。
@@ -321,21 +324,42 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		}
 		align(16)
 		trampRVA := baseRVA + uint32(len(data))
-		t := make([]byte, 0, 32)
-		t = append(t, 0x51, 0x52, 0x41, 0x50) // push rcx; push rdx; push r8
-		// 注意：这是 Win64 的 C 调用，第一个参数必须在 **rcx**（原先写 r11，函数拿到的是垃圾 → 校验失败 →
-		// 加载期直接 trap，现象是「DLL 初始化例程失败」）。rcx 已在上面压栈，这里可以放心覆盖。
-		lea := make([]byte, 7)
-		lea[0], lea[1], lea[2] = 0x48, 0x8D, 0x0D // lea rcx,[rip+disp32]
-		binary.LittleEndian.PutUint32(lea[3:], uint32(int32(tableRVA)-int32(trampRVA+uint32(len(t)+7))))
-		t = append(t, lea...)
-		t = append(t, 0xE8) // call rel32
-		callOff := len(t)
-		t = append(t, 0, 0, 0, 0)
-		t = append(t, 0x41, 0x58, 0x5A, 0x59) // pop r8; pop rdx; pop rcx
-		t = append(t, 0xE9)                   // jmp rel32
-		jmpOff := len(t)
-		t = append(t, 0, 0, 0, 0)
+		t := make([]byte, 0, 48)
+		var callOff, jmpOff int
+		if opt.EntryHookSysV {
+			// System V（ELF）：入口处 rdx 里可能是 _start 需要的 rtld_fini，必须原样保留；
+			// r12 是 callee-saved，用它保存原始 rsp，被调用的 C 函数会替我们保住它。
+			t = append(t, 0x52)                   // push rdx
+			t = append(t, 0x49, 0x89, 0xE4)       // mov r12, rsp
+			t = append(t, 0x48, 0x83, 0xE4, 0xF0) // and rsp, -16（C 调用要求 16 字节对齐）
+			lea := make([]byte, 7)
+			lea[0], lea[1], lea[2] = 0x48, 0x8D, 0x3D // lea rdi,[rip+disp32]（SysV 第一个参数）
+			binary.LittleEndian.PutUint32(lea[3:], uint32(int32(tableRVA)-int32(trampRVA+uint32(len(t)+7))))
+			t = append(t, lea...)
+			t = append(t, 0xE8) // call rel32
+			callOff = len(t)
+			t = append(t, 0, 0, 0, 0)
+			t = append(t, 0x4C, 0x89, 0xE4) // mov rsp, r12
+			t = append(t, 0x5A)             // pop rdx
+			t = append(t, 0xE9)             // jmp rel32
+			jmpOff = len(t)
+			t = append(t, 0, 0, 0, 0)
+		} else {
+			t = append(t, 0x51, 0x52, 0x41, 0x50) // push rcx; push rdx; push r8（Win64）
+			// 注意：这是 Win64 的 C 调用，第一个参数必须在 **rcx**（原先写 r11，函数拿到的是垃圾 → 校验失败 →
+			// 加载期直接 trap，现象是「DLL 初始化例程失败」）。rcx 已在上面压栈，这里可以放心覆盖。
+			lea := make([]byte, 7)
+			lea[0], lea[1], lea[2] = 0x48, 0x8D, 0x0D // lea rcx,[rip+disp32]
+			binary.LittleEndian.PutUint32(lea[3:], uint32(int32(tableRVA)-int32(trampRVA+uint32(len(t)+7))))
+			t = append(t, lea...)
+			t = append(t, 0xE8) // call rel32
+			callOff = len(t)
+			t = append(t, 0, 0, 0, 0)
+			t = append(t, 0x41, 0x58, 0x5A, 0x59) // pop r8; pop rdx; pop rcx
+			t = append(t, 0xE9)                   // jmp rel32
+			jmpOff = len(t)
+			t = append(t, 0, 0, 0, 0)
+		}
 		verifyRVA := baseRVA + uint32(opt.VerifyFn)
 		binary.LittleEndian.PutUint32(t[callOff:], uint32(int32(verifyRVA)-int32(trampRVA+uint32(callOff+4))))
 		binary.LittleEndian.PutUint32(t[jmpOff:], uint32(int32(opt.EntryRVA)-int32(trampRVA+uint32(jmpOff+4))))

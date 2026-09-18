@@ -684,6 +684,24 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第三十七轮：实现 **ELF 版入口挂钩**（对标 PE 的 EntryHook），(c) 在 ELF 上也有拦截点
+>
+> ### 394. 实现
+> · `payload.go` 增加 `EntryHookSysV`：按 System V 生成蹦床 ——
+>   `push rdx`（入口处 rdx 里可能是 `_start` 需要的 `rtld_fini`，必须原样传下去）→
+>   `mov r12, rsp`（r12 是 callee-saved，C 函数会替我们保住）→ `and rsp,-16`（C 调用对齐）→
+>   `lea rdi,[rip+表]`（SysV 第一个参数在 rdi）→ `call 校验` → `mov rsp,r12` → `pop rdx` → `jmp 原入口`；
+>   与 Win64 版本（rcx + 影子空间那一套）并存，各按平台选用。
+> · `internal/load/elf` 增加 `SetEntry()`（改写 ELF64 头偏移 24 的 e_entry）；
+> · `ApplyELF` 在注入段之后把入口点指向蹦床；`packELF` 打开该挂钩（仅 x86-64 ELF，arm64 暂不动）。
+>
+> ### 395. 本地结构验证
+> ```
+> linux_target.vmp  e_type=2(ET_EXEC)  e_entry=0x59A120   （原文件是 0x46F240 → 已改到 payload 区）
+> linux_pie.vmp     e_type=3(ET_PIE)   e_entry=0x5C2120   （同样落在 payload 区）
+> ```
+> 本地 ELF 载荷差分仍 ✓（该测试不执行 e_entry，所以真正跑蹦床的是 CI 的 linux-amd64 E2E：它会原生运行打包后的 ELF）。
+>
 > ## 第三十六轮：二分出 ELF 的触发点 —— **vm_run 读目标函数入口字节**这一步
 >
 > ### 392. 二分过程（本地 ELF 探针，每步约一分钟）

@@ -368,6 +368,16 @@ func writePhdr(data []byte, off int, p Program) {
 }
 
 // Save 写回磁盘
+// SetEntry 改写 ELF64 头里的 e_entry（偏移 24）：入口挂钩用它把控制权先交给"校验蹦床"。
+func (f *File) SetEntry(v uint64) error {
+	if len(f.Data) < 32 {
+		return fmt.Errorf("ELF 头过短")
+	}
+	binary.LittleEndian.PutUint64(f.Data[24:], v)
+	f.Entry = v
+	return nil
+}
+
 func (f *File) Save(path string) error {
 	return os.WriteFile(path, f.Data, 0o755)
 }
