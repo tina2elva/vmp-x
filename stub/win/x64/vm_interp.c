@@ -40,6 +40,10 @@ VM_STATIC_ASSERT(sizeof(vm_desc_t) == VM_DESC_SIZE, desc_size);
 
 /* 前向声明（blob 入口符号） */
 int vm_run(vm_ctx_t *vm);
+#ifndef VM_RELEASE
+/* 调试探针：入口路径的阶段计数器（仅非 release；实现在文件后部） */
+extern u64 vm_last_pc;
+#endif
 u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
 
@@ -483,10 +487,16 @@ static int vm_bc_acquire(void) {
 
 int vm_run(vm_ctx_t *vm) {
     int slot = -1;
+#ifndef VM_RELEASE
+    vm_last_pc = 0xAA000001u; /* 已进入 vm_run */
+#endif
     /* 加密支持：先查明文缓存；未命中则验签+解密到缓存槽（全忙则解到帧内缓冲）。
      * 验签失败返回 3，绝不执行未经验证的字节码。 */
     if (vm->desc) {
         const vm_desc_t *d = (const vm_desc_t *)vm->desc;
+#ifndef VM_RELEASE
+        vm_last_pc = 0xAA000002u; /* 拿到描述符 */
+#endif
         if (d->flags & VM_DESC_FLAG_ENC) {
             /* (c) 防回填完整性校验：入口补丁的字节 + 构建密钥做 FNV-1a，与描述符里的值比对。
              * 静态分析报告里那条绕过 —— 按函数尾声把被覆盖的 5 字节推回来 —— 会撞在这里。
@@ -531,6 +541,9 @@ int vm_run(vm_ctx_t *vm) {
                     return 2;
                 }
                 dst = vm_bc_cache[c];
+#ifndef VM_RELEASE
+                vm_last_pc = 0xAA000003u; /* 即将 AEAD 解密 */
+#endif
                 if (!vm_aead_open_aad(key, d->nonce, aad, 8, ct, d->encLen, d->tag, dst)) {
                     vm_bc_leave();
                     return 3;
@@ -546,6 +559,9 @@ int vm_run(vm_ctx_t *vm) {
             vm->codeLen = d->codeLen;
         }
     }
+#ifndef VM_RELEASE
+    vm_last_pc = 0xAA000004u; /* 解密完成，进入解释循环前 */
+#endif
     vm_keep_verify_ref(vm);
     u64 rsp_start = vm->regs[VRSP]; /* 诊断用：客户机栈起点，见 vm_run_inner 注释 */
 #ifndef VM_RELEASE /* release 构建不带任何诊断状态：少一份明文、少一族特征 */

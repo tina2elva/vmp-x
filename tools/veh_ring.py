@@ -81,7 +81,8 @@ def handler(info):
             hlog('    probe read failed: %r' % (e,))
     ring_rva = CFG.get('ring_rva')
     vmpb_rva = CFG.get('vmpb_rva')
-    if ring_rva is not None and base:
+    vmpb_rva = CFG.get('vmpb_rva')
+    if ring_rva is not None and vmpb_rva is not None and base:
         p = base + vmpb_rva + ring_rva
         try:
             hdr = (ctypes.c_uint64 * 2).from_address(p)
@@ -106,7 +107,7 @@ def main():
     ap.add_argument('--dir', required=True)
     ap.add_argument('--module', required=True)
     ap.add_argument('--expr', required=True)
-    ap.add_argument('--vmpb-rva', type=lambda s: int(s, 0), required=True)
+    ap.add_argument('--vmpb-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--ring-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--probe-rva', type=lambda s: int(s, 0), default=None)
     a = ap.parse_args()
