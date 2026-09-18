@@ -684,6 +684,31 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标 第 3 轮（续）：正式修法是**放大 margin**，不是挪栈 —— 覆盖口径 6/14
+>
+> ### 414. 私有栈方案为什么必须撤掉
+> E2E 的 `framed` 用例立刻全红（`framed(0): native=10 protected=-2021379994`）：
+> 它是**专门**用来验证 FRAME_SKEW 的 —— 第 5 个参数位于**调用方栈帧**里，靠 `FRAME_SKEW` 修正才能取到。
+> 把客户机栈搬到 .bss 的私有缓冲后，"客户机栈与宿主调用方帧"的固定对应关系就断了，这类访问必然取错。
+> 也就是说：**挪栈必须先做"运行期捕获宿主 RSP、把 skew 变成运行期量"的重构**，不是本轮能顺手做的。
+>
+> ### 415. 正式修法（已落地，仅 Windows/x64）
+> `VM_MARGIN: 0xC00 → 0x4000`（3KB → 16KB）。关键是：**skew 与 stub 的 SP 是同一份常量算出来的**，
+> 所以放大 margin 不会破坏 framed 那类访问（自洽）；而不像挪栈那样单方面改变 SP。
+> 复测：
+> ```
+> e2e: 146 passed, 0 failed        （含 framed / mt / calls_* 全部）
+> go test ./...  全通
+> 6 函数同时保护：fib(10)=55 fib(15)=610 n.shape=(10,) greet=Hello, vmp! time_len=19 add_dly=5.0
+> 原生                      ：同上一行完全一致
+> ```
+>
+> ### 416. 另外三个平台为什么不一起放大
+> `stub/linux/amd64/vm_abi.h` 里我早先写过结论：模拟栈位于宿主 RSP 之下约 12.7KB，而 Go 的 goroutine
+> 初始栈只有 8KB —— 在 linux-amd64 的差分用例里会直接 `runtime: split stack overflow`；
+> 单纯调小 margin 又会被 vmpbuild 以 `margin < 解释器最大帧(4544)+512` 拒绝。
+> 所以 Linux/arm64 上"两边都要"的唯一出路仍是**客户机私有栈 + 运行期 skew**（见下一条待办），本轮先只改 Windows/x64。
+>
 > ## 新目标 第 3 轮（add_dly）：**修好了** —— 私有客户机栈（6/14 已验证）
 >
 > ### 411. 修法
