@@ -684,6 +684,26 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标（mt 偶发）第 15 轮：把崩溃上报换成 VEH，等下一次 CI 偶发给地址
+>
+> ### 479. 改动
+> `testdata/target.c` 里把崩溃上报从只用 `SetUnhandledExceptionFilter` 改成**再加一层 VEH**：
+> `AddVectoredExceptionHandler(1, ...)`（更早、对线程内/收尾期的访问违例也生效）+ 一次性打印 +
+> `CONTINUE_SEARCH`（**不改变原有退出行为**，退出码照旧）。
+> 自检（故意空指针）：
+> ```
+> CRASH code=0xC0000005 addr=00007FF6269D3355 module=00007FF6269D0000 rva=0x3355
+> rc=-1073741819        ← 退出码保持原样
+> ```
+>
+> ### 480. 本地仍然复现不出来（前后数字）
+> ```
+> e2e.ps1                      146 passed, 0 failed   （VEH 在正常路径不误报）
+> 8 路并发压测 mt 200 次        异常 0 次
+> ```
+> 所以这条只能靠 CI：下一次偶发时，`E2EFAIL` 摘要里会直接带上 `CRASH code/addr/module/rva`
+> （诊断输出已放宽到 200 字符），有了地址就能像 add_dly 那样迅速收敛。
+>
 > ### 478. CI 终于给出崩溃码：**0xC0000005（访问违例）**，不是栈溢出
 > 上一轮换用 .NET Process API 之后，`E2EFAIL` 摘要里第一次拿到了真实退出码：
 > ```

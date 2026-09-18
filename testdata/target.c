@@ -361,7 +361,10 @@ static DWORD WINAPI mt_worker(LPVOID p) {
 /* 崩溃自证：CI 上 mt 偶发崩溃时，注解里只有"protected 为空"，看不到崩在哪。
  * 这里装一个顶层异常过滤器，把异常码、故障地址、所属模块和模块内偏移打到 stderr ---
  * E2E 的失败诊断会抓 stderr，于是 CI 注解里就能带上崩溃地址，便于映射回 blob 符号。 */
-static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
+/* VEH 版本：SetUnhandledExceptionFilter 对某些线程内/收尾期的访问违例不会触发（CI 实测 err 为空），
+ * 而向量化异常处理器更早、范围更广。只打印一次，然后 CONTINUE_SEARCH，不改变原有退出行为。 */
+static volatile LONG g_crash_reported = 0;
+static void vmp_crash_line(EXCEPTION_POINTERS *ep) {
     void *addr = (void *)ep->ExceptionRecord->ExceptionAddress;
     HMODULE mod = NULL;
     fprintf(stderr, "CRASH code=0x%08lX addr=%p", (unsigned long)ep->ExceptionRecord->ExceptionCode, addr);
@@ -372,10 +375,23 @@ static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
     }
     fprintf(stderr, "\n");
     fflush(stderr);
+}
+static LONG WINAPI vmp_veh(EXCEPTION_POINTERS *ep) {
+    if (InterlockedExchange(&g_crash_reported, 1) == 0) {
+        vmp_crash_line(ep);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
+    if (InterlockedExchange(&g_crash_reported, 1) == 0) {
+        vmp_crash_line(ep);
+    }
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
 int main(int argc, char **argv) {
+    AddVectoredExceptionHandler(1, vmp_veh);   /* 更早、更广：CI 上那个 AV 只有它能抓到 */
     SetUnhandledExceptionFilter(vmp_crash_filter);
     if (argc >= 2 && strcmp(argv[1], "crash_test") == 0) { /* 自检用：故意解引用空指针 */
         volatile int *nullp = (volatile int *)0;
