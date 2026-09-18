@@ -46,6 +46,11 @@ extern u64 vm_last_pc;
 extern u64 vm_last_call; /* 最后一次本机调用的目标 */
 extern u64 vm_last_call_rcx; /* 发起该调用时的 guest RCX（第一个参数） */
 extern u64 vm_last_call_sp;  /* 发起该调用时的 guest RSP */
+extern u64 vm_last_store_pc;   /* 最后一次 guest STORE 的 pc */
+extern u64 vm_last_store_base; /* 其基址寄存器的值 */
+extern u64 vm_last_store_addr; /* 它算出来的最终地址 */
+extern u64 vm_last_call_pc;    /* 最后一次本机调用的 pc */
+extern u64 vm_last_call_ret;   /* 该调用的返回值（RAX） */
 #endif
 u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
@@ -700,6 +705,11 @@ u64 vm_last_pc;
 u64 vm_last_call;
 u64 vm_last_call_rcx;
 u64 vm_last_call_sp;
+u64 vm_last_store_pc;
+u64 vm_last_store_base;
+u64 vm_last_store_addr;
+u64 vm_last_call_pc;
+u64 vm_last_call_ret;
 #endif
 
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
@@ -873,6 +883,11 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             if (idx != VM_NO_REG)
                 addr += vm->regs[idx & VM_REG_MASK] * (u64)scale;
             u64 v = vm->regs[src];
+#ifndef VM_RELEASE
+            vm_last_store_pc = pc;
+            vm_last_store_base = vm->regs[base];
+            vm_last_store_addr = addr;
+#endif
             switch (width) {
             case 8:  *(volatile u8 *)addr = (u8)v; break;
             case 16: *(volatile u16 *)addr = (u16)v; break;
@@ -1041,11 +1056,15 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_last_call = addr; /* 探针：最后一次 CALLN 的目标 */
             vm_last_call_rcx = vm->regs[VRCX];
             vm_last_call_sp = vm->regs[VRSP];
+            vm_last_call_pc = pc;
 #endif
             typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fn_t fn = (fn_t)addr;
             vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
                                 vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+#ifndef VM_RELEASE
+            vm_last_call_ret = vm->regs[VRAX];
+#endif
             vm->pc = pc + 9;
             break;
         }

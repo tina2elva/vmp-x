@@ -684,6 +684,27 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第十九轮：add_dly 的崩溃定位到一条 STORE —— 基址寄存器里是坏指针
+>
+> ### 359. 新探针：最后一次 guest STORE 的现场
+> vm_last_store_pc / vm_last_store_base（基址寄存器的值）/ vm_last_store_addr（算出的地址）；
+> 另加 vm_last_call_pc / vm_last_call_ret（本机调用的 pc 与返回值）。读数：
+> ```
+> last pc=0x43C（该构建里是 OP_STORE）   store_pc=0x43C
+> store_base = 0x7FFF382E9130           store_addr = 0x7FFF382E9130（= 异常写目标）
+> 上一条本机调用：call_pc=0x3EC  call_ret=0x275D9C70D50
+> ```
+> ⇒ STORE 的地址计算（base+disp+idx*scale）没有问题，是**基址寄存器的值本身就是坏指针**；
+> 而且它**不等于**上一条本机调用的返回值 → 坏值是在 0x3EC 与 0x43C 之间被写进那个寄存器的。
+>
+> ### 360. 一个必须记住的坑（这轮又差点栽进去）
+> 解码字节码要用**该次打包时**的 opcode 映射；我这轮先打包、随后又重建了 blob（生成新 manifest），
+> 于是拿新映射去解旧字节码，出现一片「未知字节」。正确做法：打包与解码之间不要重建 blob。
+>
+> ### 361. 工具
+> · build/probe_fn3.ps1：一次打包 + 自动算探针 RVA + 跑 VEH 读现场；
+> · build/decode_bc.py：从 vm_interp.c 的 vm_insn_size 解析指令长度表，再线性解码字节码。
+>
 > ## 第十八轮：修复 —— 打包端丢弃运行期自校验调用（current_time_str 恢复正常，覆盖率 4/14 → 5/14）
 >
 > ### 356. 实现（cmd/vmpack）
