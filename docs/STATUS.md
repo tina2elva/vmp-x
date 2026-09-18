@@ -684,6 +684,28 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第二十五轮：查明 CI 其实从第 3 轮起就一直是红的（我此前只跑 PE/x64 的 E2E，没看 CI）
+>
+> ### 373. 定位（查 GitHub Actions 运行记录）
+> 最后一次绿：e4e43da2（第 2 轮，feat(b)）；第一次红：e0abbb8f（第 3 轮，feat(c) 入口补丁密钥校验）。
+> 之后每次（含第 18/21/24 轮）都是 failure —— 也就是说我这几轮"全绿"的印象只覆盖了 PE/x64 的 E2E。
+>
+> ### 374. 红的四个步骤
+> · windows-amd64：Linux payload executed on Windows（就是本地那 6 处 checkKey 不一致）
+> · linux-amd64：payload probe（把载荷按原 VA 映射执行）
+> · linux-arm64：Linux/arm64 end-to-end（qemu-aarch64）
+> · windows-arm64-blob：build Windows/arm64 blob（构建失败）
+>
+> ### 375. 判断
+> 前三项共同点：都被 (c) 那套"入口补丁字节完整性校验"覆盖。第 3 轮加的校验在运行时重算 patch 的 FNV 与
+> 描述符里的期望值比对，不一致就 trap —— ELF/arm64 路径上打包端写的期望值与运行期实际字节显然不一致，
+> 于是载荷被拒绝执行（表现为结果错乱而非崩溃）。第四项是另一回事：我第 22/24 轮加的反调试内联汇编是 x86-64 的，
+> 编到 aarch64 目标直接编译失败（需要按架构加保护）。
+>
+> ### 376. 流程教训（已写进本轮提交）
+> 我每轮只跑 tools/e2e.ps1（PE/x64）与 e2e_dll.ps1，几乎没跑 tools/gates.ps1、也从没看 CI —— 所以一个 20 轮前的回归
+> 一直没被发现。今后：每次 push 后看 CI 结论；本地至少跑一次 gates.ps1（含 ELF 与 arm64 步骤）。
+>
 > ## 第二十四轮：(g) 反调试通过验证；同时暴露一个更早存在的 ELF 载荷回归
 >
 > ### 370. 反调试：实现 + A/B 数字
