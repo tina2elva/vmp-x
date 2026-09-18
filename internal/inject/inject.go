@@ -27,6 +27,18 @@ func Apply(f *pe.File, opt Options) (*Result, error) {
 		copy(f.Data[off:off+len(p.EntryPatch)], p.EntryPatch)
 	}
 
+	// 入口补丁打完后，把被保护函数的 .pdata 记录删掉（并清掉对应 UNWIND_INFO）：
+	// 否则分析者既能据此定位"哪个函数被特殊处理过"，也能从 prologue 描述把被覆盖的字节推回来。
+	var patched []uint32
+	for _, p := range pl.Placements {
+		patched = append(patched, p.FuncRVA)
+	}
+	if removed, err := neutralizeUnwind(f, patched); err != nil {
+		return nil, fmt.Errorf("清理 .pdata 失败: %w", err)
+	} else if removed > 0 && opt.Verbose {
+		fmt.Printf("[*] 已从 .pdata 删除 %d 条 RUNTIME_FUNCTION\n", removed)
+	}
+
 	// payload 布局：[blob(含 .bss)] [描述符/thunk/字节码槽]。.bss 在 blob **中部**，
 	// 所以按"可写区间"切成三段、按顺序追加，RVA 必须与 blob 里的偏移一致：
 	//   .vmp  : [0, bssOff)                 → R+X（代码/只读数据）

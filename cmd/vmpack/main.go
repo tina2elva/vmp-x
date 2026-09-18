@@ -334,7 +334,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	}, opcodeMap, verbose)
 	must(err)
 
-	res, err := inject.Apply(f, inject.Options{SectionName: section, Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, BSSOff: bssOff, BSSSize: bssSize})
+	res, err := inject.Apply(f, inject.Options{SectionName: section, Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize})
 	must(err)
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新节 %s: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",
@@ -385,7 +385,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 	}, opcodeMap, verbose)
 	must(err)
 
-	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, BSSOff: bssOff, BSSSize: bssSize})
+	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch, DescMagic: descMagic, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize})
 	must(err)
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新 PT_LOAD: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",

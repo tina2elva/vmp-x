@@ -49,6 +49,8 @@ type Options struct {
 	// DescMagic：写进描述符的魔数。0 表示用默认常量；release 构建由 vmpack 从 manifest 传入
 	// 每次构建不同的随机值，避免产物里留下固定 4 字节特征。
 	DescMagic uint32
+	// Verbose：打印注入过程的细节。
+	Verbose bool
 	// Arch 目标架构："x86-64"（默认）或 "arm64"。
 	// 影响两处**架构相关**的编码：thunk 的调用指令（E8 rel32 / BL imm26）
 	// 与函数入口补丁（E9 rel32 / B imm26）。
