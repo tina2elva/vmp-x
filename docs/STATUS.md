@@ -684,6 +684,28 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标 第 4 轮（结论）：**add_dly 修好了**，CI 5/5 全绿；上一轮的 mt 失败是偶发
+>
+> ### 421. 判定
+> ```
+> f26989a2（16KB margin 重推）  5/5 全绿：linux-amd64 ✓ linux-arm64 ✓ windows-amd64 ✓ win-arm64-blob ✓ win-arm64-run ✓
+> 4c52bfb1（同一份代码的上一轮）windows-amd64 ✗（mt(0)）
+> ```
+> 同一份代码两轮结果不同 ⇒ CI 的 `mt` 用例**本身是偶发的**（4 线程 × 20000 次调用、专门压 4 槽字节码缓存的竞争）。
+> 这是一条重要提醒：以后 CI 上 `mt` 红了，先重跑一轮再动手。
+>
+> ### 422. add_dly 的最终修法与验证
+> · 根因：客户机栈就是 `host_rsp - VM_MARGIN`，VM 里发起的原生调用（Cython/numpy）帧从 host_rsp 往下长，
+>   3KB 不够就整片压到客户机栈上（实测一次 CALLN 改掉 guest 栈顶 31/32 个 qword）；
+> · 修法：`VM_MARGIN` 3KB → **16KB**（Windows/x64）。关键点：skew 与 stub 的 SP 由同一常量导出，故语义自洽，
+>   `framed`（专测调用方栈帧参数）依旧通过 —— 这与"把栈挪到私有缓冲"完全不同（那条会破坏对应关系）。
+> · 验证：e2e 146/146（本地 + CI）、mt×20 / framed×10 与原生逐字节一致、
+>   6 函数同时保护与原生逐项一致（fib 55/610、n.shape、greet、time_len=19、**add_dly=5.0**）。
+>
+> ### 423. 覆盖口径
+> `n / fibonacci / current_time_str / add_dly / pymod_create / bisect_code_objects` —— **6/14**（原 5/14）。
+> 目标剩余项：ELF 那条"运行期读目标字节导致结果错乱"的根因（台账）。
+>
 > ## 新目标 第 4 轮：用"再跑一次 CI"来区分偶发与真问题
 >
 > ### 420. 本地复核（16KB margin，重新构建受保护目标后）
