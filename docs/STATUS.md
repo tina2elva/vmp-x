@@ -684,6 +684,37 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标（覆盖口径）第 13 轮：更正一条错记录，并把已验证组合钉到 **9/11**
+>
+> ### 474. pymod_create 的真相：**导入期就崩**，而且是老问题
+> 逐函数 + 组合二分（全部用当前 blob；另外还把代码 checkout 回第 8 轮的提交复测了一遍）：
+> ```
+> pymod_import_only   rc=3221225477   ← 只保护 pymod_create，连 import 都过不去
+> pymod_plus_bisect   rc=3221225477
+> pymod_plus_n        rc=3221225477
+> 在第 8 轮的提交 6a7cb12 上 pymod 单独保护：同样 rc=3221225477
+> ```
+> 也就是说：**`__pyx_pymod_create` 一受保护，模块初始化就崩**，与组合无关、也与我第 9–12 轮的改动无关。
+>
+> ### 475. 更正：第 8 轮那句「8 个函数已验证」是错的
+> 那个 8 函数集合里**包含 pymod_create**；它今天单独/组合都崩。最可能的解释是我当时用到了
+> **过期的 blob**（`build/vm_interp_rel.bin` 没重建）——这又是「工具与被测对象不同步」，第 9 次。
+> 现在用当前工具链重新测：
+> ```
+> no_pymod_7   rc=0  OK 55 610 (10,) Hello, vmp! 19 5.0     ← 7 函数组合完全正确
+> with_pymod_8 rc=3221225477                                ← 加回 pymod 就崩（导入期）
+> ```
+>
+> ### 476. 把 greet 与 fibonacci 包装也加进来：**9/11 全部正确**
+> ```
+> 9 函数集合保护后：fib 55/610、n (10,)、greet Hello, vmp!、time 19、add_dly 5.0
+> 原生            ：fib 55/610、n (10,)、greet Hello, vmp!、time 19、add_dly 5.0   ← 逐字节一致
+> ```
+> 于是当前口径（11 个候选名）：
+> · **端到端验证通过：9**（n、pf_n、pw_fibonacci、pf_fibonacci、pw_greet、pw_current_time_str、pf_current_time_str、pw_add_dly、bisect）；
+> · **打包期拒绝：1**（pf_8add_dly，字节码 7313 > 槽 4096，由本轮新增的硬校验挡下）；
+> · **已知坏：1**（pw/pymod_create：受保护即崩在模块初始化，老问题、可复现）。
+>
 > ## 新目标（覆盖口径）第 12 轮：**大函数崩点的真正根因**：字节码超过缓存槽，vm_run 静默返回错误码
 >
 > ### 470. 根因（终于对上了所有现象）
