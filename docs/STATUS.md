@@ -684,6 +684,25 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第三十八轮：找到并修掉 CI 四个红 job 的根因 —— `vm_selfcheck` 被 `#if` 挡住了
+>
+> ### 396. 根因
+> 第 32 轮我把自哈希那段代码插在 `volatile u64 vm_peb_seen;` 之后，而那一行**正好在反调试的**
+> `#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)` **里** —— 于是：
+> · win/x64 上两个宏都成立 → 代码被编进来 → 本地一切正常（**所以本地门禁全绿掩盖了这个问题**）；
+> · linux/amd64、linux/arm64、win/arm64 上整块被排除 → `vm_run` 里的 `vm_selfcheck()` 找不到定义 →
+>   CI 报 `call to undeclared function 'vm_selfcheck'` / `引用了未定义符号 "vm_selfcheck"`。
+> 这是"只在某个平台编译的分支里塞了跨平台代码"这类典型错误，而且本地门禁只覆盖 win/x64，抓不到。
+>
+> ### 397. 修复与验证
+> 把 guard 下移，只包住反调试的 `vm_debugger_present`/`vm_antidebug`；自哈希与 `vm_peb_seen` 回到文件作用域（全平台编译）。
+> 本地验证：
+> ```
+> win/x64   blob 构建 exit=0
+> linux/amd64 blob 构建 exit=0   ← 这正是 CI 四个红 job 之一
+> ```
+> 教训补充：本地门禁只跑 win/x64 的 blob 构建，**跨平台构建必须靠 CI** —— 所以 CI 一红就要立刻看，不能只看本地。
+>
 > ## 第三十七轮：实现 **ELF 版入口挂钩**（对标 PE 的 EntryHook），(c) 在 ELF 上也有拦截点
 >
 > ### 394. 实现

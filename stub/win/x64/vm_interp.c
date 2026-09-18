@@ -495,7 +495,6 @@ static int vm_bc_acquire(void) {
  * vm_peb_seen 只用于自证这段代码确实跑过（volatile 防止被优化掉）。 */
 /* 仅 Windows 宿主 + x86-64：这段内联汇编是 x86-64 的，编到 aarch64 目标会编译失败
  * （CI 的 windows-arm64-blob 就是因此红的）。arm64 上反调试暂时置空。 */
-#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
 volatile u64 vm_peb_seen;
 /* ---- (g) 解释器/桩代码段自哈希 ----
  * vmpbuild 在合并完成后把三个值写进下面三个全局（都在 .bss，位于被哈希区间之外）：
@@ -517,6 +516,7 @@ static void vm_selfcheck(void) {
     if (h != vm_self_hash) __builtin_trap();
 }
 
+#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
 static int vm_debugger_present(void) {
     const u8 *peb;
     __asm__ volatile("movq %%gs:0x60, %0" : "=r"(peb));
