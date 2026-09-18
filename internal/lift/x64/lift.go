@@ -44,6 +44,12 @@ type Lifter struct {
 	ScratchRVA uint32
 	rbpEff     int64 // rbp 相对进入时 RSP 的偏移（仅当 rbp 直接由 rsp 派生时有效）
 	rbpKnown   bool
+	// aliasKnown/aliasEff：把 RSP（或已跟踪的 RBP）的值取到**任意通用寄存器**后记下的等效偏移。
+	// 之后用该寄存器做内存访问时，按与 RSP 相同的 FrameSkew 规则折算 —— 这正是 rbpEff 对 RBP 做的事，
+	// 只是推广到任意寄存器。没有这层跟踪时，这类寄存器只能用于"保存/还原 SP"；
+	// 一旦被用来访问**调用方帧**就会差一个 FrameSkew（实测 add_dly 的函数体因此崩在 numpy 里）。
+	aliasKnown [16]bool
+	aliasEff   [16]int64
 }
 
 func NewLifter(imageBase uint64) *Lifter { return &Lifter{ImageBase: imageBase} }
@@ -100,6 +106,7 @@ func (l *Lifter) LiftFunc(name string, code []byte, rva uint32) (*ir.Func, error
 	// 每个函数独立的栈跟踪状态：spDelta 从 0（进入时 RSP）开始
 	l.spDelta, l.spKnown, l.spLostBy = 0, true, ""
 	l.rbpEff, l.rbpKnown = 0, false
+	l.aliasKnown, l.aliasEff = [16]bool{}, [16]int64{}
 
 	// ---- 分区域翻译 ----
 	// 函数主体是一段连续代码，但编译器会把**冷块**（switch 的默认分支、不常走的分支）
@@ -353,6 +360,11 @@ func (l *Lifter) memAddr(ins x64dec.Insn, m x86asm.Mem) (base, index ir.Reg, sca
 		disp = l.adjustStackDisp(disp, int64(disp)+l.spDelta)
 	} else if base == ir.RBP && l.rbpKnown {
 		disp = l.adjustStackDisp(disp, int64(disp)+l.rbpEff)
+	} else if base < 16 && l.aliasKnown[base] {
+		// mov reg,rsp / mov reg,rbp 之后用该寄存器访问内存：按同一条 FrameSkew 规则折算，
+		// 并把基址换回 RSP —— 这样"调用方帧（正偏移）"与"自己的帧（负偏移）"都能对。
+		disp = l.adjustStackDisp(disp, int64(disp)+l.aliasEff[base])
+		base = ir.RSP
 	}
 	return base, index, scale, disp, nil
 }
@@ -882,6 +894,9 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 		if r == ir.RBP {
 			l.rbpKnown = false
 		}
+		if r < 16 {
+			l.aliasKnown[r] = false
+		}
 	}
 	argReg := func(i int) (ir.Reg, bool) {
 		if i >= len(args) {
@@ -984,13 +999,19 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 			} else {
 				l.rbpKnown = false
 			}
+		case dst == ir.RSP && src != ir.RSP && src < 16 && l.aliasKnown[src]:
+			// mov rsp, reg（reg 是之前从 rsp 存下来的）：把栈跟踪恢复到保存时的状态。
+			l.spDelta, l.spKnown = l.aliasEff[src], true
 		case dst != ir.RSP && src == ir.RSP:
-			// mov reg, rsp：放行，寄存器拿到的是模拟栈那一侧的值（= 当前 guest RSP）。
-			// 这对"存一下、最后 mov rsp,reg 还原"的用法（greet 就是）是正确的；
-			// 但如果该寄存器随后被用来访问**调用方帧**（正偏移），就会差一个 FrameSkew ——
-			// 实测 add_dly 的函数体正是这样（崩溃点在 numpy 里，VM 侧一切正常）。
-			// 彻底修法是把这类寄存器纳入与 rbpEff 同类的**别名跟踪**，见 docs/STATUS.md。
+			// mov reg, rsp：寄存器拿到的是模拟栈那一侧的值（= 保存时的 guest RSP），
+			// 这对"存一下、最后 mov rsp,reg 还原"（greet 就是）是正确的；
+			// 同时**记下别名**，这样它随后被当作内存基址时，memAddr 能按 eff 的符号补 FrameSkew
+			// —— 也就是"访问调用方帧"那种用法（add_dly 的函数体）。
 			clobber(dst)
+			if dst < 16 && l.spKnown {
+				l.aliasKnown[dst] = true
+				l.aliasEff[dst] = l.spDelta
+			}
 		default:
 			clobber(dst)
 		}
