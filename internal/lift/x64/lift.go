@@ -684,6 +684,16 @@ func (l *Lifter) liftOne(f *ir.Func, ins x64dec.Insn, off uint32) error {
 	case x86asm.JMP:
 		if rel, ok := relArg(args[0]); ok {
 			target := ins.PC + uint64(ins.Len()) + uint64(rel)
+			// 目标落在函数外 = **尾调用**：原语义是"跳到那里、然后返回我的调用者"，
+			// 等价于 call 目标; ret。VM 里有 CALLN（相对）与 RET，且参数本来就在客户机寄存器里。
+			if target < f.Addr || target >= f.Addr+uint64(f.Size) {
+				if target < l.ImageBase {
+					return fmt.Errorf("尾调用目标 0x%X 低于镜像基址", target)
+				}
+				em(ir.Insn{Op: ir.CallN, Imm: target - l.ImageBase})
+				em(ir.Insn{Op: ir.Ret})
+				return nil
+			}
 			em(ir.Insn{Op: ir.Jmp, TargetOff: uint32(target - f.Addr)})
 			return nil
 		}

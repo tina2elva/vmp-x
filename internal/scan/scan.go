@@ -259,8 +259,17 @@ func TrimTrailingPadding(imageBase uint64, rva uint32, code []byte) ([]byte, int
 		return nil, 0, fmt.Errorf("整段都是填充字节")
 	}
 	last := insns[i]
-	if last.Op() != x86asm.RET {
-		return nil, 0, fmt.Errorf("函数末尾不是 RET（+0x%X 是 %s）", last.PC-base, last.Text())
+	// 末尾允许 RET，或**直接无条件跳转**（尾调用 / 跳到别处 —— 增量链接与 thunk 都这么收尾）。
+	// 跳转的具体语义交给 lifter 判定：目标在函数外时会被抬成 CALLN + RET。
+	// `jmp [rip+disp]`（导入桩）仍然保守拒绝，避免把"跳到导入表"当成函数体。
+	okTail := last.Op() == x86asm.RET
+	if !okTail && last.Op() == x86asm.JMP && len(last.Inst.Args) > 0 {
+		if _, isRel := last.Inst.Args[0].(x86asm.Rel); isRel {
+			okTail = true
+		}
+	}
+	if !okTail {
+		return nil, 0, fmt.Errorf("函数末尾不是 RET/JMP（+0x%X 是 %s）", last.PC-base, last.Text())
 	}
 	end := int(last.PC-base) + last.Len()
 	return code[:end], i + 1, nil
