@@ -684,6 +684,17 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ### 430. CI 结论（6f3f849）
+> ```
+> linux-amd64      ✓   ← 运行期补丁校验在 ELF 上开着也能正确执行（bash 夹具补映射后）
+> linux-arm64      ✓   ← arm64 的 8 字节补丁同样校验通过
+> windows-arm64-blob ✓  windows-arm64-run ✓
+> windows-amd64    ✗   E2E 145 passed, 1 failed —— 又是 mt(0)（同一份代码另一轮是绿的）
+> ```
+> 即：ELF 那条台账**已收口并上了 CI 验证**；剩下唯一的红点是 mt 这个已知偶发用例。
+> mt 是 4 线程 × 20000 次、专压 4 槽字节码缓存的多线程用例 —— 它间歇性失败说明缓存那段**可能存在真实竞争**，
+> 值得单独查（不属于本目标范围，但会持续干扰 CI 信号）。
+>
 > ### 429. 补：Linux 侧的 bash 夹具同样要补映射
 > 本地 `.ps1` 通了但 CI 的 `linux-amd64` 仍红 —— 因为 CI 跑的是 `tools/verify_linux_payload.sh`（另一个实现），
 > 它同样只映射 payload。已给 `payload_probe_linux.c` 加上"非数字参数=补丁文件"的处理（mmap 目标页后写入），
