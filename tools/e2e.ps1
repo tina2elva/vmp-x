@@ -48,8 +48,8 @@ function Run-FileDiag([string]$exe, [string[]]$a, [int]$sec) {
         if ($null -eq $o) { $o = "" }; if ($null -eq $e) { $e = "" }
         $o = ($o -replace "[\r\n]+", " ").Trim()
         $e = ($e -replace "[\r\n]+", " ").Trim()
-        if ($o.Length -gt 60) { $o = $o.Substring(0, 60) }
-        if ($e.Length -gt 80) { $e = $e.Substring(0, 80) }
+        if ($o.Length -gt 200) { $o = $o.Substring(0, 200) }
+        if ($e.Length -gt 200) { $e = $e.Substring(0, 200) }
         return ("rc=" + $rc + " out[" + $o + "] err[" + $e + "]")
     } catch {
         return ("STARTFAIL: " + $_.Exception.Message)
