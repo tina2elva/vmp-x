@@ -11,6 +11,7 @@ import (
 	dbgpe "debug/pe"
 	"encoding/binary"
 	"fmt"
+	"sort"
 
 	"golang.org/x/arch/x86/x86asm"
 
@@ -61,43 +62,58 @@ func findFunctionRaw(path string, f *pe.File, name string) (*Found, error) {
 		//   · .pdata 里同起点的那条（精确）；
 		//   · 否则 .pdata 里下一个函数的起点（叶子函数常常没有自己的条目）；
 		//   · 再否则下一个导出；最后才退到节尾。
-		end := uint32(0)
-		take := func(v uint32) {
-			if v > rva && (end == 0 || v < end) {
-				end = v
+		// 边界候选全部列出，然后**从小到大试**，取第一个"末尾确实是 RET/JMP"的。
+		// 只取最小上界会出问题：.pdata/下一个符号给的 end 可能落在函数中间（实测 greet 与
+		// add_dly 的函数体就是这样），于是"最后一个真实指令"是普通指令而被保守拒绝。
+		// 反过来，"宁可选大"也不行——那会把下一个函数的代码吞进来。
+		var cands []uint32
+		add := func(v uint32) {
+			if v > rva {
+				cands = append(cands, v)
 			}
 		}
+		if e, ok := mapNextBegin(rva); ok {
+			add(e)
+		}
 		if _, e, ok2 := pdataEnd(df, rva); ok2 {
-			take(e)
+			add(e)
 		}
 		if e2, ok3 := pdataNextBegin(df, rva); ok3 {
-			take(e2)
+			add(e2)
 		}
 		if e3, ok4 := nextExportEnd(df, rva); ok4 {
-			take(e3)
+			add(e3)
 		}
 		if si, ok5 := sectionOfRVA(f, rva); ok5 {
-			take(sectionEndOf(f, si))
+			add(sectionEndOf(f, si))
 		}
-		if end <= rva {
+		if len(cands) == 0 {
 			return nil, fmt.Errorf("导出 %q（RVA 0x%X）找不到可用边界", name, rva)
 		}
-		code, cerr := readCode(f, rva, end)
-		if cerr != nil {
-			return nil, cerr
-		}
-		var trimmed []byte
-		var n int
+		sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
 		var terr error
-		if f.Machine == peMachineARM64 {
-			trimmed, n, terr = trimTrailingPaddingARM64(rva, code)
-		} else {
-			trimmed, n, terr = TrimTrailingPadding(f.ImageBase, rva, code)
+		for _, end := range cands {
+			code, cerr := readCode(f, rva, end)
+			if cerr != nil {
+				terr = cerr
+				continue
+			}
+			var trimmed []byte
+			var n int
+			if f.Machine == peMachineARM64 {
+				trimmed, n, terr = trimTrailingPaddingARM64(rva, code)
+			} else {
+				trimmed, n, terr = TrimTrailingPadding(f.ImageBase, rva, code)
+			}
+			if terr != nil {
+				continue
+			}
+			return &Found{Name: name, RVA: rva, End: rva + uint32(len(trimmed)), Code: trimmed, InstrNum: n}, nil
 		}
-		if terr != nil {
-			return nil, terr
+		if terr == nil {
+			terr = fmt.Errorf("函数 %q（RVA 0x%X）的候选边界里没有以 RET/JMP 收尾的", name, rva)
 		}
-		return &Found{Name: name, RVA: rva, End: rva + uint32(len(trimmed)), Code: trimmed, InstrNum: n}, nil
+		return nil, terr
 	}
 	secIdx := int(target.SectionNumber) - 1
 	if secIdx < 0 || secIdx >= len(f.Sections) {

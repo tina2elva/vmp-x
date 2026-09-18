@@ -76,3 +76,15 @@ func mapRVA(name string) (uint32, bool) {
 	v, ok := mapSymbols[name]
 	return v, ok
 }
+
+// mapNextBegin 返回 MAP 里比 rva 大的最近函数起点 —— 这是"函数真正的结束位置"最可靠的来源
+// （相邻函数的起点就是上一个函数的终点）。.pdata 有时会给出一条落在函数中间的边界（实测 greet）。
+func mapNextBegin(rva uint32) (uint32, bool) {
+	best := uint32(0)
+	for _, v := range mapSymbols {
+		if v > rva && (best == 0 || v < best) {
+			best = v
+		}
+	}
+	return best, best != 0
+}
