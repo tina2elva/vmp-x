@@ -684,6 +684,37 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标（覆盖口径）第 9 轮：**单函数翻译 11/11**，端到端 10/11
+>
+> ### 458. 新能力：常量偏移的"栈地址物化"
+> `mov reg, rsp` 与 `lea reg, [rsp+disp]`（**不带索引**）现在允许翻译：照搬 `memAddr` 已有的 FrameSkew 规则
+> （`eff >= 0` 的访问补 FrameSkew），于是物化出来的值就是宿主侧那个地址，与普通内存访问算出来的完全一致；
+> 后续 `[reg+disp]` 按普通寄存器基址算，也是对的。
+> **带索引**的形式（`lea reg,[rsp+idx*scale+disp]`，且落在调用方帧一侧）仍然**保守拒绝**：
+> 真实偏移的符号取决于运行期 idx，无法判定要不要补 FrameSkew —— 宁可拒绝也不猜。
+> 单测也跟着改了：原来的 `TestLiftRejectsStackAddressEscape` 编码的是"一律拒绝"的旧规则，
+> 现在拆成 `TestLiftStackAddressMaterialization`：常量形式必须通过、带索引形式必须被拒。
+>
+> ### 459. 口径（同一份样本、同一条判据）
+> ```
+> OK __pyx_pw_7example_1n          127 IR   950 B      OK __pyx_pw_7example_7current_time_str 285 IR 2050 B
+> OK __pyx_pf_7example_n           127 IR   950 B      OK __pyx_pf_7example_6current_time_str 285 IR 2050 B
+> OK __pyx_pw_7example_3fibonacci  139 IR  1076 B      OK __pyx_pw_7example_9add_dly          150 IR 1171 B
+> OK __pyx_pf_7example_2fibonacci  310 IR  2223 B      OK __pyx_pf_7example_8add_dly          990 IR 7313 B
+> OK __pyx_pw_7example_5greet      212 IR  1644 B      OK __pyx_pymod_create                  264 IR 1783 B
+>                                                      OK __pyx_bisect_code_objects            47 IR  293 B
+> 单函数翻译：前 8/11 → 后 **11/11**
+> ```
+>
+> ### 460. 端到端（这才是判据）
+> ```
+> greet   rc=0   OK Hello, vmp!      ← 它需要的正是本轮新打通的 lea rax,[rsp+0x98]
+> fibw    rc=0   OK 55               ← fibonacci 包装函数
+> adddly  rc=3221225477 (0xC0000005) ← __pyx_pf_7example_8add_dly（990 IR，迄今最大的函数）仍然崩
+> ```
+> 加上此前验证过的 8 个 ⇒ **10/11 端到端验证通过**；唯一未过的是那个 990 IR 的大函数。
+> 门禁 `tools/gates.ps1` **8/8**（单测与 E2E 均未回归）。
+>
 > ## 新目标（覆盖口径）第 8 轮：边界改成"候选从小到大试"，剩下的卡点收敛成**一条指令family**
 >
 > ### 455. 边界选择已改

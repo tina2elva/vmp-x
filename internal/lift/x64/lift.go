@@ -919,7 +919,7 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 			return nil
 		}
 		m, isM := memArg(args[1])
-		if !isM || m.Index != 0 {
+		if !isM {
 			clobber(dst)
 			return nil
 		}
@@ -931,6 +931,15 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 		case m.Base == x86asm.RBP && l.rbpKnown:
 			eff, known = l.rbpEff+int64(m.Disp), true
 		default:
+			clobber(dst)
+			return nil
+		}
+		if m.Index != 0 {
+			// 带索引的栈地址：真实偏移 = 常量部分 + idx*scale，符号取决于运行期 idx，
+			// 无法判定要不要补 FrameSkew。落在"调用方帧"那一侧时宁可拒绝，也不猜。
+			if known && eff >= 0 && l.FrameSkew != 0 {
+				return fmt.Errorf("栈地址（相对进入时 RSP %+d，带索引）被取到 %s，无法判定是否需要 FrameSkew 修正", eff, dst)
+			}
 			clobber(dst)
 			return nil
 		}
@@ -948,8 +957,11 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 				l.rbpKnown = false
 			}
 		default:
-			if known && eff >= 0 && l.FrameSkew != 0 {
-				return fmt.Errorf("栈地址（相对进入时 RSP %+d）被取到 %s，无法跟踪其后续使用", eff, dst)
+			// 把栈地址取到普通寄存器：**没有索引寄存器时地址是常量偏移**，可以照搬 memAddr 的修正规则
+			// （eff >= 0 的访问补 FrameSkew），于是寄存器的值就是宿主侧那个地址，后续 [reg+disp] 也是对的。
+			// 带索引的形式（rsp + idx*scale + disp）符号取决于运行期 idx，无法判定是否要补 FrameSkew → 仍保守拒绝。
+			if known && eff >= 0 && l.FrameSkew != 0 && m.Index != 0 {
+				return fmt.Errorf("栈地址（相对进入时 RSP %+d，带索引）被取到 %s，无法判定是否需要修正", eff, dst)
 			}
 			clobber(dst)
 		}
@@ -973,9 +985,7 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 				l.rbpKnown = false
 			}
 		case dst != ir.RSP && src == ir.RSP:
-			if l.spKnown && l.spDelta >= 0 && l.FrameSkew != 0 {
-				return fmt.Errorf("栈地址（相对进入时 RSP %+d）被取到 %s，无法跟踪其后续使用", l.spDelta, dst)
-			}
+			// mov reg, rsp：同上，常量偏移（入口 RSP）可以照搬修正规则，值即宿主侧地址。
 			clobber(dst)
 		default:
 			clobber(dst)

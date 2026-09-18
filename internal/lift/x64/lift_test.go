@@ -183,17 +183,41 @@ func TestLiftCallerFrameGetsSkew(t *testing.T) {
 }
 
 // 把调用方栈地址取到别的寄存器属于“无法跟踪的逃逸”，必须拒绝
-func TestLiftRejectsStackAddressEscape(t *testing.T) {
+// 栈地址物化的现行规则（第 2026-xx 轮改过，原因见 docs/STATUS.md 第 456 节附近）：
+//
+//	· 常量偏移（lea reg,[rsp+disp]、mov reg,rsp）→ **允许**：照搬 memAddr 的 FrameSkew 修正，
+//	  物化出来的值就是宿主侧那个地址，与普通内存访问算出来的完全一致；
+//	· 带索引（lea reg,[rsp+idx*scale+disp]）→ **仍拒绝**：符号取决于运行期 idx，无法判定要不要补 FrameSkew。
+func TestLiftStackAddressMaterialization(t *testing.T) {
+	newL := func() *Lifter {
+		l := NewLifter(0x140000000)
+		l.SetFrameSkew(8608)
+		return l
+	}
 	// lea rax,[rsp+0x8] ; ret
-	code, err := hex.DecodeString("488d442408" + "c3")
+	codeConst, err := hex.DecodeString("488d442408" + "c3")
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := NewLifter(0x140000000)
-	l.SetFrameSkew(8608)
-	f, err := l.LiftFunc("escape", code, 0x1000)
+	if _, err := newL().LiftFunc("lea_const", codeConst, 0x1000); err != nil {
+		t.Fatalf("常量偏移的栈地址应当可以物化，实际: %v", err)
+	}
+	// mov rax,rsp ; ret
+	codeMov, err := hex.DecodeString("4889e0" + "c3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newL().LiftFunc("mov_rsp", codeMov, 0x1000); err != nil {
+		t.Fatalf("mov rax,rsp 应当可以物化，实际: %v", err)
+	}
+	// lea rax,[rsp+rcx*8+0x8] ; ret
+	codeIdx, err := hex.DecodeString("488d44cc08" + "c3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := newL().LiftFunc("lea_idx", codeIdx, 0x1000)
 	if err == nil {
-		t.Fatal("栈地址逃逸应当被拒绝")
+		t.Fatal("带索引的栈地址仍应被拒绝")
 	}
 	if len(f.Unsupported) == 0 {
 		t.Fatal("应当给出原因")
