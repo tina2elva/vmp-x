@@ -120,3 +120,38 @@ func neutralizeUnwind(f *pe.File, rvas []uint32) (int, error) {
 	binary.LittleEndian.PutUint32(f.Data[dirOff+4:], uint32(kept*runtimeFuncSize))
 	return removed, nil
 }
+
+// EntryRVA 读 PE 的 AddressOfEntryPoint（RVA）。
+func EntryRVA(f *pe.File) (uint32, bool) {
+	d := f.Data
+	if len(d) < 0x40 {
+		return 0, false
+	}
+	peOff := int(binary.LittleEndian.Uint32(d[0x3C:]))
+	if peOff+24 > len(d) || d[peOff] != 'P' || d[peOff+1] != 'E' {
+		return 0, false
+	}
+	optOff := peOff + 24
+	if optOff+20 > len(d) {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint32(d[optOff+16:]), true
+}
+
+// SetEntryRVA 改写 PE 的 AddressOfEntryPoint（我们用它把加载期校验蹦床接管过去）。
+func SetEntryRVA(f *pe.File, rva uint32) error {
+	d := f.Data
+	if len(d) < 0x40 {
+		return fmt.Errorf("PE 头过短")
+	}
+	peOff := int(binary.LittleEndian.Uint32(d[0x3C:]))
+	if peOff+24 > len(d) || d[peOff] != 'P' || d[peOff+1] != 'E' {
+		return fmt.Errorf("不是 PE")
+	}
+	optOff := peOff + 24
+	if optOff+20 > len(d) {
+		return fmt.Errorf("可选头过短")
+	}
+	binary.LittleEndian.PutUint32(d[optOff+16:], rva)
+	return nil
+}

@@ -49,6 +49,13 @@ type Options struct {
 	// DescMagic：写进描述符的魔数。0 表示用默认常量；release 构建由 vmpack 从 manifest 传入
 	// 每次构建不同的随机值，避免产物里留下固定 4 字节特征。
 	DescMagic uint32
+	// EntryHook：把 PE/ELF 的入口点改成 payload 里的"校验蹦床"（加载期跑 vm_verify_table）。
+	// 这是拦住"回填原生字节"那条绕过的唯一位置 —— 解释器里的校验在回填后根本不会执行。
+	EntryHook bool
+	// VerifyFn：vm_verify_table 在 blob 内的偏移（manifest 的 symbols 里查）。
+	VerifyFn int
+	// EntryRVA：目标原本的入口点 RVA（蹦床校验完要跳回去）。
+	EntryRVA uint32
 	// PatchKey：入口补丁完整性校验用的密钥前缀（通常取 blob 主密钥前 8 字节）。
 	// 全 0 表示不启用校验（例如 -no-encrypt 的调试构建）。
 	PatchKey [8]byte
@@ -104,6 +111,9 @@ type Payload struct {
 	CodeSize int
 	BSSOff   int
 	BSSSize  int
+	// EntryHookRVA：校验蹦床的 RVA（0 = 没有）；EntryHookLen：蹦床长度。
+	EntryHookRVA uint32
+	EntryHookLen int
 }
 
 // Result 注入结果
@@ -177,7 +187,9 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		align(16)
 	}
 
-	pl := &Payload{Data: data, CodeSize: len(data) - opt.BSSSize, BSSOff: opt.BSSOff, BSSSize: opt.BSSSize}
+	var placements []Placement
+	patchChecks := make([]uint32, len(opt.Funcs))
+	patchLens := make([]int, len(opt.Funcs))
 	for i, fn := range opt.Funcs {
 		d, t, c := slots[i].descOff, slots[i].thunkOff, codeOffs[i]
 
@@ -251,9 +263,11 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 				h = (h ^ uint32(b)) * 16777619
 			}
 			binary.LittleEndian.PutUint32(data[d+60:], h)
+			patchChecks[i] = h
+			patchLens[i] = len(patch)
 		}
 
-		pl.Placements = append(pl.Placements, Placement{
+		placements = append(placements, Placement{
 			Name:          fn.Name,
 			FuncRVA:       fn.RVA,
 			BytecodeSize:  len(fn.Code),
@@ -264,6 +278,52 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			EntryPatchHex: fmt.Sprintf("% X", patch),
 		})
 	}
+	// ---- (c) 加载期校验：校验表 + 入口蹦床 ----
+	// 表：u32 count，随后每项 { i32 delta(funcRVA-表首RVA); u32 len; u32 check }。
+	// 蹦床：push rcx/rdx/r8 → lea r11,[rip+表] → call vm_verify_table → pop → jmp 原入口。
+	// 三个 cdecl/win64 参数寄存器是 DLL entry 的 (HINSTANCE, reason, reserved)，必须原样传下去；
+	// 所有跳转都是 rel32 相对距离，因此与 ASLR 无关。
+	entryHookRVA := uint32(0)
+	entryHookLen := 0
+	if opt.EntryHook && opt.VerifyFn >= 0 && len(opt.Funcs) > 0 {
+		align(4)
+		tableRVA := baseRVA + uint32(len(data))
+		w32 := func(v uint32) {
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], v)
+			data = append(data, b[:]...)
+		}
+		w32(uint32(len(opt.Funcs)))
+		for i, fn := range opt.Funcs {
+			w32(uint32(int32(fn.RVA) - int32(tableRVA))) // delta（有符号）
+			w32(uint32(patchLens[i]))
+			w32(patchChecks[i])
+		}
+		align(16)
+		trampRVA := baseRVA + uint32(len(data))
+		t := make([]byte, 0, 32)
+		t = append(t, 0x51, 0x52, 0x41, 0x50) // push rcx; push rdx; push r8
+		// 注意：这是 Win64 的 C 调用，第一个参数必须在 **rcx**（原先写 r11，函数拿到的是垃圾 → 校验失败 →
+		// 加载期直接 trap，现象是「DLL 初始化例程失败」）。rcx 已在上面压栈，这里可以放心覆盖。
+		lea := make([]byte, 7)
+		lea[0], lea[1], lea[2] = 0x48, 0x8D, 0x0D // lea rcx,[rip+disp32]
+		binary.LittleEndian.PutUint32(lea[3:], uint32(int32(tableRVA)-int32(trampRVA+uint32(len(t)+7))))
+		t = append(t, lea...)
+		t = append(t, 0xE8) // call rel32
+		callOff := len(t)
+		t = append(t, 0, 0, 0, 0)
+		t = append(t, 0x41, 0x58, 0x5A, 0x59) // pop r8; pop rdx; pop rcx
+		t = append(t, 0xE9)                   // jmp rel32
+		jmpOff := len(t)
+		t = append(t, 0, 0, 0, 0)
+		verifyRVA := baseRVA + uint32(opt.VerifyFn)
+		binary.LittleEndian.PutUint32(t[callOff:], uint32(int32(verifyRVA)-int32(trampRVA+uint32(callOff+4))))
+		binary.LittleEndian.PutUint32(t[jmpOff:], uint32(int32(opt.EntryRVA)-int32(trampRVA+uint32(jmpOff+4))))
+		data = append(data, t...)
+		entryHookRVA = trampRVA
+		entryHookLen = len(t)
+	}
+	pl := &Payload{Data: data, Placements: placements, CodeSize: len(data) - opt.BSSSize, BSSOff: opt.BSSOff, BSSSize: opt.BSSSize, EntryHookRVA: entryHookRVA, EntryHookLen: entryHookLen}
 	return pl, nil
 }
 

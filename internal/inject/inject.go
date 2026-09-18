@@ -74,6 +74,14 @@ func Apply(f *pe.File, opt Options) (*Result, error) {
 		}
 	}
 
+	// (c) 加载期校验：把入口点改到 payload 里的校验蹦床（它验完再跳回原入口）。
+	// 只有加载期能拦住"把补丁字节回填成原生代码"那种绕过 —— 那时 VM 根本不会被执行。
+	if pl.EntryHookRVA != 0 {
+		if err := SetEntryRVA(f, pl.EntryHookRVA); err != nil {
+			return nil, fmt.Errorf("改写 PE 入口点失败: %w", err)
+		}
+	}
+
 	return &Result{
 		SectionRVA:   sec.VirtualAddress,
 		SectionSize:  bssOff, // 第一段（R+X）的长度；后面还有可能的 RW/RX 段

@@ -149,7 +149,8 @@ def main():
                 r = subprocess.run([a.python, '-c', code], capture_output=True, timeout=60)
                 out = (r.stdout + r.stderr).decode('utf-8', 'replace').strip().splitlines()
                 verdict = 'STILL RUNS (bypass succeeds)' if r.returncode == 0 else 'refused/crashed'
-                print('    %s  exit=%d  %s' % (verdict, r.returncode, out[-1][:90] if out else ''))
+                last = (out[-1] if out else '').encode('ascii', 'replace').decode('ascii')
+                print('    %s  exit=%d  %s' % (verdict, r.returncode, last[:100]))
             except subprocess.TimeoutExpired:
                 print('    TIMEOUT (likely hung)')
     print()

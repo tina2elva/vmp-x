@@ -401,6 +401,7 @@ static void vm_bc_leave(void) { __atomic_store_n(&vm_bc_lock, 0u, __ATOMIC_RELEA
  * 用"位移"而不是"直接比较下界"：后者在宿主把 regs[VRSP] 配成 0 的场合（单元测试的 harness）
  * 会因为无符号回绕而误报。 */
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start);
+static void vm_keep_verify_ref(vm_ctx_t *vm);
 
 static u8 vm_bc_cache[VM_BC_CACHE_SLOTS][VM_SCRATCH_SIZE];
 static const void *vm_bc_key[VM_BC_CACHE_SLOTS];
@@ -545,6 +546,7 @@ int vm_run(vm_ctx_t *vm) {
             vm->codeLen = d->codeLen;
         }
     }
+    vm_keep_verify_ref(vm);
     u64 rsp_start = vm->regs[VRSP]; /* 诊断用：客户机栈起点，见 vm_run_inner 注释 */
 #ifndef VM_RELEASE /* release 构建不带任何诊断状态：少一份明文、少一族特征 */
     vm_diag[0] = vm->regs[0];          /* 入口 X0（客户机参数） */
@@ -1068,4 +1070,36 @@ u64 vm_selftest(void *ctxp) {
         h = h * 131u + (u64)vm_insn_size((u8)op);
     }
     return h * 2u + (u64)rc;
+}
+
+/* ---- (c) 加载期完整性校验 ----
+ * 由 internal/inject 放进 payload 的入口蹦床调用。
+ * 表格式：u32 count；随后每项 { i32 delta; u32 len; u32 check; }，delta 相对表首。
+ * 算法与打包端一致：FNV-1a，先喂 key[0..8)，再喂被保护函数的入口字节。
+ *
+ * 为什么必须在**加载期**做：回填（把被覆盖的几字节补回原生代码）之后，被保护函数
+ * 根本不再进入 VM —— 放在解释器里的校验永远不会执行。只有加载期的检查能拦住它。 */
+void vm_verify_table(const u32 *t) {
+    u32 n, i, j;
+    const u8 *base = (const u8 *)t;
+    u8 key[32] = VM_KEY_BYTES;
+    if (!t) return;
+    n = t[0];
+    for (i = 0; i < n; i++) {
+        const u32 *e = t + 1 + i * 3;
+        const u8 *p = base + (i32)e[0];
+        u32 len = e[1], want = e[2], h = 2166136261u;
+        for (j = 0; j < 8; j++) { h ^= (u32)key[j]; h *= 16777619u; }
+        for (j = 0; j < len; j++) { h ^= (u32)p[j]; h *= 16777619u; }
+        if (h != want) __builtin_trap();
+    }
+}
+
+/* 钉住 vm_verify_table 的符号：release 构建里它在 blob 内部没有别的引用，内置合并器会
+ * 丢掉未被引用的全局符号，manifest 里就查不到偏移（入口蹦床会白做）。这里用永不成立
+ * 条件里的直接调用（rel32、位置无关 —— 函数指针常量会生成绝对重定位，被合并器拒绝）。 */
+static void vm_keep_verify_ref(vm_ctx_t *vm) {
+    if (vm->codeLen == 0xFFFFFFFEu) {
+        vm_verify_table((const u32 *)0);
+    }
 }
