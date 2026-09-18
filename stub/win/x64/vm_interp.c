@@ -501,29 +501,7 @@ static int vm_bc_acquire(void) {
 
 /* ---------------- 主循环入口 ---------------- */
 
-/* ---- (g) 反调试 ----
- * 直接读 PEB，不依赖任何导入（blob 是 freestanding，没有导入表）：
- *   x64 上 gs:[0x60] 就是 PEB；PEB+0x02 = BeingDebugged。
- * 为什么不用 IsDebuggerPresent：那是 kernel32 的导出，我们调不到。
- * 命中就 __builtin_trap()（非法指令，进程立即死）—— 是拒绝执行，不是悄悄继续。 */
-#ifdef VM_BLOB_USES_WIN64
-volatile u64 vm_peb_seen; /* 诊断：反调试实际读到的 PEB 地址（0 = 这段代码没跑）；volatile 防止被优化掉 */
-static int vm_debugger_present(void) {
-    const u8 *peb;
-    __asm__ volatile("movq %%gs:0x60, %0" : "=r"(peb));
-    vm_peb_seen = (u64)peb;
-    if (!peb) return 0;
-    return *(const u8 *)(peb + 0x02) ? 1 : 0;
-}
-static void vm_antidebug(void) {
-    if (vm_debugger_present()) __builtin_trap();
-}
-#else
-static void vm_antidebug(void) { }
-#endif
-
 int vm_run(vm_ctx_t *vm) {
-    vm_antidebug();
     int slot = -1;
 #ifndef VM_RELEASE
     vm_last_pc = 0xAA000001u; /* 已进入 vm_run */
@@ -1118,14 +1096,88 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
 #endif
             typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fn_t fn = (fn_t)addr;
-/* ---- (c) ?????????????----
- * ??internal/inject ??? payload ????????????? * ??????u32 count????????{ i32 delta; u32 len; u32 check; }??elta ???????? * ??????????????FNV-1a?????key[0..8)?????????????????????? *
- * ???????????????????????????????Go ???????????? blob?????????????? * ?????????????blob"???????????tools/gates.ps1????*/
+            vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
+                                vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+#ifndef VM_RELEASE
+            vm_last_call_ret = vm->regs[VRAX];
+#endif
+            vm->pc = pc + 9;
+            break;
+        }
+        case OP_CALLR: {
+            /* 间接调用（虚调用/函数指针）：寄存器里是**客户机地址**（模块基址 + RVA），
+             * 与 CALLN 的区别只是目标来自运行时。调用约定仍是宿主的（blob 由哪个工具链编译就是哪个）。
+             * 空指针明确失败，而不是跳到 0。 */
+            u64 addr = vm->regs[c[pc + 1] & VM_REG_MASK];
+#ifndef VM_RELEASE
+            vm_last_call = addr | 0x8000000000000000ull; /* 高位标记：来自 CALLR */
+#endif
+            if (addr == 0) return 1;
+            typedef u64 (*fnr_t)(u64, u64, u64, u64, u64, u64, u64, u64);
+            fnr_t fn = (fnr_t)addr;
+            vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
+                                vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+            vm->pc = pc + 2;
+            break;
+        }
+        default:
+            return 98; /* 未知操作码：失败而不是猜（用 98 与 OP_HALT 的正常返回 1 区分开，便于 CI 判读） */
+        }
+    }
+}
+
+/* 指令长度表（Go/C 两侧共用同一份规格；M2 起由 vmpbuild 生成） */
+u32 vm_insn_size(u8 op) {
+    switch (op) {
+    case OP_HALT: case OP_NOP: case OP_RET: return 1;
+    case OP_MOV_RR: return 4;
+    case OP_MOV_RI: return 11;
+    case OP_MOV_RI32: return 6;
+    case OP_LEA: return 10;
+    case OP_ALU_RR: return 6;
+    case OP_ALU_RI: return 9;
+    case OP_ALU_U: return 5;
+    case OP_CMP_RR: return 5;
+    case OP_CMP_RI: return 8;
+    case OP_EXT: return 5;
+    case OP_LOAD: return 11;
+    case OP_STORE: return 10;
+    case OP_ATOMIC: return 12;
+    case OP_FP: return 15;
+    case OP_PUSH_R: return 2;
+    case OP_PUSH_I: return 5;
+    case OP_POP_R: return 2;
+    case OP_JCC: return 6;
+    case OP_JMP: return 5;
+    case OP_JBZ: case OP_JBNZ: return 6;
+    case OP_CALLN: return 9;
+    case OP_CALLR: return 2;
+    default: return 0;
+    }
+}
+
+/* 自检入口：验证 blob 抽取后的重定位修补（会走 vm_insn_size 的 .rdata 表） */
+u64 vm_selftest(void *ctxp) {
+    vm_ctx_t *vm = (vm_ctx_t *)ctxp;
+    int rc = vm_run(vm);
+    u64 h = 0;
+    for (u32 op = 0; op <= 0x7F; op++) {
+        h = h * 131u + (u64)vm_insn_size((u8)op);
+    }
+    return h * 2u + (u64)rc;
+}
+
+/* ---- (c) 加载期完整性校验 ----
+ * 由 internal/inject 放进 payload 的入口蹦床调用。
+ * 表格式：u32 count；随后每项 { i32 delta; u32 len; u32 check; }，delta 相对表首。
+ * 算法与打包端一致：FNV-1a，先喂 key[0..8)，再喂被保护函数的入口字节。
+ *
+ * 为什么必须在**加载期**做：回填（把被覆盖的几字节补回原生代码）之后，被保护函数
+ * 根本不再进入 VM —— 放在解释器里的校验永远不会执行。只有加载期的检查能拦住它。 */
 void vm_verify_table(const u32 *t) {
     u32 n, i, j;
     const u8 *base = (const u8 *)t;
     u8 key[32] = VM_KEY_BYTES;
-    vm_antidebug();
     if (!t) return;
     n = t[0];
     for (i = 0; i < n; i++) {
@@ -1138,9 +1190,11 @@ void vm_verify_table(const u32 *t) {
     }
 }
 
+/* 钉住 vm_verify_table 的符号：release 构建里它在 blob 内部没有别的引用，内置合并器会
+ * 丢掉未被引用的全局符号，manifest 里就查不到偏移（入口蹦床会白做）。这里用永不成立
+ * 条件里的直接调用（rel32、位置无关 —— 函数指针常量会生成绝对重定位，被合并器拒绝）。 */
 static void vm_keep_verify_ref(vm_ctx_t *vm) {
     if (vm->codeLen == 0xFFFFFFFEu) {
         vm_verify_table((const u32 *)0);
     }
 }
-
