@@ -500,6 +500,19 @@ volatile u64 vm_peb_seen;
 /* 诊断：模拟栈指针在"第一条指令"与"最后一条指令"时的值 —— 用来判断是否发生 SP 漂移。 */
 u64 vm_first_sp;
 u64 vm_last_sp;
+/* 追踪"谁写了 guest 寄存器 1"：每检测到 reg1 变化就记下**执行它的那条指令的 pc** 与写后的值。
+ * 为什么单开一条环：add_dly 的崩溃链路里 reg1 是个坏指针，而通用写入者表只覆盖最近一步，
+ * 回溯不到最初把它写坏的那条指令。 */
+u64 vm_r1_pcs[64];
+u64 vm_r1_vals[64];
+u32 vm_r1_i;
+u64 vm_r1_prev;
+u64 vm_r1_prev_pc;
+/* 追踪最近的 STORE：pc / 目标地址 / 写入值。用来回答"那个栈槽是谁写的"。 */
+u64 vm_st_pcs[16];
+u64 vm_st_addrs[16];
+u64 vm_st_vals[16];
+u32 vm_st_i;
 #endif
 /* ---- (g) 解释器/桩代码段自哈希 ----
  * vmpbuild 在合并完成后把三个值写进下面三个全局（都在 .bss，位于被哈希区间之外）：
@@ -792,6 +805,14 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         vm_last_pc = (u64)pc | ((u64)op << 32);
         if (!vm_first_sp) vm_first_sp = vm->regs[VRSP];
         vm_last_sp = vm->regs[VRSP];
+        if (vm->regs[1] != vm_r1_prev) {
+            /* 变化是在本步检出的，真正写它的指令是**上一条** */
+            vm_r1_pcs[vm_r1_i & 63u] = vm_r1_prev_pc;
+            vm_r1_vals[vm_r1_i & 63u] = vm->regs[1];
+            vm_r1_i++;
+            vm_r1_prev = vm->regs[1];
+        }
+        vm_r1_prev_pc = pc;
 #endif
 #ifndef VM_RELEASE
         /* 现场记录（见 vm_ring_hdr 的注释）：只记环形缓冲，不影响语义 */
@@ -938,6 +959,12 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             if (idx != VM_NO_REG)
                 addr += vm->regs[idx & VM_REG_MASK] * (u64)scale;
             u64 v = vm->regs[src];
+#ifndef VM_RELEASE
+            vm_st_pcs[vm_st_i & 15u] = pc;
+            vm_st_addrs[vm_st_i & 15u] = addr;
+            vm_st_vals[vm_st_i & 15u] = v;
+            vm_st_i++;
+#endif
             switch (width) {
             case 8:  *(volatile u8 *)addr = (u8)v; break;
             case 16: *(volatile u16 *)addr = (u16)v; break;
