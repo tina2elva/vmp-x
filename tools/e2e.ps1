@@ -30,16 +30,22 @@ function Run-FileDiag([string]$exe, [string[]]$a, [int]$sec) {
     $outFile = Join-Path $env:TEMP ("vmpdiag_" + $tag + ".out")
     $errFile = Join-Path $env:TEMP ("vmpdiag_" + $tag + ".err")
     try {
-        $p = Start-Process -FilePath $path -ArgumentList $a -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-        # 用 .NET 的 WaitForExit(ms)：它既带超时，又会在返回后把 ExitCode 填好。
-        # 之前用 Wait-Process -Id，进程对象没被刷新，读 ExitCode 会抛异常 -> 只打印 "?"，
-        # 结果连"崩溃码"都拿不到（这正是分辨 stack overflow 0xC00000FD 的关键）。
-        $exited = $p.WaitForExit($sec * 1000)
-        if (-not $exited) { try { Stop-Process -Id $p.Id -Force } catch {}; return "TIMEOUT" }
+        # 用 .NET Process API 直接拿 ExitCode：Start-Process -PassThru 的对象在崩溃场景下
+        # 读 ExitCode 会得到空值（CI 摘要里一直只有 rc=），而崩溃码正是分辨
+        # stack overflow(0xC00000FD) 与其它异常的关键。
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $path
+        $psi.Arguments = ($a -join ' ')
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $o = $proc.StandardOutput.ReadToEnd()
+        $e = $proc.StandardError.ReadToEnd()
+        if (-not $proc.WaitForExit($sec * 1000)) { try { $proc.Kill() } catch {}; return "TIMEOUT" }
         $rc = "?"
-        try { $rc = [string]$p.ExitCode } catch { $rc = "?" }
-        $o = ""; if (Test-Path $outFile) { $o = [string](Get-Content $outFile -Raw -ErrorAction SilentlyContinue) }
-        $e = ""; if (Test-Path $errFile) { $e = [string](Get-Content $errFile -Raw -ErrorAction SilentlyContinue) }
+        try { $rc = [string]$proc.ExitCode } catch { $rc = "?" }
+        if ($null -eq $o) { $o = "" }; if ($null -eq $e) { $e = "" }
         $o = ($o -replace "[\r\n]+", " ").Trim()
         $e = ($e -replace "[\r\n]+", " ").Trim()
         if ($o.Length -gt 60) { $o = $o.Substring(0, 60) }
