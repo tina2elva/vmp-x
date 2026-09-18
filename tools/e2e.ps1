@@ -21,6 +21,33 @@ New-Item -ItemType Directory -Force -Path build | Out-Null
 # Run-File: run a short-lived process, capture stdout to a file.
 # Retries once: concurrent temp-file handling occasionally races with very fast exits
 # ("Cannot process request because the process has exited") - that is harness noise.
+
+# On failure: re-run twice and report exit code / stdout / stderr excerpts.
+# Goal: turn a CI flake into readable data -- crash (rc != 0) vs wrong value (rc == 0, output differs).
+function Run-FileDiag([string]$exe, [string[]]$a, [int]$sec) {
+    $path = (Resolve-Path $exe).Path
+    $tag = [guid]::NewGuid().ToString("N")
+    $outFile = Join-Path $env:TEMP ("vmpdiag_" + $tag + ".out")
+    $errFile = Join-Path $env:TEMP ("vmpdiag_" + $tag + ".err")
+    try {
+        $p = Start-Process -FilePath $path -ArgumentList $a -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $null = Wait-Process -Id $p.Id -Timeout $sec -ErrorAction SilentlyContinue
+        if (-not $p.HasExited) { try { Stop-Process -Id $p.Id -Force } catch {}; return "TIMEOUT" }
+        $rc = "?"
+        try { if ($null -ne $p.ExitCode) { $rc = [string]$p.ExitCode } } catch { $rc = "?" }
+        $o = ""; if (Test-Path $outFile) { $o = [string](Get-Content $outFile -Raw -ErrorAction SilentlyContinue) }
+        $e = ""; if (Test-Path $errFile) { $e = [string](Get-Content $errFile -Raw -ErrorAction SilentlyContinue) }
+        $o = ($o -replace "[\r\n]+", " ").Trim()
+        $e = ($e -replace "[\r\n]+", " ").Trim()
+        if ($o.Length -gt 60) { $o = $o.Substring(0, 60) }
+        if ($e.Length -gt 80) { $e = $e.Substring(0, 80) }
+        return ("rc=" + $rc + " out[" + $o + "] err[" + $e + "]")
+    } catch {
+        return ("STARTFAIL: " + $_.Exception.Message)
+    } finally {
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
 function Run-File([string]$exe, [string[]]$a, [int]$sec) {
     $r = Run-FileOnce $exe $a $sec
     if ($r -like "STARTFAIL:*") { Start-Sleep -Milliseconds 50; $r = Run-FileOnce $exe $a $sec }
@@ -102,7 +129,14 @@ foreach ($c in $cases) {
         $n = Run-File "build/target.exe" @($c.f, "$a") 30
         $v = Run-File "build/target_vmp.exe" @($c.f, "$a") 30
         $ok = ($n -notmatch "TIMEOUT|STARTFAIL") -and ($n -ne "") -and ($n -eq $v)
-        if ($ok) { $pass++ } else { $fail++ }
+        if ($ok) {
+            $pass++
+        } else {
+            $fail++
+            $d1 = Run-FileDiag "build/target_vmp.exe" @($c.f, "$a") 30
+            $d2 = Run-FileDiag "build/target_vmp.exe" @($c.f, "$a") 30
+            Write-Output ("         diag: try1[" + $d1 + "] try2[" + $d2 + "]")
+        }
         $tag = if ($ok) { "OK  " } else { "FAIL" }
         Write-Output ("  [{0}] {1}({2}): native={3} protected={4}" -f $tag, $c.f, $a, $n, $v)
     }
