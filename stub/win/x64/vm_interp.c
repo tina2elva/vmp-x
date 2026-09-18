@@ -51,6 +51,10 @@ extern u64 vm_last_store_base; /* 其基址寄存器的值 */
 extern u64 vm_last_store_addr; /* 它算出来的最终地址 */
 extern u64 vm_last_call_pc;    /* 最后一次本机调用的 pc */
 extern u64 vm_last_call_ret;   /* 该调用的返回值（RAX） */
+extern u64 vm_pc_ring[32];     /* 最近 32 条指令的 pc（崩溃时用它还原现场） */
+extern u32 vm_pc_ring_i;
+extern u64 vm_regs_snap[64];  /* 崩溃点那条 STORE 执行时的 guest 寄存器快照 */
+extern u32 vm_regs_n;
 #endif
 u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
@@ -710,6 +714,10 @@ u64 vm_last_store_base;
 u64 vm_last_store_addr;
 u64 vm_last_call_pc;
 u64 vm_last_call_ret;
+u64 vm_pc_ring[32];
+u32 vm_pc_ring_i;
+u64 vm_regs_snap[64];
+u32 vm_regs_n;
 #endif
 
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
@@ -737,6 +745,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         u8 op = c[pc];
 #ifndef VM_RELEASE
         vm_last_pc = (u64)pc | ((u64)op << 32);
+        vm_pc_ring[vm_pc_ring_i & 31u] = pc;
+        vm_pc_ring_i++;
 #endif
 #ifndef VM_RELEASE
         /* 现场记录（见 vm_ring_hdr 的注释）：只记环形缓冲，不影响语义 */
@@ -887,6 +897,11 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_last_store_pc = pc;
             vm_last_store_base = vm->regs[base];
             vm_last_store_addr = addr;
+            {
+                u32 ri;
+                for (ri = 0; ri < 64u; ri++) vm_regs_snap[ri] = vm->regs[ri];
+                vm_regs_n = 64u;
+            }
 #endif
             switch (width) {
             case 8:  *(volatile u8 *)addr = (u8)v; break;

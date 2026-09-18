@@ -684,6 +684,28 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第二十轮：把 add_dly 的崩溃解码到具体指令 —— 是对**只读地址**做读改写
+>
+> ### 362. 解码（用同一次打包的 opcode 映射）与现场
+> ```
+> 0x3EC OP_CALLN   rva=0x1F80        ← 调用 __pyx_pf_7example_8add_dly
+> 0x3F9 OP_LOAD    dst=0x01 ...
+> 0x40F OP_LOAD    dst=0x11
+> 0x41A OP_CMP_RI
+> 0x428 OP_LOAD    {kind=0, width=64, dst=0x11, base=0x01, idx=none, disp=0}   ← reg17 = [reg1]
+> 0x433 OP_ALU_RI  dst=0x11
+> 0x43C OP_STORE   {width=64, base=0x01, idx=none, disp=0, src=0x11}          ← [reg1] = reg17（崩）
+> ```
+> guest 寄存器快照（store 之前）：reg1=0x7FFF382E9130（= 异常写目标）、reg16=模块基址、
+> reg17=0xEC8348564157563F（这串字节读出来是 x86 序言 `56 57 41 56 48 83 EC …`）→ 说明 0x428 的 LOAD
+> 从那个地址**读到了代码**（读没崩，因为地址可读），然后 0x43C 想写回去 → 只读页 → 访问违例。
+>
+> ### 363. 结论与下一步
+> 崩溃的形态是「对只读地址做读改写」，根因是 **reg1 这个指针本身错了**（它应指向可写数据）。
+> reg1 在 0x3EC 之前就被写好（环里能看到 0x232/0x23A/0x360 等一串循环指令），
+> 而 `__pyx_pw_9add_dly` 是包装层、参数是 Python 对象 —— 需要继续往前追 reg1 的来源
+> （下一步：把「写某个寄存器的 pc」也做成探针，直接得到写 reg1 的那条指令）。
+>
 > ## 第十九轮：add_dly 的崩溃定位到一条 STORE —— 基址寄存器里是坏指针
 >
 > ### 359. 新探针：最后一次 guest STORE 的现场

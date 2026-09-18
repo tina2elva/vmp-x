@@ -97,6 +97,16 @@ def handler(info):
             hlog('    %s = 0x%X' % (nm, hv))
         except Exception as e:
             hlog('    read %s failed: %r' % (item[0], e))
+    for item in CFG.get('dumps', []):
+        try:
+            nm, spec = item[0], item[1]
+            rva_s, cnt_s = spec.split(':')
+            av = base + int(rva_s, 0)
+            cnt = int(cnt_s)
+            vals = [ctypes.c_uint64.from_address(av + 8 * i).value for i in range(cnt)]
+            hlog('    %s (%d x u64): %s' % (nm, cnt, ' '.join('0x%X' % v for v in vals)))
+        except Exception as e:
+            hlog('    dump %s failed: %r' % (item[0], e))
     ring_rva = CFG.get('ring_rva')
     vmpb_rva = CFG.get('vmpb_rva')
     if ring_rva is not None and vmpb_rva is not None and base:
@@ -130,6 +140,7 @@ def main():
     ap.add_argument('--probe-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--probe2-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--read-rva', action='append', default=[], help='name=0xRVA[:u32|u64]，崩溃时打印该处内存')
+    ap.add_argument('--dump-rva', action='append', default=[], help='name=0xRVA:count，崩溃时按 u64 打印 count 个值')
     a = ap.parse_args()
     LOG['fd'] = os.open('build/veh_ring.log', os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
     CFG['vmpb_rva'] = a.vmpb_rva
@@ -137,6 +148,7 @@ def main():
     CFG['probe_rva'] = a.probe_rva
     CFG['probe2_rva'] = a.probe2_rva
     CFG['reads'] = [x.split('=') for x in a.read_rva]
+    CFG['dumps'] = [x.split('=') for x in a.dump_rva]
     CFG['module_name'] = a.module_name
     proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.POINTER(EXCEPTION_POINTERS))
     global HANDLER
