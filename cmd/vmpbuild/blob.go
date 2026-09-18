@@ -302,7 +302,8 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 				}
 				binary.LittleEndian.PutUint32(m.Data[field:], insn)
 			default:
-				return 0, fmt.Errorf("%s+0x%X: 不支持的重定位类型 0x%X（绝对引用必须失败）", o.Sections[r.SecIdx].Name, r.Off, r.RawType)
+				return 0, fmt.Errorf("%s+0x%X: 不支持的重定位类型 0x%X（绝对引用必须失败; format=%s sym=%q targetSec=%d addend=%d）",
+					o.Sections[r.SecIdx].Name, r.Off, r.RawType, o.Format, r.SymName, r.TargetSec, r.Addend)
 			}
 			if verbose {
 				fmt.Printf("    [reloc] %s+0x%X type=0x%X sym=%s -> target=0x%X\n", o.Sections[r.SecIdx].Name, r.Off, r.RawType, r.SymName, target)

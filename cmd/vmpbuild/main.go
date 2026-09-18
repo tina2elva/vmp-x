@@ -497,10 +497,13 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 			args = append(args,
 				// aarch64 上非 PIC 代码会经字面量池产生绝对重定位，而我们的合并器按设计拒绝绝对重定位；
 				// 统一按位置无关来编，让 GNU 工具链也只生成 PC 相对形式。
-				"-fPIC",
+				// -fPIC 已撤销：clang 的 aarch64-pc-windows-msvc 不支持它；真正的修法见下面的 -fno-pie
 				"-DVM_GUEST_ARM64=1", "-DVM_REG_COUNT=35",
 				"-I", platformDir,
 				"-I", filepath.Join(tmp, "arm64"))
+		}
+		if !compilerIsWindows {
+			args = append(args, "-fno-pie")
 		}
 		if compilerIsWindows {
 			args = append(args, "-DVM_BLOB_USES_WIN64=1")

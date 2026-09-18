@@ -684,6 +684,18 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第二十八轮（续）：用更完整的报错定位到真因 —— R_AARCH64_ADR_GOT_PAGE
+>
+> 把重定位报错补成 `type/format/sym/targetSec/addend` 之后，下一次 CI 立刻给出了确切类型：
+> ```
+> [!] .text+0xA68: 不支持的重定位类型 0x137（绝对引用必须失败）
+> ```
+> 对照 Go 标准库的 `debug/elf` 常量表：**0x137 = R_AARCH64_ADR_GOT_PAGE** —— GOT 引用，
+> 不是绝对地址表。根因是 **Ubuntu 的 gcc 默认 PIE**：它会为全局符号生成经 GOT 的寻址，
+> 而我们的合并器按设计只接受 PC 相对的直接形式。
+> 修法：给 arm64 的 blob 编译加 `-fno-pie`（只在非 Windows 编译器上加 —— clang 的
+> aarch64-pc-windows-msvc 不支持 -fPIC 一类选项，我前一天加 -fPIC 时把 windows-arm64-run 弄红过，已撤销）。
+>
 > ## 第二十八轮：针对 linux-arm64 的绝对重定位做两件事（-fPIC + 更完整的报错）
 >
 > 合并器的 aarch64 重定位分支只认 BRANCH26 / ADRP_PREL_PG_HI21 / ADD_ABS_LO12，其余一律拒绝
