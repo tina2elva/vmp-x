@@ -684,6 +684,16 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ### 462. CI 验证：arm64 回归已修
+> `af9235c` → **5/5 全绿**（linux-arm64 ✓）。也就是说本轮那个"裁剪器用错架构"的修复被 CI 确认了。
+>
+> ### 463. 崩溃码为什么还是空的：换用 .NET Process API
+> 上一轮我把 `Run-FileDiag` 从 `Wait-Process -Id` 改成 `$p.WaitForExit(ms)`，但最新一次偶发（`6a7cb12`）
+> 摘要里 `rc=` **仍然是空** —— 说明 `Start-Process -PassThru` 的对象在崩溃场景下拿不到 ExitCode。
+> 现在改成直接用 .NET：`ProcessStartInfo`（`UseShellExecute=false` + 重定向 stdout/stderr）→ `Process.Start` →
+> `WaitForExit(ms)` → `$proc.ExitCode`，并把已读到的 stdout/stderr 直接用于诊断行。
+> 本地 `e2e.ps1` 仍 146/146、解析 OK。下次偶发就会给出真正的崩溃码。
+>
 > ### 461. 我引入的 arm64 回归：ELF 裁剪器用错了架构
 > `linux-arm64` 连续两次红，报 `[!] sum_to: 代码长度 29 不是 4 的倍数（A64 定长）` 并 panic。根因：
 > `internal/scan/elf.go` 里给"符号带 Size"的分支**一律调用 x86-64 的 `TrimTrailingPadding`**，与目标架构无关。
