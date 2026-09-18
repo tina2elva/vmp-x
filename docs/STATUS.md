@@ -684,6 +684,31 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第十六轮：根因找到了 —— 崩在 `__security_check_cookie`（栈 cookie 协议）
+>
+> ### 349. 同一个构建里把崩溃点的字节码解出来
+> 用这次打包的 -dumpbytecode 与 manifest 的 opcodeMap：c[0x80A]=0xE3 → 在本次构建里 0xE3 正是 **OP_RET**，
+> 与探针记录的 op=0xE3 完全一致 → 探针语义确认（op 就是字节码里的那个字节），且崩溃发生在**函数返回处**。
+>
+> ### 350. 目标 0x6E40 在原模块里是什么（objdump + 交叉验证）
+> · 原模块里 `call 0x180006e40` 出现在多处，其中包括 __pyx_pf_7example_6current_time_str 自己（0x1D48）；
+> · 而**能正常工作的 fibonacci 不调用 0x6E40**（它调用的是 *0x1800083e8 / 0x180003c90 / 0x180003dc0 等）——
+>   这就解释了为什么同一套 stub/解释器下只有它和 add_dly 崩；
+> · 0x180006E40 的第一条指令是 `cmp 0x51b9(%rip),%rcx  # 0x18000c000`，而 0x18000C000 正是 .data 里的
+>   `__security_cookie` → 这是标准的 **`__security_check_cookie`**。
+>
+> ### 351. 机制（与探针读数完全吻合）
+> MSVC 的栈保护协议：序言把 `cookie ^ RSP` 存进栈帧，尾声把它取回再 `xor RSP` 还原成 cookie，
+> 然后调用 __security_check_cookie 与真实 cookie 比较；不一致就 __report_gsfailure → 写全局并快速失败。
+> 我们的 VM 里 RSP 是**模拟栈**：只要序言与尾声用的模拟 SP 不完全一致，还原出的 cookie 就不等于真实 cookie，
+> 校验必然失败 —— 于是「VM 调用了本机函数，那个函数写坏了地址（写目标恰好等于它自己的入口）」。
+> 结论：**这是 lift 阶段对 guest SP（RSP）追踪的漂移**，不是 stub、不是栈余量、不是我前几轮猜的那些。
+>
+> ### 352. 下一步（可验证）
+> 加一个 guest SP 探针（vm_last_sp），在「取 cookie」与「校验前」两处各记一次：
+> 如果两个值不等，就直接坐实 SP 漂移，并能在该函数里定位到是哪条指令（add rsp / pop / call 返回）没把 SP 还原。
+> 修好后 current_time_str / add_dly 应恢复，(f) 覆盖率 4/14 → 6/14。
+>
 > ## 第十五轮：崩溃点 = 最后一次本机调用的目标地址（两者完全相同）
 >
 > ### 346. 新增探针：最后一次 CALLN/CALLR 的目标
