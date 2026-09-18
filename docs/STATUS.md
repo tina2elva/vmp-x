@@ -684,6 +684,33 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第十七轮：cookie 校验其实是**通过**的 —— 真正的毛病是 CALLN 把 guest 的 RAX 冲掉了
+>
+> ### 353. 加参数探针（guest RCX / guest RSP / 调用目标 / pc）
+> 崩溃读数：
+> ```
+> last pc=0x80A  op=0x79 (本次构建里 0x79 = OP_RET)
+> last native call target = 0x7FFF281C6E40   (CALLN，模块基址+0x6E40 = __security_check_cookie)
+> guest_rcx_at_call       = 0x73E213027669
+> real_security_cookie    = 0x73E213027669   ← 与 guest 传进去的完全相等
+> 异常：写访问 0x7fff281c6e40（与调用目标同地址）
+> ```
+> 也就是说：**cookie 校验是通过的**（我第 16 轮「SP 漂移导致校验失败」的推测错了，在此更正）。
+> 而崩溃点仍显示最后执行的是 RET —— 与「在 __security_check_cookie 里失败」矛盾。
+>
+> ### 354. 真正的机制
+> 解释器的 CALLN 是 `vm->regs[VRAX] = fn(...)` —— **无条件把 guest 的 RAX 覆盖成被调函数的返回值**。
+> 而 `__security_check_cookie` 是 MSVC 的内建：它的实现（cmp rcx,[__security_cookie] / jne / ret）
+> **不碰 RAX**，编译器因此允许调用方在它之后继续使用 RAX 里的返回值。
+> 我们的 VM 把 RAX 冲成了垃圾（被调函数地址一带的值），函数返回的就是这个垃圾指针；
+> 于是 Cython 包装层拿它当 PyObject 用，在别处（python313.dll 的代码里）写 ob_refcnt 时崩掉 ——
+> 写目标恰好 = 模块基址 + 0x6E40，即那个垃圾指针指向的地址，与调用目标重合。
+>
+> ### 355. 修的方向
+> 打包端（vmpack 手里有模块镜像）识别这类调用目标：入口字节形如 `48 3B 0D xx xx xx xx`
+> （cmp rcx,[rip+disp]，指向 .data 的 __security_cookie）→ 该调用在 VM 里没有意义（cookie 是我们自己模拟栈的产物），
+> 直接把这条 CallN 丢掉。这也是商业壳对运行期自校验的常规处理方式。
+>
 > ## 第十六轮：根因找到了 —— 崩在 `__security_check_cookie`（栈 cookie 协议）
 >
 > ### 349. 同一个构建里把崩溃点的字节码解出来

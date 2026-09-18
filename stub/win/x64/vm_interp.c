@@ -43,7 +43,9 @@ int vm_run(vm_ctx_t *vm);
 #ifndef VM_RELEASE
 /* 调试探针：入口路径的阶段计数器（仅非 release；实现在文件后部） */
 extern u64 vm_last_pc;
-extern u64 vm_last_call; /* 最后一次本机调用的目标（判断 CALLN/CALLR 目标是否合理） */
+extern u64 vm_last_call; /* 最后一次本机调用的目标 */
+extern u64 vm_last_call_rcx; /* 发起该调用时的 guest RCX（第一个参数） */
+extern u64 vm_last_call_sp;  /* 发起该调用时的 guest RSP */
 #endif
 u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
@@ -696,6 +698,8 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
 #ifndef VM_RELEASE
 u64 vm_last_pc;
 u64 vm_last_call;
+u64 vm_last_call_rcx;
+u64 vm_last_call_sp;
 #endif
 
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
@@ -1035,6 +1039,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             u64 addr = vm->regs[VRBASE] + rd64(&c[pc + 1]);
 #ifndef VM_RELEASE
             vm_last_call = addr; /* 探针：最后一次 CALLN 的目标 */
+            vm_last_call_rcx = vm->regs[VRCX];
+            vm_last_call_sp = vm->regs[VRSP];
 #endif
             typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fn_t fn = (fn_t)addr;
