@@ -684,6 +684,35 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标（覆盖口径）第 17 轮：**大函数是一整类问题**，而且我的 release 校验上一轮压根没生效
+>
+> ### 484. 又一个同类实例：`__pyx_pymod_exec_example`
+> 顺手把另一个"模块初始化函数"也拿来保护，结果是：
+> ```
+> __pyx_pymod_exec_example: RVA=0x2E80 native=2523B -> 630 IR -> 4971B bytecode
+> import example →  SystemError: execution of module example failed without setting an exception
+> ```
+> 这个报错正是"exec 函数返回值既不是 0 也不是 -1"的典型症状 —— 而我们的 `vm_run` 在字节码超过缓存槽时
+> **返回 2**，桩把这个错误码当函数返回值交回去。**与 add_dly 函数体是同一个类**（4971 > 4096）。
+>
+> ### 485. 更要紧的：我上一轮那个"打包期硬校验"在 release 配置下根本没生效
+> 复核时发现 `vm_bc_slot_size` 这个 const 在 `-release` 构建里**没有出现在 manifest 符号表里** ——
+> 说明它被优化掉了（没人引用它），于是 `bytecodeLimitFlag = 0`，校验被静默跳过。
+> 修法：在 `vm_keep_verify_ref` 里加一条永不执行的引用（与 `vm_verify_table` 同一套把戏）。
+> 修完实测（都用 **release** blob）：
+> ```
+> [!] __pyx_pf_7example_8add_dly:  生成的字节码 7313 字节超过解释器缓存槽上限 4096 ...   rc=1
+> [!] __pyx_pymod_exec_example:    生成的字节码 4971 字节超过解释器缓存槽上限 4096 ...   rc=1
+> ```
+> 两个超限函数都**在打包期被拒绝**了 —— 这才是上一轮我想做但没做成的事。
+>
+> ### 486. 顺带排除：pymod_create 不是这一类
+> 它的字节码只有 1783 字节（不超限）；而且这轮把**打包后 pyd 的导入表/节表与原始文件逐项比对**——
+> `.text/.rdata/.data/.pdata/.rsrc/.reloc` 的 VA/大小/文件偏移**完全一致**，三个新节是追加的，
+> IAT 槽 0x8498=PyThreadState_Get、0x83d0=PyInterpreterState_GetID 也都对；
+> 再把生成的字节码逐条解出来（`LOAD VMSCR,[0x8498]` + `CALLR VMSCR` + `LOAD RCX,[RAX+0x10]`）也全对。
+> 所以它的崩溃另有原因，仍挂账。
+>
 > ## 新目标（pymod_create）第 16 轮：排除"翻译错"这一支，并补两件工具（本轮没有修复）
 >
 > ### 481. IR 级核对：那条 IAT 间接调用**翻译是对的**

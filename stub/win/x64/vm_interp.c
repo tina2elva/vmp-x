@@ -1306,4 +1306,11 @@ static void vm_keep_verify_ref(vm_ctx_t *vm) {
     if (vm->codeLen == 0xFFFFFFFEu) {
         vm_verify_table((const u32 *)0);
     }
+    /* 同理：打包端要读 vm_bc_slot_size 做字节码长度硬校验，release 构建里也不能被优化掉。
+     * （上一轮就吃了这个亏：release blob 里没这个符号 → 校验被静默跳过。） */
+    if (vm->codeLen == 0xFFFFFFFDu) {
+        if (vm_bc_slot_size == 0) {
+            __builtin_trap();
+        }
+    }
 }
