@@ -72,6 +72,10 @@ def handler(info):
     ctypes.windll.kernel32.VirtualQuery(ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
     base = mbi.AllocationBase or 0
     hlog('    module/allocation base=0x%X (region 0x%X size 0x%X)' % (base, mbi.BaseAddress or 0, mbi.RegionSize))
+    mb = ctypes.windll.kernel32.GetModuleHandleW(CFG.get('module_name', ''))
+    if mb:
+        hlog('    GetModuleHandleW base=0x%X (VirtualQuery 的 AllocationBase=0x%X 不一定是我们的模块)' % (mb, base))
+        base = mb
     probe_rva = CFG.get('probe_rva')
     if probe_rva is not None and base:
         try:
@@ -106,6 +110,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dir', required=True)
     ap.add_argument('--module', required=True)
+    ap.add_argument('--module-name', default='example.cp313-win_amd64.pyd')
     ap.add_argument('--expr', required=True)
     ap.add_argument('--vmpb-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--ring-rva', type=lambda s: int(s, 0), default=None)
@@ -115,6 +120,7 @@ def main():
     CFG['vmpb_rva'] = a.vmpb_rva
     CFG['ring_rva'] = a.ring_rva
     CFG['probe_rva'] = a.probe_rva
+    CFG['module_name'] = a.module_name
     proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.POINTER(EXCEPTION_POINTERS))
     global HANDLER
     HANDLER = proto(handler)  # 必须留引用：临时对象会被回收，回调就变成野指针
@@ -122,6 +128,12 @@ def main():
     hlog('VEH registered handle=0x%X' % (h or 0))
     sys.path.insert(0, a.dir)
     __import__(a.module)
+    k32 = ctypes.windll.kernel32
+    k32.GetModuleHandleW.restype = ctypes.c_void_p
+    mb0 = k32.GetModuleHandleW(a.module_name)
+    if mb0 and CFG.get('probe_rva') is not None:
+        v0 = ctypes.c_uint64.from_address(mb0 + CFG['probe_rva']).value
+        hlog('    probe BEFORE call = 0x%X (module base 0x%X)' % (v0, mb0))
     mod = sys.modules[a.module]
     print('loaded %s' % getattr(mod, '__file__', '?'), flush=True)
     print('call ->', eval(a.expr, {a.module: mod}), flush=True)
