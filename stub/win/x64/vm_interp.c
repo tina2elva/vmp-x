@@ -55,6 +55,10 @@ extern u64 vm_pc_ring[32];     /* 最近 32 条指令的 pc（崩溃时用它还
 extern u32 vm_pc_ring_i;
 extern u64 vm_regs_snap[64];  /* 崩溃点那条 STORE 执行时的 guest 寄存器快照 */
 extern u32 vm_regs_n;
+extern u64 vm_reg_writer;      /* 最后一次改变 reg1 的指令 pc（用来追坏指针的来源） */
+extern u64 vm_r1_prev;
+extern u64 vm_writer_tab[64];  /* 每个 guest 寄存器最后是被哪条 pc 改的 */
+extern u64 vm_regs_prev[64];
 #endif
 u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
@@ -718,6 +722,10 @@ u64 vm_pc_ring[32];
 u32 vm_pc_ring_i;
 u64 vm_regs_snap[64];
 u32 vm_regs_n;
+u64 vm_reg_writer;
+u64 vm_r1_prev;
+u64 vm_writer_tab[64];
+u64 vm_regs_prev[64];
 #endif
 
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
@@ -747,6 +755,19 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         vm_last_pc = (u64)pc | ((u64)op << 32);
         vm_pc_ring[vm_pc_ring_i & 31u] = pc;
         vm_pc_ring_i++;
+        if (vm->regs[1] != vm_r1_prev) {
+            vm_reg_writer = pc; /* reg1 变了：记下是哪条指令改的 */
+            vm_r1_prev = vm->regs[1];
+        }
+        {
+            u32 ri;
+            for (ri = 0; ri < 64u; ri++) {
+                if (vm->regs[ri] != vm_regs_prev[ri]) {
+                    vm_writer_tab[ri] = pc; /* 上一条指令改了 ri */
+                    vm_regs_prev[ri] = vm->regs[ri];
+                }
+            }
+        }
 #endif
 #ifndef VM_RELEASE
         /* 现场记录（见 vm_ring_hdr 的注释）：只记环形缓冲，不影响语义 */
