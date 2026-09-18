@@ -506,7 +506,11 @@ volatile u64 vm_peb_seen;
 u64 vm_code_off;
 u64 vm_self_len;
 u32 vm_self_hash;
-extern void vm_entry(void); /* 声明成函数：gcc 才会用 PC 相对引用，数组会生成 .refptr 绝对指针 */
+/* vm_entry 由各平台的 vm_entry_asm.S 定义。两个要点：
+ * 1) 必须声明成**函数**：数组形式会让 gcc 生成 .refptr 绝对指针节（被合并器拒绝）；
+ * 2) 必须标 **hidden**：PIE 默认下 gcc 认为它可被外部抢占，于是走 GOT（linux/amd64 上报的
+ *    R_X86_64_REX_GOTPCRELX=0x2A 就是这个），hidden 之后才回到 PC 相对引用。 */
+extern void vm_entry(void) __attribute__((visibility("hidden")));
 static void vm_selfcheck(void) {
     const u8 *base = (const u8 *)&vm_entry - (u32)vm_code_off;
     u32 h = 2166136261u;

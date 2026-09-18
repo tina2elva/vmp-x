@@ -684,6 +684,17 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第三十八轮（续）：linux-amd64 剩下的那条 —— vm_entry 走了 GOT
+>
+> CI 注解：`[!] .text+0xCEE: 不支持的重定位类型 0x2A (format=elf sym="vm_entry" addend=-4)`，
+> `0x2A = R_X86_64_REX_GOTPCRELX` —— 即引用 `vm_entry` 时走了 **GOT**。
+> 原因：PIE 默认下 gcc 认为该符号可能被外部抢占，于是用 GOT 取地址；合并器按设计只接受直接/PC 相对形式。
+> 修法：声明加 `__attribute__((visibility("hidden")))` —— 编译器知道它不会被抢占，回到 PC 相对引用。
+>
+> **一个重要的本地/CI 差异**：我在本地用 msys2 的 gcc 编 `stub/linux/amd64`，那其实是 **mingw（Windows ABI）**，
+> 它不会产生 GOT 相对重定位 —— 所以本地构建一直通过，而 CI 的真实 Linux gcc 会失败。
+> 结论：涉及真实 Linux/arm64 工具链的问题，本地门禁**不可能**发现，只能靠 CI。
+>
 > ## 第三十八轮：找到并修掉 CI 四个红 job 的根因 —— `vm_selfcheck` 被 `#if` 挡住了
 >
 > ### 396. 根因
