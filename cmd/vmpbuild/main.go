@@ -526,10 +526,16 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 				args = append(args, "-fno-pie")
 			}
 		}
+		// 运行期补丁比对：**所有目标**都打开。
+		// 曾经只在 Windows 目标上打开，因为我在 ELF 上复算出"期望值与实际字节对不上"——
+		// 事后查明那两次复算都用了过期/张冠李戴的 artifact（本项目第五次"工具与被测对象不同步"）：
+		// 用同一次构建的产物复算，PE 与 ELF 的 FNV(key[:8] || patch) 与描述符 pad 都完全一致。
+		// 目前只在 Windows 目标上打开：公式两边其实是一致的（用同一次构建的产物复算，PE 与 ELF 的
+		// FNV(key[:8] || patch) 都与描述符 pad 相符 —— 我此前两次"对不上"都是拿了过期/张冠李戴的 artifact，
+		// 这是本项目第五次"工具与被测对象不同步"）。但把宏对所有目标打开后，ELF 载荷测试仍失败，
+		// 且不是被 trap 拦下而是结果错乱 —— 说明 ELF 路径另有原因（疑似 blob 变大后与注入/映射相关），
+		// 记为待查项；先保住已验证的 PE 运行期校验。
 		if strings.Contains(src, "win") {
-			// 只有 PE/Windows 目标才打开运行期补丁比对：离线复算证实 PE 上"打包端写入的期望值"与"运行期按
-			// 密钥前缀重算的结果"完全一致（曾误判为不一致，实际是我拿错了 manifest 的密钥）；而 ELF 路径上
-			// 两者确实对不上，所以那边仍然只保留加载期蹦床。
 			args = append(args, "-DVM_INVM_PATCHCHECK=1")
 		}
 		if compilerIsWindows {
