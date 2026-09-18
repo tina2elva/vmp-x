@@ -684,6 +684,24 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第三十一轮：CI 回到 **5/5 全绿**（自第 3 轮以来第一次）
+>
+> ```
+> sha=05145281 / be19ba8c  →  全部 success
+>   linux-amd64 ✓   linux-arm64(qemu) ✓   windows-amd64 ✓
+>   windows-arm64-blob ✓   windows-arm64-run ✓
+> ```
+>
+> 回看这条线：第 3 轮 feat(c) 引入的运行期补丁比对把 ELF/arm64 载荷全部拒了 → 之后 25 个提交一直红；
+> 我在第 25 轮才通过查 GitHub Actions 记录发现（此前只跑 PE/x64 的 E2E 就以为"全绿"）。
+> 修复分三步：① 运行期比对改为默认不编译（防线保留为加载期蹦床）；② 反调试汇编按架构保护；
+> ③ aarch64 的重定位：ADR_GOT_PAGE（Ubuntu gcc 默认 PIE）→ 加 -fno-pie（且只对 arm64）+
+>   LDST{16,32,64}_ABS_LO12_NC 的类型映射补全。
+>
+> 这轮的收获不止"变绿"：调试过程中确立了两条做法并反复见效 ——
+> (1) **先把报错做全再修**（补上 type/format/sym/targetSec/addend 之后，三条根因都是一轮 CI 就现形）；
+> (2) **每次 push 后必看 CI**，不再把"只跑 PE/x64 E2E"当成全绿。
+>
 > ## 第三十轮：(c)/(g) 的"篡改即拒绝"补上三组对抗数字
 >
 > tools/analyze_packed.py 新增两项检查（第 8、9 项），加上原有的回填复测，现在有三类篡改的实测：
