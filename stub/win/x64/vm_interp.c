@@ -673,6 +673,13 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
 #define VM_STEP_BUDGET 20000000u
 #endif
 
+/* 调试探针（仅非 release）：最后执行的 pc | op<<32。
+ * 不写描述符：描述符所在节是 RX 映射，写它会直接访问违例；
+ * 用全局的地址 = 模块基址 + sectionRVA + (符号偏移 - bssOff)，三个量都由打包器自己给出。 */
+#ifndef VM_RELEASE
+u64 vm_last_pc;
+#endif
+
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
     u32 steps = 0;
     (void)steps;
@@ -696,6 +703,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         const u8 *c = vm->code;
         u32 pc = vm->pc;
         u8 op = c[pc];
+#ifndef VM_RELEASE
+        vm_last_pc = (u64)pc | ((u64)op << 32);
+#endif
 #ifndef VM_RELEASE
         /* 现场记录（见 vm_ring_hdr 的注释）：只记环形缓冲，不影响语义 */
         {

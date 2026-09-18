@@ -72,6 +72,13 @@ def handler(info):
     ctypes.windll.kernel32.VirtualQuery(ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
     base = mbi.AllocationBase or 0
     hlog('    module/allocation base=0x%X (region 0x%X size 0x%X)' % (base, mbi.BaseAddress or 0, mbi.RegionSize))
+    probe_rva = CFG.get('probe_rva')
+    if probe_rva is not None and base:
+        try:
+            v = (ctypes.c_uint64).from_address(base + probe_rva).value
+            hlog('    last pc=0x%X  op=0x%X  (raw=0x%X)' % (v & 0xFFFFFFFF, v >> 32, v))
+        except Exception as e:
+            hlog('    probe read failed: %r' % (e,))
     ring_rva = CFG.get('ring_rva')
     vmpb_rva = CFG.get('vmpb_rva')
     if ring_rva is not None and base:
@@ -100,11 +107,13 @@ def main():
     ap.add_argument('--module', required=True)
     ap.add_argument('--expr', required=True)
     ap.add_argument('--vmpb-rva', type=lambda s: int(s, 0), required=True)
-    ap.add_argument('--ring-rva', type=lambda s: int(s, 0), required=True)
+    ap.add_argument('--ring-rva', type=lambda s: int(s, 0), default=None)
+    ap.add_argument('--probe-rva', type=lambda s: int(s, 0), default=None)
     a = ap.parse_args()
     LOG['fd'] = os.open('build/veh_ring.log', os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
     CFG['vmpb_rva'] = a.vmpb_rva
     CFG['ring_rva'] = a.ring_rva
+    CFG['probe_rva'] = a.probe_rva
     proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.POINTER(EXCEPTION_POINTERS))
     global HANDLER
     HANDLER = proto(handler)  # 必须留引用：临时对象会被回收，回调就变成野指针
