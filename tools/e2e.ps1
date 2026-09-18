@@ -31,10 +31,13 @@ function Run-FileDiag([string]$exe, [string[]]$a, [int]$sec) {
     $errFile = Join-Path $env:TEMP ("vmpdiag_" + $tag + ".err")
     try {
         $p = Start-Process -FilePath $path -ArgumentList $a -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-        $null = Wait-Process -Id $p.Id -Timeout $sec -ErrorAction SilentlyContinue
-        if (-not $p.HasExited) { try { Stop-Process -Id $p.Id -Force } catch {}; return "TIMEOUT" }
+        # 用 .NET 的 WaitForExit(ms)：它既带超时，又会在返回后把 ExitCode 填好。
+        # 之前用 Wait-Process -Id，进程对象没被刷新，读 ExitCode 会抛异常 -> 只打印 "?"，
+        # 结果连"崩溃码"都拿不到（这正是分辨 stack overflow 0xC00000FD 的关键）。
+        $exited = $p.WaitForExit($sec * 1000)
+        if (-not $exited) { try { Stop-Process -Id $p.Id -Force } catch {}; return "TIMEOUT" }
         $rc = "?"
-        try { if ($null -ne $p.ExitCode) { $rc = [string]$p.ExitCode } } catch { $rc = "?" }
+        try { $rc = [string]$p.ExitCode } catch { $rc = "?" }
         $o = ""; if (Test-Path $outFile) { $o = [string](Get-Content $outFile -Raw -ErrorAction SilentlyContinue) }
         $e = ""; if (Test-Path $errFile) { $e = [string](Get-Content $errFile -Raw -ErrorAction SilentlyContinue) }
         $o = ($o -replace "[\r\n]+", " ").Trim()
