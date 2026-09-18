@@ -122,6 +122,7 @@ $cases = @(
 )
 
 $pass = 0; $fail = 0
+$failLines = @()
 Write-Output "[*] differential test (native vs protected)..."
 if ((Get-Item build\target_vmp.exe).LastWriteTime -ne $packTime) { Write-Host "[FAIL] target_vmp.exe changed after packing"; exit 1 }
 foreach ($c in $cases) {
@@ -136,6 +137,9 @@ foreach ($c in $cases) {
             $d1 = Run-FileDiag "build/target_vmp.exe" @($c.f, "$a") 30
             $d2 = Run-FileDiag "build/target_vmp.exe" @($c.f, "$a") 30
             Write-Output ("         diag: try1[" + $d1 + "] try2[" + $d2 + "]")
+            $n1 = ($n -replace "\s+", " ").Trim()
+            $v1 = ($v -replace "\s+", " ").Trim()
+            $failLines += ("E2EFAIL " + $c.f + "(" + $a + ") native=[" + $n1 + "] protected=[" + $v1 + "] try1[" + $d1 + "] try2[" + $d2 + "]")
         }
         $tag = if ($ok) { "OK  " } else { "FAIL" }
         Write-Output ("  [{0}] {1}({2}): native={3} protected={4}" -f $tag, $c.f, $a, $n, $v)
@@ -166,5 +170,9 @@ foreach ($p in $perf) {
 }
 
 Write-Output ""
+if ($failLines.Count -gt 0) {
+    Write-Output "--- failure summary (one line per case, for CI annotations) ---"
+    foreach ($fl in $failLines) { Write-Output $fl }
+}
 Write-Output ("e2e: {0} passed, {1} failed" -f $pass, $fail)
 if ($fail -ne 0) { exit 1 }

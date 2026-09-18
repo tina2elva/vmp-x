@@ -42,7 +42,7 @@ jobs:
           if ($rc -ne 0) {
             # 关键行优先：注解会被截断，先放 [FAIL]/崩溃/fatal 行，再放尾部几行，
             # 否则 runner 上"到底哪个用例失败"会被埋在长日志里（前几轮就吃过这个亏）。
-            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|fatal error|\[!\]|panicked|LOAD |payloadVA=|bss 在 payload|VMRING01|core_pattern|pc=0x|core:" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $fails = @(Select-String -Path $log -Pattern "\[FAIL\]|E2EFAIL|diag:|MISMATCH|<crash|fatal error|\[!\]|panicked|LOAD |payloadVA=|bss 在 payload|VMRING01|core_pattern|pc=0x|core:" -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
             $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
             $msg = (($fails + $tail) -join "%0A") -replace "%", "%25"
             $msg = $msg -replace [char]13, ""

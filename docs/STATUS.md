@@ -684,6 +684,25 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ### 437. 为什么上一版诊断在 CI 上"看不见"
+> 读 `.github/workflows/ci.yml` 才发现注解是怎么拼的：
+> ```powershell
+> $fails = Select-String -Path $log -Pattern "\[FAIL\]|MISMATCH|<crash|..." | Select -First 12
+> $msg   = (($fails + (Get-Content $log -Tail 4)) -join "%0A")
+> ```
+> 也就是**只抓匹配模式的行 + 末尾 4 行**。我的 `diag:` 行不匹配 → 被过滤掉；
+> 而 `[FAIL]` 行的尾部（protected 侧的多个数字）又很可能被注解长度裁掉。
+>
+> ### 438. 改成"自包含的一行摘要"
+> * `tools/e2e.ps1`：失败时把每个用例汇成**一行**，结束前统一打印：
+> ```
+> --- failure summary (one line per case, for CI annotations) ---
+> E2EFAIL mt(0) native=[...] protected=[...] try1[rc=... out[...] err[...]] try2[...]
+> ```
+> * `.github/workflows/ci.yml`：注解抓取模式加入 `E2EFAIL|diag:`。
+> 验证：临时造一个必失败用例 → 摘要行如期出现且自包含；移除临时用例后 `e2e 146/146`、解析 OK。
+> 下次 CI 偶发时，注解里就会直接给出"rc + 两次重跑的输出片段"。
+>
 > ## 新目标（mt 偶发）第 2 轮：E2E 失败诊断已就位
 >
 > ### 435. 上一轮那次 PowerShell 解析错误的真正原因
