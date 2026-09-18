@@ -501,9 +501,12 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 				"-DVM_GUEST_ARM64=1", "-DVM_REG_COUNT=35",
 				"-I", platformDir,
 				"-I", filepath.Join(tmp, "arm64"))
-		}
-		if !compilerIsWindows {
-			args = append(args, "-fno-pie")
+			// Ubuntu 的 gcc 默认 PIE：arm64 上会为全局符号生成 GOT 引用（R_AARCH64_ADR_GOT_PAGE），
+			// 而合并器按设计只接受 PC 相对形式。只在 arm64 且非 Windows 编译器（即 Linux 交叉 GNU 工具链）上关掉 PIE ——
+			// 加到 x86-64 会让它改用绝对 32 位寻址（R_X86_64_32S），反而把 linux-amd64 弄红（已经发生过）。
+			if !compilerIsWindows {
+				args = append(args, "-fno-pie")
+			}
 		}
 		if compilerIsWindows {
 			args = append(args, "-DVM_BLOB_USES_WIN64=1")

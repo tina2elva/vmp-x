@@ -684,6 +684,17 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第二十九轮：把 -fno-pie 收窄到 arm64，并补上 LDST 系列重定位
+>
+> 上一轮的两处过度修改在 CI 里同时暴露（一次看全）：
+> · linux-amd64 变红：`type 0xB`（R_X86_64_32S）—— 因为我把 -fno-pie 加到了所有非 Windows 编译器上，
+>   x86-64 因此改用绝对 32 位寻址；**-fno-pie 现在只在 arm64 分支里加**；
+> · linux-arm64 仍红：`type 0x11E`（R_AARCH64_LDST64_ABS_LO12_NC，来自 ldr/str 的 #:lo12: 形式）。
+>   它与 ADRP 配对使用、整体是 PC 相对的，属于位置无关；而合并器的 kind 与补丁函数早就有了（relAArch64LDSTLo12），
+>   只是 ELF 侧的**类型映射**漏了这三种（16/32/64）。已补上映射与本地常量（284/285/286）。
+>
+> 本地：go build/test 全绿、E2E 146/146、ELF 载荷差分（下一行结果）。
+>
 > ## 第二十八轮（续）：用更完整的报错定位到真因 —— R_AARCH64_ADR_GOT_PAGE
 >
 > 把重定位报错补成 `type/format/sym/targetSec/addend` 之后，下一次 CI 立刻给出了确切类型：
