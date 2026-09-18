@@ -31,12 +31,12 @@ Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
 $m = Get-Content build/linux_vmp.json | ConvertFrom-Json
 $p = $m.placements | Where-Object { $_.name -eq "main.checkKey" }
 $thunkOff = '{0:X}' -f ($p.thunkRVA - $m.sectionRVA)
-$meta = & .\build\extractpayload.exe -elf build/linux_target.vmp -rva $m.sectionRVA -size $m.sectionSize -thunk $p.thunkRVA -out build/linux_payload.bin
+$meta = & .\build\extractpayload.exe -elf build/linux_target.vmp -rva $m.sectionRVA -size $m.sectionSize -thunk $p.thunkRVA -out build/linux_payload.bin -patchout build/linux_payload_patch.txt
 $meta | ForEach-Object { Write-Host "    $_" }
 $va = ($meta | Select-String -Pattern 'payloadVA=(0x[0-9A-Fa-f]+)').Matches[0].Groups[1].Value
 
 Write-Host "[*] executing the protected payload (guest arg register = RAX for Go binaries)..."
-$out = & .\build\payload_probe.exe build/linux_payload.bin $va 0x$thunkOff 10 0 1 255 12345 1000000
+$out = & .\build\payload_probe.exe build/linux_payload.bin $va 0x$thunkOff 10 0 1 255 12345 1000000 --patch build/linux_payload_patch.txt
 $out | ForEach-Object { Write-Host $_ }
 
 $expected = @{ 10 = 143; 0 = 213; 1 = 206; 255 = 2012; 12345 = 86342; 1000000 = 6999829 }
@@ -68,14 +68,14 @@ if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] PIE packing failed"; exit 1 }
 $mp = Get-Content build/linux_pie.json | ConvertFrom-Json
 $pp = $mp.placements | Where-Object { $_.name -eq "main.checkKey" }
 $pthunkOff = '{0:X}' -f ($pp.thunkRVA - $mp.sectionRVA)
-$pmeta = & .\build\extractpayload.exe -elf build/linux_pie.vmp -rva $mp.sectionRVA -size $mp.sectionSize -thunk $pp.thunkRVA -out build/linux_pie_payload.bin
+$pmeta = & .\build\extractpayload.exe -elf build/linux_pie.vmp -rva $mp.sectionRVA -size $mp.sectionSize -thunk $pp.thunkRVA -out build/linux_pie_payload.bin -patchout build/linux_pie_payload_patch.txt
 $pmeta | ForEach-Object { Write-Host "    $_" }
 $pva = ($pmeta | Select-String -Pattern 'payloadVA=(0x[0-9A-Fa-f]+)').Matches[0].Groups[1].Value
 
-$a1 = @("build/linux_pie_payload.bin", $pva, "0x$pthunkOff", "10", "0", "1", "255", "12345", "1000000")
+$a1 = @("build/linux_pie_payload.bin", $pva, "0x$pthunkOff", "10", "0", "1", "255", "12345", "1000000", "--patch", "build/linux_pie_payload_patch.txt")
 $run1 = & .\build\payload_probe.exe @a1
 $biased = "0x" + ('{0:X}' -f ([Convert]::ToInt64($pva, 16) + 0x100000))
-$a2 = @("build/linux_pie_payload.bin", $biased, "0x$pthunkOff", "10", "0", "1", "255", "12345", "1000000")
+$a2 = @("build/linux_pie_payload.bin", $biased, "0x$pthunkOff", "10", "0", "1", "255", "12345", "1000000", "--patch", "build/linux_pie_payload_patch.txt")
 $run2 = & .\build\payload_probe.exe @a2
 Write-Host "    load address 1 (original VA): $pva"
 Write-Host "    load address 2 (+0x100000)  : $biased"

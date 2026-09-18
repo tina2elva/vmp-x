@@ -6,9 +6,11 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	elfload "github.com/vmpx/vmp-x/internal/load/elf"
 )
@@ -19,6 +21,7 @@ func main() {
 	size := flag.Int("size", 0, "注入段大小")
 	thunkRVA := flag.Uint64("thunk", 0, "thunk 的 RVA")
 	out := flag.String("out", "payload.bin", "输出文件")
+	patchOut := flag.String("patchout", "", "把入口补丁字节（及它相对 payload 起点的偏移）写成文本，供探针在读到\"未映射的目标页\"时也能满足运行期校验")
 	flag.Parse()
 
 	f, err := elfload.Open(*elfPath)
@@ -44,6 +47,23 @@ func main() {
 		nonce := data[descOff+32 : descOff+44]
 		tag := data[descOff+44 : descOff+60]
 		fmt.Printf("desc nonce=%X tag=%X\n", nonce, tag)
+		// 运行期校验要读目标函数入口的补丁字节（pb = d + reserved2，按 ASLR 无关的相对偏移定位）。
+		// 探针只映射 payload 段，目标页不在映射里 —— 这里把补丁字节连同偏移导出来，让探针补上这一段，
+		// 这样"探针里跑"与"真实 Linux 上跑"对内层校验是等价的。
+		flags := binary.LittleEndian.Uint32(data[descOff+20:])
+		plen := int((flags >> 8) & 0xFF)
+		rel := int32(binary.LittleEndian.Uint32(data[descOff+28:]))
+		if *patchOut != "" && plen > 0 {
+			off := int32(descOff) + rel
+			patch, perr := f.ReadVA(base+*rva+uint64(int64(off)), plen)
+			if perr != nil {
+				must(perr)
+			}
+			var sb []string
+			sb = append(sb, fmt.Sprintf("%d %s", off, hex.EncodeToString(patch)))
+			must(os.WriteFile(*patchOut, []byte(strings.Join(sb, "\n")+"\n"), 0o644))
+			fmt.Printf("patch off=0x%X bytes=%X\n", off, patch)
+		}
 	}
 }
 

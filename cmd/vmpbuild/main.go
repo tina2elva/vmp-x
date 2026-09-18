@@ -535,9 +535,9 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		// 这是本项目第五次"工具与被测对象不同步"）。但把宏对所有目标打开后，ELF 载荷测试仍失败，
 		// 且不是被 trap 拦下而是结果错乱 —— 说明 ELF 路径另有原因（疑似 blob 变大后与注入/映射相关），
 		// 记为待查项；先保住已验证的 PE 运行期校验。
-		if strings.Contains(src, "win") {
-			args = append(args, "-DVM_INVM_PATCHCHECK=1")
-		}
+		// 运行期补丁比对：所有目标都打开。ELF 上"对不上"的两次都是测量/夹具问题（夹具只映射 payload 段，
+		// 目标入口页不在映射里 → 校验读不到补丁字节 → trap），现在夹具会补映射补丁页，故两边一致。
+		args = append(args, "-DVM_INVM_PATCHCHECK=1")
 		if compilerIsWindows {
 			args = append(args, "-DVM_BLOB_USES_WIN64=1")
 		}

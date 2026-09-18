@@ -41,6 +41,47 @@ static unsigned char *read_file(const char *p, long *n) {
     return b;
 }
 
+/* 可选参数 --patch <file>：文件每行是 "<相对 payload 起点的偏移(十进制)> <补丁字节(hex)>"。
+ * 运行期补丁校验要读目标函数入口的那几个字节（pb = 描述符 + reserved2）。探针只映射 payload 段，
+ * 目标页并不在映射里，于是校验必然失败、载荷被 ud2 打死。把补丁字节补到对应地址后，
+ * 探针环境与真实 Linux（整张镜像都在）对内层校验就是等价的。 */
+static void apply_patch_file(unsigned char *mem, long n, unsigned long long va, const char *path) {
+    FILE *f = fopen(path, "r");
+    char line[512];
+    if (!f) { fprintf(stderr, "[!] cannot read patch file %s\n", path); exit(2); }
+    while (fgets(line, sizeof(line), f)) {
+        char *sp = strchr(line, ' ');
+        unsigned char bytes[64];
+        int len = 0, i;
+        long off;
+        unsigned char *dst;
+        if (!sp) continue;
+        *sp = 0;
+        off = strtol(line, NULL, 10);
+        sp++;
+        while (sp[0] && sp[0] != '\n' && sp[0] != '\r' && len < (int)sizeof(bytes)) {
+            unsigned int v;
+            if (sscanf(sp, "%2x", &v) != 1) break;
+            bytes[len++] = (unsigned char)v;
+            sp += 2;
+        }
+        if (len <= 0) continue;
+        if (off < 0 || (unsigned long long)off + (unsigned long long)len > (unsigned long long)n) {
+            unsigned long long addr = va + (unsigned long long)off;
+            unsigned long long page = addr & ~0xFFFULL;
+            if (!VirtualAlloc((LPVOID)(uintptr_t)page, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) {
+                fprintf(stderr, "[!] VirtualAlloc patch page 0x%llX failed\n", page);
+                exit(2);
+            }
+            dst = (unsigned char *)(uintptr_t)addr;
+        } else {
+            dst = mem + off;
+        }
+        memcpy(dst, bytes, (size_t)len);
+        printf("patch %d bytes -> %p (off %ld)\n", len, (void *)dst, off);
+    }
+    fclose(f);
+}
 int main(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr, "usage: payload_probe <payload.bin> <va(hex)> <thunkOff(hex)> <arg>...\n");
@@ -69,6 +110,16 @@ int main(int argc, char **argv) {
     void *mem = (unsigned char *)region + off;
     memcpy(mem, payload, (size_t)n);
     FlushInstructionCache(GetCurrentProcess(), mem, (SIZE_T)n);
+
+    /* 可选 --patch <file> */
+    for (int i = 4; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--patch") == 0) {
+            apply_patch_file((unsigned char *)mem, n, va, argv[i + 1]);
+            for (int j = i; j + 2 < argc; j++) argv[j] = argv[j + 2];
+            argc -= 2;
+            break;
+        }
+    }
 
     void *thunk = (unsigned char *)mem + thunkOff;
     printf("payload @ %p (va=0x%llX, %ld bytes), thunk @ %p\n", mem, va, n, thunk);

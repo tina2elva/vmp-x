@@ -684,6 +684,25 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标 第 6 轮：ELF 也开上了**运行期补丁校验**（台账项关闭）
+>
+> ### 427. 做法：让夹具把"目标入口页"补上
+> 上一轮查明：探针只映射 payload 段，而校验要读目标入口的补丁字节 → 读到未映射内存 → trap。
+> 所以这一轮不是改产品，而是把**夹具补全**：
+> · `extractpayload` 新增 `-patchout`：把补丁字节与它相对 payload 起点的偏移导出（形如 `-992544 E95B751000`）；
+> · `payload_probe` 新增 `--patch <file>`：把这几字节写到对应地址（落在 payload 内就直接写，
+>   落在目标段就单独 VirtualAlloc 一页再写）；
+> · `vmpbuild` 去掉"仅 Windows"的限制，**所有目标**都定义 `-DVM_INVM_PATCHCHECK=1`。
+>
+> ### 428. 复测
+> ```
+> elf payload exit=0
+>   payloadVA=0x585000 ... patch off=0x-F2520 bytes=E95B751000   → patch 5 bytes -> 0x492AE0
+>   payloadVA=0x5AD000 ... patch off=0x-11A140 bytes=E97BF11200
+>   PIE payload: identical to native at BOTH load addresses   ← 两个加载地址都通过
+> ```
+> 即：**ELF 上运行期校验开着也能正确执行**，PE 上原本就开着。至此"防回填"在两侧都是加载期蹦床 + 运行期校验两层。
+>
 > ## 新目标 第 5 轮：ELF 那条台账的**根因查明** —— 是测试夹具的假象，不是产品缺陷
 >
 > ### 424. 四步二分（每步都是改一处、跑 `tools/verify_linux_payload.ps1`）
