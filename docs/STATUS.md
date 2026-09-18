@@ -684,6 +684,40 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标（覆盖口径）第 5 轮：把"6/14"换成可复算的 **6/11**，并把拒绝原因分了三类
+>
+> ### 444. 口径先说清楚
+> 候选集合 = 该模块的 `__pyx_pw_*` / `__pyx_pf_*`（各 5 个）＋ `__pyx_pymod_create` ＋ `__pyx_bisect_code_objects`，共 11 个；
+> 判据 = **单个函数能否翻译**（逐个 `-func` 打包，成功即计入）。实测 **6 / 11**。
+>
+> ### 445. 逐函数结果（这是"前"的数字）
+> ```
+> OK    __pyx_pf_7example_n                    127 IR -> 950 B
+> OK    __pyx_pf_7example_2fibonacci           310 IR -> 2223 B
+> OK    __pyx_pf_7example_6current_time_str     285 IR -> 2050 B
+> OK    __pyx_pw_7example_9add_dly              150 IR -> 1171 B
+> OK    __pyx_pymod_create                      258 IR -> 1753 B
+> OK    __pyx_bisect_code_objects                47 IR -> 293 B
+> FAIL  __pyx_pw_7example_1n                    函数末尾缺少 RET（+0x0 处 JMP .+11）
+> FAIL  __pyx_pw_7example_7current_time_str     函数末尾缺少 RET（+0x0 处 JMP .+11）
+> FAIL  __pyx_pw_7example_5greet                函数末尾缺少 RET（+0x20B 处 MOV RDI, RAX）
+> FAIL  __pyx_pf_7example_8add_dly              函数末尾缺少 RET（+0x21 处 XOR R12L, R12L）
+> FAIL  __pyx_pw_7example_3fibonacci             1/125 条指令无法翻译
+> ```
+>
+> ### 446. 三类拒绝原因（都可动手）
+> 1. **首指令是 5 字节 `jmp` 桩**（2 个）：反汇编 `__pyx_pw_7example_1n` 得到
+>    `180001000: e9 0b 00 00 00  jmp 0x180001010` 后面全是 `int3` —— 这是增量链接的 ILT 桩，
+>    **真正的函数体在跳转目标处**。修法：识别到"首指令为 `jmp rel32` 且目标在模块内"时，
+>    按**目标 RVA** 去翻译**并打补丁**（桩保持原样，它自然会把控制流带进我们的补丁）。预计 +2。
+> 2. **函数末尾不是 RET**（2 个）：`greet` 与 `add_dly` 的 pf 体都以尾调用/后续指令收尾，
+>    而 lifter 要求最后一条必须是 RET。修法：允许末尾的无条件跳转，抬成 `CALLN/CALLR 目标; RET`
+>    （VM 已有 CALLN/CALLR，且参数本来就在客户机寄存器里）。预计 +2。
+> 3. **单条指令不支持**（1 个）：`fibonacci` 的 wrapper 有 1/125 条无法翻译 —— 需要先把那条指令打出来。预计 +1。
+>
+> 三类都落地的话，单函数翻译口径可以从 6/11 提到 ~10-11/11，而且每一类都是**通用**的（不止这一个模块）。
+> 另外：CI 那边 `mt` 的崩溃自证还在等下一次偶发（本轮 CI 未复现）。
+>
 > ### 443. 环境对照
 > CI 的 notice 显示：`gcc=D:\a\_temp\msys64\ucrt64\bin\gcc.exe` —— 与我本地 `C:\msys64\ucrt64\bin\gcc.exe`
 > 是**同一支 ucrt64**，但 CI 是 setup-msys2 现装的最新包，**版本很可能比我本地新**。
