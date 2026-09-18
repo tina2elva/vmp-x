@@ -125,7 +125,11 @@ typedef struct {
 /* 入口汇编也要用这些：放在守卫外面 */
 #define VM_DESC_FLAG_ENC 1u
 #define VM_DESC_SIZE 64
+/* 描述符魔数：默认是这个固定值；release 构建由 vmpbuild 用 -D 注入**每次构建不同**的值，
+ * 这样发布产物里不存在固定的 4 字节特征（原来它就是「VMPK」）。 */
+#ifndef VM_DESC_MAGIC
 #define VM_DESC_MAGIC 0x4B504D56u /* "VMPK" */
+#endif
 
 /* ---- thunk 布局（5 字节，紧跟描述符之后） ----
  *   E8 <disp32>   call vm_entry    ; disp = vm_entry - (thunk + 5)

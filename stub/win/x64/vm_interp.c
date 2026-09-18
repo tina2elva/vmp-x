@@ -435,11 +435,13 @@ u64 vm_tmp[3];
  * 而注入段里只有 .bss 那一截被映射成可写（.data 在 RX 区）→ 解释器一写就 SIGSEGV。
  * 这不是假设：第一版带初始化器时本机 E2E 立刻从 146/146 掉成 protected 全空。
  * 所以 magic 在记录时再写。 */
+#ifndef VM_RELEASE
 u64 vm_ring_hdr[2]; /* [0]=magic, [1]=已记录条数（.bss） */
 /* 客户机入口/出口的关键状态（诊断用，非 static 以便进 manifest 符号表）：
  * arm64 宿主上被保护函数返回值恒定，需要确认"参数有没有到达客户机、客户机最后算出了什么"。 */
 u64 vm_diag[16]; /* [0..7] 见下；[8..10] = 解密后字节码前 24 字节（诊断用） */
 u64 vm_ring[16][2]; /* {pc, op}（.bss） */
+#endif /* !VM_RELEASE */
 
 static int vm_bc_lookup(const void *desc) {
     for (int i = 0; i < VM_BC_CACHE_SLOTS; i++) {
@@ -524,6 +526,7 @@ int vm_run(vm_ctx_t *vm) {
         }
     }
     u64 rsp_start = vm->regs[VRSP]; /* 诊断用：客户机栈起点，见 vm_run_inner 注释 */
+#ifndef VM_RELEASE /* release 构建不带任何诊断状态：少一份明文、少一族特征 */
     vm_diag[0] = vm->regs[0];          /* 入口 X0（客户机参数） */
     vm_diag[1] = rsp_start;            /* 入口模拟 SP */
     vm_diag[2] = (u64)(unsigned long)vm->code; /* 明文/密文字节码指针（freestanding，别用 uintptr_t） */
@@ -535,11 +538,14 @@ int vm_run(vm_ctx_t *vm) {
             vm_diag[8 + i] = w;
         }
     }
+#endif /* !VM_RELEASE */
     int rc = vm_run_inner(vm, rsp_start);
+#ifndef VM_RELEASE
     vm_diag[4] = vm->regs[0];          /* 出口 X0（返回值） */
     vm_diag[5] = vm->regs[VRSP];
     vm_diag[6] = vm->pc;
     vm_diag[7] = (u64)(u32)rc;
+#endif /* !VM_RELEASE */
     if (slot >= 0) {
         /* 原子递减：别的线程可能正在临界区里检查"这个槽有没有人在用" */
         __atomic_fetch_sub(&vm_bc_inuse[slot], 1u, __ATOMIC_RELEASE);
@@ -641,12 +647,17 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
 /* 一次调用的指令预算（诊断用）：超了就以 96 返回。
  * 为什么需要：arm64 上带循环的 sum_to 在探针里"永不返回"，我们需要它快速返回、
  * 并把环形缓冲（最近执行的 pc/op）留下来，才能看出是哪条分支没让 pc 前进。 */
+#ifndef VM_RELEASE
 #define VM_STEP_BUDGET 20000000u
+#endif
 
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
     u32 steps = 0;
+    (void)steps;
     for (;;) {
+#ifndef VM_RELEASE
         if (++steps > VM_STEP_BUDGET) return 96;
+#endif
         /* 诊断用（见 vm_run_inner 的注释）：客户机压栈越过给它的栈下界时当场返回 99。
          * 这样 Linux 上那个"跳进 .bss"就能被区分成"客户机踩穿了自己的栈"或"另有原因"。 */
 #ifndef VM_GUEST_ARM64
@@ -663,6 +674,7 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         const u8 *c = vm->code;
         u32 pc = vm->pc;
         u8 op = c[pc];
+#ifndef VM_RELEASE
         /* 现场记录（见 vm_ring_hdr 的注释）：只记环形缓冲，不影响语义 */
         {
             u32 k = (u32)(vm_ring_hdr[1] & 15);
@@ -671,6 +683,7 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_ring_hdr[0] = 0x564D52494E473031ULL; /* "VMRING01"：运行时写，避免落进 .data */
             vm_ring_hdr[1]++;
         }
+#endif /* !VM_RELEASE */
 
         switch (op) {
         case OP_HALT: return 1;

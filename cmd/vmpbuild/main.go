@@ -44,16 +44,25 @@ type sectInfo struct {
 	Size    int    `json:"size"`
 }
 
+// release 构建开关与本次构建的描述符魔数（由 main 从 flag 设置，compile 读）。
+var (
+	releaseBuild bool
+	releaseMagic uint32 = 0x4B504D56 // 默认与 vm_abi.h 的固定值一致
+)
+
 type manifest struct {
-	Source       string         `json:"source"`
-	Entry        string         `json:"entry"`
-	EntryOff     int            `json:"entryOff"`
-	BlobSize     int            `json:"blobSize"`
-	SHA256       string         `json:"sha256"`
-	FrameSize    int            `json:"frameSize"`
-	Margin       int            `json:"margin"`
-	FrameSkew    int            `json:"frameSkew"`
-	MaxStubFrame int            `json:"maxStubStackFrame"`
+	Source       string `json:"source"`
+	Entry        string `json:"entry"`
+	EntryOff     int    `json:"entryOff"`
+	BlobSize     int    `json:"blobSize"`
+	SHA256       string `json:"sha256"`
+	FrameSize    int    `json:"frameSize"`
+	Margin       int    `json:"margin"`
+	FrameSkew    int    `json:"frameSkew"`
+	MaxStubFrame int    `json:"maxStubStackFrame"`
+	// DescMagic：本 blob 期望的描述符魔数。release 构建里它是**每次构建随机**的，
+	// 这样发布产物里不存在固定 4 字节特征（原来那个特征就是字符串 "VMPK"）。
+	DescMagic    uint32         `json:"descMagic"`
 	BSSOff       int            `json:"bssOff"`  // blob 里可写数据（.bss）的起始偏移
 	BSSSize      int            `json:"bssSize"` // 可写数据大小：这一段必须单独映射成 RW
 	RelocsTotal  int            `json:"relocsTotal"`
@@ -77,6 +86,7 @@ func main() {
 	keep := flag.Bool("keep", false, "保留临时目录")
 	tmpRoot := flag.String("tmp", "", "临时目录（默认系统临时目录；必须是 ASCII 路径）")
 	objdump := flag.String("objdump", "objdump", "objdump 路径（用于测量解释器栈帧）")
+	release := flag.Bool("release", false, "release 构建：去掉全部诊断代码，描述符魔数每次构建随机")
 	stageRoot := flag.String("stage-root", "stub", "要整体 stage 的源码树根（BLOB.sources 的路径相对它）")
 	randomOpcodes := flag.Bool("random-opcodes", true, "为本次构建生成随机的 VM 操作码映射（默认开启）")
 	guest := flag.String("guest", "x86-64", "客户机 ISA：x86-64（默认）或 arm64")
@@ -148,6 +158,10 @@ func main() {
 	// 多目标直拼时 objPath 只是第一个对象，栈帧要**在所有对象上取最大**
 	maxFrame := 0
 	for _, p := range objs {
+		if *release {
+			releaseBuild = true
+			releaseMagic = rand.Uint32()
+		}
 		f, err := measureMaxFrame(*objdump, p, *verbose)
 		must(err)
 		if f > maxFrame {
@@ -226,6 +240,7 @@ func main() {
 		Guest:        *guest,
 		RegCount:     regCountFor(*guest),
 		MaxStubFrame: maxFrame,
+		DescMagic:    releaseMagic,
 		BlobSize:     len(blob),
 		SHA256:       fmt.Sprintf("%x", sum[:]),
 		RelocsTotal:  nReloc,
@@ -419,6 +434,10 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	isClang := strings.Contains(strings.ToLower(filepath.Base(cc)), "clang") || strings.Contains(machine, "msvc")
 	if (strings.Contains(machine, "aarch64") || strings.Contains(machine, "arm64")) && !isClang {
 		common = append(common, "-mno-outline-atomics")
+	}
+	if releaseBuild {
+		common = append(common, "-DVM_RELEASE=1",
+			fmt.Sprintf("-DVM_DESC_MAGIC=0x%Xu", releaseMagic))
 	}
 
 	// 只编译 BLOB.sources 里显式列出的文件（测试/工具程序不能被链进 blob）
