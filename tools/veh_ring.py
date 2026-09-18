@@ -81,10 +81,12 @@ def handler(info):
         try:
             v = (ctypes.c_uint64).from_address(base + probe_rva).value
             hlog('    last pc=0x%X  op=0x%X  (raw=0x%X)' % (v & 0xFFFFFFFF, v >> 32, v))
+            if CFG.get('probe2_rva') is not None:
+                v2 = (ctypes.c_uint64).from_address(base + CFG['probe2_rva']).value
+                hlog('    last native call target=0x%X  (via %s)' % (v2 & 0x7FFFFFFFFFFFFFFF, 'CALLR' if (v2 >> 63) else 'CALLN'))
         except Exception as e:
             hlog('    probe read failed: %r' % (e,))
     ring_rva = CFG.get('ring_rva')
-    vmpb_rva = CFG.get('vmpb_rva')
     vmpb_rva = CFG.get('vmpb_rva')
     if ring_rva is not None and vmpb_rva is not None and base:
         p = base + vmpb_rva + ring_rva
@@ -115,11 +117,13 @@ def main():
     ap.add_argument('--vmpb-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--ring-rva', type=lambda s: int(s, 0), default=None)
     ap.add_argument('--probe-rva', type=lambda s: int(s, 0), default=None)
+    ap.add_argument('--probe2-rva', type=lambda s: int(s, 0), default=None)
     a = ap.parse_args()
     LOG['fd'] = os.open('build/veh_ring.log', os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
     CFG['vmpb_rva'] = a.vmpb_rva
     CFG['ring_rva'] = a.ring_rva
     CFG['probe_rva'] = a.probe_rva
+    CFG['probe2_rva'] = a.probe2_rva
     CFG['module_name'] = a.module_name
     proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.POINTER(EXCEPTION_POINTERS))
     global HANDLER
@@ -134,6 +138,8 @@ def main():
     if mb0 and CFG.get('probe_rva') is not None:
         v0 = ctypes.c_uint64.from_address(mb0 + CFG['probe_rva']).value
         hlog('    probe BEFORE call = 0x%X (module base 0x%X)' % (v0, mb0))
+        if CFG.get('probe2_rva') is not None:
+            hlog('    probe2 BEFORE call = 0x%X' % ctypes.c_uint64.from_address(mb0 + CFG['probe2_rva']).value)
     mod = sys.modules[a.module]
     print('loaded %s' % getattr(mod, '__file__', '?'), flush=True)
     print('call ->', eval(a.expr, {a.module: mod}), flush=True)

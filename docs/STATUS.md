@@ -684,6 +684,34 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第十五轮：崩溃点 = 最后一次本机调用的目标地址（两者完全相同）
+>
+> ### 346. 新增探针：最后一次 CALLN/CALLR 的目标
+> vm_last_call 记录 CALLN 的 addr（高位清零）或 CALLR 的 addr（最高位置 1 作标记）。崩溃读数：
+> ```
+> probe BEFORE call = 0x0 / probe2 BEFORE call = 0x0
+> last pc=0x80A  op=0xE3
+> last native call target=0x7FFF3B7A6E40  (via CALLN)
+> 异常写访问目标        =0x7fff3b7a6e40      ← 与上一条**完全相同**
+> GetModuleHandleW base =0x7FFF3B7A0000      → 目标 RVA = 0x6E40
+> ```
+> 也就是说：VM 在 pc=0x80A 处发起了一次 CALLN，目标是「模块基址 + 0x6E40」，紧接着就崩在同一个地址上。
+>
+> ### 347. 同一个函数的原生代码长什么样（objdump 原 pyd）
+> ```
+> 180001a91: 41 ff d0            call *%r8
+> 180001a96: ff 15 2c 69 00 00   call *0x692c(%rip)   # 0x1800083c8
+> 180001ac6: ff 15 1c 67 00 00   call *0x671c(%rip)   # 0x1800081e8
+> ```
+> 该函数的原生调用几乎全是**经 IAT 的间接调用**（call qword ptr [rip+disp]）。
+> 所以最大嫌疑是「这类调用被提升成 CALLN 时，RVA/目标算错了」——目标 0x6E40 落在原 .text 里，
+> 而那正是 DbgHelp/RtlVirtualUnwind 一类被 objdump 显示为普通函数的区域；
+> 另一个可能是目标正确但**传入的寄存器是错的**（比如把 IAT 槽位的值/RVA 当成了指针），导致被调函数写坏地址。
+> 两者都指向 lift 阶段的「间接调用处理」，是下一步要读代码确认的地方。
+>
+> ### 348. 工具修正记录
+> tools/veh_ring.py 增加 --probe2-rva（读第二个探针）；同时修掉我插入代码时的缩进错误（if 落在 try 之外）。
+>
 > ## 第十四轮：找到并修正探针的第三个错误 —— 崩溃其实发生在**解释循环内部**（pc=0x80A）
 >
 > ### 343. 错误：读探针时用的模块基址不对

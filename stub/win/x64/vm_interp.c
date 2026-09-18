@@ -43,6 +43,7 @@ int vm_run(vm_ctx_t *vm);
 #ifndef VM_RELEASE
 /* 调试探针：入口路径的阶段计数器（仅非 release；实现在文件后部） */
 extern u64 vm_last_pc;
+extern u64 vm_last_call; /* 最后一次本机调用的目标（判断 CALLN/CALLR 目标是否合理） */
 #endif
 u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
@@ -694,6 +695,7 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
  * 用全局的地址 = 模块基址 + sectionRVA + (符号偏移 - bssOff)，三个量都由打包器自己给出。 */
 #ifndef VM_RELEASE
 u64 vm_last_pc;
+u64 vm_last_call;
 #endif
 
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
@@ -1031,6 +1033,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         case OP_CALLN: {
             /* 字节码里存的是 RVA：真实地址 = 模块基址 + RVA */
             u64 addr = vm->regs[VRBASE] + rd64(&c[pc + 1]);
+#ifndef VM_RELEASE
+            vm_last_call = addr; /* 探针：最后一次 CALLN 的目标 */
+#endif
             typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fn_t fn = (fn_t)addr;
             vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
@@ -1043,6 +1048,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
              * 与 CALLN 的区别只是目标来自运行时。调用约定仍是宿主的（blob 由哪个工具链编译就是哪个）。
              * 空指针明确失败，而不是跳到 0。 */
             u64 addr = vm->regs[c[pc + 1] & VM_REG_MASK];
+#ifndef VM_RELEASE
+            vm_last_call = addr | 0x8000000000000000ull; /* 高位标记：来自 CALLR */
+#endif
             if (addr == 0) return 1;
             typedef u64 (*fnr_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fnr_t fn = (fnr_t)addr;
