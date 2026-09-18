@@ -203,6 +203,18 @@ def main():
         print('    %s' % r4)
     print()
 
+    print('[10] interpreter/stub code tamper (flip one .vmp code byte, then run)')
+    vmp = next((s for s in pe['secs'] if s['name'] == '.vmp'), None)
+    if not (vmp and a.packed.endswith('.pyd')):
+        print('    skipped (need a .vmp section and a .pyd)')
+    else:
+        d5 = bytearray(d)
+        off5 = vmp['roff'] + 0x1000          # 段内偏一点，确保落在代码里
+        d5[off5] ^= 0xFF
+        r5 = run_packed(a, d5, 'vmpk_codetamper_')
+        print('    %s' % r5)
+    print()
+
 
 def run_packed(a, data, prefix):
     """把改动后的产物写成 pyd 跑一次，返回判定字符串。"""
@@ -220,5 +232,7 @@ def run_packed(a, data, prefix):
     if r.returncode != 0:
         return 'refused/crashed  exit=%d  %s' % (r.returncode, last[:90])
     return 'runs but wrong?  exit=0  %s' % last[:90]
+
+
 if __name__ == '__main__':
     main()

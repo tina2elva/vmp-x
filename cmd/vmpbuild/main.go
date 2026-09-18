@@ -15,6 +15,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -230,6 +231,23 @@ func main() {
 			bssOff = s.BlobOff
 			bssSize = (s.Size + 0xFFF) &^ 0xFFF
 		}
+	}
+
+	// (g) 解释器/桩代码段自哈希：把 [0, bssOff) 的 FNV-1a 与两个偏移写进 blob 里的三个全局
+	// （它们在 .bss，位于被哈希区间之外，所以不会自我指涉）。运行时由 vm_selfcheck() 重算比对。
+	if off, ok := syms["vm_self_hash"]; ok && bssOff > 0 {
+		h := uint32(2166136261)
+		for _, b := range blob[:bssOff] {
+			h = (h ^ uint32(b)) * 16777619
+		}
+		binary.LittleEndian.PutUint32(blob[off:], h)
+		if o2, ok2 := syms["vm_self_len"]; ok2 {
+			binary.LittleEndian.PutUint64(blob[o2:], uint64(bssOff))
+		}
+		if o3, ok3 := syms["vm_code_off"]; ok3 {
+			binary.LittleEndian.PutUint64(blob[o3:], uint64(entryOff))
+		}
+		must(os.WriteFile(*out, blob, 0o644))
 	}
 
 	sum := sha256.Sum256(blob)

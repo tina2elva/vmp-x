@@ -684,6 +684,28 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 第三十二轮：(g) 最后一层 —— 解释器/桩**代码段自哈希**（篡改解释器即拒绝执行）
+>
+> ### 383. 实现
+> · vmpbuild 在合并完成后，对 `[0, bssOff)`（.text + .rdata，即桩与解释器的代码）算 FNV-1a，
+>   并把 `vm_self_hash`、`vm_self_len`、`vm_code_off` 三个值写进 blob 里的三个全局（都在 .bss，位于被哈希区间之外，不自我指涉）；
+> · 运行期 vm_selfcheck() 用 `&vm_entry - vm_code_off` 还原区间起点，重算比对，不一致 __builtin_trap()；
+>   在 vm_run 入口每次调用都查（加载期那段以后也可加）。
+> 一个坑：C 里若把汇编符号声明成数组（`extern u8 vm_entry[]`），gcc 会生成 `.refptr.vm_entry` 绝对指针节，
+> 被合并器以"引用了 blob 之外的节"拒绝；**声明成函数**（`extern void vm_entry(void)`）才会走 PC 相对引用。
+>
+> ### 384. 对抗复测（analyze_packed.py 新增第 10 项）
+> ```
+> [7]  回填（补回原始入口字节）        → refused/crashed  exit=1（DLL 加载失败）
+> [8]  字节码篡改（翻一个密文字节）    → refused/crashed  exit=3221225477 = 0xC0000005（AEAD 标签）
+> [9]  入口补丁篡改（翻一个补丁字节）  → refused/crashed  exit=1（加载期蹦床校验表）
+> [10] 解释器代码篡改（翻 .vmp 一个字节）→ refused/crashed exit=3221225501 = 0xC000001D（自哈希 trap）
+> ```
+> 正常路径不受影响：打包后 `fib(10)=55`、exit=0。
+>
+> ### 385. 本地门禁
+> tools/gates.ps1 **8/8 全过**（含本轮新增的"blob 必须能构建"、arm64 guest 差分、Linux 载荷）。
+>
 > ## 第三十一轮：CI 回到 **5/5 全绿**（自第 3 轮以来第一次）
 >
 > ```

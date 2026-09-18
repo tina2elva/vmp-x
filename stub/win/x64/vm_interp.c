@@ -497,6 +497,26 @@ static int vm_bc_acquire(void) {
  * （CI 的 windows-arm64-blob 就是因此红的）。arm64 上反调试暂时置空。 */
 #if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
 volatile u64 vm_peb_seen;
+/* ---- (g) 解释器/桩代码段自哈希 ----
+ * vmpbuild 在合并完成后把三个值写进下面三个全局（都在 .bss，位于被哈希区间之外）：
+ *   vm_code_off  = vm_entry 相对 blob 起点的偏移
+ *   vm_self_len  = 被哈希区间长度（blob 起点到 .bss 起点）
+ *   vm_self_hash = 该区间的 FNV-1a
+ * 运行时重算比对：把解释器补丁成 dumper、或改掉校验逻辑，都会在这里被拒。
+ * 为什么要 vm_code_off：C 侧只能拿到 &vm_entry（汇编符号），拿不到节区起点。 */
+u64 vm_code_off;
+u64 vm_self_len;
+u32 vm_self_hash;
+extern void vm_entry(void); /* 声明成函数：gcc 才会用 PC 相对引用，数组会生成 .refptr 绝对指针 */
+static void vm_selfcheck(void) {
+    const u8 *base = (const u8 *)&vm_entry - (u32)vm_code_off;
+    u32 h = 2166136261u;
+    u64 i;
+    if (!vm_self_len) return; /* 还没被烘焙（比如本地直接编 blob 跑测试） */
+    for (i = 0; i < vm_self_len; i++) { h ^= (u32)base[i]; h *= 16777619u; }
+    if (h != vm_self_hash) __builtin_trap();
+}
+
 static int vm_debugger_present(void) {
     const u8 *peb;
     __asm__ volatile("movq %%gs:0x60, %0" : "=r"(peb));
@@ -513,6 +533,7 @@ static void vm_antidebug(void) { }
 
 int vm_run(vm_ctx_t *vm) {
     vm_antidebug();
+    vm_selfcheck();
     int slot = -1;
 #ifndef VM_RELEASE
     vm_last_pc = 0xAA000001u; /* 已进入 vm_run */
