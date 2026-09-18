@@ -267,11 +267,20 @@ func (a a64Adapter) LiftFunc(name string, code []byte, rva uint32) (*ir.Func, er
 // liftAll 对所有目标函数做 lift + codegen（与容器/架构无关）
 func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, error), opcodeMap *vm.OpcodeMap, verbose bool, bytesAt func(rva uint32, n int) ([]byte, bool), keepSelfChecks bool) ([]inject.FuncSpec, error) {
 	var specs []inject.FuncSpec
+	seen := map[uint32]string{}
 	for _, name := range names {
 		found, err := find(name)
 		if err != nil {
 			return nil, err
 		}
+		// 去重：桩解析之后，"包装函数"和它跳转到的函数体会落在同一个 RVA 上。
+		// 同一个 RVA 放两份 = 后者覆盖前者的补丁字节，加载期校验表就必然对不上（实测：DLL 初始化例程失败）。
+		if prev, dup := seen[found.RVA]; dup {
+			fmt.Printf("    %s: RVA=0x%X 与 %s 相同（桩/别名），跳过重复放置", name, found.RVA, prev)
+			fmt.Println()
+			continue
+		}
+		seen[found.RVA] = name
 		irFunc, err := lifter.LiftFunc(name, found.Code, found.RVA)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[!] %s: %v", name, err)

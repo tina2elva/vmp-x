@@ -28,7 +28,7 @@ type Found struct {
 }
 
 // FindFunction 按符号名定位函数；path 用于读取 COFF 符号表
-func FindFunction(path string, f *pe.File, name string) (*Found, error) {
+func findFunctionRaw(path string, f *pe.File, name string) (*Found, error) {
 	df, err := dbgpe.Open(path)
 	if err != nil {
 		return nil, err
@@ -51,6 +51,9 @@ func FindFunction(path string, f *pe.File, name string) (*Found, error) {
 		if !ok {
 			rva, ok = exportRVA(df, name)
 		}
+		// 增量链接（ILT）会把函数符号指向一条 5 字节 `jmp rel32` 桩，真正的函数体在目标处；
+		// 翻译桩没有意义（后面是 int3 填充），所以先跟到目标 RVA。
+		rva = followThunk(f, rva)
 		if !ok {
 			return nil, fmt.Errorf("找不到符号 %q（该 PE 有 %d 个符号；MAP 与导出表里都没有这个名字，可用 -map 指定 MAP）", name, len(df.Symbols))
 		}
@@ -335,4 +338,97 @@ func readCode(f *pe.File, rva, end uint32) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("RVA 0x%X 不在任何节内", rva)
+}
+
+// FindFunction：定位函数并做一层"桩解析"——有些函数的符号指向一个 5 字节的 `jmp rel32`（增量链接的 ILT 桩），
+// 真正的函数体在跳转目标处。翻译桩本身没有意义（后面是 int3 填充），所以跟到目标：
+// 用**目标的 RVA** 去翻译并打补丁 —— 桩保持原样，它自然会把控制流带进我们的补丁。
+func FindFunction(path string, f *pe.File, name string) (*Found, error) {
+	found, err := findFunctionRaw(path, f, name)
+	if err != nil {
+		return nil, err
+	}
+	return resolveLeadingThunk(f, path, found)
+}
+
+// resolveLeadingThunk 跟随开头的直接跳转桩（最多 4 跳，防环）。
+func resolveLeadingThunk(f *pe.File, path string, found *Found) (*Found, error) {
+	df, err := dbgpe.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer df.Close()
+	for hop := 0; hop < 4; hop++ {
+		c := found.Code
+		if len(c) < 5 {
+			return found, nil
+		}
+		if c[0] == 0xFF && len(c) >= 6 && c[1] == 0x25 {
+			return nil, fmt.Errorf("%s 是导入桩（jmp [rip+disp]），不是本模块的函数", found.Name)
+		}
+		if c[0] != 0xE9 {
+			return found, nil
+		}
+		rel := int32(binary.LittleEndian.Uint32(c[1:5]))
+		target := uint32(int64(found.RVA) + 5 + int64(rel))
+		if target == 0 || target == found.RVA {
+			return found, nil
+		}
+		end := uint32(0)
+		take := func(v uint32) {
+			if v > target && (end == 0 || v < end) {
+				end = v
+			}
+		}
+		if _, e, ok := pdataEnd(df, target); ok {
+			take(e)
+		}
+		if e, ok := pdataNextBegin(df, target); ok {
+			take(e)
+		}
+		if e, ok := nextExportEnd(df, target); ok {
+			take(e)
+		}
+		if si, ok := sectionOfRVA(f, target); ok {
+			take(sectionEndOf(f, si))
+		}
+		if end <= target {
+			return nil, fmt.Errorf("%s 的 jmp 桩目标 0x%X 找不到可用边界", found.Name, target)
+		}
+		code, cerr := readCode(f, target, end)
+		if cerr != nil {
+			return nil, cerr
+		}
+		var trimmed []byte
+		var n int
+		var terr error
+		if f.Machine == peMachineARM64 {
+			trimmed, n, terr = trimTrailingPaddingARM64(target, code)
+		} else {
+			trimmed, n, terr = TrimTrailingPadding(f.ImageBase, target, code)
+		}
+		if terr != nil {
+			return nil, terr
+		}
+		found = &Found{Name: found.Name, RVA: target, End: target + uint32(len(trimmed)), Code: trimmed, InstrNum: n}
+	}
+	return found, nil
+}
+
+// followThunk 跟随开头的直接跳转桩（最多 4 跳，防环）。只跟 `jmp rel32`；
+// `jmp [rip+disp]`（导入桩）不跟随——那种不是本模块的函数。
+func followThunk(f *pe.File, rva uint32) uint32 {
+	for hop := 0; hop < 4; hop++ {
+		b, err := readCode(f, rva, rva+5)
+		if err != nil || len(b) < 5 || b[0] != 0xE9 {
+			return rva
+		}
+		rel := int32(binary.LittleEndian.Uint32(b[1:5]))
+		target := uint32(int64(rva) + 5 + int64(rel))
+		if target == 0 || target == rva {
+			return rva
+		}
+		rva = target
+	}
+	return rva
 }
