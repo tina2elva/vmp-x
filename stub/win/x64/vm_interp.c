@@ -392,8 +392,8 @@ static int cond_holds(vm_ctx_t *vm, u32 cond) {
  * 超限后 vm_run 会直接 return 2 —— 而调用方拿到的是"返回值"，于是把垃圾交给下一层，最后崩在 numpy 里。
  * 这种**静默失败**最危险，所以：① 槽放大到 16KB；② 打包端按这个常量做硬校验（见 vm_bc_slot_size）。 */
 #ifndef VM_BC_SLOT_SIZE
-#define VM_BC_SLOT_SIZE 4096 /* 试过 16KB：单函数可以工作，但会让多函数构建在别处崩（布局相关，未查清）——
-                              * 因此暂时保持 4KB，并靠打包端的硬校验把"超限的大函数"在打包期就拒掉 */
+#define VM_BC_SLOT_SIZE 16384 /* 16KB：真实函数里出现过 7313B（add_dly 函数体）与 4971B（pymod_exec）。
+                               * 之前"多函数组合崩"已查明是 __pyx_pymod_create 那个独立问题（不是槽大小），本轮复核。 */
 #endif
 #endif
 
