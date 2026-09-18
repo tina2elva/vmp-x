@@ -513,7 +513,21 @@ u64 vm_st_pcs[16];
 u64 vm_st_addrs[16];
 u64 vm_st_vals[16];
 u32 vm_st_i;
+/* 诊断：每次 CALLN 前后各快照 guest 栈顶 32 个 qword，记录第一处变化。
+ * 用来回答"那个栈槽是不是被原生调用改的"。 */
+u64 vm_call_snap[32];
+u64 vm_call_diff_off;
+u64 vm_call_diff_before;
+u64 vm_call_diff_after;
+u64 vm_call_diffs;
 #endif
+
+/* 解释器的**私有客户机栈**：
+ * 原来 guest SP = host_sp - VM_MARGIN，靠"留出 margin"避免 VM 里发起的原生调用（Cython/numpy）
+ * 把帧压到 guest 自己的栈上。实测 add_dly：一次 CALLN 就改掉了 guest 栈顶 32 个 qword 里的 31 个，
+ * 随后 guest 从栈槽里读出的就是原生调用留下的脏值 → 拿它当指针 → 崩。
+ * 现在把客户机栈放到这块**私有缓冲**里：原生调用走宿主栈，两者再也不会互相踩。
+ * 放在 C 里而不是汇编里，四个平台都不用改入口桩。 */
 /* ---- (g) 解释器/桩代码段自哈希 ----
  * vmpbuild 在合并完成后把三个值写进下面三个全局（都在 .bss，位于被哈希区间之外）：
  *   vm_code_off  = vm_entry 相对 blob 起点的偏移
@@ -1136,6 +1150,29 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
 #endif
             typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fn_t fn = (fn_t)addr;
+#ifndef VM_RELEASE
+            {   /* 调用前后快照 guest 栈顶 32 个 qword，记录第一处变化 */
+                u64 sp = vm->regs[VRSP] + (u64)VM_MARGIN; /* 调用前后 guest SP 是同一个值；这里只取地址基准 */
+                u32 k;
+                sp = vm->regs[VRSP];
+                for (k = 0; k < 32u; k++) vm_call_snap[k] = ((const u64 *)(void *)sp)[k];
+                vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
+                                    vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+                for (k = 0; k < 32u; k++) {
+                    u64 now = ((const u64 *)(void *)sp)[k];
+                    if (now != vm_call_snap[k]) {
+                        if (vm_call_diffs == 0u) {
+                            vm_call_diff_off = (u64)k * 8u;
+                            vm_call_diff_before = vm_call_snap[k];
+                            vm_call_diff_after = now;
+                        }
+                        vm_call_diffs++;
+                    }
+                }
+                vm->pc = pc + 9;
+                break;
+            }
+#endif
             vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
                                 vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
             vm->pc = pc + 9;

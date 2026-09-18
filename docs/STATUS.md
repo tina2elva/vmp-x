@@ -684,6 +684,33 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标 第 2 轮（add_dly）：**根因确认** —— 原生调用踩掉了客户机自己的栈
+>
+> ### 408. 决定性证据一：CALLN 前后对比 guest 栈顶 32 个 qword
+> ```
+> vm_last_call      = 0x7FFF17C61F80    （= 模块基址 + 0x1F80 = __pyx_pf_7example_8add_dly，目标正确）
+> vm_call_diff_off  = 0x8               （第一处变化在 guest_sp + 8）
+> vm_call_diff_before = 0x13
+> vm_call_diff_after  = 0x9200000001
+> vm_call_diffs     = 0x1F              ← 32 个 qword 里有 **31 个**被这次调用改写
+> ```
+> 也就是说：VM 里发起的原生调用（Cython→numpy 那条链）**把 guest 自己的栈整片覆盖了**。
+> 之前 guest 栈就是 `host_sp - VM_MARGIN`（3KB），原生调用的帧从 host_sp 往下长，超过 3KB 就压到 guest 栈上。
+>
+> ### 409. 决定性证据二：把 margin 临时放到 16KB，add_dly **直接就好了**
+> ```
+> 保护后：add_dly= 5.0    fib= 55    exit=0
+> 原生  ：add_dly= 5.0    fib= 55
+> ```
+> （margin=64KB 的那次会先在别处崩，所以不能拿它下结论 —— 16KB 才是有效实验。）
+>
+> ### 410. 但"放大 margin"不是能长期采用的修法
+> margin 是**宿主相关**的预算：CI 里 Go 宿主跑在 goroutine 栈上（日志显示 stack 区间只有 4KB），
+> 这正是当初把它定在 3KB 的原因；放大到 16KB 会让 Go 那边的 E2E 崩。
+> 正确修法是把**客户机栈搬到私有缓冲**（原生调用走宿主栈，两者彻底不重叠）—— 我在 C 里做了一版
+> （不动汇编，四个平台通用），但第一版崩在模块内部写新缓冲的位置（`module+0x549F8`，落在新缓冲区内却报写违例），
+> 说明注入段的**虚拟大小/映射**没跟上 256KB 的新缓冲。已回退这一版，保持树绿，下一轮带着这个线索重做。
+>
 > ## 新目标 第 1 轮（add_dly）：把两条环装上，链路又前进了一步
 >
 > ### 405. reg1 只被写 4 次（ring: vm_r1_pcs / vm_r1_vals）
