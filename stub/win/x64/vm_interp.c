@@ -496,6 +496,11 @@ static int vm_bc_acquire(void) {
 /* 仅 Windows 宿主 + x86-64：这段内联汇编是 x86-64 的，编到 aarch64 目标会编译失败
  * （CI 的 windows-arm64-blob 就是因此红的）。arm64 上反调试暂时置空。 */
 volatile u64 vm_peb_seen;
+#ifndef VM_RELEASE
+/* 诊断：模拟栈指针在"第一条指令"与"最后一条指令"时的值 —— 用来判断是否发生 SP 漂移。 */
+u64 vm_first_sp;
+u64 vm_last_sp;
+#endif
 /* ---- (g) 解释器/桩代码段自哈希 ----
  * vmpbuild 在合并完成后把三个值写进下面三个全局（都在 .bss，位于被哈希区间之外）：
  *   vm_code_off  = vm_entry 相对 blob 起点的偏移
@@ -785,6 +790,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         u8 op = c[pc];
 #ifndef VM_RELEASE
         vm_last_pc = (u64)pc | ((u64)op << 32);
+        if (!vm_first_sp) vm_first_sp = vm->regs[VRSP];
+        vm_last_sp = vm->regs[VRSP];
 #endif
 #ifndef VM_RELEASE
         /* 现场记录（见 vm_ring_hdr 的注释）：只记环形缓冲，不影响语义 */
