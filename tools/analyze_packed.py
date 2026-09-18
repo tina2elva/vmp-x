@@ -175,5 +175,50 @@ def main():
     print()
 
 
+    print('[8] bytecode tamper (flip one ciphertext byte, then run)')
+    rep = None
+    if a.report and os.path.exists(a.report):
+        rep = json.load(open(a.report))
+    pls = (rep or {}).get('placements') or []
+    if not (pls and a.packed.endswith('.pyd')):
+        print('    skipped (need --report with placements and a .pyd)')
+    else:
+        desc_off = rva2off(pe, pls[0]['descRVA'])
+        code_rva = struct.unpack_from('<I', d, desc_off + 8)[0]
+        code_off = desc_off + code_rva
+        d3 = bytearray(d)
+        d3[code_off + 8] ^= 0xFF
+        r3 = run_packed(a, d3, 'vmpk_bctamper_')
+        print('    %s' % r3)
+    print()
+
+    print('[9] entry-patch tamper (flip one patch byte, then run)')
+    if not (real and a.packed.endswith('.pyd')):
+        print('    skipped (need a patched entry and a .pyd)')
+    else:
+        src = rva2off(pe, real[0][0])
+        d4 = bytearray(d)
+        d4[src] ^= 0xFF
+        r4 = run_packed(a, d4, 'vmpk_patchtamper_')
+        print('    %s' % r4)
+    print()
+
+
+def run_packed(a, data, prefix):
+    """把改动后的产物写成 pyd 跑一次，返回判定字符串。"""
+    tmp = tempfile.mkdtemp(prefix=prefix)
+    mod = a.module or os.path.basename(a.packed).split('.')[0]
+    path = os.path.join(tmp, mod + '.cp313-win_amd64.pyd')
+    open(path, 'wb').write(bytes(data))
+    code = "import sys; sys.path.insert(0, r'%s'); import %s; %s" % (tmp, mod, a.expr)
+    try:
+        r = subprocess.run([a.python, '-c', code], capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return 'TIMEOUT (likely hung)'
+    out = (r.stdout + r.stderr).decode('utf-8', 'replace').strip().splitlines()
+    last = (out[-1] if out else '').encode('ascii', 'replace').decode('ascii')
+    if r.returncode != 0:
+        return 'refused/crashed  exit=%d  %s' % (r.returncode, last[:90])
+    return 'runs but wrong?  exit=0  %s' % last[:90]
 if __name__ == '__main__':
     main()
