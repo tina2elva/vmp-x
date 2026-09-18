@@ -374,6 +374,16 @@ static void vmp_crash_line(EXCEPTION_POINTERS *ep) {
                 (unsigned long long)((unsigned char *)addr - (unsigned char *)mod));
     }
     fprintf(stderr, "\n");
+    /* 再把 GPR 打出来：偶发崩溃往往只差一个寄存器的值就能定性（尤其/疑似缓存/原子路径）。 */
+    if (ep->ContextRecord) {
+        CONTEXT *c = ep->ContextRecord;
+        fprintf(stderr, "  rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p rbp=%p rsp=%p\n",
+                (void *)c->Rax, (void *)c->Rbx, (void *)c->Rcx, (void *)c->Rdx,
+                (void *)c->Rsi, (void *)c->Rdi, (void *)c->Rbp, (void *)c->Rsp);
+        fprintf(stderr, "  r8=%p r9=%p r10=%p r11=%p r12=%p r13=%p r14=%p r15=%p\n",
+                (void *)c->R8, (void *)c->R9, (void *)c->R10, (void *)c->R11,
+                (void *)c->R12, (void *)c->R13, (void *)c->R14, (void *)c->R15);
+    }
     fflush(stderr);
 }
 static LONG WINAPI vmp_veh(EXCEPTION_POINTERS *ep) {
