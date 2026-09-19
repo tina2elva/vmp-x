@@ -342,6 +342,11 @@ static void write_reg(vm_ctx_t *vm, u32 r, u32 width, u64 val) {
 #ifdef VM_GUEST_ARM64
     if (r == VRARM64_ZR) return; /* XZR/WZR：写被丢弃 */
 #endif
+    /* 索引来自字节码。注意 VM_REG_MASK 是 31，而 regs[] 只有 VM_REG_COUNT(17/18) 项 ——
+     * 所以"掩码"并不能保证在界内：一旦字节码损坏或解码失步，写入就会越界。
+     * 读越界只是拿到错值，写越界会踩坏上下文（第 35 轮那个 adst 就是这么崩到栈守护页的）。
+     * 写是危险动作 ⇒ 这里一律先校验；越界就不写（宁可算错也不破坏宿主内存）。 */
+    if (r >= (u32)VM_REG_COUNT) return;
     if (width >= 64) { vm->regs[r] = val; return; }
     if (width == 32) { vm->regs[r] = val & 0xFFFFFFFFull; return; }
     u64 m = width_mask(width);
