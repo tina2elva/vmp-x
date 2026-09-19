@@ -634,47 +634,62 @@ int vm_run(vm_ctx_t *vm) {
             vm_last_pc = 0xAA000005u; /* 补丁校验通过 */
 #endif
             u8 *dst = 0;
+            const u8 *ct = (const u8 *)d + d->codeRVA;
+            u8 key[32] = VM_KEY_BYTES;
+            /* AAD 绑定槽位：selfRVA || funcRVA（打包端用同样的字节密封） */
+            u8 aad[8];
+            aad[0] = (u8)(d->selfRVA); aad[1] = (u8)(d->selfRVA >> 8);
+            aad[2] = (u8)(d->selfRVA >> 16); aad[3] = (u8)(d->selfRVA >> 24);
+            aad[4] = (u8)(d->reserved1); aad[5] = (u8)(d->reserved1 >> 8);
+            aad[6] = (u8)(d->reserved1 >> 16); aad[7] = (u8)(d->reserved1 >> 24);
+            /* 取槽：**等**，不要失败。
+             * 曾经这里在"槽全忙"时直接 return 2 —— 而这条返回值会被桩当成被保护函数的返回值交回客户机，
+             * 是"静默算错"甚至偶发崩溃的来源（实测：E2E 一次保护 25 个函数、槽只有 16 个时尤其容易撞上）。
+             * 现在改成锁外自旋重试：槽只在别的调用跑完时才会释放，而它们总会跑完，所以这里一定能等到。 */
+            for (u32 attempt = 0; ; attempt++) {
 #ifndef VM_RELEASE
-            vm_last_pc = 0xAA000006u; /* 即将进缓存临界区 */
+                vm_last_pc = 0xAA000006u; /* 即将进缓存临界区 */
 #endif
-            vm_bc_enter();
-            slot = vm_bc_lookup(vm->desc);
+                vm_bc_enter();
+                slot = vm_bc_lookup(vm->desc);
 #ifndef VM_RELEASE
-            vm_last_pc = 0xAA000007u; /* 缓存查找完成 */
+                vm_last_pc = 0xAA000007u; /* 缓存查找完成 */
 #endif
-            if (slot >= 0) {
-                vm_bc_inuse[slot]++;
-                dst = vm_bc_cache[slot];
-            } else {
-                const u8 *ct = (const u8 *)d + d->codeRVA;
-                u8 key[32] = VM_KEY_BYTES;
-                /* AAD 绑定槽位：selfRVA || funcRVA（打包端用同样的字节密封） */
-                u8 aad[8];
-                aad[0] = (u8)(d->selfRVA); aad[1] = (u8)(d->selfRVA >> 8);
-                aad[2] = (u8)(d->selfRVA >> 16); aad[3] = (u8)(d->selfRVA >> 24);
-                aad[4] = (u8)(d->reserved1); aad[5] = (u8)(d->reserved1 >> 8);
-                aad[6] = (u8)(d->reserved1 >> 16); aad[7] = (u8)(d->reserved1 >> 24);
-                int c = vm_bc_acquire();
-                if (c < 0 || (u32)d->codeLen > (u32)VM_BC_SLOT_SIZE) {
-                    /* 槽全忙（并发 + 嵌套超过槽数）：宁可直接失败，也不要用错的值继续跑 */
+                if (slot >= 0) {
+                    vm_bc_inuse[slot]++;
+                    dst = vm_bc_cache[slot];
                     vm_bc_leave();
-                    return 2;
+                    break;
                 }
-                dst = vm_bc_cache[c];
-#ifndef VM_RELEASE
-                vm_last_pc = 0xAA000003u; /* 即将 AEAD 解密 */
-#endif
-                if (!vm_aead_open_aad(key, d->nonce, aad, 8, ct, d->encLen, d->tag, dst)) {
+                if ((u32)d->codeLen > (u32)VM_BC_SLOT_SIZE) {
                     vm_bc_leave();
-                    return 3;
+                    return 2; /* 字节码比槽还大：打包期就该被拒（见 cmd/vmpack 的硬校验） */
                 }
-                if (c >= 0) {
-                    vm_bc_key[c] = vm->desc;
-                    vm_bc_inuse[c]++;
-                    slot = c;
+                {
+                    int c = vm_bc_acquire();
+                    if (c >= 0) {
+                        dst = vm_bc_cache[c];
+#ifndef VM_RELEASE
+                        vm_last_pc = 0xAA000003u; /* 即将 AEAD 解密 */
+#endif
+                        if (!vm_aead_open_aad(key, d->nonce, aad, 8, ct, d->encLen, d->tag, dst)) {
+                            vm_bc_leave();
+                            return 3;
+                        }
+                        vm_bc_key[c] = vm->desc;
+                        vm_bc_inuse[c]++;
+                        slot = c;
+                        vm_bc_leave();
+                        break;
+                    }
+                }
+                vm_bc_leave(); /* 全忙：放锁让出，稍后重试 */
+                if (attempt > 2000000u) {
+                    return 2; /* 兜底：等了极久仍未空出（理论上不该发生） */
+                }
+                for (volatile u32 spin = 0; spin < 200u; spin++) {
                 }
             }
-            vm_bc_leave();
             vm->code = dst;
             vm->codeLen = d->codeLen;
         }
