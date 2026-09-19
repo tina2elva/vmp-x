@@ -1103,7 +1103,15 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
                         vm->regs[VRAX] = expect & am;
                     }
                 }
-                if (adst != VM_NO_REG) vm->regs[adst] = old & am;
+                if (adst != VM_NO_REG) {
+                /* 目的寄存器索引必须落在 ctx 的 regs[] 之内。adst 来自字节码、**未经掩码**
+                 * （因为 0xFF 要表示"不写寄存器"）；一旦字节码损坏或 PC 失步，这里就是越界写。
+                 * CI 上那些"写、地址≈rsp-16KB、protect=0x104(守护页)"的偶发崩溃正是这条：
+                 * 反汇编里就是 `mov %rsi,(%r15,%rax,8)`（r15=ctx，rax=adst）。
+                 * 越界即响亮失败（98 = 未知/非法操作），绝不越界写。 */
+                if (adst >= (u32)(sizeof(vm->regs) / sizeof(vm->regs[0]))) return 98;
+                vm->regs[adst] = old & am;
+            }
             } else {
                 /* 读改写：用对应的 fetch_* 内建（原子完成，并返回旧值） */
                 switch (aw) {
@@ -1158,7 +1166,15 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
                     default: break;
                     }
                 }
-                if (adst != VM_NO_REG) vm->regs[adst] = old & am;
+                if (adst != VM_NO_REG) {
+                /* 目的寄存器索引必须落在 ctx 的 regs[] 之内。adst 来自字节码、**未经掩码**
+                 * （因为 0xFF 要表示"不写寄存器"）；一旦字节码损坏或 PC 失步，这里就是越界写。
+                 * CI 上那些"写、地址≈rsp-16KB、protect=0x104(守护页)"的偶发崩溃正是这条：
+                 * 反汇编里就是 `mov %rsi,(%r15,%rax,8)`（r15=ctx，rax=adst）。
+                 * 越界即响亮失败（98 = 未知/非法操作），绝不越界写。 */
+                if (adst >= (u32)(sizeof(vm->regs) / sizeof(vm->regs[0]))) return 98;
+                vm->regs[adst] = old & am;
+            }
             }
             if (keep) vm->flags = saved;
             vm->pc = pc + 12;
