@@ -153,9 +153,15 @@ foreach ($c in $cases) {
             $v1 = ($v -replace "\s+", " ").Trim()
             # 诊断放最前面：GitHub 注解会截断超长消息，而 try1/try2 里的 CRASH(fault/rva/寄存器) 才是最要紧的；
             # 原先把 native/protected 长输出放前面，mt_many 这种多行输出会把崩溃现场挤掉。
-            $n2 = if ($n1.Length -gt 120) { $n1.Substring(0, 120) + "..." } else { $n1 }
-            $v2 = if ($v1.Length -gt 120) { $v1.Substring(0, 120) + "..." } else { $v1 }
-            $failLines += ("E2EFAIL " + $c.f + "(" + $a + ") try1[" + $d1 + "] try2[" + $d2 + "] native=[" + $n2 + "] protected=[" + $v2 + "]")
+            # 长输出（mt_many 那种几十行）会让 GitHub 截掉关键信息。改为只给"长度 + 首个不同位置 + 各自尾部"，
+            # 这样一眼能看出：保护区跑到第几轮就断了、以及第一个分叉在哪。
+            $fd = -1
+            $lim = [Math]::Min($n1.Length, $v1.Length)
+            for ($k = 0; $k -lt $lim; $k++) { if ($n1[$k] -ne $v1[$k]) { $fd = $k; break } }
+            $tn = if ($n1.Length -gt 60) { $n1.Substring($n1.Length - 60) } else { $n1 }
+            $tv = if ($v1.Length -gt 60) { $v1.Substring($v1.Length - 60) } else { $v1 }
+            $sum = "lenN=$($n1.Length) lenP=$($v1.Length) firstDiff=$fd tailN=[$tn] tailP=[$tv]"
+            $failLines += ("E2EFAIL " + $c.f + "(" + $a + ") " + $sum + " try1[" + $d1 + "] try2[" + $d2 + "]")
         }
         $tag = if ($ok) { "OK  " } else { "FAIL" }
         Write-Output ("  [{0}] {1}({2}): native={3} protected={4}" -f $tag, $c.f, $a, $n, $v)
