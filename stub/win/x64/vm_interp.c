@@ -353,6 +353,16 @@ static void write_reg(vm_ctx_t *vm, u32 r, u32 width, u64 val) {
     vm->regs[r] = (vm->regs[r] & ~m) | (val & m);
 }
 
+/* 读寄存器：索引同样来自字节码。注意 VM_REG_MASK(31) **大于** regs[] 的项数(17/18)，
+ * 所以 `& VM_REG_MASK` 并不保证在界内 —— 对被当作"内存基址/调用目标"来用的读，越界会放大成野地址。
+ * 这里统一收口：越界一律读作 0（读错值不会破坏宿主内存，但会让地址立刻算错，问题暴露得更早）。
+ * 写侧见 write_reg（第 36 轮已设防）。 */
+static u64 vm_rdreg(vm_ctx_t *vm, u32 i) {
+    i &= VM_REG_MASK;
+    if (i >= (u32)(sizeof(vm->regs) / sizeof(vm->regs[0]))) return 0;
+    return vm->regs[i];
+}
+
 static int cond_holds(vm_ctx_t *vm, u32 cond) {
 #ifdef VM_GUEST_ARM64
     return arm64_cond_holds(cond & 15u, vm->flags);
@@ -1072,9 +1082,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             u32 aw = c[pc + 2], adst = c[pc + 3], asrc = c[pc + 4] & VM_REG_MASK; /* adst 不掩码：要能表示 VM_NO_REG */
             u32 abase = c[pc + 5] & VM_REG_MASK, aidx = c[pc + 6], ascale = c[pc + 7];
             i64 adisp = (i64)(i32)rd32(&c[pc + 8]);
-            u64 addr = vm->regs[abase] + (u64)adisp;
+            u64 addr = vm_rdreg(vm, abase) + (u64)adisp;
             if (aidx != VM_NO_REG)
-                addr += vm->regs[aidx & VM_REG_MASK] * (u64)ascale;
+                addr += vm_rdreg(vm, aidx) * (u64)ascale;
             u32 saved = vm->flags;
             u64 sv = vm->regs[asrc] & width_mask(aw);
             u64 old = 0;
@@ -1276,7 +1286,7 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             /* 间接调用（虚调用/函数指针）：寄存器里是**客户机地址**（模块基址 + RVA），
              * 与 CALLN 的区别只是目标来自运行时。调用约定仍是宿主的（blob 由哪个工具链编译就是哪个）。
              * 空指针明确失败，而不是跳到 0。 */
-            u64 addr = vm->regs[c[pc + 1] & VM_REG_MASK];
+            u64 addr = vm_rdreg(vm, c[pc + 1]); /* 调用目标：越界读作 0 ⇒ 立刻走下面的空指针分支，不会野跳 */
 #ifndef VM_RELEASE
             vm_last_call = addr | 0x8000000000000000ull; /* 高位标记：来自 CALLR */
 #endif

@@ -684,6 +684,26 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标（mt 偶发）第 41 轮：查清 CI 拉取失败的原因 + 读侧收口
+>
+> ### 539. 不是网络问题，是 **GitHub API 限流**
+> 连续三轮拉取都失败，报错是 `data.workflow_runs is not iterable` ⇒ 返回体不是正常响应，而是**限流提示**
+> （未认证调用每小时 60 次；我这些轮问得太密）。⇒ 之后改成"少问、一次问够"，不再每轮都去拉。
+>
+> ### 540. 读侧收口：`vm_rdreg`
+> ```c
+> static u64 vm_rdreg(vm_ctx_t *vm, u32 i) {
+>     i &= VM_REG_MASK;
+>     if (i >= (u32)(sizeof(vm->regs)/sizeof(vm->regs[0]))) return 0;  /* 越界读作 0 */
+>     return vm->regs[i];
+> }
+> ```
+> 已用于**值会变成地址或调用目标**的两处（最危险的两处）：
+> * `OP_ATOMIC` 的 base / idx（越界直接算错地址，不再野写）；
+> * `OP_CALLR` 的调用目标（越界读作 0 ⇒ 走既有的空指针分支，**不会野跳**）。
+> 依据：`VM_REG_MASK` 是 31，而 `regs[]` 只有 17/18 项 —— **掩码不等于界限检查**（写侧第 36 轮已收口）。
+> 复测：`e2e` **147 passed, 0 failed**；`coverage_pyd.py` 原生/保护版逐字节一致（10 函数）。
+>
 > ### 538. 补完最后一条：`vm_fp_step` 恒返回 `pc + 15`（与长度表一致）
 > ```
 > 768: return pc + 15;   ← vm_fp_step 唯一的返回
