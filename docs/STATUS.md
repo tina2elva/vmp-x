@@ -684,6 +684,27 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ### 590. IR 层面：崩溃点是**尾调用**，被翻成 `CALL` + `RET`
+> `vmpack -v` 的输出里，`0x2D98`（`__Pyx_PyObject_CallMethO`）出现在两处，前后完全相同：
+> ```
+> IR[142] MOV_RR  dst=1 a=7        ← RCX ← RDI
+> IR[143] LOAD    dst=17 disp=33256
+> IR[144] ?       a=17             ← 间接调用（CallR）
+> IR[145] CMP_RR  dst=0 a=14 b=14
+> IR[146] JCC     target=93
+> IR[147] CALL    imm=0x2D98       ← 调用 __Pyx_PyObject_CallMethO
+> IR[148] RET                      ← **紧接着就 RET**
+> ```
+> 即：原代码在此处是 `jmp __Pyx_PyObject_CallMethO`（**尾调用**），lifter 按既有规则翻成 `CALL` + `RET`。
+> 参数由 `IR[142]` 设置：`RCX ← RDI`。而实测崩溃瞬间 `RCX` 是**模块 dict** ⇒ 说明 **RDI 在那个点已经是 dict**，
+> 或者更早的寄存器分配已经把它放错了。
+>
+> ### 591. 下一步：与原生代码逐指令对照
+> 把 `__pyx_pymod_create` 里这条尾调用**前后**的原生指令反汇编出来，看它实际用的是哪个寄存器（是 RDI 还是别处，
+> 以及前面是否还有一条 `mov %rcx,%rdi` 之类），再与 IR[142] 对照：
+> * 若原生确实是 `mov %rdi,%rcx` ⇒ 我们的翻译忠实，问题在更早的寄存器值（继续往前追）；
+> * 若原生是别的寄存器 ⇒ **lifter 的寄存器映射/别名跟踪有错**，改它即可 —— 这正是覆盖口径最后一块的直接入口。
+>
 > ### 588. **拿到了崩溃那次 CALLN 的入参** —— RCX 里是 dict，方法指针却在 R8
 > 探针 `vm_last_call_args` + `vm_diag[8..11]` 一起用，抓到的最后一条采样：
 > ```
