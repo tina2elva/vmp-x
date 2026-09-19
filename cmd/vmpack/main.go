@@ -582,15 +582,33 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 			fmt.Println("[*] ELF 整体加密：跳过（没有主密钥）")
 		default:
 			for _, p := range f.Progs {
-				if p.Type == 1 && p.Flags&elfload.PF_X != 0 && p.Filesz > 0 {
-					imgSecs = append(imgSecs, inject.ImgSection{RVA: uint32(p.Vaddr - imageBase), Size: uint32(p.Filesz), Flags: 1})
-					fmt.Printf("[*] ELF 整体加密：PT_LOAD(X) va=0x%X size=0x%X（入口自解密）", p.Vaddr, p.Filesz)
-					fmt.Println()
+				if p.Type != 1 || p.Flags&elfload.PF_X == 0 || p.Filesz == 0 {
+					continue
+				}
+				// 第一个 LOAD 段往往**从文件偏移 0 开始**（Go 的 ET_EXEC 就是），
+				// 也就是说 ELF 头与程序头表都在这个段里 —— 加载器要从**文件**读它们，
+				// 绝不能加密（CI 第一次跑就抓到了：e_entry 被加密后读出来是垃圾）。
+				// 跳过 [0, align_up(程序头表末尾))，第 0 页保持明文。
+				skip := uint64(f.Phoff) + uint64(f.Phnum)*uint64(f.Phentsize)
+				skip = (skip + 0xFFF) &^ 0xFFF
+				if skip < 0x1000 {
+					skip = 0x1000
+				}
+				if p.Filesz <= skip {
+					fmt.Println("[*] ELF 整体加密：跳过（可执行段全落在文件头那一页里）")
 					break
 				}
+				imgSecs = append(imgSecs, inject.ImgSection{
+					RVA:   uint32(p.Vaddr - imageBase + skip),
+					Size:  uint32(p.Filesz - skip),
+					Flags: 1,
+				})
+				fmt.Printf("[*] ELF 整体加密：PT_LOAD(X) va=0x%X 跳过头部 %d 字节，加密 %d 字节（入口自解密）", p.Vaddr, skip, p.Filesz-skip)
+				fmt.Println()
+				break
 			}
 			if len(imgSecs) == 0 {
-				fmt.Println("[*] ELF 整体加密：跳过（找不到可执行的 PT_LOAD）")
+				fmt.Println("[*] ELF 整体加密：跳过（找不到可加密的可执行段）")
 			}
 		}
 	}

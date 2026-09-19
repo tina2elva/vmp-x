@@ -15,12 +15,22 @@ def exec_segment(path):
     phnum = struct.unpack_from('<H', d, 0x38)[0]
     if phoff + phnum * phentsize > len(d):
         raise SystemExit('[!] program header table out of range')
+    # 打包端会跳过 [0, align_up(程序头表末尾))：ELF 头/程序头表必须保持明文（加载器要从文件读）。
+    # 这里必须用同一套口径，否则头部明文块会被当成"残留"。
+    hdr_skip = (phoff + phnum * phentsize + 0xFFF) & ~0xFFF
+    if hdr_skip < 0x1000:
+        hdr_skip = 0x1000
     for i in range(phnum):
         o = phoff + i * phentsize
         p_type, p_flags = struct.unpack_from('<II', d, o)
         p_off, p_va, _pa, p_filesz, _memsz = struct.unpack_from('<QQQQQ', d, o + 8)
         if p_type == 1 and (p_flags & 1) and p_filesz:
-            return d[p_off:p_off + p_filesz], p_va, p_filesz
+            inner_skip = hdr_skip - p_off
+            if inner_skip < 0:
+                inner_skip = 0
+            if inner_skip >= p_filesz:
+                raise SystemExit('[!] executable segment is entirely inside the header page')
+            return d[p_off + inner_skip:p_off + p_filesz], p_va + inner_skip, p_filesz - inner_skip
     raise SystemExit('[!] no executable PT_LOAD')
 
 def main():
