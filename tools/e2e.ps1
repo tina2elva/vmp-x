@@ -151,7 +151,11 @@ foreach ($c in $cases) {
             Write-Output ("         diag: try1[" + $d1 + "] try2[" + $d2 + "]")
             $n1 = ($n -replace "\s+", " ").Trim()
             $v1 = ($v -replace "\s+", " ").Trim()
-            $failLines += ("E2EFAIL " + $c.f + "(" + $a + ") native=[" + $n1 + "] protected=[" + $v1 + "] try1[" + $d1 + "] try2[" + $d2 + "]")
+            # 诊断放最前面：GitHub 注解会截断超长消息，而 try1/try2 里的 CRASH(fault/rva/寄存器) 才是最要紧的；
+            # 原先把 native/protected 长输出放前面，mt_many 这种多行输出会把崩溃现场挤掉。
+            $n2 = if ($n1.Length -gt 120) { $n1.Substring(0, 120) + "..." } else { $n1 }
+            $v2 = if ($v1.Length -gt 120) { $v1.Substring(0, 120) + "..." } else { $v1 }
+            $failLines += ("E2EFAIL " + $c.f + "(" + $a + ") try1[" + $d1 + "] try2[" + $d2 + "] native=[" + $n2 + "] protected=[" + $v2 + "]")
         }
         $tag = if ($ok) { "OK  " } else { "FAIL" }
         Write-Output ("  [{0}] {1}({2}): native={3} protected={4}" -f $tag, $c.f, $a, $n, $v)
