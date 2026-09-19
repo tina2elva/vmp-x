@@ -1411,6 +1411,30 @@ static long vm_syscall3(long n, long a, long b, long c) {
     return r;
 }
 
+/* 诊断：CI 上（真 Linux）跑挂时，唯一能看到现场的通道就是 stderr。
+ * 只在**失败路径**打印：什么都没打印 = 桩根本没跑（或跑之前就死了），本身就是信息。 */
+static void vm_dbg_trace(const char *tag, long v) {
+    char buf[96];
+    u32 n = 0;
+    while (tag[n] && n < 60) {
+        buf[n] = tag[n];
+        n++;
+    }
+    char tmp[24];
+    u32 m = 0;
+    int neg = v < 0;
+    unsigned long u = neg ? (unsigned long)(-v) : (unsigned long)v;
+    if (u == 0) tmp[m++] = '0';
+    while (u != 0) {
+        tmp[m++] = (char)('0' + (u % 10));
+        u /= 10;
+    }
+    if (neg) buf[n++] = '-';
+    while (m != 0) buf[n++] = tmp[--m];
+    buf[n++] = 10;
+    vm_syscall3(1 /* SYS_write */, 2 /* stderr */, (long)buf, (long)n);
+}
+
 int vm_unpack_image(const void *tblp) {
     if (vm_img_done) return 0;
     const u8 *t = (const u8 *)tblp;
@@ -1424,8 +1448,8 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[1] = base;
     vm_img_diag[2] = wantBase;
     vm_img_diag[3]++;
-    if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; return -1; } /* 反推出来的基址没有 ELF 魔数 */
-    if (wantBase && base != wantBase) { vm_img_diag[0] = 2; return -2; }      /* 不是期望的加载基址 */
+    if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; vm_dbg_trace("VMPELF badmagic base=", (long)base); return -1; }
+    if (wantBase && base != wantBase) { vm_img_diag[0] = 2; vm_dbg_trace("VMPELF basemismatch base=", (long)base); vm_dbg_trace("VMPELF want=", (long)wantBase); return -2; }
     u8 key[32] = VM_KEY_BYTES;
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;
@@ -1439,13 +1463,17 @@ int vm_unpack_image(const void *tblp) {
         u8 aad[8];
         *(u32 *)(aad + 0) = rva;
         *(u32 *)(aad + 4) = size;
-        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; return -4; }
+        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_dbg_trace("VMPELF verifyfail rva=", (long)rva); vm_dbg_trace("VMPELF verifyfail size=", (long)size); return -4; }
         /* mprotect 按页：整页放宽再解，解完恢复（代码段 RWX 只是这一瞬间） */
         u64 page = 0x1000;
         u64 pstart = (u64)dst & ~(page - 1);
         u64 pend = ((u64)dst + size + page - 1) & ~(page - 1);
-        if (vm_syscall3(10 /* SYS_mprotect */, (long)pstart, (long)(pend - pstart), 1 | 2 | 4) != 0) {
+        long mr = vm_syscall3(10 /* SYS_mprotect */, (long)pstart, (long)(pend - pstart), 1 | 2 | 4);
+        if (mr != 0) {
             vm_img_diag[0] = 5;
+            vm_dbg_trace("VMPELF mprotectfail rva=", (long)rva);
+            vm_dbg_trace("VMPELF mprotect errno=", -mr);
+            vm_dbg_trace("VMPELF mprotect len=", (long)(pend - pstart));
             return -5;
         }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
