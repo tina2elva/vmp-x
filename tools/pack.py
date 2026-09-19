@@ -48,19 +48,28 @@ def ensure_blob(blob, manifest, stub_src, release):
     if rc != 0: sys.exit('[!] vmpbuild failed:' + chr(10) + out)
 
 def candidate_names(inp, mapfile):
-    names = []
+    """Return [(rva, name), ...] sorted by rva."""
+    pairs = []
     if mapfile and os.path.exists(mapfile):
         for line in open(mapfile, errors='replace'):
             m = MAP_RE.match(line)
-            if m and not JUNK_RE.match(m.group(2)): names.append(m.group(2))
-        return names
-    objdump = shutil.which('objdump') or r'C:\msys64\ucrt64\bin\objdump.exe'
-    if os.path.exists(objdump):
-        rc, out = sh([objdump, '-t', inp])
-        for line in out.splitlines():
-            m = COFF_RE.search(line)
-            if m and not JUNK_RE.match(m.group(2)): names.append(m.group(2))
-    return names
+            if m and not JUNK_RE.match(m.group(2)):
+                pairs.append((int(m.group(1), 16), m.group(2)))
+    else:
+        objdump = shutil.which('objdump') or r'C:\msys64\ucrt64\bin\objdump.exe'
+        if os.path.exists(objdump):
+            rc, out = sh([objdump, '-t', inp])
+            for line in out.splitlines():
+                m = COFF_RE.search(line)
+                if m and not JUNK_RE.match(m.group(2)):
+                    pairs.append((int(m.group(1), 16), m.group(2)))
+    pairs.sort()
+    return pairs
+
+def select_pairs(pairs, grep):
+    if not grep: return pairs
+    g = grep.lower()
+    return [(rva, n) for rva, n in pairs if g in n.lower()]
 
 def pack(inp, out, funcs, blob, manifest, mapfile, report, no_encrypt, tools):
     d = os.path.dirname(out)
@@ -80,6 +89,8 @@ def main():
     ap.add_argument('-f', '--func', action='append', default=[], help='function name(s); repeatable or comma separated')
     ap.add_argument('-r', '--report', default='', help='injection report JSON')
     ap.add_argument('--list', action='store_true', help='only list candidate function names')
+    ap.add_argument('--list-all', action='store_true', help='with --list: print every candidate, not just the first 40')
+    ap.add_argument('--grep', default='', help='case-insensitive substring filter for names (applies to --list and --all)')
     ap.add_argument('--all', action='store_true', help='probe candidates one by one, keep the ones that lift')
     ap.add_argument('--all-any', action='store_true', help='with --all: also try names starting with _ or ? (CRT/internal)')
     ap.add_argument('--max', type=int, default=12, help='with --all: keep at most N functions')
@@ -104,9 +115,11 @@ def main():
     print('[blob] %s' % a.blob)
 
     if a.list:
-        names = candidate_names(a.input, a.map)
-        print('candidate functions: %d (first 40)' % len(names))
-        for n in names[:40]: print('   ' + n)
+        pairs = select_pairs(candidate_names(a.input, a.map), a.grep)
+        shown = pairs if a.list_all else pairs[:40]
+        tail = '' if a.list_all else ' (use --list-all to print every one, --grep PAT to filter)'
+        print('candidate functions: %d matched, showing %d%s' % (len(pairs), len(shown), tail))
+        for rva, n in shown: print('   0x%X  %s' % (rva, n))
         print('tip: -f <name> (repeatable) to pick, or --all to probe automatically.')
         return 0
 
@@ -117,10 +130,10 @@ def main():
     if funcs:
         chosen = funcs
     elif a.all:
-        cand = candidate_names(a.input, a.map)
-        if not cand: sys.exit('[!] no candidate names (MSVC needs -m; gcc targets need COFF symbols)')
-        # 默认跳过 CRT/内部符号（以下划线开头、或 C++ 修饰名），否则 --all 会先挑到 _DllMainCRTStartup 这类
-        if not a.all_any:
+        cand = [n for _, n in select_pairs(candidate_names(a.input, a.map), a.grep)]
+        if not cand: sys.exit('[!] no candidate names (MSVC needs -m; gcc targets need COFF symbols; check --grep)')
+        # default: skip CRT/internal names (leading _ or ? mangling), else --all starts with _DllMainCRTStartup and friends
+        if not a.all_any and not a.grep:   # an explicit --grep means the user knows what they want
             cand = [n for n in cand if not n.startswith('_') and not n.startswith('?')]
             if not cand: sys.exit('[!] only CRT/internal names found; use --all-any to include them')
         print('[all ] candidates=%d probe-limit=%d max=%d' % (len(cand), a.probe_limit, a.max))
