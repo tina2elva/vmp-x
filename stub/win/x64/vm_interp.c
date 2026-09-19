@@ -720,7 +720,11 @@ int vm_run(vm_ctx_t *vm) {
                     /* 命中即复核：槽里的字节码应当与装载时逐字节一致。不一致 ⇒ 有人写了它（缓存竞争/越界写）。 */
                     if (vm_bc_sum_len[slot] == d->codeLen &&
                         vm_bc_fnv(vm_bc_cache[slot], d->codeLen) != vm_bc_sum[slot]) {
-                        __builtin_trap();
+                        /* 用**空指针写**而不是 ud2：这样两种内部失败在现场里可区分 ——
+                         *   fault=0x0 的 AV  ⇒ 缓存槽字节码被写过；
+                         *   0xC000001D(ud2)  ⇒ 越界寄存器索引；
+                         *   其他 AV          ⇒ 执行期间别处出问题。 */
+                        *(volatile u8 *)0 = 0x5A;
                     }
 #endif
                     vm_bc_inuse[slot]++;
