@@ -51,7 +51,6 @@ u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
 
 static u32 rd32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
-static u64 rd64(const u8 *p) { return (u64)rd32(p) | ((u64)rd32(p + 4) << 32); }
 
 /* 寄存器字段的掩码：x86-64 客户机 18 个槽位（5 位足够），
  * ARM64 客户机 35 个槽位（必须是 8 位）。
@@ -406,37 +405,19 @@ static int cond_holds(vm_ctx_t *vm, u32 cond) {
 
 /* ---------------- 主循环 ---------------- */
 
-/* ---------------- 明文解密缓存 ----------------
- * 逐次解密会让每次调用都付一次 AEAD（实测把小函数从 ~30ns 拉到 ~345ns）。
- * 因此把验签后的明文缓存在 blob 的 .bss 里：
- *   - 明文是只读的，同一函数的递归/嵌套调用可以安全共用；
- *   - 槽位有上限，只回收"当前没在跑"的槽（活跃计数为 0）；全忙时退回本次调用的帧内缓冲，
- *     绝不覆盖正在执行的明文；
- *   - 前提是注入段**可写**（PE 的 .vmp 加了 ScnMemWrite、ELF 的新 PT_LOAD 加了 PF_W）。
- */
-#ifndef VM_BC_CACHE_SLOTS
-#define VM_BC_CACHE_SLOTS 32 /* 32 > E2E 一次保护的 25 个函数：16 个槽时，25 个不同描述符必然触发淘汰，
-                               * 多线程 + 嵌套调用下 vm_bc_acquire 会返回 -1，而那条路径把错误码当函数返回值交回客户机
-                               * （与"字节码超槽"同一类静默失败）。槽数给够是从根上消掉这条路径。 */
-/* 每个缓存槽的容量。原来是 4KB，但实测有真实函数（__pyx_pf_7example_8add_dly）的字节码有 7313 字节，
- * 超限后 vm_run 会直接 return 2 —— 而调用方拿到的是"返回值"，于是把垃圾交给下一层，最后崩在 numpy 里。
- * 这种**静默失败**最危险，所以：① 槽放大到 16KB；② 打包端按这个常量做硬校验（见 vm_bc_slot_size）。 */
+/* 字节码长度上限：**打包端**读 vm_bc_slot_size 做硬校验（超限的字节码在打包期就被拒绝，
+ * 而不是在运行期静默算错、把错误码当函数返回值交回客户机）。
+ *
+ * 这里曾经有一整套"验签后把明文缓存在 .bss 里"的机制（缓存槽 + 自旋锁 + 引用计数，
+ * 理由是逐次 AEAD 会把小函数从 ~30ns 拉到 ~345ns）。改成流式取指（见 vm_bcs_t）之后
+ * **不再需要任何明文缓冲**：只验签（Poly1305 认证的是**密文**），取指时按块取 ChaCha20
+ * 密钥流、逐字节异或还原。顺带消掉三类老问题：跨线程共享同一份明文、槽位耗尽、
+ * 以及"整份明文常驻内存可被 dump"（现在有专门的门禁盯着这条，见 tools/gates.ps1）。 */
 #ifndef VM_BC_SLOT_SIZE
-#define VM_BC_SLOT_SIZE 16384 /* 16KB：真实函数里出现过 7313B（add_dly 函数体）与 4971B（pymod_exec）。
-                               * 之前"多函数组合崩"已查明是 __pyx_pymod_create 那个独立问题（不是槽大小），本轮复核。 */
+#define VM_BC_SLOT_SIZE 16384 /* 只是长度上限：真实函数出现过 7313B（add_dly）与 4971B（pymod_exec） */
 #endif
-#endif
-
-/* 并发保护：槽位分配与回收必须互斥，否则两个线程可能拿到同一个槽，
- * 或者回收掉另一个线程**正在执行**的明文（实测：4 线程 × 6 个被保护函数就会崩）。
- * 临界区很短（一次 AEAD + 几次数组写），所以用自旋锁；原子内建在 freestanding 下可用。 */
-static u32 vm_bc_lock = 0;
-static void vm_bc_enter(void) {
-    while (__atomic_exchange_n(&vm_bc_lock, 1u, __ATOMIC_ACQUIRE) != 0u) {
-        /* spin */
-    }
-}
-static void vm_bc_leave(void) { __atomic_store_n(&vm_bc_lock, 0u, __ATOMIC_RELEASE); }
+/* 打包端要按这个值做校验：const 会落到 .rdata（可读、且不会被写），打包时从 blob 字节里读出真实值。 */
+const u64 vm_bc_slot_size = VM_BC_SLOT_SIZE;
 
 /* 前向声明：外层 vm_run 要调用它。
  * rsp_start 是进入时的模拟 RSP。诊断用：客户机压栈超过"自己栈下界"（rsp_start - VM_MARGIN）
@@ -447,30 +428,9 @@ static void vm_bc_leave(void) { __atomic_store_n(&vm_bc_lock, 0u, __ATOMIC_RELEA
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start);
 static void vm_keep_verify_ref(vm_ctx_t *vm);
 
-static u8 vm_bc_cache[VM_BC_CACHE_SLOTS][VM_BC_SLOT_SIZE];
-/* 打包端要按这个值做校验：const 会落到 .rdata（可读、且不会被写），打包时从 blob 字节里读出真实值。 */
-const u64 vm_bc_slot_size = VM_BC_SLOT_SIZE;
-#ifndef VM_RELEASE
-/* 缓存槽里字节码的校验和：装载时记录，**每次命中该槽时复核**。
- * 目的很直接：如果"偶发错值"真的是字节码在缓存里被写坏，这个检查会当场把它变成可观测的信号
- * （非 release 构建里直接 trap ⇒ E2E 报出的退出码会是 0xC000001D(ud2)，一眼可辨，而不是含混的 AV）。 */
-static u32 vm_bc_sum[VM_BC_CACHE_SLOTS];
-static u32 vm_bc_sum_len[VM_BC_CACHE_SLOTS];
-static u32 vm_bc_fnv(const u8 *p, u32 n) {
-    u32 h = 2166136261u;
-    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
-    return h;
-}
-#endif
-static const void *vm_bc_key[VM_BC_CACHE_SLOTS];
-static u32 vm_bc_inuse[VM_BC_CACHE_SLOTS];
-static u32 vm_bc_tick[VM_BC_CACHE_SLOTS];
-static u32 vm_bc_clock = 0;
-
-/* 注意：这里曾经有一份"兜底缓冲池"（缓存槽全忙时用独占的一份）。
- * 二分实验证明它是错的：并发线程 + 嵌套调用会把它耗尽，于是返回错误码、客户机算出错值
- * （CI 的 mt 用例：4 线程 × 嵌套，200 次里错 24 次）。而缓存槽本身就会在并发调用间**共享**
- * 同一份明文（只读 + 引用计数），所以"池"本来就是多余概念 —— 直接给足缓存槽即可。 */
+/* 这里曾经有一份"兜底缓冲池"，更早还有一整套明文缓存槽（含自旋锁与引用计数）。
+ * 两者都随流式取指一起消失了：现在每次调用只在前向的 64 字节密钥流缓存上工作，
+ * 既没有跨线程共享的明文，也没有"槽位耗尽"这条失败路径。 */
 
 /* XMM 寄存器堆：x86-64 里 XMM0-15 是**调用者保存**（volatile），
  * 所以被保护函数不需要从宿主那里复制进来/送回去——只要有一块私有内存当寄存器堆即可。
@@ -501,41 +461,6 @@ u64 vm_ring_hdr[2]; /* [0]=magic, [1]=已记录条数（.bss） */
 u64 vm_diag[16]; /* [0..7] 见下；[8..10] = 解密后字节码前 24 字节（诊断用） */
 u64 vm_ring[16][2]; /* {pc, op}（.bss） */
 #endif /* !VM_RELEASE */
-
-static int vm_bc_lookup(const void *desc) {
-    for (int i = 0; i < VM_BC_CACHE_SLOTS; i++) {
-        if (vm_bc_key[i] == desc) {
-            vm_bc_tick[i] = ++vm_bc_clock;
-            return i;
-        }
-    }
-    return -1;
-}
-
-/* 找一个可以放新明文的槽：优先空槽，其次回收"没在跑"里最久未用的；全忙返回 -1 */
-static int vm_bc_acquire(void) {
-    int cand = -1;
-    for (int i = 0; i < VM_BC_CACHE_SLOTS; i++) {
-        if (vm_bc_key[i] == 0) {
-            cand = i;
-            break;
-        }
-    }
-    if (cand < 0) {
-        u32 best = 0xFFFFFFFFu;
-        for (int i = 0; i < VM_BC_CACHE_SLOTS; i++) {
-            if (vm_bc_inuse[i] == 0 && vm_bc_tick[i] < best) {
-                best = vm_bc_tick[i];
-                cand = i;
-            }
-        }
-    }
-    if (cand >= 0) {
-        vm_bc_tick[cand] = ++vm_bc_clock;
-    }
-    return cand;
-}
-
 
 /* ---------------- 主循环入口 ---------------- */
 
@@ -593,6 +518,55 @@ u32 vm_call_ring_n;
 u64 vm_code_off;
 u64 vm_self_len;
 u32 vm_self_hash;
+/* ---- 流式取指：字节码在内存里始终是密文 ----
+ * ks 缓存的是 ChaCha20 **密钥流**（不是明文）。解释器取指只向前走，所以单块缓存就够：
+ * 跨块时重取一次（一块 64 字节，约合 8-16 条指令），回跳自然落到新块。 */
+typedef struct {
+    const u8 *ct;     /* 密文基址（就在镜像里） */
+    const u8 *key;    /* 32 字节主密钥 */
+    const u8 *nonce;  /* 12 字节 nonce（指向描述符） */
+    u32 ks_block;     /* 当前密钥流块号；0xFFFFFFFF = 未装载 */
+    u8  ks[64];
+    int enc;          /* 0 = 未加密（调试/单测路径），直接读 ct */
+} vm_bcs_t;
+
+static inline u8 vmb_byte(vm_bcs_t *s, u32 off) {
+    if (!s->enc) return s->ct[off];
+    u32 blk = off >> 6;
+    if (blk != s->ks_block) {
+        vm_chacha20_keystream(s->key, blk + 1u, s->nonce, s->ks); /* AEAD 数据流从 counter=1 开始 */
+        s->ks_block = blk;
+    }
+    return (u8)(s->ct[off] ^ s->ks[off & 63u]);
+}
+
+static inline u32 vmb_rd32(vm_bcs_t *s, u32 off) {
+    return (u32)vmb_byte(s, off) | ((u32)vmb_byte(s, off + 1) << 8) |
+           ((u32)vmb_byte(s, off + 2) << 16) | ((u32)vmb_byte(s, off + 3) << 24);
+}
+
+static inline u64 vmb_rd64(vm_bcs_t *s, u32 off) {
+    return (u64)vmb_rd32(s, off) | ((u64)vmb_rd32(s, off + 4) << 32);
+}
+
+static inline void vm_bcs_init(vm_bcs_t *s, const vm_ctx_t *vm) {
+    const vm_desc_t *d = (const vm_desc_t *)vm->desc;
+    s->ks_block = 0xFFFFFFFFu;
+    s->key = 0;
+    s->nonce = 0;
+    if (d && (d->flags & VM_DESC_FLAG_ENC)) {
+        static const u8 k[32] = VM_KEY_BYTES;
+        s->enc = 1;
+        s->ct = (const u8 *)d + d->codeRVA;
+        s->key = k;
+        s->nonce = d->nonce;
+    } else {
+        s->enc = 0;
+        s->ct = vm->code;
+    }
+}
+
+
 /* vm_entry 由各平台的 vm_entry_asm.S 定义。两个要点：
  * 1) 必须声明成**函数**：数组形式会让 gcc 生成 .refptr 绝对指针节（被合并器拒绝）；
  * 2) 必须标 **hidden**：PIE 默认下 gcc 认为它可被外部抢占，于是走 GOT（linux/amd64 上报的
@@ -654,7 +628,6 @@ int vm_run(vm_ctx_t *vm) {
      * 但它会破坏"客户机栈与宿主栈保持固定 skew"这条前提 —— E2E 的 framed 用例（第 5 个参数在
      * 调用方栈帧里，靠 FRAME_SKEW 修正）立刻全红。所以正解是**放大 margin**（skew 与 stub 一起变，自洽），
      * 而不是把栈挪走。 */
-    int slot = -1;
 #ifndef VM_RELEASE
     vm_last_pc = 0xAA000001u; /* 已进入 vm_run */
 #endif
@@ -699,85 +672,21 @@ int vm_run(vm_ctx_t *vm) {
 #ifndef VM_RELEASE
             vm_last_pc = 0xAA000005u; /* 补丁校验通过 */
 #endif
-            u8 *dst = 0;
-            const u8 *ct = (const u8 *)d + d->codeRVA;
+            /* 流式取指：**不解密到任何缓冲**。
+             * Poly1305 认证的是**密文**，所以完整性可以在不解密的前提下校验；
+             * 字节码在执行期始终以密文留在镜像里，取指时按块取 ChaCha20 密钥流逐字节还原，
+             * 明文只以"寄存器里的一个字节"存在 —— 内存里不再有整份明文。 */
             u8 key[32] = VM_KEY_BYTES;
-            /* AAD 绑定槽位：selfRVA || funcRVA（打包端用同样的字节密封） */
+            const u8 *ct = (const u8 *)d + d->codeRVA;
             u8 aad[8];
             aad[0] = (u8)(d->selfRVA); aad[1] = (u8)(d->selfRVA >> 8);
             aad[2] = (u8)(d->selfRVA >> 16); aad[3] = (u8)(d->selfRVA >> 24);
             aad[4] = (u8)(d->reserved1); aad[5] = (u8)(d->reserved1 >> 8);
             aad[6] = (u8)(d->reserved1 >> 16); aad[7] = (u8)(d->reserved1 >> 24);
-            /* 取槽：**等**，不要失败。
-             * 曾经这里在"槽全忙"时直接 return 2 —— 而这条返回值会被桩当成被保护函数的返回值交回客户机，
-             * 是"静默算错"甚至偶发崩溃的来源（实测：E2E 一次保护 25 个函数、槽只有 16 个时尤其容易撞上）。
-             * 现在改成锁外自旋重试：槽只在别的调用跑完时才会释放，而它们总会跑完，所以这里一定能等到。 */
-            for (u32 attempt = 0; ; attempt++) {
-#ifndef VM_RELEASE
-                vm_last_pc = 0xAA000006u; /* 即将进缓存临界区 */
-#endif
-                vm_bc_enter();
-                slot = vm_bc_lookup(vm->desc);
-#ifndef VM_RELEASE
-                vm_last_pc = 0xAA000007u; /* 缓存查找完成 */
-#endif
-                if (slot >= 0) {
-#ifndef VM_RELEASE
-                    /* 命中即复核：槽里的字节码应当与装载时逐字节一致。不一致 ⇒ 有人写了它（缓存竞争/越界写）。 */
-                    if (vm_bc_sum_len[slot] == d->codeLen &&
-                        vm_bc_fnv(vm_bc_cache[slot], d->codeLen) != vm_bc_sum[slot]) {
-                        /* 用**空指针写**而不是 ud2：这样两种内部失败在现场里可区分 ——
-                         *   fault=0x0 的 AV  ⇒ 缓存槽字节码被写过；
-                         *   0xC000001D(ud2)  ⇒ 越界寄存器索引；
-                         *   其他 AV          ⇒ 执行期间别处出问题。 */
-                        *(volatile u8 *)0 = 0x5A;
-                    }
-#endif
-                    vm_bc_inuse[slot]++;
-                    dst = vm_bc_cache[slot];
-                    vm_bc_leave();
-                    break;
-                }
-                if ((u32)d->codeLen > (u32)VM_BC_SLOT_SIZE) {
-                    vm_bc_leave();
-                    return 2; /* 字节码比槽还大：打包期就该被拒（见 cmd/vmpack 的硬校验） */
-                }
-                {
-                    int c = vm_bc_acquire();
-                    if (c >= 0) {
-                        dst = vm_bc_cache[c];
-#ifndef VM_RELEASE
-                        vm_last_pc = 0xAA000003u; /* 即将 AEAD 解密 */
-#endif
-                        if (!vm_aead_open_aad(key, d->nonce, aad, 8, ct, d->encLen, d->tag, dst)) {
-                            vm_bc_leave();
-                            return 3;
-                        }
-                        vm_bc_key[c] = vm->desc;
-#ifndef VM_RELEASE
-                        vm_bc_sum[c] = vm_bc_fnv(dst, d->codeLen);
-                        vm_bc_sum_len[c] = d->codeLen;
-#endif
-                        vm_bc_inuse[c]++;
-                        slot = c;
-                        vm_bc_leave();
-                        break;
-                    }
-                }
-                vm_bc_leave(); /* 全忙：放锁让出，稍后重试 */
-                /* 兜底：等了很久仍抢不到槽（说明槽数 < 并发嵌套深度，属于配置错误）。
-                 * 这里**必须响亮地失败**：返回错误码会被桩当成被保护函数的返回值交回客户机，
-                 * 那正是这一整类"静默算错/偶发崩溃"的来源；直接 trap 至少让人立刻知道配置不对。 */
-                if (attempt > 200000u) {
-#ifndef VM_RELEASE
-                    vm_last_pc = 0xAA000009u; /* 缓存槽长期不可得 */
-#endif
-                    __builtin_trap();
-                }
-                for (volatile u32 spin = 0; spin < 200u; spin++) {
-                }
+            if (!vm_aead_verify_aad(key, d->nonce, aad, 8, ct, d->encLen, d->tag)) {
+                return 3; /* 验签失败：绝不执行未经验证的字节码 */
             }
-            vm->code = dst;
+            vm->code = (u8 *)ct;   /* 注意：这里存的是**密文**基址，取指经 vmb_byte 还原 */
             vm->codeLen = d->codeLen;
         }
     }
@@ -789,10 +698,10 @@ int vm_run(vm_ctx_t *vm) {
 #ifndef VM_RELEASE /* release 构建不带任何诊断状态：少一份明文、少一族特征 */
     vm_diag[0] = vm->regs[0];          /* 入口 X0（客户机参数） */
     vm_diag[1] = rsp_start;            /* 入口模拟 SP */
-    vm_diag[2] = (u64)(unsigned long long)vm->code; /* 明文/密文字节码指针（Windows 的 unsigned long 是 32 位，会截断） */
+    vm_diag[2] = (u64)(unsigned long long)vm->code; /* **密文**字节码指针（Windows 的 unsigned long 是 32 位，会截断） */
     vm_diag[3] = vm->codeLen;
     if (vm->code) {
-        for (int i = 0; i < 8; i++) { /* 前 64 字节：字节码都不超过这个长度，够看清循环与分支 */
+        for (int i = 0; i < 8; i++) { /* 前 64 字节（现在是**密文**，只用于对拍/定位，不再是明文） */
             u64 w = 0;
             for (int j = 0; j < 8; j++) w |= (u64)vm->code[i * 8 + j] << (8 * j);
             vm_diag[8 + i] = w;
@@ -806,31 +715,17 @@ int vm_run(vm_ctx_t *vm) {
     vm_diag[6] = vm->pc;
     vm_diag[7] = (u64)(u32)rc;
 #endif /* !VM_RELEASE */
-    if (slot >= 0) {
-        /* 原子递减：别的线程可能正在临界区里检查"这个槽有没有人在用" */
-        __atomic_fetch_sub(&vm_bc_inuse[slot], 1u, __ATOMIC_RELEASE);
-    }
 #ifndef VM_RELEASE
-    /* 缓存占用快照（放进早已可读的 vm_diag[12..15]）：用来判定"inuse 会不会只增不减"这类泄漏。
-     * 若有泄漏，mt_many 这种长跑用例里 sum/busy 会单调上升，最终把 32 个槽全"占满"。 */
-    {
-        u32 s = 0, busy = 0, mx = 0, i;
-        for (i = 0; i < VM_BC_CACHE_SLOTS; i++) {
-            u32 v = vm_bc_inuse[i];
-            s += v;
-            if (v) busy++;
-            if (v > mx) mx = v;
-        }
-        vm_diag[12] = s;
-        vm_diag[13] = busy;
-        vm_diag[14] = mx;
-        vm_diag[15] = vm_call_ring_n;
-    }
+    /* 明文缓存已移除（流式取指）：12..14 保留为 0，老观测脚本仍可读 */
+    vm_diag[12] = 0;
+    vm_diag[13] = 0;
+    vm_diag[14] = 0;
+    vm_diag[15] = vm_call_ring_n;
 #endif
     return rc;
 }
 
-/* 内层解释循环：所有 return 都从这里出去，缓存计数由外层统一收尾 */
+/* 内层解释循环：所有 return 都从这里出去；取指由 vm_bcs_t 流式还原（无明文缓冲） */
 /* 浮点标量运算：**单独成函数**。
  * 为什么不让它留在那个巨大的 switch 里：实测只要把浮点代码写在 vm_run_inner 内部，
  * gcc -O2 就会把整个函数编译错（连根本不执行浮点的函数结果都是错的）；
@@ -838,14 +733,14 @@ int vm_run(vm_ctx_t *vm) {
 /* noinline：-O2 下如果它被内联回 vm_run_inner，整个解释器会被编译错（实测）。
  * 独立成函数 + 禁止内联之后，-O2 恢复正常。 */
 /* 浮点标量运算：独立成函数并禁止内联（详见 STATUS 第 71/72 轮）。 */
-__attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 pc) {
+__attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, vm_bcs_t *s, u32 pc) {
 
 
             /* 浮点标量运算：解释器本身就是原生代码，直接用它自己的 FPU 最准。
              * 操作数是**相对 VMBASE 的偏移**（Disp=目标、Imm=第一操作数、Imm2=第二操作数，0 表示不用）。
              * 运算不额外改标志位，除了 UCOMISD/COMISD 按 SDM 的表设置 ZF/PF/CF。 */
-            u32 fk = c[pc + 1], fw = c[pc + 2];
-            u32 fdst = rd32(&c[pc + 3]), fa = rd32(&c[pc + 7]), fb = rd32(&c[pc + 11]);
+            u32 fk = vmb_byte(s, pc + 1), fw = vmb_byte(s, pc + 2);
+            u32 fdst = vmb_rd32(s, pc + 3), fa = vmb_rd32(s, pc + 7), fb = vmb_rd32(s, pc + 11);
             u8 *fbase = (u8 *)(vm->regs[VRBASE]);
             void *pa = (void *)(fbase + fa);
             void *pb = fb ? (void *)(fbase + fb) : 0;
@@ -919,8 +814,6 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, const u8 *c, u32 p
     return pc + 15;
 }
 
-
-
 /* 一次调用的指令预算（诊断用）：超了就以 96 返回。
  * 为什么需要：arm64 上带循环的 sum_to 在探针里"永不返回"，我们需要它快速返回、
  * 并把环形缓冲（最近执行的 pc/op）留下来，才能看出是哪条分支没让 pc 前进。 */
@@ -941,6 +834,8 @@ u64 vm_last_call_sp;
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
     u32 steps = 0;
     (void)steps;
+    vm_bcs_t bcs;
+    vm_bcs_init(&bcs, vm);
     for (;;) {
 #ifndef VM_RELEASE
         if (++steps > VM_STEP_BUDGET) return 96;
@@ -958,9 +853,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         }
 #endif
         if (vm->pc >= vm->codeLen) return 1;
-        const u8 *c = vm->code;
         u32 pc = vm->pc;
-        u8 op = c[pc];
+        u8 op = vmb_byte(&bcs, pc);
 #ifndef VM_RELEASE
         vm_last_pc = (u64)pc | ((u64)op << 32);
         if (!vm_first_sp) vm_first_sp = vm->regs[VRSP];
@@ -991,26 +885,26 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         case OP_RET:  return 0;
 
         case OP_MOV_RR: {
-            u32 width = c[pc + 1];
-            write_reg(vm, c[pc + 2] & VM_REG_MASK, width, vm->regs[c[pc + 3] & VM_REG_MASK]);
+            u32 width = vmb_byte(&bcs, pc + 1);
+            write_reg(vm, vmb_byte(&bcs, pc + 2) & VM_REG_MASK, width, vm->regs[vmb_byte(&bcs, pc + 3) & VM_REG_MASK]);
             vm->pc = pc + 4;
             break;
         }
         case OP_MOV_RI: {
-            u32 width = c[pc + 1];
-            write_reg(vm, c[pc + 2] & VM_REG_MASK, width, rd64(&c[pc + 3]));
+            u32 width = vmb_byte(&bcs, pc + 1);
+            write_reg(vm, vmb_byte(&bcs, pc + 2) & VM_REG_MASK, width, vmb_rd64(&bcs, pc + 3));
             vm->pc = pc + 11;
             break;
         }
         case OP_MOV_RI32: {
-            vm->regs[c[pc + 1] & VM_REG_MASK] = (u64)rd32(&c[pc + 2]); /* 32 位 mov 零扩展 */
+            vm->regs[vmb_byte(&bcs, pc + 1) & VM_REG_MASK] = (u64)vmb_rd32(&bcs, pc + 2); /* 32 位 mov 零扩展 */
             vm->pc = pc + 6;
             break;
         }
         case OP_LEA: {
-            u32 width = c[pc + 1], dst = c[pc + 2] & VM_REG_MASK, base = c[pc + 3], idx = c[pc + 4];
-            u64 scale = c[pc + 5];
-            i64 disp = (i64)(i32)rd32(&c[pc + 6]);
+            u32 width = vmb_byte(&bcs, pc + 1), dst = vmb_byte(&bcs, pc + 2) & VM_REG_MASK, base = vmb_byte(&bcs, pc + 3), idx = vmb_byte(&bcs, pc + 4);
+            u64 scale = vmb_byte(&bcs, pc + 5);
+            i64 disp = (i64)(i32)vmb_rd32(&bcs, pc + 6);
             u64 addr = (u64)disp;
             if (base != VM_NO_REG) addr += vm_rdreg(vm, base);
             if (idx != VM_NO_REG) addr += vm_rdreg(vm, idx) * scale;
@@ -1019,10 +913,10 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         case OP_ALU_RR: {
-            u32 kind = c[pc + 1], width = c[pc + 2], dst = c[pc + 3] & VM_REG_MASK;
+            u32 kind = vmb_byte(&bcs, pc + 1), width = vmb_byte(&bcs, pc + 2), dst = vmb_byte(&bcs, pc + 3) & VM_REG_MASK;
             u32 keep = kind & VM_ALU_KEEP_FLAGS;
             kind &= (u32)~VM_ALU_KEEP_FLAGS;
-            u64 a = vm->regs[c[pc + 4] & VM_REG_MASK], b = vm->regs[c[pc + 5] & VM_REG_MASK];
+            u64 a = vm->regs[vmb_byte(&bcs, pc + 4) & VM_REG_MASK], b = vm->regs[vmb_byte(&bcs, pc + 5) & VM_REG_MASK];
             u32 saved = vm->flags;
             write_reg(vm, dst, width, alu_apply(vm, kind, width, a, b));
             if (keep) vm->flags = saved;
@@ -1030,11 +924,11 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         case OP_ALU_RI: {
-            u32 kind = c[pc + 1], width = c[pc + 2], dst = c[pc + 3] & VM_REG_MASK;
+            u32 kind = vmb_byte(&bcs, pc + 1), width = vmb_byte(&bcs, pc + 2), dst = vmb_byte(&bcs, pc + 3) & VM_REG_MASK;
             u32 keep = kind & VM_ALU_KEEP_FLAGS;
             kind &= (u32)~VM_ALU_KEEP_FLAGS;
-            u64 a = vm->regs[c[pc + 4] & VM_REG_MASK];
-            u32 raw = rd32(&c[pc + 5]);
+            u64 a = vm->regs[vmb_byte(&bcs, pc + 4) & VM_REG_MASK];
+            u32 raw = vmb_rd32(&bcs, pc + 5);
             /* x86: ADD/SUB/MUL 的 imm32 符号扩展；AND/OR/XOR 的 imm32 零扩展。
              * 注意：判断前要屏蔽 keep-flags 位，否则负立即数会被零扩展成 +2^32。 */
             u32 kc = kind & (u32)~VM_ALU_KEEP_FLAGS;
@@ -1046,10 +940,10 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         case OP_ALU_U: {
-            u32 kind = c[pc + 1], width = c[pc + 2], dst = c[pc + 3] & VM_REG_MASK;
+            u32 kind = vmb_byte(&bcs, pc + 1), width = vmb_byte(&bcs, pc + 2), dst = vmb_byte(&bcs, pc + 3) & VM_REG_MASK;
             u32 keep = kind & VM_ALU_KEEP_FLAGS;
             kind &= (u32)~VM_ALU_KEEP_FLAGS;
-            u64 a = vm->regs[c[pc + 4] & VM_REG_MASK];
+            u64 a = vm->regs[vmb_byte(&bcs, pc + 4) & VM_REG_MASK];
             u32 saved = vm->flags;
             write_reg(vm, dst, width, alu_unary(vm, kind, width, a));
             if (keep) vm->flags = saved;
@@ -1057,8 +951,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         case OP_CMP_RR: {
-            u32 kind = c[pc + 1], width = c[pc + 2];
-            u64 a = vm->regs[c[pc + 3] & VM_REG_MASK], b = vm->regs[c[pc + 4] & VM_REG_MASK];
+            u32 kind = vmb_byte(&bcs, pc + 1), width = vmb_byte(&bcs, pc + 2);
+            u64 a = vm->regs[vmb_byte(&bcs, pc + 3) & VM_REG_MASK], b = vm->regs[vmb_byte(&bcs, pc + 4) & VM_REG_MASK];
             u64 m = width_mask(width);
             u64 x = a & m, y = b & m;
             /* 走 alu_apply：这样 ARM64 客户机的 C 位语义（无借位）也生效 */
@@ -1071,9 +965,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         case OP_CMP_RI: {
-            u32 kind = c[pc + 1], width = c[pc + 2];
-            u64 a = vm->regs[c[pc + 3] & VM_REG_MASK];
-            u32 raw = rd32(&c[pc + 4]);
+            u32 kind = vmb_byte(&bcs, pc + 1), width = vmb_byte(&bcs, pc + 2);
+            u64 a = vm->regs[vmb_byte(&bcs, pc + 3) & VM_REG_MASK];
+            u32 raw = vmb_rd32(&bcs, pc + 4);
             u64 b = (kind == KC_TEST) ? (u64)raw : (u64)(i64)(i32)raw;
             u64 m = width_mask(width);
             u64 x = a & m, y = b & m;
@@ -1086,16 +980,16 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         case OP_EXT: {
-            u32 kind = c[pc + 1], srcw = c[pc + 2], dst = c[pc + 3] & VM_REG_MASK;
-            u64 v = vm->regs[c[pc + 4] & VM_REG_MASK];
+            u32 kind = vmb_byte(&bcs, pc + 1), srcw = vmb_byte(&bcs, pc + 2), dst = vmb_byte(&bcs, pc + 3) & VM_REG_MASK;
+            u64 v = vm->regs[vmb_byte(&bcs, pc + 4) & VM_REG_MASK];
             vm->regs[dst] = kind ? (u64)sign_extend_w(v, srcw) : (v & width_mask(srcw));
             vm->pc = pc + 5;
             break;
         }
         case OP_LOAD: {
-            u32 kind = c[pc + 1], width = c[pc + 2], dst = c[pc + 3] & VM_REG_MASK, base = c[pc + 4] & VM_REG_MASK;
-            u32 idx = c[pc + 5], scale = c[pc + 6];
-            i64 disp = (i64)(i32)rd32(&c[pc + 7]);
+            u32 kind = vmb_byte(&bcs, pc + 1), width = vmb_byte(&bcs, pc + 2), dst = vmb_byte(&bcs, pc + 3) & VM_REG_MASK, base = vmb_byte(&bcs, pc + 4) & VM_REG_MASK;
+            u32 idx = vmb_byte(&bcs, pc + 5), scale = vmb_byte(&bcs, pc + 6);
+            i64 disp = (i64)(i32)vmb_rd32(&bcs, pc + 7);
             u64 addr = vm_rdreg(vm, base) + (u64)disp;
             if (idx != VM_NO_REG)
                 addr += vm_rdreg(vm, idx) * (u64)scale;
@@ -1111,10 +1005,10 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         case OP_STORE: {
-            u32 width = c[pc + 1], base = c[pc + 2] & VM_REG_MASK;
-            u32 idx = c[pc + 3], scale = c[pc + 4];
-            i64 disp = (i64)(i32)rd32(&c[pc + 5]);
-            u32 src = c[pc + 9] & VM_REG_MASK;
+            u32 width = vmb_byte(&bcs, pc + 1), base = vmb_byte(&bcs, pc + 2) & VM_REG_MASK;
+            u32 idx = vmb_byte(&bcs, pc + 3), scale = vmb_byte(&bcs, pc + 4);
+            i64 disp = (i64)(i32)vmb_rd32(&bcs, pc + 5);
+            u32 src = vmb_byte(&bcs, pc + 9) & VM_REG_MASK;
             u64 addr = vm_rdreg(vm, base) + (u64)disp;
             if (idx != VM_NO_REG)
                 addr += vm_rdreg(vm, idx) * (u64)scale;
@@ -1139,12 +1033,12 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             /* 原子读改写：真用宿主硬件的原子指令（__atomic_* 在 x86-64 上就是 lock 前缀指令），
              * 所以多线程语义与原生一致——不是"假装原子"。
              * 布局：[op][kind][width][dst][src][base][idx][scale][disp32] */
-            u32 ak = c[pc + 1];
+            u32 ak = vmb_byte(&bcs, pc + 1);
             u32 keep = ak & VM_ALU_KEEP_FLAGS;
             ak &= (u32)~VM_ALU_KEEP_FLAGS;
-            u32 aw = c[pc + 2], adst = c[pc + 3], asrc = c[pc + 4] & VM_REG_MASK; /* adst 不掩码：要能表示 VM_NO_REG */
-            u32 abase = c[pc + 5] & VM_REG_MASK, aidx = c[pc + 6], ascale = c[pc + 7];
-            i64 adisp = (i64)(i32)rd32(&c[pc + 8]);
+            u32 aw = vmb_byte(&bcs, pc + 2), adst = vmb_byte(&bcs, pc + 3), asrc = vmb_byte(&bcs, pc + 4) & VM_REG_MASK; /* adst 不掩码：要能表示 VM_NO_REG */
+            u32 abase = vmb_byte(&bcs, pc + 5) & VM_REG_MASK, aidx = vmb_byte(&bcs, pc + 6), ascale = vmb_byte(&bcs, pc + 7);
+            i64 adisp = (i64)(i32)vmb_rd32(&bcs, pc + 8);
             u64 addr = vm_rdreg(vm, abase) + (u64)adisp;
             if (aidx != VM_NO_REG)
                 addr += vm_rdreg(vm, aidx) * (u64)ascale;
@@ -1260,9 +1154,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         }
 
 
-        case OP_FP: { vm->pc = vm_fp_step(vm, c, pc); break; }
+        case OP_FP: { vm->pc = vm_fp_step(vm, &bcs, pc); break; }
         case OP_PUSH_R: {
-            u32 r = c[pc + 1] & VM_REG_MASK;
+            u32 r = vmb_byte(&bcs, pc + 1) & VM_REG_MASK;
             u64 sp = vm->regs[VRSP] - 8;
             *(volatile u64 *)sp = vm->regs[r];
             vm->regs[VRSP] = sp;
@@ -1271,13 +1165,13 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         }
         case OP_PUSH_I: {
             u64 sp = vm->regs[VRSP] - 8;
-            *(volatile u64 *)sp = (u64)(i64)(i32)rd32(&c[pc + 1]);
+            *(volatile u64 *)sp = (u64)(i64)(i32)vmb_rd32(&bcs, pc + 1);
             vm->regs[VRSP] = sp;
             vm->pc = pc + 5;
             break;
         }
         case OP_POP_R: {
-            u32 r = c[pc + 1] & VM_REG_MASK;
+            u32 r = vmb_byte(&bcs, pc + 1) & VM_REG_MASK;
             u64 sp = vm->regs[VRSP];
             vm->regs[r] = *(volatile u64 *)sp;
             vm->regs[VRSP] = sp + 8;
@@ -1285,26 +1179,26 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             break;
         }
         case OP_JCC: {
-            u32 cond = c[pc + 1];
-            if (cond_holds(vm, cond)) vm->pc = rd32(&c[pc + 2]);
+            u32 cond = vmb_byte(&bcs, pc + 1);
+            if (cond_holds(vm, cond)) vm->pc = vmb_rd32(&bcs, pc + 2);
             else vm->pc = pc + 6;
             break;
         }
         case OP_JBZ:
         case OP_JBNZ: {
-            u32 r = c[pc + 1] & VM_REG_MASK;
-            u32 target = rd32(&c[pc + 2]);
+            u32 r = vmb_byte(&bcs, pc + 1) & VM_REG_MASK;
+            u32 target = vmb_rd32(&bcs, pc + 2);
             int isZero = (vm->regs[r] == 0);
-            int take = (c[pc] == OP_JBZ) ? isZero : !isZero;
+            int take = (vmb_byte(&bcs, pc) == OP_JBZ) ? isZero : !isZero;
             vm->pc = take ? target : pc + 6;
             break;
         }
         case OP_JMP:
-            vm->pc = rd32(&c[pc + 1]);
+            vm->pc = vmb_rd32(&bcs, pc + 1);
             break;
         case OP_CALLN: {
             /* 字节码里存的是 RVA：真实地址 = 模块基址 + RVA */
-            u64 addr = vm->regs[VRBASE] + rd64(&c[pc + 1]);
+            u64 addr = vm->regs[VRBASE] + vmb_rd64(&bcs, pc + 1);
 #ifndef VM_RELEASE
             vm_last_call = addr; /* 探针：最后一次 CALLN 的目标 */
             vm_last_call_rcx = vm->regs[VRCX];
@@ -1364,7 +1258,7 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             /* 间接调用（虚调用/函数指针）：寄存器里是**客户机地址**（模块基址 + RVA），
              * 与 CALLN 的区别只是目标来自运行时。调用约定仍是宿主的（blob 由哪个工具链编译就是哪个）。
              * 空指针明确失败，而不是跳到 0。 */
-            u64 addr = vm_rdreg(vm, c[pc + 1]); /* 调用目标：越界读作 0 ⇒ 立刻走下面的空指针分支，不会野跳 */
+            u64 addr = vm_rdreg(vm, vmb_byte(&bcs, pc + 1)); /* 调用目标：越界读作 0 ⇒ 立刻走下面的空指针分支，不会野跳 */
 #ifndef VM_RELEASE
             vm_last_call = addr | 0x8000000000000000ull; /* 高位标记：来自 CALLR */
             vm_last_call_args[0] = vm->regs[VRCX];
@@ -1475,3 +1369,232 @@ static void vm_keep_verify_ref(vm_ctx_t *vm) {
         }
     }
 }
+
+
+/* ---- (h) 原镜像整体加密：入口自解密 ----
+ *
+ * 打包端把目标 .text 的**文件字节**原地加密（ChaCha20-Poly1305；AAD = rva||size，
+ * nonce = rva||size||构建 salt，两者都由本函数按同样的规则算出来），并把"要解密的节表"
+ * 放进 payload。本函数由入口蹦床**最先**调用：
+ *   ① 验签（Poly1305 认证的是密文，不需要明文）；
+ *   ② VirtualProtect 成可写；
+ *   ③ 原地解密；
+ *   ④ 恢复成原来的保护（代码段 PAGE_EXECUTE_READ，只读数据 PAGE_READONLY）。
+ * 之后蹦床跳到原始入口点（或先跳到补丁校验蹦床），程序照常启动。
+ *
+ * 两个前置条件（打包端保证，这里 fail-fast 复检）：
+ *   1) 镜像必须落在**首选基址**上 —— 打包端清掉 DYNAMIC_BASE，加载器因此不做重定位
+ *      （若基址被占，Windows 会强制重定位；那时密文已被改写，必须拒绝执行而不是跑飞）；
+ *   2) 目标不能有 TLS 回调 —— TLS 回调在入口点之前运行，那时 .text 还是密文。
+ *
+ * 表布局（与 cmd/vmpack 的 imgTable 字节级一致）：
+ *   [0]  u64 imageBase
+ *   [8]  u32 salt
+ *   [12] u32 count
+ *   [16] u32 selfRVA（表自身的 RVA；用它 + 表地址反推镜像基址）
+ *   [20] u32 reserved
+ *   [24] count x { u32 rva; u32 size; u32 flags; u32 pad; u8 tag[16] }
+ *        flags: bit0 = 解密后恢复成可执行，bit1 = 解密后恢复成可写（打包端 inject.ImgSection）
+ */
+/* 幂等标志：TLS 回调最先解密一次，入口蹦床随后还会调一次（加载器的调用顺序是
+ * TLS 回调 -> 入口点）。放在 .bss（不能有初始化器，否则落进只读的 .data 段）。 */
+static u32 vm_img_done;
+
+#if defined(VM_BLOB_TARGET_LINUX) && defined(__x86_64__)
+/* ---- Linux/amd64：同样"只验签 + 原地解密"，但改页保护走 mprotect(2) 系统调用（无 libc），
+ * 基址用"表地址 - selfRVA"反推（和 Windows 侧同一套表格式）。 ---- */
+u64 vm_img_diag[4];
+
+static long vm_syscall3(long n, long a, long b, long c) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+    return r;
+}
+
+int vm_unpack_image(const void *tblp) {
+    if (vm_img_done) return 0;
+    const u8 *t = (const u8 *)tblp;
+    u64 wantBase = *(const u64 *)(t + 0);
+    u32 salt = *(const u32 *)(t + 8);
+    u32 count = *(const u32 *)(t + 12);
+    u32 selfRVA = *(const u32 *)(t + 16);
+    if (!selfRVA) return -1;
+    u64 base = (u64)(const void *)t - (u64)selfRVA;
+    vm_img_diag[0] = 0;
+    vm_img_diag[1] = base;
+    vm_img_diag[2] = wantBase;
+    vm_img_diag[3]++;
+    if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; return -1; } /* 反推出来的基址没有 ELF 魔数 */
+    if (wantBase && base != wantBase) { vm_img_diag[0] = 2; return -2; }      /* 不是期望的加载基址 */
+    u8 key[32] = VM_KEY_BYTES;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *e = t + 24 + (u64)i * 32;
+        u32 rva = *(const u32 *)(e + 0), size = *(const u32 *)(e + 4), flags = *(const u32 *)(e + 8);
+        const u8 *tag = e + 16;
+        u8 *dst = (u8 *)(base + rva);
+        u8 nonce[12];
+        *(u32 *)(nonce + 0) = rva;
+        *(u32 *)(nonce + 4) = size;
+        *(u32 *)(nonce + 8) = salt;
+        u8 aad[8];
+        *(u32 *)(aad + 0) = rva;
+        *(u32 *)(aad + 4) = size;
+        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; return -4; }
+        /* mprotect 按页：整页放宽再解，解完恢复（代码段 RWX 只是这一瞬间） */
+        u64 page = 0x1000;
+        u64 pstart = (u64)dst & ~(page - 1);
+        u64 pend = ((u64)dst + size + page - 1) & ~(page - 1);
+        if (vm_syscall3(10 /* SYS_mprotect */, (long)pstart, (long)(pend - pstart), 1 | 2 | 4) != 0) {
+            vm_img_diag[0] = 5;
+            return -5;
+        }
+        vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        long prot = (flags & 1u) ? (1 | 4) : 1;
+        if (flags & 2u) prot |= 2;
+        vm_syscall3(10, (long)pstart, (long)(pend - pstart), prot);
+    }
+    vm_img_done = 1;
+    vm_img_diag[0] = 0;
+    return 0;
+}
+#elif defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
+static u64 vm_peb_base(void) {
+    u64 p;
+    __asm__ volatile("movq %%gs:0x60, %0" : "=r"(p));
+    return p;
+}
+
+/* ASCII 大小写不敏感比较（blob 没有 libc） */
+static int vm_name_eq(const char *a, const char *b) {
+    for (;;) {
+        char x = *a++, y = *b++;
+        if (x >= 'a' && x <= 'z') x = (char)(x - 32);
+        if (y >= 'a' && y <= 'z') y = (char)(y - 32);
+        if (x != y) return 0;
+        if (!x) return 1;
+    }
+}
+
+/* 只走 PEB -> Ldr -> InMemoryOrderModuleList（x64 偏移：Ldr@0x18，
+ * 表头@Ldr+0x20，节点 InMemoryOrderLinks@entry+0x10，DllBase@+0x30，BaseDllName@+0x58）。 */
+static u64 vm_find_module(const char *name) {
+    u64 peb = vm_peb_base();
+    if (!peb) return 0;
+    u64 ldr = *(const u64 *)(peb + 0x18);
+    if (!ldr) return 0;
+    u64 head = ldr + 0x20;
+    u64 cur = *(const u64 *)head;
+    for (int i = 0; i < 512 && cur && cur != head; i++) {
+        u64 ent = cur - 0x10;
+        u64 base = *(const u64 *)(ent + 0x30);
+        u16 len = *(const u16 *)(ent + 0x58);
+        const u16 *buf = *(const u16 *const *)(ent + 0x60);
+        char tmp[64];
+        u32 n = len / 2;
+        if (n > 63) n = 63;
+        for (u32 k = 0; k < n && buf; k++) {
+            u16 ch = buf[k];
+            tmp[k] = (ch < 128) ? (char)ch : '?';
+        }
+        tmp[n] = 0;
+        if (base && vm_name_eq(tmp, name)) return base;
+        cur = *(const u64 *)cur;
+    }
+    return 0;
+}
+
+/* 从模块的导出表按名字取函数地址（PE32+：导出目录在可选头 +112） */
+static void *vm_get_proc(u64 mod, const char *fn) {
+    const u8 *p = (const u8 *)mod;
+    if (!p || *(const u16 *)p != 0x5A4D) return 0;              /* "MZ" */
+    u32 lfanew = *(const u32 *)(p + 0x3C);
+    const u8 *pe = p + lfanew;
+    if (*(const u32 *)pe != 0x00004550u) return 0;              /* "PE\0\0" */
+    u32 expRva = *(const u32 *)(pe + 24 + 112);
+    if (!expRva) return 0;
+    const u8 *exp = p + expRva;
+    u32 nFuncs = *(const u32 *)(exp + 20);
+    u32 nNames = *(const u32 *)(exp + 24);
+    const u32 *funcs = (const u32 *)(p + *(const u32 *)(exp + 28));
+    const u32 *names = (const u32 *)(p + *(const u32 *)(exp + 32));
+    const u16 *ords = (const u16 *)(p + *(const u32 *)(exp + 36));
+    for (u32 i = 0; i < nNames; i++) {
+        const char *nm = (const char *)(p + names[i]);
+        if (vm_name_eq(nm, fn)) {
+            u16 o = ords[i];
+            return (o < nFuncs) ? (void *)(p + funcs[o]) : 0;
+        }
+    }
+    return 0;
+}
+
+/* 返回 0 = 成功；负数是可辨认的失败码（会以"被保护程序莫名退出"的形式暴露，便于定位） */
+/* 诊断：整体加密自解密的观测量（.bss；非 static 以便进 manifest 符号表）。
+ * [0]=rc [1]=实际镜像基址 [2]=期望基址 [3]=被调用次数。加载失败后镜像会被卸载，
+ * 所以失败路径额外用 ExitProcess(0xC0DE0000|code) 把 rc 带到退出码上（现场可辨）。 */
+u64 vm_img_diag[4];
+
+static void vm_img_fail(u32 code) {
+    typedef void (*exitfn_t)(u32);
+    exitfn_t ex = (exitfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "ExitProcess");
+    if (ex) ex(0xC0DE0000u | code);
+    __builtin_trap();
+}
+
+int vm_unpack_image(const void *tblp) {
+    if (vm_img_done) return 0;
+    const u8 *t = (const u8 *)tblp;
+    u64 wantBase = *(const u64 *)(t + 0);
+    u32 salt = *(const u32 *)(t + 8);
+    u32 count = *(const u32 *)(t + 12);
+    /* 基址不能用 PEB->ImageBaseAddress：那是**宿主 EXE** 的基址。DLL 在被加载时，
+     * 那个字段指向宿主进程的主镜像，于是 base != wantBase 永远成立（实测直接 -2）。
+     * 正确做法：表就在 payload 里，用"表的地址 - 表自身的 RVA"反推本镜像基址。 */
+    u32 selfRVA = *(const u32 *)(t + 16);
+    if (!selfRVA) return -1;
+    u64 base = (u64)(const void *)t - (u64)selfRVA;
+    vm_img_diag[0] = 0;
+    vm_img_diag[1] = base;
+    vm_img_diag[2] = wantBase;
+    vm_img_diag[3]++;
+    if (*(const u16 *)base != 0x5A4D) { vm_img_diag[0] = 1; vm_img_fail(1); return -1; } /* 反推出来的基址没有 MZ */
+    if (base != wantBase) { vm_img_diag[0] = 2; vm_img_fail(2); return -2; }             /* 不是首选基址 */
+    typedef int (*vpfn_t)(void *, u64, u32, u32 *);
+    vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
+    if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }
+    u8 key[32] = VM_KEY_BYTES;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *e = t + 24 + (u64)i * 32;   /* 表头 24 字节（imageBase/salt/count/selfRVA/保留） */
+        u32 rva = *(const u32 *)(e + 0);
+        u32 size = *(const u32 *)(e + 4);
+        u32 flags = *(const u32 *)(e + 8);
+        const u8 *tag = e + 16;
+        u8 *dst = (u8 *)(base + rva);
+        u8 nonce[12];
+        *(u32 *)(nonce + 0) = rva;
+        *(u32 *)(nonce + 4) = size;
+        *(u32 *)(nonce + 8) = salt;
+        u8 aad[8];
+        *(u32 *)(aad + 0) = rva;
+        *(u32 *)(aad + 4) = size;
+        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_img_fail(4); return -4; }
+        u32 old = 0;
+        if (!vp(dst, size, 0x40u /* PAGE_EXECUTE_READWRITE */, &old)) { vm_img_diag[0] = 5; vm_img_fail(5); return -5; }
+        vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）
+         * PAGE_READONLY=0x02 / PAGE_READWRITE=0x04 / PAGE_EXECUTE_READ=0x20 / PAGE_EXECUTE_READWRITE=0x40 */
+        u32 prot;
+        if (flags & 2u) {
+            prot = (flags & 1u) ? 0x40u : 0x04u;
+        } else {
+            prot = (flags & 1u) ? 0x20u : 0x02u;
+        }
+        vp(dst, size, prot, &old);
+    }
+    vm_img_done = 1;
+    vm_img_diag[0] = 0;
+    return 0;
+}
+#else
+int vm_unpack_image(const void *tblp) { (void)tblp; return -9; } /* 目前只做 Windows/x64 */
+#endif

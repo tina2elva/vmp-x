@@ -38,6 +38,28 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		}
 	}
 
+	// (d) 抹除原生机器码（与 PE 侧同义）：入口补丁之外的原生函数体不再留在镜像里，
+	// 否则同源的另一份构建就能按 RVA 差分把函数体拼回来。
+	if opt.Wipe {
+		_, patchLen, aerr := opt.Arch.info()
+		if aerr != nil {
+			return nil, aerr
+		}
+		for i := range pl.Placements {
+			p := &pl.Placements[i]
+			if p.NativeSize <= patchLen {
+				continue
+			}
+			n := p.NativeSize - patchLen
+			buf := make([]byte, n)
+			wipeResidue(buf, 0, n, wipeSeed(opt.PatchKey, p.FuncRVA, baseRVA))
+			if err := f.WriteVA(imageBase+uint64(p.FuncRVA)+uint64(patchLen), buf); err != nil {
+				return nil, fmt.Errorf("%s: 抹除原生机器码失败: %w", p.Name, err)
+			}
+			p.WipedBytes = n
+		}
+	}
+
 	// (c) 加载期校验：把 ELF 入口点（e_entry）改成 payload 里的校验蹦床，它验完再跳到原入口。
 	// 这条路径不依赖"运行期读目标字节"（那个做法在 ELF 上会出问题，见 STATUS 第 392 条）。
 	if pl.EntryHookRVA != 0 {
@@ -79,32 +101,14 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		f.SwapPhdrs(oi, pi)
 	}
 
-	// 顺序修正（很关键）：内核按程序头表顺序依次 mmap 各 PT_LOAD，**重叠区间上后面的覆盖前面的**。
-	// 可写覆盖段必须排在 payload 段之后，否则 .bss 会被随后的 RX 映射盖回去 ——
-	// 解释器写解密缓存就 SIGSEGV（SEGV_ACCERR，Linux 上实测；PE 侧按节合并、写标志生效，不暴露此问题）。
-	// 实测：payload 复用了 PT_NOTE（索引 1），覆盖段则落到更低的索引 0（可丢弃的 PT_PHDR），
-	// 于是 payload 后映射、把 RW 盖掉。
-	if pi, oi := paypayloadPhdrIndex(f, newVA), paypayloadPhdrIndex(f, baseVA+uint64(pl.BSSOff)); pi >= 0 && oi >= 0 && oi < pi {
-		f.SwapPhdrs(oi, pi)
-	}
-
 	return &Result{
 		SectionRVA:   baseRVA,
 		SectionSize:  len(pl.Data),
 		StubEntryRVA: baseRVA + uint32(opt.StubEntry),
 		Placements:   pl.Placements,
+		ImgTableRVA:  pl.ImgTableRVA,
+		ImgTableLen:  pl.ImgTableLen,
 	}, nil
-}
-
-// payloadPhdrIndex 按 VA 找出某个 PT_LOAD 在程序头表里的索引（找不到返回 -1）。
-// 用于把"可写覆盖段必须排在 payload 段之后"这条约束落实到位。
-func paypayloadPhdrIndex(f *elf.File, va uint64) int {
-	for i, p := range f.Progs {
-		if p.Type == elf.PT_LOAD && p.Vaddr == va {
-			return i
-		}
-	}
-	return -1
 }
 
 // payloadPhdrIndex 按 VA 找出某个 PT_LOAD 在程序头表里的索引（找不到返回 -1）。

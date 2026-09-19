@@ -9,6 +9,7 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -55,6 +56,11 @@ func main() {
 	blobPath := flag.String("blob", "build/vm_interp.bin", "解释器 blob 路径")
 	manPath := flag.String("manifest", "build/vm_interp.json", "blob manifest 路径")
 	noEncrypt := flag.Bool("no-encrypt", false, "不加密字节码（调试用；默认加密）")
+	wipe := flag.Bool("wipe", true, "抹除被保护函数的原生机器码（默认开；-wipe=false 保留旧行为，仅供对照实验）")
+	noEncImage := flag.Bool("no-enc-image", false, "关闭原镜像整体加密（默认对 x86-64 EXE 开启）")
+	encImageSections := flag.String("enc-image-sections", "", "只整体加密这些节（逗号分隔；留空=默认 .text,.rdata,.data）")
+	noEncImageDLL := flag.Bool("no-enc-image-dll", false, "对 DLL 关闭原镜像整体加密（默认对 DLL 也开）")
+	encImageELF := flag.Bool("enc-image-elf", false, "对 ET_EXEC 的 x86-64 ELF 也做整体加密（默认关：入口路径需 Linux/CI 验证）")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
@@ -64,6 +70,11 @@ func main() {
 	var funcs multiFlag
 	flag.Var(&funcs, "func", "要保护的函数名（可重复）")
 	flag.Parse()
+	wipeEnabled = *wipe
+	encImageEnabled = !*noEncImage
+	encImageDLLEnabled = !*noEncImageDLL
+	encImageELFEnabled = *encImageELF
+	encImageSectionList = *encImageSections
 
 	if *exe == "" || len(funcs) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: vmpack -exe in.bin -func name [-func name2] [-out out.bin]")
@@ -114,6 +125,7 @@ func main() {
 		}
 		aead, err := chacha20poly1305.New(key)
 		must(err)
+		imgAEAD = aead
 		enc = func(plain []byte, aad []byte) ([]byte, [12]byte, [16]byte, error) {
 			var nonce [12]byte
 			if _, err := rand.Read(nonce[:]); err != nil {
@@ -199,7 +211,7 @@ func main() {
 		if !hasVerifyELF {
 			verifyFnELF = -1
 		}
-		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFnELF, scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
+		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFnELF, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
 	} else {
 		scratchOff, hasCache := man.Symbols["vm_bc_cache"]
 		scratchEnd, hasLock := man.Symbols["vm_bc_lock"]
@@ -213,7 +225,7 @@ func main() {
 		}
 		*section = sectionNamesFor(*section)
 		bytecodeLimitFlag = bytecodeLimit(man.Symbols, stub)
-		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFn, scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
+		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
 	for _, p := range res.Placements {
@@ -326,12 +338,12 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 				fmt.Println()
 			}
 		}
-		specs = append(specs, inject.FuncSpec{Name: name, RVA: found.RVA, Code: gen.Code})
+		specs = append(specs, inject.FuncSpec{Name: name, RVA: found.RVA, Code: gen.Code, NativeSize: len(found.Code)})
 	}
 	return specs, nil
 }
 
-func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
+func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
 	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
@@ -382,13 +394,128 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	}, opcodeMap, verbose, func(rva uint32, n int) ([]byte, bool) { return peRvaBytes(f.Data, rva, n) }, keepSelfChecksFlag != nil && *keepSelfChecksFlag)
 	must(err)
 
+	// 原镜像整体加密：默认对 x86-64 的 EXE 开启；不支持/不合适的情形**跳过并说明**，
+	// 绝不 fatalf —— 它是默认开的功能，不能把 ARM64 或 DLL 这类目标直接卡死。
+	var imgSecs []inject.ImgSection
+	var imgTLS []uint64
+	var tlsDirCopy []byte
+	imgSkip := ""
+	switch {
+	case !encImageEnabled:
+		imgSkip = "已用 -no-enc-image 关闭"
+	case imgAEAD == nil:
+		imgSkip = "-no-encrypt（没有主密钥，无法验签/解密）"
+	case f.Machine != pe.MachineAMD64:
+		imgSkip = "只支持 x86-64 的 PE"
+	case f.Characteristics&0x2000 != 0 && !encImageDLLEnabled:
+		imgSkip = "目标是 DLL（已用 -no-enc-image-dll 关闭）"
+	}
+	if imgSkip == "" {
+		// 候选节 -> 保护标志（bit0 执行 / bit1 可写）。数据目录守卫统一把关：
+		// 除 TLS 目录（会被原样搬进 payload 并重指）之外，任何"加载器在入口点之前要读/要写"的
+		// 目录落在候选节里，这一节就跳过 —— 不同链接器会把 .idata/.rdata/.data 合并，不能假设 mingw 的布局。
+		// 候选集可由 -enc-image-sections 覆盖（默认三节）；flags: bit0 执行 / bit1 可写。
+		allCand := []struct {
+			name  string
+			flags uint32
+		}{
+			{".text", 1},
+			{".rdata", 0},
+			{".data", 2},
+		}
+		cand := allCand
+		if encImageSectionList != "" {
+			cand = nil
+			for _, want := range strings.Split(encImageSectionList, ",") {
+				want = strings.TrimSpace(want)
+				for _, c := range allCand {
+					if c.name == want {
+						cand = append(cand, c)
+					}
+				}
+			}
+		}
+		for _, c := range cand {
+			for _, s := range f.Sections {
+				if s.Name != c.name || s.SizeOfRawData == 0 {
+					continue
+				}
+				if why := loaderDirConflict(f, s); why != "" {
+					fmt.Printf("[*] 原镜像整体加密：跳过 %s（%s）", s.Name, why)
+					fmt.Println()
+					continue
+				}
+				imgSecs = append(imgSecs, inject.ImgSection{RVA: s.VirtualAddress, Size: s.SizeOfRawData, Flags: c.flags})
+			}
+		}
+		if len(imgSecs) == 0 && imgSkip == "" {
+			imgSkip = "没有可安全加密的节"
+		}
+		if imgSkip == "" && len(imgSecs) == 0 {
+			imgSkip = "找不到 .text"
+		}
+	}
+	if imgSkip != "" {
+		fmt.Printf("[*] 原镜像整体加密：跳过（%s）", imgSkip)
+		fmt.Println()
+		imgSecs = nil
+	} else {
+		if cbs := tlsCallbacks(f); len(cbs) > 0 {
+			fmt.Printf("[*] 目标有 %d 个 TLS 回调：把自己的自解密回调插到数组最前面", len(cbs))
+			fmt.Println()
+			imgTLS = cbs
+		}
+		for _, s := range imgSecs {
+			fmt.Printf("[*] 原镜像整体加密：%s RVA=0x%X size=0x%X（入口自解密）", sectionNameOfRVA(f, s.RVA), s.RVA, s.Size)
+			fmt.Println()
+		}
+		// TLS 目录如果落在被加密的节里，加载器会在我们之前读它 —— 搬到 payload 并把数据目录指过来。
+		if dir := tlsDirectoryRVA(f); dir != 0 {
+			for _, s := range imgSecs {
+				if s.RVA <= dir && dir < s.RVA+s.Size {
+					to, err := f.RVAtoOffset(dir)
+					if err != nil || to < 0 || to+40 > len(f.Data) {
+						fatalf("TLS 目录（RVA 0x%X）读不出来，无法整体加密 %s", dir, sectionNameOfRVA(f, dir))
+					}
+					tlsDirCopy = append([]byte(nil), f.Data[to:to+40]...)
+					fmt.Printf("[*] TLS 目录在 %s 里：搬到 payload（加载器在入口点之前要读它）", sectionNameOfRVA(f, dir))
+					fmt.Println()
+				}
+			}
+		}
+	}
 	entryRVA, _ := inject.EntryRVA(f)
 	res, err := inject.Apply(f, inject.Options{SectionName: section, SectionNameB: sectionNames[1], SectionNameC: sectionNames[2], Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
 		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
+		ImgSections: imgSecs, ImageBase: f.ImageBase, UnpackFn: unpackFn, ImgTlsCallbacks: imgTLS, TlsDirCopy: tlsDirCopy,
+		Wipe:      wipeEnabled,
 		EntryHook: patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0,
 		VerifyFn:  verifyFn,
 		EntryRVA:  entryRVA})
 	must(err)
+	if len(imgSecs) > 0 {
+		if imgAEAD == nil {
+			fatalf("-enc-image 需要主密钥（不能与 -no-encrypt 同时用）")
+		}
+		if err := encryptImageSections(f, res, imgAEAD); err != nil {
+			fatalf("原镜像加密失败: %v", err)
+		}
+		clearDynamicBase(f)
+		stripRelocations(f)
+		tlsDir := tlsDirectoryRVA(f)
+		if len(tlsDirCopy) > 0 && res.TlsDirRVA != 0 {
+			if err := setTLSDirectoryRVA(f, res.TlsDirRVA); err != nil {
+				fatalf("重指 TLS 数据目录失败: %v", err)
+			}
+			tlsDir = res.TlsDirRVA
+		}
+		if res.ImgTlsArrayRVA != 0 {
+			if err := setTLSCallbacks(f, tlsDir, f.ImageBase+uint64(res.ImgTlsArrayRVA)); err != nil {
+				fatalf("改写 TLS 回调数组失败: %v", err)
+			}
+		}
+		fmt.Println("[*] 原镜像 .text 已原地加密，并清除 DYNAMIC_BASE（加载器因此不做重定位）")
+	}
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新节 %s: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",
 		section, res.SectionRVA, res.SectionSize, res.StubEntryRVA)
@@ -399,7 +526,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	return res
 }
 
-func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
+func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
 	f, err := elfload.Open(exe)
 	must(err)
 	imageBase := f.ImageBase()
@@ -442,13 +569,45 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 	if f.Entry > imageBase && f.Entry-imageBase <= 0xFFFFFFFF {
 		entryRVA = uint32(f.Entry - imageBase)
 	}
+	// ELF 整体加密（默认关）：只做 ET_EXEC —— PIE/ET_DYN 会被 ld.so 重定位写进密文，
+	// 解密出来就是垃圾（和 DLL 那边同一个道理），需要单独的方案。
+	var imgSecs []inject.ImgSection
+	if encImageELFEnabled {
+		switch {
+		case f.Machine != elfload.EM_X86_64:
+			fmt.Println("[*] ELF 整体加密：跳过（只支持 x86-64）")
+		case f.EType != 2:
+			fmt.Println("[*] ELF 整体加密：跳过（只支持 ET_EXEC；PIE 会被重定位破坏密文）")
+		case imgAEAD == nil:
+			fmt.Println("[*] ELF 整体加密：跳过（没有主密钥）")
+		default:
+			for _, p := range f.Progs {
+				if p.Type == 1 && p.Flags&elfload.PF_X != 0 && p.Filesz > 0 {
+					imgSecs = append(imgSecs, inject.ImgSection{RVA: uint32(p.Vaddr - imageBase), Size: uint32(p.Filesz), Flags: 1})
+					fmt.Printf("[*] ELF 整体加密：PT_LOAD(X) va=0x%X size=0x%X（入口自解密）", p.Vaddr, p.Filesz)
+					fmt.Println()
+					break
+				}
+			}
+			if len(imgSecs) == 0 {
+				fmt.Println("[*] ELF 整体加密：跳过（找不到可执行的 PT_LOAD）")
+			}
+		}
+	}
 	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
 		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize,
+		ImgSections: imgSecs, ImageBase: 0, UnpackFn: unpackFn,
+		Wipe:          wipeEnabled,
 		EntryHook:     patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0 && f.Machine == elfload.EM_X86_64,
 		EntryHookSysV: true,
 		VerifyFn:      verifyFn,
 		EntryRVA:      entryRVA})
 	must(err)
+	if len(imgSecs) > 0 {
+		if err := encryptImageSectionsELF(f, imageBase, res, imgAEAD); err != nil {
+			fatalf("ELF 原镜像加密失败: %v", err)
+		}
+	}
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新 PT_LOAD: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",
 		res.SectionRVA, res.SectionSize, res.StubEntryRVA)
@@ -508,6 +667,25 @@ func sectionNamesFor(base string) string {
 
 // keepSelfChecksFlag：由 main 里 flag.Parse 设定，packPE/packELF 里读取。
 var keepSelfChecksFlag *bool
+
+// wipeEnabled：是否抹除被保护函数的原生机器码（-wipe，默认开）。
+var wipeEnabled bool
+
+// encImageEnabled：是否把原镜像 .text 整体加密（默认对 x86-64 EXE 开启，-no-enc-image 关闭）。
+var encImageEnabled bool
+
+// encImageSectionList：-enc-image-sections 的取值（空 = 用默认候选集）。
+var encImageSectionList string
+
+// encImageELFEnabled：是否对 ELF 也整体加密（默认关；只支持 ET_EXEC，见 docs/STATUS.md）。
+var encImageELFEnabled bool
+
+// encImageDLLEnabled：是否对 DLL 也加密（默认**开**；-no-enc-image-dll 关闭）。
+// DLL 只有在"落在首选基址"时才成立：打包端已拆掉重定位表，落不下会明确失败。
+var encImageDLLEnabled bool
+
+// imgAEAD：原镜像加密用的 AEAD（与字节码同一个主密钥；-no-encrypt 时为空）。
+var imgAEAD cipher.AEAD
 
 func reportOrDevNull(p string) string { return p }
 
@@ -604,4 +782,248 @@ func fatalf(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "[!] "+format, a...)
 	fmt.Fprintln(os.Stderr)
 	os.Exit(1)
+}
+
+// encryptImageSections 按解密表把原镜像的节**原地**加密，并把 AEAD 标签回填进表里。
+// 与 blob 里的 vm_unpack_image 逐字节对齐：nonce = rva||size||salt，AAD = rva||size，
+// AEAD 的数据流从 counter=1 开始（Go 的 chacha20poly1305 正是这个约定）。
+func encryptImageSections(f *pe.File, res *inject.Result, aead cipher.AEAD) error {
+	off, err := f.RVAtoOffset(res.ImgTableRVA)
+	if err != nil {
+		return err
+	}
+	if off < 0 || off+res.ImgTableLen > len(f.Data) || res.ImgTableLen < 24 {
+		return fmt.Errorf("解密表越界（off=0x%X len=%d）", off, res.ImgTableLen)
+	}
+	tbl := f.Data[off : off+res.ImgTableLen]
+	salt := binary.LittleEndian.Uint32(tbl[8:])
+	count := binary.LittleEndian.Uint32(tbl[12:])
+	if int(24+count*32) > len(tbl) {
+		return fmt.Errorf("解密表条目数 %d 超出表长 %d", count, len(tbl))
+	}
+	for i := uint32(0); i < count; i++ {
+		e := tbl[24+i*32:]
+		rva := binary.LittleEndian.Uint32(e[0:])
+		size := binary.LittleEndian.Uint32(e[4:])
+		so, err := f.RVAtoOffset(rva)
+		if err != nil {
+			return err
+		}
+		if so < 0 || so+int(size) > len(f.Data) {
+			return fmt.Errorf("节 0x%X（%d 字节）越界", rva, size)
+		}
+		var nonce [12]byte
+		binary.LittleEndian.PutUint32(nonce[0:], rva)
+		binary.LittleEndian.PutUint32(nonce[4:], size)
+		binary.LittleEndian.PutUint32(nonce[8:], salt)
+		var aad [8]byte
+		binary.LittleEndian.PutUint32(aad[0:], rva)
+		binary.LittleEndian.PutUint32(aad[4:], size)
+		sealed := aead.Seal(nil, nonce[:], f.Data[so:so+int(size)], aad[:])
+		copy(f.Data[so:so+int(size)], sealed[:size])
+		copy(e[16:32], sealed[size:])
+	}
+	return nil
+}
+
+// stripRelocations 把重定位表整个拆掉：数据目录清零 + 该节内容清零 + 置 IMAGE_FILE_RELOCS_STRIPPED。
+//
+// 为什么必须这么做：整体加密是在**文件字节**上做的，加载器一旦按重定位改写 .text，密文就被破坏，
+// 解密出来就是垃圾。清 DYNAMIC_BASE 只挡"系统为了 ASLR 主动重定位"，挡不住强制的镜像重定位
+// （Windows 的 Mandatory ASLR 对 DLL 就会这么做 —— 实测：DLL 只加密 .text 也 1114）。
+// 拆掉重定位表之后，加载器**只能**落在首选基址；落不下就明确失败，而不是悄悄跑飞。
+func stripRelocations(f *pe.File) {
+	const relocDir = 5
+	o := f.OptHeaderOffset + 112 + relocDir*8
+	if o+8 <= len(f.Data) {
+		rva := binary.LittleEndian.Uint32(f.Data[o:])
+		binary.LittleEndian.PutUint32(f.Data[o:], 0)
+		binary.LittleEndian.PutUint32(f.Data[o+4:], 0)
+		if rva != 0 {
+			for _, s := range f.Sections {
+				if s.VirtualAddress != rva || s.SizeOfRawData == 0 {
+					continue
+				}
+				so, err := f.RVAtoOffset(s.VirtualAddress)
+				if err != nil || so < 0 || so+int(s.SizeOfRawData) > len(f.Data) {
+					continue
+				}
+				for i := so; i < so+int(s.SizeOfRawData); i++ {
+					f.Data[i] = 0
+				}
+			}
+		}
+	}
+	coff := f.Lfanew + 22 // COFF Characteristics
+	if coff+2 <= len(f.Data) {
+		v := binary.LittleEndian.Uint16(f.Data[coff:])
+		binary.LittleEndian.PutUint16(f.Data[coff:], v|0x0001) // IMAGE_FILE_RELOCS_STRIPPED
+	}
+}
+
+// encryptImageSectionsELF 与 PE 版逐字节等价，只是按 ELF 的 VA 读/写。
+// ImageBase 传 0 表示"运行期不强制校验基址"（ET_EXEC 下基址就是链接地址；PIE 我们不支持）。
+func encryptImageSectionsELF(f *elfload.File, imageBase uint64, res *inject.Result, aead cipher.AEAD) error {
+	off, err := f.VAtoOffset(imageBase + uint64(res.ImgTableRVA))
+	if err != nil {
+		return err
+	}
+	if off < 0 || off+res.ImgTableLen > len(f.Data) || res.ImgTableLen < 24 {
+		return fmt.Errorf("解密表越界（off=0x%X len=%d）", off, res.ImgTableLen)
+	}
+	tbl := f.Data[off : off+res.ImgTableLen]
+	salt := binary.LittleEndian.Uint32(tbl[8:])
+	count := binary.LittleEndian.Uint32(tbl[12:])
+	if int(24+count*32) > len(tbl) {
+		return fmt.Errorf("解密表条目数 %d 超出表长 %d", count, len(tbl))
+	}
+	for i := uint32(0); i < count; i++ {
+		e := tbl[24+i*32:]
+		rva := binary.LittleEndian.Uint32(e[0:])
+		size := binary.LittleEndian.Uint32(e[4:])
+		buf, err := f.ReadVA(imageBase+uint64(rva), int(size))
+		if err != nil {
+			return err
+		}
+		var nonce [12]byte
+		binary.LittleEndian.PutUint32(nonce[0:], rva)
+		binary.LittleEndian.PutUint32(nonce[4:], size)
+		binary.LittleEndian.PutUint32(nonce[8:], salt)
+		var aad [8]byte
+		binary.LittleEndian.PutUint32(aad[0:], rva)
+		binary.LittleEndian.PutUint32(aad[4:], size)
+		sealed := aead.Seal(nil, nonce[:], buf, aad[:])
+		if err := f.WriteVA(imageBase+uint64(rva), sealed[:size]); err != nil {
+			return err
+		}
+		copy(e[16:32], sealed[size:])
+	}
+	return nil
+}
+
+// clearDynamicBase 清掉 DYNAMIC_BASE：加载器因此不会重定位镜像。
+// 密文是在**文件字节**上做的，一旦加载器按重定位写了 .text，解密出来的就是垃圾；
+// vm_unpack_image 还会在"实际基址 != 首选基址"时直接拒绝执行（fail-fast）。
+func clearDynamicBase(f *pe.File) {
+	const dllCharOff = 70 // PE32+ 可选头里 DllCharacteristics 的偏移（+0x46）
+	o := f.OptHeaderOffset + dllCharOff
+	if o+2 > len(f.Data) {
+		return
+	}
+	v := binary.LittleEndian.Uint16(f.Data[o:])
+	binary.LittleEndian.PutUint16(f.Data[o:], v&^uint16(0x40))
+}
+
+// tlsCallbacks 读出目标原有的 TLS 回调 VA 列表（没有就返回 nil）。
+// 注意：仅仅存在 TLS 目录是无害的（mingw 的 exe 几乎都有），关键是**回调**——它们在
+// 入口点之前运行，那时 .text 还是密文，所以我们必须把自己的回调插到数组最前面。
+func tlsCallbacks(f *pe.File) []uint64 {
+	o := f.OptHeaderOffset + 112 + 9*8
+	if o+8 > len(f.Data) {
+		return nil
+	}
+	dirRVA := binary.LittleEndian.Uint32(f.Data[o:])
+	if dirRVA == 0 {
+		return nil
+	}
+	to, err := f.RVAtoOffset(dirRVA)
+	if err != nil || to < 0 || to+40 > len(f.Data) {
+		return nil
+	}
+	cbVA := binary.LittleEndian.Uint64(f.Data[to+24:]) // IMAGE_TLS_DIRECTORY64.AddressOfCallBacks
+	if cbVA == 0 || cbVA < f.ImageBase {
+		return nil
+	}
+	co, err := f.RVAtoOffset(uint32(cbVA - f.ImageBase))
+	if err != nil || co < 0 {
+		return nil
+	}
+	var out []uint64
+	for i := 0; i < 64 && co+i*8+8 <= len(f.Data); i++ {
+		v := binary.LittleEndian.Uint64(f.Data[co+i*8:])
+		if v == 0 {
+			break
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// setTLSCallbacks 把 TLS 目录里的 AddressOfCallBacks 指向 payload 里的新数组
+// （数组第 0 项是我们的自解密 thunk，后面接原有的回调）。
+func setTLSCallbacks(f *pe.File, dirRVA uint32, va uint64) error {
+	if dirRVA == 0 {
+		return fmt.Errorf("没有 TLS 目录")
+	}
+	to, err := f.RVAtoOffset(dirRVA)
+	if err != nil {
+		return err
+	}
+	if to < 0 || to+32 > len(f.Data) {
+		return fmt.Errorf("TLS 目录越界")
+	}
+	binary.LittleEndian.PutUint64(f.Data[to+24:], va)
+	return nil
+}
+
+// loaderDirConflict 返回"加载器在入口点之前要用、且落在该节里"的数据目录名；空串 = 可以整节加密。
+// TLS 目录（索引 9）不在此列：它会被原样搬进 payload 并把数据目录指过来（见 packPE 里的搬迁）。
+// SECURITY 项存的是文件偏移而非 RVA、DEBUG 只有调试器读，两者都不算冲突。
+func loaderDirConflict(f *pe.File, s pe.Section) string {
+	dirs := []struct {
+		idx  int
+		name string
+	}{
+		{1, "IMPORT"}, {2, "RESOURCE"}, {3, "EXCEPTION"}, {5, "BASERELOC"},
+		{10, "LOADCONFIG"}, {11, "BOUNDIMPORT"}, {12, "IAT"}, {13, "DELAYIMPORT"}, {14, "CLR"},
+	}
+	end := s.VirtualAddress + s.SizeOfRawData
+	for _, d := range dirs {
+		o := f.OptHeaderOffset + 112 + d.idx*8
+		if o+8 > len(f.Data) {
+			continue
+		}
+		rva := binary.LittleEndian.Uint32(f.Data[o:])
+		size := binary.LittleEndian.Uint32(f.Data[o+4:])
+		if rva == 0 {
+			continue
+		}
+		if rva < end && rva+size > s.VirtualAddress {
+			return d.name + " 目录落在这一节里（加载器在入口点之前要用）"
+		}
+	}
+	return ""
+}
+
+// tlsDirectoryRVA 返回 TLS 数据目录指向的 RVA（0 = 没有）。
+func tlsDirectoryRVA(f *pe.File) uint32 {
+	o := f.OptHeaderOffset + 112 + 9*8
+	if o+8 > len(f.Data) {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(f.Data[o:])
+}
+
+// setTLSDirectoryRVA 把 TLS 数据目录重新指向 payload 里的那份副本。
+func setTLSDirectoryRVA(f *pe.File, rva uint32) error {
+	o := f.OptHeaderOffset + 112 + 9*8
+	if o+8 > len(f.Data) {
+		return fmt.Errorf("没有 TLS 目录项")
+	}
+	binary.LittleEndian.PutUint32(f.Data[o:], rva)
+	return nil
+}
+
+// sectionNameOfRVA 只是为了日志说清楚"哪个节"。
+func sectionNameOfRVA(f *pe.File, rva uint32) string {
+	for _, s := range f.Sections {
+		span := s.VirtualSize
+		if s.SizeOfRawData > span {
+			span = s.SizeOfRawData
+		}
+		if s.VirtualAddress <= rva && rva < s.VirtualAddress+span {
+			return s.Name
+		}
+	}
+	return "?"
 }

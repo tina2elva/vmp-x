@@ -195,6 +195,49 @@ void vm_poly1305(const u8 key[32], const u8 *m, u32 len, u8 tag[16]) {
 
 /* ---------------- AEAD ---------------- */
 
+void vm_chacha20_keystream(const u8 key[32], u32 counter, const u8 nonce[12], u8 out[64]) {
+    chacha20_block(key, counter, nonce, out);
+}
+
+/* 只算 MAC（RFC 8439 §2.8：aad || pad16 || ct || pad16 || le64(aadLen) || le64(ctLen)），
+ * 与 vm_aead_open_aad 的验签部分逐字一致，但**不产生任何明文**。 */
+int vm_aead_verify_aad(const u8 key[32], const u8 nonce[12], const u8 *aad, u32 aadLen,
+                       const u8 *ct, u32 len, const u8 tag[16]) {
+    u8 block0[64];
+    chacha20_block(key, 0, nonce, block0);
+    u8 polyKey[32];
+    for (int i = 0; i < 32; i++) polyKey[i] = block0[i];
+
+    poly1305_state ps;
+    poly1305_init(&ps, polyKey);
+    u32 aadFull = aadLen & ~15u;
+    if (aadFull) poly1305_blocks(&ps, aad, aadFull, 1u << 24);
+    if (aadLen - aadFull) {
+        u8 tail[16];
+        for (u32 i = 0; i < aadLen - aadFull; i++) tail[i] = aad[aadFull + i];
+        for (u32 i = aadLen - aadFull; i < 16; i++) tail[i] = 0;
+        poly1305_blocks(&ps, tail, 16, 1u << 24);
+    }
+    u32 full = len & ~15u;
+    if (full) poly1305_blocks(&ps, ct, full, 1u << 24);
+    if (len - full) {
+        u8 tail[16];
+        for (u32 i = 0; i < len - full; i++) tail[i] = ct[full + i];
+        for (u32 i = len - full; i < 16; i++) tail[i] = 0;
+        poly1305_blocks(&ps, tail, 16, 1u << 24);
+    }
+    u8 lens[16];
+    for (int i = 0; i < 8; i++) lens[i] = (u8)(((u64)aadLen) >> (8 * i));
+    for (int i = 0; i < 8; i++) lens[8 + i] = (u8)(((u64)len) >> (8 * i));
+    poly1305_blocks(&ps, lens, 16, 1u << 24);
+    u8 want[16];
+    poly1305_finish(&ps, want);
+
+    u32 diff = 0;
+    for (int i = 0; i < 16; i++) diff |= (u32)(want[i] ^ tag[i]);
+    return diff == 0;
+}
+
 int vm_aead_open_aad(const u8 key[32], const u8 nonce[12], const u8 *aad, u32 aadLen,
                      const u8 *ct, u32 len, const u8 tag[16], u8 *out) {
     u8 block0[64];

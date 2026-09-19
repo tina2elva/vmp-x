@@ -3622,3 +3622,363 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 
 
+
+## 加固：把「入口蹦床」升级成真正的整段替换（原生机器码不再留在镜像里）
+
+### 328. 问题（先量化，再决定改什么）
+把旧产物与原产物逐字节对比（按 manifest 的 `funcRVA` 定位，窗口取到「下一个被保护函数」之前）：
+
+| 产物 | 25 个被保护函数、2944 字节窗口里与原产物不同的字节 |
+|---|---|
+| 旧（`-wipe=false`） | **124** = 25×5 − 1：只有入口那 5 字节补丁（check_key 的第 5 字节恰好与原字节重合） |
+| 新（默认 `-wipe`） | **1339** |
+
+即：旧产物里 25 个函数共 **1346 字节原生机器码，1221 字节（90.7%）原样躺在镜像里**，
+每个函数只丢了最前面那 5 字节 —— 「还原」确实退化成了「把入口改回去」。
+（第 30–40 行的 `.pdata` 清理只挡住「从 prologue 描述反推被覆盖的字节」这一条路，函数体本身还在。）
+
+### 329. 改法
+- `inject.FuncSpec` 增加 `NativeSize`（取 `scan.Found.Code` 的长度：已按尾部填充裁剪，末尾必是 RET/JMP，边界是精确的）；
+- `vmpack -wipe`（**默认开**）：PE / ELF 两侧在写完入口补丁后，把 `[entry+patchLen, entry+NativeSize)`
+  填成伪随机字节；**入口跳板本身保留**（运行期要靠它进 VM）；
+- 填充种子 = `wipeSeed(构建密钥, funcRVA, payload 基址)`：不同函数、不同构建各不相同 ——
+  固定填充（0x00/0xCC）本身就是「这段被处理过」的静态特征；
+- 报告 JSON 新增 `nativeBytes` / `wipedBytes`，可直接核对；
+- `internal/inject/wipe_test.go`：跳板保留 + 函数体被改 + 不越界、短于跳板的函数跳过、种子随密钥/函数变化。
+
+### 330. 本机验证
+- `build/target.exe` 25 个函数：`nativeBytes` 合计 **1346**、`wipedBytes` 合计 **1221**（= 1346 − 25×5）；
+- 差分（原生 vs 打包，wipe 开）**146 passed / 0 failed**，用例与旧版同一批、同一份 target.exe；
+- `go test ./...` 11 个包全绿；
+- `-wipe=false` 对照复测仍是 **124** 字节差异、`wipedBytes` 合计 0 ⇒ 开关有效、旧行为可复现。
+
+### 331. 这一步解决了什么、没解决什么
+- **解决**：产物里不再存在「被同源的另一份构建按 RVA 差分直接拼回」的函数体；还原要么反编译 VM 字节码，
+  要么把同源版本重新链接进来。
+- **没解决（必须写清楚）**：在「攻击者手里有同源的另一份构建」这个前提下，**任何只做变换、不引入密钥的
+  保护都是可无损还原的** —— 他可以完全不碰我们的字节码，直接把同源那份的原生函数搬进这个槽位
+  （这个槽位对调用方而言本来就是「一次调用」的语义）。所以「整段替换 + 字节码解释执行」本身并不改变
+  可还原性的**类别**，它改变的是工程成本（需要 devirtualizer 或重链接）；真正的类别变化来自**密钥依赖**：
+  让被保护函数读到的**数据**也是 per-build 加密的（密钥只存在于 VM 状态里），或者引入许可/服务器密钥。
+  那是独立的一步，不在本轮。
+
+### 332. 补上真正的判据：**内存里也不能出现**（不是只文件里）
+「整段替换」的判据不是"文件里没有"，而是"**运行期内存里也没有**" —— PE/ELF 是把映像映射进内存的，
+文件级的残留必然等价于内存级的残留。为了把这条变成可测的，新增 `tools/residue_probe.py`：
+对被保护进程做一次全地址空间扫描（`VirtualQueryEx` + `ReadProcessMemory`），同时查两类模式 ——
+原生函数体（原镜像 `[funcRVA+5, funcRVA+nativeBytes)`）与 VM 字节码**明文**（`vmpack -dumpbytecode` 的产物）。
+
+实测（`target.exe`，运行 `bench check_key 100000000`，扫描 11.0 MB 可读内存）：
+
+| 产物 | native:check_key | native:sum_to | bytecode:check_key | bytecode:sum_to |
+|---|---|---|---|---|
+| wipe 开（整段替换） | **absent** | **absent** | FOUND（解密缓存） | absent（未被调用，仍是密文） |
+| wipe 关（入口蹦床） | **FOUND @…19D5** | **FOUND @…2105** | — | — |
+
+两个命中地址正好是 `funcRVA+5`（0x19D0+5、0x2100+5），即被映射进内存的原生函数体。
+这就是"入口蹦床"在内存层面的真相：**原文一字不少地在内存里**，还原不需要任何分析；
+而 wipe 开之后"原生码在内存中不出现"这条才第一次**成立并且可验证**。
+
+### 333. 这条判据已进本地门禁
+`tools/gates.ps1` 新增第 9 条 `residue probe (no native code in image/memory)`：
+对 e2e 刚产出的 `target_vmp.exe` 跑同一套扫描，带 `--fail-on-native`，只要原生函数体命中就红。
+即"抹除"从一次性动作变成**回归门禁** —— 谁把 `-wipe` 关掉，门禁立刻红。
+
+### 334. 仍然存在、且必须承认的残留：字节码明文缓存
+上表第 3 列：`bytecode:check_key` 在内存里 **FOUND**。源码位置在 `stub/win/x64/vm_interp.c`
+的 `vm_bc_cache`：解释器把 AEAD 密封的字节码解密进 `.bss` 的明文槽（`vm_aead_open_aad(..., dst)`），
+槽按描述符键控、引用计数保留，**用完不清零、不重加密**。含义分两面：
+
+- 对"**原生码不可还原**"这条 —— 达标（native 0 命中）；
+- 对"**反 devirtualize**"这条 —— **不达标**：一次内存 dump 就拿到全部字节码明文，
+  AEAD 的 nonce/tag/密钥在这一步被整体绕过（只有没被调用过的函数还留在密文状态）。
+
+所以"整段替换 + 字节码"要真正达到"不可无损还原"，需要补的是第二半：
+**被替换掉的原文不能在内存里以另一种形式复活**。修法候选（下一轮）：
+按基本块/按指令解密（只解当前块，执行完清零并重加密），或缓存只存密文 + 一个小窗口明文；
+代价在取指热路径上多一次解密，需要实测倍率再决定。
+
+## 数据面加固：字节码在**内存里也始终是密文**（流式取指），并把它变成门禁
+
+### 335. 上一轮承认的缺口
+上一轮实测：原生机器码已经在文件与内存里 0 残留，但 `vm_bc_cache` 把**整份字节码解密到 .bss 常驻**
+（内存扫描 `bytecode:check_key` FOUND）。那等于"原文以另一种形式复活"，devirtualizer 一次 dump 就拿到全部指令流。
+
+### 336. 改法（两处，都很小）
+1. **只验签、不解密**：Poly1305 认证的是**密文**，所以完整性校验不需要明文。
+   新增 `vm_aead_verify_aad()`（`stub/win/x64/vm_crypto.c`），AEAD 的 MAC 部分原样复用，
+   只是不再调用 `vm_chacha20_xor` 把明文写进任何缓冲。
+2. **流式取指**：新增 `vm_chacha20_keystream()` 与解释器里的 `vm_bcs_t`——
+   缓存的是 `ChaCha20 密钥流`（不是明文），按 64 字节块前进（跨块/回跳时重取），
+   取指时 `明文 = 密文[off] ^ ks[off & 63]`，**逐字节**还原。明文只以"寄存器里的一个字节"存在。
+   47 处 `c[pc + N]` / `rd32(&c[pc+N])` 全部改走 `vmb_byte/vmb_rd32/vmb_rd64`。
+3. 顺带删掉整套明文缓存机制（缓存槽 32×16KB + 自旋锁 + 引用计数 + FNV 复核）——
+   它带来的三类老问题（跨线程共享明文、槽位耗尽、明文常驻）一起消失。
+
+### 337. 数字（本机，与改动前同一套门禁/同一口径）
+| 项 | 改动前 | 改动后 |
+|---|---|---|
+| blob | **544,768 B** | **32,768 B**（缓存数组被删，缩 16.6×） |
+| 内存里的明文字节码 | `bytecode:check_key` **FOUND** | **absent** |
+| 原生机器码残留 | 0 | 0 |
+| E2E / DLL / linux 载荷 / arm64 客户机 | 147/3/OK/OK | **147/3/OK/OK** |
+| check_key（bench） | 15.3 µs/iter | **29.0 µs/iter**（×1.9） |
+| sum_to（bench） | 17.2 µs/iter | **28.7 µs/iter**（×1.7） |
+
+### 338. 新增第 10 条门禁（把结论钉死）
+`tools/gates.ps1` 新增 `bytecode plaintext scan (no plaintext in memory)`：
+用 `vmpack -dumpbytecode` 的**明文**当模式，在 `bench check_key` 猛跑时扫描进程全地址空间，
+`--fail-on-bytecode` 时只要命中就红。当前 **10 gates / 0 failed**。
+（这条门禁同时排除了"用 64 字节明文窗口换性能"的做法：窗口会把短函数的明文整段露出来。）
+
+### 339. 边界（不夸大）
+- **"从不出现"严格做不到**：CPU 总要读到指令字节。做到的是"**不常驻**"——没有整份/成块明文缓冲，
+  只有寄存器里的单字节与立即数；门禁扫的是 ≥16 字节的连续明文模式。
+- 采样仍是快照（`--delay 1.5`），启动期的瞬时明文不能靠事后扫描排除。
+- 明文的**操作数**（立即数、跳转目标）同样以寄存器值形式短暂存在。
+
+### 340. 用户提供的、我尚未验证的信息（记录备查）
+用户说明：**pyd 那一版是另一套更强的方案** —— 不只是把函数 VM 化，而是通过 `snvm_x64`
+把 VM 字节码**上传到 HL 加密狗的固件里执行**。若属实，这解释了本机无狗时 pyd 的
+`DLL 初始化例程失败`，也意味着"宿主机内存里根本没有可用的明文 bitcode"——
+这是**类别**差别（密钥/执行体在硬件里），不是我们这条"内存里不常驻明文"能覆盖的。
+我这边没有狗、也没有该 runtime 的资料，**未做验证**；若要跟进，这是独立的一条线
+（与 docs/DESIGN.md 里 KeyProvider/根信任那节同属"密钥依赖"）。
+
+## 原镜像整体加密：做到"加密后的 demo32.exe 那一级"（自解密入口 + TLS 回调插队）
+
+### 341. 目标（用户指定：不需要 pyd 那种"字节码在狗固件里执行"，要做到加密后的 demo32.exe 这一级）
+对齐样本 `D:\其它\demo32.exe` 的实测性质：① 原模块的**整套 .text 在文件里是密文**（原地同尺寸加密，熵 5.99→7.99，
+原 64B 块 0 命中）；② 运行期由自带的 runtime 解密回内存；③ 被 VM 化的函数在内存里也查不到原机器码。
+
+vmp-x 之前只有 ③（抹除 + 门禁），文件里其余代码仍是明文——这一轮补 ①②。
+
+### 342. 改法
+- **打包端**（`cmd/vmpack -enc-image`，默认关）：把 `.text` 的**文件字节原地加密**
+  （ChaCha20-Poly1305；nonce = rva||size||构建 salt，AAD = rva||size），密钥沿用 blob 主密钥；
+  AEAD 标签回填进 payload 里的解密表。同时 `DllCharacteristics` 清掉 `DYNAMIC_BASE`。
+- **运行期**（`stub/win/x64/vm_interp.c: vm_unpack_image`）：只验签（Poly1305 认证的是密文，不需要明文）
+  → `VirtualProtect` 成可写 → 原地解密 → 恢复 `PAGE_EXECUTE_READ`。
+
+  没有导入表可用，所以 `VirtualProtect` 是**自己从 PEB 模块链表找 kernel32、再走导出表**取到的
+  （约 80 行，freestanding），这样既不用把 .text 标成 RWX，也不依赖任何外部 runtime。
+- **TLS 回调插队**：mingw 的 exe 几乎都注册了 TLS 回调（emutls/pseudo-reloc），而回调在**入口点之前**运行——
+  那时 .text 还是密文。做法：把 `vm_unpack_image` 的 thunk 插到回调数组**第 0 项**，
+  并把 TLS 目录的 `AddressOfCallBacks` 指向 payload 里的新数组；解密用 .bss 里的幂等标志保证只做一次
+  （入口蹦床随后还会再调一次）。
+- **fail-fast**：`vm_unpack_image` 先比对"PEB->ImageBaseAddress == 首选基址"，不等就直接返回错误码——
+  清掉 DYNAMIC_BASE 后理论上不会发生，但一旦发生就必须拒绝执行而不是跑飞。
+
+### 343. 本机验证
+- 打包 25 个函数 + `-enc-image`：`DIFF pass=25 fail=0`（原生 vs 整体加密版逐字节一致）；
+- **文件级**：原 `.text` 13312B 熵 5.99 → 打包后同尺寸 **熵 7.99**，原 64B 块在打包文件里只剩 6/207 命中
+  （全部是全零/填充块与打包文件里的零填充撞上；见本轮脚本输出）；
+- 过程性证据：`目标有 2 个 TLS 回调：把自己的自解密回调插到数组最前面`、`原镜像 .text 已原地加密，并清除 DYNAMIC_BASE`；
+- 默认路径（不加 `-enc-image`）不受影响：`tools/gates.ps1` 仍 10/10（见第 344 条）。
+
+### 344. 边界（写清楚）
+- 目前**只加密 `.text`**（`.rdata`/`.data` 仍明文，样本 Envelope 连 .rdata/.data 也加密了）；
+  扩大范围要先处理 CFG/load-config 这类"加载器在入口点之前会读"的数据。
+- `.idata`/`.reloc` 必须保持明文（加载器要用），因此**导入名与重定位信息仍可读**。
+- 需要**首选基址可用**（清了 DYNAMIC_BASE；基址被占则加载失败——这是明确失败，不是静默错误）。
+- 只做了 Windows/x64 的 PE；ELF/arm64 未做（`vm_unpack_image` 在非 Win64 宿主上返回 -9）。
+- 内存里 `.text` 在**解密后**是明文（同 Envelope：非 VM 化的函数必须原生跑）；被 VM 化的函数体在文件里
+  已经是伪随机填充，所以解密出来也不含原文。
+
+### 345. 第 11 条门禁 + 把原镜像整体加密切成默认
+- 命令行开关 enc-image 现在**默认开**（限 x86-64 EXE）：新增 no-enc-image 关闭、enc-image-dll 对 DLL 显式开启。
+  不支持的情形（ARM64 / DLL 默认 / no-encrypt 无密钥 / 找不到 .text）一律**跳过并打印原因**，
+  绝不 fatalf —— 默认开的功能不能把 CI 里的 arm64 目标直接卡死。
+- 新增 tools/image_residue.py：对原 .text 的每个 64B 块在打包文件里搜索，
+  **全零块单独统计并排除**（填充块必然与打包文件自身的零填充相同，不构成证据）。
+- tools/gates.ps1 第 11 条：image residue (original .text not readable in the packed file)。
+
+### 346. 验证（改动后整套门禁重跑）
+- tools/gates.ps1：**11 gates / 0 failed**。关键是 e2e **147/147 是在"整体加密默认开"的产物上跑的**
+  （不是单独的手工样本）；DLL 3/3（DLL 默认跳过加密）、arm64 客户机、linux 载荷、PIE 两装载地址全绿。
+- 第 11 条输出：chunks=208  all-zero(excluded)=7  NON-ZERO CHUNKS STILL FOUND=0。
+- 第 9/10 条（原生码残留、明文块残留）仍 0 命中；.text 熵 5.99 -> 7.99。
+- 默认路径抽查差分 3/3 与原生一致。
+
+### 347. 仍未做（如实）
+.rdata/.data 整体加密（样本 Envelope 做了；要先处理 CFG/load-config 这类"加载器在入口点之前会读"的数据）、
+ELF/arm64 侧的实现、DLL 的默认加密（当前必须显式开 enc-image-dll，未纳入常跑门禁）。
+
+### 348. 第二轮：.rdata 也整体加密（连同 TLS 目录搬迁）
+- enc-image 现在加密 .text + .rdata。关键障碍是**加载器在入口点之前要读 TLS 目录**，而它正好落在
+  .rdata 里（target.exe：TLS dir RVA=0x6460）：所以打包端把 40 字节的 IMAGE_TLS_DIRECTORY64
+  原样复制进 payload（明文），并把数据目录 [9] 重指向副本；回调数组的改写也改成写进副本。
+  TLS 目录里存的是 VA（指向 .tls 节，不加密），在"必须落在首选基址"的前提下仍然有效。
+- 其余"加载器要读"的目录都在别的节：IMPORT/IAT -> .idata、EXCEPTION -> .pdata、
+  RESOURCE -> .rsrc、BASERELOC -> .reloc（实测映射表见本轮脚本输出）。所以加密 .rdata 是安全的。
+
+### 349. 验证
+- tools/image_residue.py 支持多节（默认 .text,.rdata）；门禁第 11 条改成两节一起断言。
+- 门禁 **11 / 0 failed**：.text 208 块非零 **0** 命中；.rdata 72 块非零 **0** 命中（熵 4.88 -> 7.96）；
+  e2e **147/147 跑在"两节都已加密"的产物上**；DLL 3/3、arm64 客户机、linux 载荷、PIE 两装载地址全绿；
+  第 9/10 条（原生码残留、字节码明文残留）仍 0 命中。
+- 临时样本差分 4/4 与原生一致；日志里能看到 "TLS 目录在 .rdata 里：搬到 payload"。
+
+### 350. 仍未做（下一轮的候选，按价值排序）
+1. .data 整体加密（可写数据：加载器/CRT 可能在入口点之前写入，需要单独设计）；
+2. ELF/arm64 侧的对应实现（当前非 Win64 宿主直接返回 -9）；
+3. DLL 的默认加密（现在必须显式 enc-image-dll，未纳入常跑门禁）。
+
+### 351. 第三轮：.data 也整体加密（+ 数据目录守卫，顺手修掉页保护映射的错）
+- 候选节从 .text/.rdata 扩到 .data。flags 语义扩成 bit0 = 可执行 / bit1 = 可写，
+  vm_unpack_image 解密后按这两位恢复页保护 —— 顺带修掉一个真 bug：原来"只读"写的是 0x04，
+  而 0x04 是 PAGE_READWRITE：.rdata 解密后一直被留成可写。现在 0x02=PAGE_READONLY、
+  0x04=PAGE_READWRITE、0x20=PAGE_EXECUTE_READ、0x40=PAGE_EXECUTE_READWRITE 各归各位。
+- 新增 loaderDirConflict() 守卫：IMPORT / RESOURCE / EXCEPTION / BASERELOC / LOADCONFIG /
+  BOUNDIMPORT / IAT / DELAYIMPORT / CLR 这些"加载器在入口点之前要读"的目录只要落在候选节里，
+  **这一节就跳过并打印原因**。理由：不同链接器会把 .idata/.rdata/.data 合并，不能假设 mingw 的布局。
+  TLS 目录不在此列（它照旧被搬进 payload 并重指，见第 348 条）。SECURITY 项存的是文件偏移、
+  DEBUG 只有调试器读，两者不算冲突。
+- tools/image_residue.py 默认与门禁第 11 条一起改成 .text,.rdata,.data 三节。
+
+### 352. 验证
+- 门禁 **11 / 0 failed**：e2e **147/147 跑在"三节都已加密"的产物上**；DLL 3/3、arm64 客户机、
+  linux 载荷、PIE 两个装载地址全绿；第 9/10 条（原生码、明文字节码）仍 0 命中。
+- 文件级残留（非零 64B 块命中的个数）：
+  .text 208 块 -> **0**（熵 5.99 -> 7.99）；.rdata 72 块 -> **0**（4.88 -> 7.96）；
+  .data 8 块 -> **0**（0.75 -> 7.64）。
+
+### 353. 本轮否掉的一条：DLL 默认纳入整体加密（实测不成立，已回退）
+把 DLL 也纳入默认后，e2e_dll 立刻 0/3：`LoadLibrary(build/testlib_vmp.dll) failed: 1114`
+（DLL 初始化例程失败）。判断：清掉 DYNAMIC_BASE 只能阻止"系统为了 ASLR 主动重定位"，
+**挡不住加载器在首选基址被占时给 DLL 做重定位** —— .reloc 还在，它照样改写 .text，
+密文被改写后解密出来就是垃圾，于是 DllMain 失败。EXE 不受影响（它是进程第一个模块，基址必然可用）。
+处置：DLL 默认**回退为关**（保留 enc-image-dll 显式开关），真正修法（剥 .reloc + 自映射，
+或在 stub 里补偿重定位）留给后续轮次。
+同时记下一条改进点：入口蹦床目前**忽略** vm_unpack_image 的返回码，失败后继续跑密文、
+只表现为 1114；应该改成失败即 trap，让现场可辨。
+
+### 354. 第四轮：让"自解密失败"可诊断（fail-fast trap）+ 可指定加密节 + 拆重定位表
+- **入口蹦床与 TLS 回调 thunk 都加了 fail-fast**：`call vm_unpack_image` 之后立即
+  `test eax,eax / jz +2 / ud2`。以前失败会**带着密文继续跑**，只表现为含糊的 1114 或 AV。
+- 新增 `-enc-image-sections .text,.rdata,.data`（留空 = 默认三节），便于按节二分定位问题。
+- 新增 `stripRelocations()`：整体加密时把重定位表整个拆掉（BASERELOC 目录清零 + .reloc 节内容清零 +
+  置 IMAGE_FILE_RELOCS_STRIPPED）。理由：加密是在**文件字节**上做的，加载器一旦按重定位改写 .text，
+  密文就被破坏；清 DYNAMIC_BASE 只挡"为 ASLR 主动重定位"，挡不住强制重定位。
+  拆掉之后加载器**只能**落在首选基址，落不下就明确失败。
+
+### 355. DLL 仍然是阻塞项（如实记录，默认保持关闭）
+本轮把 DLL 失败追到下面这些事实，但**尚未修好**：
+1. 打包产物静态检查**全部正确**：BASERELOC 目录已清零、RELOCS_STRIPPED=1、DYNAMIC_BASE=0、
+   TLS 目录已搬进 payload（`.eje2d41` RX）且回调数组 = [我们的 thunk, 原回调 0x…1550, 0x…1530, 0]、
+   thunk 与 entry 的字节序列都对（含新的 fail-fast 序列 `85 c0 74 02 0f 0b`）。
+2. **按节二分**：`.text` 单独加密 / `.text,.rdata` / 三节全加密 —— 三者都是 `LoadLibrary failed: 1114`。
+   而同一 DLL 不加密时 e2e 3/3 通过。⇒ 不是 .data/.rdata 的问题，是加密 .text 之后 DLL 的初始化就失败。
+3. fail-fast 的 ud2 **一次都没触发** ⇒ `vm_unpack_image` 要么没被调用、要么返回 0（解密成功）。
+   结合 1 的静态正确性，最可能是"解密成功，但 DLL 自己的初始化随后失败"。
+下一步诊断（下一轮）：在 blob 里加一个导出的诊断数组（`vm_img_diag[4]` = {rc, 实际基址, 期望基址, 计数}），
+配一个能在 host 存活期间 ReadProcessMemory 读它的探针；或者在各阶段用已解析到的 `ExitProcess` 退出码打标。
+在此之前 **DLL 默认保持不加密**（`-enc-image-dll` 仅供实验），不纳入常跑门禁。
+
+### 356. 第四轮（续）：DLL 的根因找到了 —— 是**取错了基址**，不是重定位
+第 353/355 条把 DLL 判成"重定位破坏密文"，**这个结论是错的**。本轮加了诊断基建后一次定位：
+
+- 观测手段：`u64 vm_img_diag[4]`（.bss，进 manifest）+ 失败路径 `ExitProcess(0xC0DE0000|rc)`，
+  于是"DLL 加载失败"从含糊的 1114 变成可读的退出码。
+- 第一次实测拿到 `rc=0xC0DE0002` ⇒ `vm_unpack_image` 认为"实际基址 != 首选基址"。
+  真因：**`PEB->ImageBaseAddress` 是"宿主 EXE"的基址，不是正在加载的 DLL 的基址** ——
+  在 DLL 里它永远不等，于是自解密直接拒绝执行（EXE 恰好相等，所以只有 DLL 中招）。
+- 修法：解密表头加一个 `selfRVA`（表自身的 RVA，`payload.go` 写入、`vmpack` 的加密侧把条目偏移
+  从 16 改到 24），运行期用 **"表的地址 − selfRVA"** 反推本镜像基址，再用 `MZ` 校验一次。
+  顺手保留 `base != wantBase` 的 fail-fast。
+- 过程记录（教训）：改表头时我漏改了 C 侧的条目偏移（16→24），表现为 EXE 直接 ud2、DLL 报
+  `0xC0DE0004`（验签失败）—— 两边都在几秒内报出可读原因，这正是上一轮加 fail-fast/退出码的价值。
+
+### 357. DLL 现在默认纳入整体加密
+- `-enc-image-dll` 改成默认**开**，新增 `-no-enc-image-dll` 关闭。
+- `tools/e2e_dll.ps1`（3 例，含 LoadLibrary/GetProcAddress 调用链）在"默认加密"下 **3/3 通过**。
+- 前提与代价（写清楚）：打包端已拆掉重定位表（`IMAGE_FILE_RELOCS_STRIPPED`），
+  所以 DLL **必须**落在首选基址；落不下会明确失败（而不是跑飞）。
+  这同时意味着该 DLL 失去了 ASLR —— 这是"文件里读不到原文"换来的确定代价。
+
+### 358. 第五轮：Linux/amd64 侧的自解密运行期能力（打包端留待下一轮）
+- **先修一个隐含陷阱**：Linux 载荷的 blob 是**复用同一份** stub/win/x64/vm_interp.c
+  （BLOB.sources 里写死），而 vmpbuild 在"编译器目标是 Windows ABI"时无条件定义
+  VM_BLOB_USES_WIN64 —— 也就是说**给 Linux 编的那份里也编进了 PEB/VirtualProtect 那一套**。
+  本轮新增 VMP 目标 OS 定义：vmpbuild 在 src 路径含 "linux" 时加 -DVM_BLOB_TARGET_LINUX=1，
+  于是"运行期能力按目标 OS 选，而不是按编译宿主的 ABI 选"。
+- **新增 Linux/amd64 的 vm_unpack_image**：与 Windows 侧同一套解密表格式
+  （表头 24 字节：imageBase / salt / count / selfRVA / 保留；条目 32 字节：rva/size/flags/pad/tag），
+  基址同样用「表地址 − selfRVA」反推并校验 ELF 魔数（0x464C457F），
+  改页保护走 **mprotect(2) 系统调用**（x86-64 syscall 号 10，无 libc）：
+  先把整页放宽成 RWX 解密，再按 flags 恢复成 R+X / R / R+W。
+  失败路径带可辨认返回码，并把观测量写进 vm_img_diag[4]（rc / 实际基址 / 期望基址 / 调用次数）。
+- **本轮只到"运行期能力就位"**：两份 blob（Windows 与 Linux）都编得出来（各 32768 字节），
+  Linux 那份由门禁里的 "linux payload" 步骤真实构建并执行其载荷 —— 但**打包端尚未给 ELF 生成解密表**，
+  所以这段代码现在还是"编进去但没被调用"。给 ELF 加密 .text、发解密表、发 **SysV 版**的解密蹦床
+  （rdi 传表地址）、再串到已有的校验蹦床，是下一轮的活儿；ELF 入口路径的运行期验证需要 Linux/CI。
+- 过程记录：第一版把 static u32 vm_img_done 放在 Windows 分支里，Linux blob 立刻编译失败
+  （undeclared）——所以本轮起**两份 blob 都显式构建**，这类平台分叉问题当场暴露。
+
+### 359. 第六轮：ELF 侧打包端（默认关）+ 文件级验证
+- 新增 -enc-image-elf（默认关），只对 **ET_EXEC 的 x86-64 ELF** 生效：取第一个可执行 PT_LOAD，
+  用与 PE 完全相同的表格式（表头 24B：imageBase/salt/count/selfRVA/保留；条目 32B：rva/size/flags/pad/tag）
+  生成解密表，并给入口发一个 **SysV 版**解密蹦床（push rdx / mov r12,rsp / and rsp,-16 /
+  lea rdi,[rip+表] / call vm_unpack_image / fail-fast / mov rsp,r12 / pop rdx / jmp 校验蹦床），
+  再串到已有的 e_entry 校验蹦床。ImageBase 传 0 = 运行期不强制校验基址；
+  **PIE/ET_DYN 明确跳过**（ld.so 会把重定位写进密文，解密出来就是垃圾，需要单独方案）。
+- 新增 tools/image_residue_elf.py：解析原 ELF 的可执行 PT_LOAD，逐个 64B 非零块在打包文件里搜。
+  实测同一个构建：不加密 **9365/9398** 命中（整段可读）；-enc-image-elf 后 **1/9398**，
+  而那 1 块是 \x01 后面跟 63 个 0（任何"值为 1 的 8 字节字段 + 零填充"都能撞上）——属于巧合匹配，
+  不是代码残留。即"ELF 的代码在文件里读不到"这条在文件级成立。
+- **修掉一处我自己造成的源码重复**：internal/inject/elf.go 里"顺序修正"那段和
+  一个被改名的 paypayloadPhdrIndex 函数被整段复制（gofmt/vet/go test 都不报，因为它照样编译）。
+  本轮清理，并把 ApplyELF 的 Result 补上 ImgTableRVA/ImgTableLen ——
+  ELF 加密靠它定位解密表，漏了就会"解密表越界（off=0x0 len=0）"（本轮实测踩到并修掉）。
+- **运行期仍未验证**：ELF 入口路径本机跑不了（无 Linux 真机/qemu）；现有 "linux payload" 门禁
+  只执行载荷路径（把 blob 映射进来直接调 thunk），不经过真实 ELF 的入口。需要 CI/真机确认。
+
+### 360. 本轮门禁
+11 gates / 0 failed：e2e 147/147、dll 3/3、arm64 客户机、linux 载荷、两条残留门禁、image residue 全绿
+（ELF 默认关，所以既有 Linux 路径一行未动）。
+
+### 361. 第七轮：把 SysV 解密蹦床钉进单测（本机唯一能做的 ELF 入口验证）
+- 新增 internal/inject/payload_sysv_test.go：
+  ① TestSysVUnpackTrampoline —— 逐字节断言 ELF/SysV 版解密蹦床的形状
+     （push rdx / mov r12,rsp / and rsp,-16 / lea rdi,[rip+表] / call / test-jz-ud2 /
+     mov rsp,r12 / pop rdx / jmp），并解码三处 rel32：必须分别指向"解密表""vm_unpack_image"
+     "下一跳（校验蹦床）"；同时校验表头（imageBase=0、count、selfRVA == 表自身 RVA）与条目 {rva,size,flags}。
+  ② TestWin64UnpackTrampolineKeepsRcx —— PE 那条不能被改坏（序言必须是 push rcx/rdx/r8 + lea rcx）。
+- 意义：ELF 入口路径本机跑不了（无 Linux/qemu），但"蹦床编码有没有写错"从此有回归测试兜底 ——
+  这类错误以前只能等 CI 才暴露（本会话里就踩过一次表头偏移没同步：EXE 立刻 ud2、DLL 报 0xC0DE0004）。
+- 仍未做：ELF 入口的**运行期**验证（需 CI/真机）、PIE 方案（需重定位剥离或自映射）、arm64 侧整体加密。
+
+### 362. 第八轮：把 ELF 的运行期验证做成"可在 Linux 上一键跑"的脚本（本机仍无法执行）
+- 新增 tools/e2e_elf_image.sh：在 Linux/amd64 上依次做 ——
+  ① 用 -enc-image-elf 打包 ET_EXEC 的 x86-64 ELF；② 结构断言（e_entry 必须落在 payload 新段里）；
+  ③ 文件级断言（复用 tools/image_residue_elf.py：原执行段非零 64B 块 0 残留）；
+  ④ 运行期断言（打包后的 ELF 真跑，输出与原生逐字节一致）。
+  默认**报告模式**（失败只打印 MISMATCH、退出 0），加 --strict 才退出 1 ——
+  避免一个未经真机确认的脚本把 CI 直接卡红。
+- 为什么没有直接改 tools/e2e.sh：那段 bash 在本机无法执行，未验证的改动进 CI 风险更高；
+  等 Linux 上跑通一次再把它接进 CI（一行调用即可）。
+- **如实登记（环境阻塞）**：ELF 入口路径的运行期验证需要 Linux/amd64（或 qemu-system）——
+  本机没有，这已是连续第 3 轮同一条件（第 5/6/7 轮）。所需外部动作：
+  在 Linux 上执行 `bash tools/e2e_elf_image.sh --strict`，绿了再接进 CI。
+- arm64 侧整体加密的打包端（入口蹦床 + 保存 x0/x1/x2）仍未做，同样需要 aarch64 运行环境才能收尾。
+
+### 363. 第九轮（末轮）：arm64 入口解密蹦床 + 用自带解码器钉死编码
+- 新增 buildImgHookARM64()：mov x19/x20/x21 ← x0/x1/x2（入口参数，原始入口还要用；x19..x21 是
+  callee-saved，被调用的 C 函数会保住）、adrp+add 取表地址、bl vm_unpack_image、
+  cbz w0,+8 / brk #0（失败即 trap）、恢复 x0..x2、b 下一跳。
+  payload.go 的蹦床装配按 opt.Arch 分流，**x64 那条路径一字未动**。
+- 新增 payload_arm64_test.go：用仓库自带的 internal/decode/arm64 **解码器**逐条核对 12 条指令的
+  助记符、ADRP/BL/B 的 PC 相对目标、ADD 的 imm12、CBZ 的 +8。arm64 没真机可跑，
+  但"编码写错"从此本地就能抓到（本轮自身就踩到一个：Go 里写了 C 习惯的 0xFFFu 后缀 → 编译错误，已修）。
+
+### 364. 最终状态（如实）
+| 目标项 | 状态 |
+|---|---|
+| (1) .data 整体加密 | **完成并验证**：.text/.rdata/.data 三节原地加密，文件级非零块 0 残留，e2e 147/147、门禁 11/0 |
+| (3) DLL 默认纳入整体加密 | **完成并验证**：根因 = PEB->ImageBaseAddress 是**宿主 EXE** 的基址；改用"表地址 − selfRVA"后 DLL 通过并转默认，dll e2e 3/3 |
+| (2) ELF/arm64 对齐 | **打包端 + 运行期能力 + 编码单测 + 文件级验证全部完成**；**入口路径的运行期验证需要 Linux/aarch64 环境**（本机无 Linux 真机/qemu/aarch64 工具链，自第 5 轮起连续 4 轮同一条件）。已交付 Linux 上一键脚本 tools/e2e_elf_image.sh（默认报告模式，--strict 才失败）——跑通即可接入 CI 收尾 |
+| (4) 每轮门禁全绿 + 如实登记未做项 | **达成**：8 轮全程 11 gates / 0 failed，未做项逐轮登记在本文件 |
+
+工具侧沉淀：tools/image_residue.py（PE 多节）、tools/image_residue_elf.py（ELF 执行段）、
+tools/residue_probe.py（运行期原生码/明文字节码）、tools/live_code_{residue,map}.py、tools/rip_probe.py、
+tools/e2e_elf_image.sh（Linux 侧真机检查）。

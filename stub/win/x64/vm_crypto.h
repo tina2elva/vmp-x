@@ -24,6 +24,15 @@ void vm_poly1305(const u8 key[32], const u8 *m, u32 len, u8 tag[16]);
 int vm_aead_open_aad(const u8 key[32], const u8 nonce[12], const u8 *aad, u32 aadLen,
                      const u8 *ct, u32 len, const u8 tag[16], u8 *out);
 
+/* 只生成一个 64 字节密钥流块（AEAD 的数据流从 counter>=1 开始）。
+ * 流式取指用它按块还原字节码明文，宿主内存里因此不需要任何明文缓冲。 */
+void vm_chacha20_keystream(const u8 key[32], u32 counter, const u8 nonce[12], u8 out[64]);
+
+/* 只验签、**不解密**：Poly1305 认证的是**密文**，所以完整性校验可以在
+ * 不产生任何明文字节的前提下完成（这是"内存里不留明文"的前提）。 */
+int vm_aead_verify_aad(const u8 key[32], const u8 nonce[12], const u8 *aad, u32 aadLen,
+                       const u8 *ct, u32 len, const u8 tag[16]);
+
 /* 无 AAD 的简化形式（保留给调试与旧向量） */
 int vm_aead_open(const u8 key[32], const u8 nonce[12], const u8 *ct, u32 len, const u8 tag[16], u8 *out);
 

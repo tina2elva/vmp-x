@@ -11,6 +11,7 @@
 package inject
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -27,12 +28,61 @@ type FuncSpec struct {
 	Name string
 	RVA  uint32 // 相对镜像基址的地址（PE 的 RVA / ELF 的 VA-imageBase）
 	Code []byte // VM 字节码
+	// NativeSize：该函数在**目标镜像里**的原生机器码长度（字节）。
+	// 打包端据此抹除残留的原生指令（见 Options.Wipe）。
+	NativeSize int
 }
 
 // EncryptFunc 加密钩子：把明文字节码密封成密文 + nonce + tag。
 // 返回的密文长度必须等于明文长度（ChaCha20 是流密码），这样 payload 布局不受影响。
 // aad 把密文绑定到**具体槽位**（selfRVA || funcRVA）：把一段合法密文换到另一个函数位置会验签失败。
 type EncryptFunc func(plain []byte, aad []byte) (ct []byte, nonce [12]byte, tag [16]byte, err error)
+
+// ImgSection 一个需要入口自解密的原镜像节
+type ImgSection struct {
+	RVA   uint32
+	Size  uint32
+	Flags uint32 // bit0 = 可执行、bit1 = 可写（解密后按这两位恢复页保护）
+}
+
+// buildImgHookARM64 生成 AArch64 的入口自解密蹦床（12 条指令 / 48 字节）：
+//
+//	mov x19,x0 / mov x20,x1 / mov x21,x2      保存入口参数（x0..x2 是 PE/ELF 入口的
+//	                                          (hInstance/module, reason, reserved) 之类，原始入口还要用；
+//	                                          x19..x21 是 callee-saved，被调用的 C 函数会替我们保住）
+//	adrp x0, page(表) / add x0,x0,#(表 & 0xFFF)
+//	bl vm_unpack_image
+//	cbz w0, +8 / brk #0                       失败即 trap（不带着密文往下跑）
+//	mov x0,x19 / mov x1,x20 / mov x2,x21      恢复入口参数
+//	b 下一跳（有校验蹦床就跳它，否则跳原始入口）
+//
+// 编码正确性由 internal/inject/payload_arm64_test.go 用仓库自带的 AArch64 解码器逐条核对。
+func buildImgHookARM64(hookRVA, imgTableRVA, unpackRVA, nextRVA uint32) []byte {
+	t := make([]byte, 0, 48)
+	put := func(v uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], v)
+		t = append(t, b[:]...)
+	}
+	put(0xAA0003F3) // mov x19, x0
+	put(0xAA0103F4) // mov x20, x1
+	put(0xAA0203F5) // mov x21, x2
+	tblPage := imgTableRVA &^ 0xFFF
+	pcPage := hookRVA &^ 0xFFF
+	delta := (int64(tblPage) - int64(pcPage)) >> 12
+	immlo := uint32(delta) & 0x3
+	immhi := (uint32(delta) >> 2) & 0x7FFFF
+	put(0x90000000 | (immlo << 29) | (immhi << 5))                               // adrp x0, page(表)
+	put(0x91000000 | ((imgTableRVA & 0xFFF) << 10))                              // add x0, x0, #(表 & 0xFFF)
+	put(arm64Branch(0x94000000, int64(unpackRVA), int64(hookRVA)+int64(len(t)))) // bl unpack
+	put(0x34000000 | (2 << 5))                                                   // cbz w0, +8
+	put(0xD4200000)                                                              // brk #0
+	put(0xAA1303E0)                                                              // mov x0, x19
+	put(0xAA1403E1)                                                              // mov x1, x20
+	put(0xAA1503E2)                                                              // mov x2, x21
+	put(arm64Branch(0x14000000, int64(nextRVA), int64(hookRVA)+int64(len(t))))   // b next
+	return t
+}
 
 // Options 注入参数
 type Options struct {
@@ -67,9 +117,25 @@ type Options struct {
 	EntryHookSysV bool
 	// EntryRVA：目标原本的入口点 RVA（蹦床校验完要跳回去）。
 	EntryRVA uint32
+	// ImgSections：需要"入口自解密"的原镜像节（原镜像整体加密）。为空则不启用。
+	ImgSections []ImgSection
+	// ImageBase：目标的首选镜像基址（写进表头；运行期据此拒绝"被重定位"的情况）。
+	ImageBase uint64
+	// UnpackFn：vm_unpack_image 在 blob 内的偏移（manifest 的 symbols 里查）。
+	UnpackFn int
+	// TlsDirCopy：TLS 目录（IMAGE_TLS_DIRECTORY64，40 字节）的副本。TLS 目录常常落在 .rdata 里，
+	// 而加载器在入口点之前必须读它 —— 整体加密 .rdata 时得把它搬到 payload（明文）并把数据目录指过来。
+	TlsDirCopy []byte
+	// ImgTlsCallbacks：目标原有的 TLS 回调 VA（非空时我们会把自己的回调插到数组最前面，
+	// 因为回调在入口点之前运行，那时 .text 还是密文）。
+	ImgTlsCallbacks []uint64
 	// PatchKey：入口补丁完整性校验用的密钥前缀（通常取 blob 主密钥前 8 字节）。
 	// 全 0 表示不启用校验（例如 -no-encrypt 的调试构建）。
 	PatchKey [8]byte
+	// Wipe：抹除被保护函数的原生机器码（入口补丁之外的部分全部填成伪随机字节）。
+	// 不抹除时，产物里除了 5/8 字节跳板，整段原生函数体仍原样保留 ——
+	// 拿到同源的另一份构建即可按 RVA 差分拼回，等于没有保护。
+	Wipe bool
 	// Verbose：打印注入过程的细节。
 	Verbose bool
 	// Arch 目标架构："x86-64"（默认）或 "arm64"。
@@ -105,6 +171,8 @@ func (a Arch) info() (thunkLen, patchLen int, err error) {
 type Placement struct {
 	Name          string `json:"name"`
 	FuncRVA       uint32 `json:"funcRVA"`
+	NativeSize    int    `json:"nativeBytes"`
+	WipedBytes    int    `json:"wipedBytes"`
 	BytecodeSize  int    `json:"bytecodeBytes"`
 	DescRVA       uint32 `json:"descRVA"`
 	ThunkRVA      uint32 `json:"thunkRVA"`
@@ -125,16 +193,26 @@ type Payload struct {
 	// EntryHookRVA：校验蹦床的 RVA（0 = 没有）；EntryHookLen：蹦床长度。
 	EntryHookRVA uint32
 	EntryHookLen int
+	// ImgTableRVA/ImgTableLen：原镜像解密表（0 = 没启用）；ImgHookRVA：入口自解密蹦床。
+	ImgTableRVA    uint32
+	ImgTableLen    int
+	ImgHookRVA     uint32
+	ImgTlsArrayRVA uint32
+	TlsDirRVA      uint32
 }
 
 // Result 注入结果
 type Result struct {
 	// SectionNames：本次注入实际使用的节名（打包端默认随机生成，分析脚本据此定位我们的节）。
-	SectionNames []string    `json:"sectionNames"`
-	SectionRVA   uint32      `json:"sectionRVA"`
-	SectionSize  int         `json:"sectionSize"`
-	StubEntryRVA uint32      `json:"stubEntryRVA"`
-	Placements   []Placement `json:"placements"`
+	SectionNames   []string    `json:"sectionNames"`
+	SectionRVA     uint32      `json:"sectionRVA"`
+	SectionSize    int         `json:"sectionSize"`
+	StubEntryRVA   uint32      `json:"stubEntryRVA"`
+	Placements     []Placement `json:"placements"`
+	ImgTableRVA    uint32      `json:"imgTableRVA"`
+	ImgTableLen    int         `json:"imgTableLen"`
+	ImgTlsArrayRVA uint32      `json:"imgTlsArrayRVA"`
+	TlsDirRVA      uint32      `json:"tlsDirRVA"`
 }
 
 // BuildPayload 组装 payload；baseRVA 是 payload 将被放置的地址（相对镜像基址）
@@ -299,6 +377,7 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		placements = append(placements, Placement{
 			Name:          fn.Name,
 			FuncRVA:       fn.RVA,
+			NativeSize:    fn.NativeSize,
 			BytecodeSize:  len(fn.Code),
 			DescRVA:       baseRVA + uint32(d),
 			ThunkRVA:      thunkRVA,
@@ -373,7 +452,133 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		entryHookRVA = trampRVA
 		entryHookLen = len(t)
 	}
-	pl := &Payload{Data: data, Placements: placements, CodeSize: len(data) - opt.BSSSize, BSSOff: opt.BSSOff, BSSSize: opt.BSSSize, EntryHookRVA: entryHookRVA, EntryHookLen: entryHookLen}
+	// ---- 原镜像整体加密：解密表 + 入口自解密蹦床 ----
+	// 表头 + 每个节一条（tag 先留 0，打包端加密完再回填）；蹦床先调 vm_unpack_image，
+	// 再跳到补丁校验蹦床（若有），最后到原始入口点。
+	imgTableRVA := uint32(0)
+	imgTableLen := 0
+	imgHookRVA := uint32(0)
+	if len(opt.ImgSections) > 0 && opt.UnpackFn >= 0 {
+		align(16)
+		imgTableRVA = baseRVA + uint32(len(data))
+		var saltB [4]byte
+		if _, err := rand.Read(saltB[:]); err != nil {
+			return nil, err
+		}
+		salt := binary.LittleEndian.Uint32(saltB[:])
+		put32 := func(v uint32) {
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], v)
+			data = append(data, b[:]...)
+		}
+		var ib [8]byte
+		binary.LittleEndian.PutUint64(ib[:], opt.ImageBase)
+		data = append(data, ib[:]...)
+		put32(salt)
+		put32(uint32(len(opt.ImgSections)))
+		// 表自身的 RVA：运行期用它从"表的地址"反推镜像基址。
+		// 不能用 PEB->ImageBaseAddress —— 那是**宿主 EXE** 的基址，DLL 里取到的是错的（实测 -2）。
+		put32(imgTableRVA)
+		put32(0) // 保留
+		for _, s := range opt.ImgSections {
+			put32(s.RVA)
+			put32(s.Size)
+			put32(s.Flags)
+			put32(0)
+			data = append(data, make([]byte, 16)...) // tag：打包端加密后回填
+		}
+		imgTableLen = len(data) - int(imgTableRVA-baseRVA)
+		align(16)
+		imgHookRVA = baseRVA + uint32(len(data))
+		next := entryHookRVA
+		if next == 0 {
+			next = opt.EntryRVA
+		}
+		var t []byte
+		if opt.Arch == ArchARM64 {
+			t = buildImgHookARM64(imgHookRVA, imgTableRVA, baseRVA+uint32(opt.UnpackFn), next)
+		} else {
+			t = make([]byte, 0, 64)
+			var lea []byte
+			if opt.EntryHookSysV {
+				// System V（ELF）：入口处 rdx 可能是 _start 需要的 rtld_fini，必须原样保留；
+				// r12 是 callee-saved，用它保存原始 rsp，被调用的 C 函数会替我们保住它。
+				t = append(t, 0x52)                   // push rdx
+				t = append(t, 0x49, 0x89, 0xE4)       // mov r12, rsp
+				t = append(t, 0x48, 0x83, 0xE4, 0xF0) // and rsp, -16（C 调用要求 16 字节对齐）
+				lea = make([]byte, 7)
+				lea[0], lea[1], lea[2] = 0x48, 0x8D, 0x3D // lea rdi,[rip+disp32]（SysV 第一个参数）
+			} else {
+				t = append(t, 0x51, 0x52, 0x41, 0x50) // push rcx; push rdx; push r8
+				lea = make([]byte, 7)
+				lea[0], lea[1], lea[2] = 0x48, 0x8D, 0x0D // lea rcx,[rip+disp32]
+			}
+			binary.LittleEndian.PutUint32(lea[3:], uint32(int32(imgTableRVA)-int32(imgHookRVA+uint32(len(t)+7))))
+			t = append(t, lea...)
+			t = append(t, 0xE8)
+			callOff := len(t)
+			t = append(t, 0, 0, 0, 0)
+			// 失败即 trap：vm_unpack_image 返回非 0 时不能继续跑到密文上（以前会静默变成 1114/AV，难定位）
+			t = append(t, 0x85, 0xC0) // test eax, eax
+			t = append(t, 0x74, 0x02) // jz +2
+			t = append(t, 0x0F, 0x0B) // ud2
+			if opt.EntryHookSysV {
+				t = append(t, 0x4C, 0x89, 0xE4) // mov rsp, r12
+				t = append(t, 0x5A)             // pop rdx
+			} else {
+				t = append(t, 0x41, 0x58, 0x5A, 0x59) // pop r8; pop rdx; pop rcx
+			}
+			t = append(t, 0xE9)
+			jmpOff := len(t)
+			t = append(t, 0, 0, 0, 0)
+			unpackRVA := baseRVA + uint32(opt.UnpackFn)
+			binary.LittleEndian.PutUint32(t[callOff:], uint32(int32(unpackRVA)-int32(imgHookRVA+uint32(callOff+4))))
+			binary.LittleEndian.PutUint32(t[jmpOff:], uint32(int32(next)-int32(imgHookRVA+uint32(jmpOff+4))))
+		}
+		data = append(data, t...)
+	}
+	// ---- TLS 目录副本（当它落在被整体加密的节里时） ----
+	tlsDirRVA := uint32(0)
+	if len(opt.TlsDirCopy) > 0 {
+		align(8)
+		tlsDirRVA = baseRVA + uint32(len(data))
+		data = append(data, opt.TlsDirCopy...)
+	}
+	// ---- TLS 回调：把自己的回调放到数组最前面 ----
+	// 加载器在**入口点之前**依次调用 TLS 回调；mingw 的 exe 几乎都注册了回调
+	// （emutls 初始化 / pseudo-reloc），它们会先执行 .text —— 那时还是密文。
+	// 所以把 vm_unpack_image 的 thunk 插到回调数组的第 0 项。
+	imgTlsArrayRVA := uint32(0)
+	if len(opt.ImgSections) > 0 && opt.UnpackFn >= 0 && len(opt.ImgTlsCallbacks) > 0 {
+		align(16)
+		thunkRVA := baseRVA + uint32(len(data))
+		th := make([]byte, 0, 16)
+		th = append(th, 0x48, 0x8D, 0x0D) // lea rcx,[rip+disp32]
+		leaOff := len(th)
+		th = append(th, 0, 0, 0, 0)
+		th = append(th, 0xE8) // call vm_unpack_image
+		callOff := len(th)
+		th = append(th, 0, 0, 0, 0)
+		th = append(th, 0x85, 0xC0) // test eax, eax
+		th = append(th, 0x74, 0x02) // jz +2
+		th = append(th, 0x0F, 0x0B) // ud2（失败即 trap）
+		th = append(th, 0xC3)       // ret
+		binary.LittleEndian.PutUint32(th[leaOff:], uint32(int32(imgTableRVA)-int32(thunkRVA+uint32(leaOff+4))))
+		unpackRVA := baseRVA + uint32(opt.UnpackFn)
+		binary.LittleEndian.PutUint32(th[callOff:], uint32(int32(unpackRVA)-int32(thunkRVA+uint32(callOff+4))))
+		data = append(data, th...)
+		align(8)
+		imgTlsArrayRVA = baseRVA + uint32(len(data))
+		var va [8]byte
+		binary.LittleEndian.PutUint64(va[:], opt.ImageBase+uint64(thunkRVA))
+		data = append(data, va[:]...)
+		for _, cb := range opt.ImgTlsCallbacks {
+			binary.LittleEndian.PutUint64(va[:], cb)
+			data = append(data, va[:]...)
+		}
+		data = append(data, make([]byte, 8)...) // 终止项
+	}
+	pl := &Payload{Data: data, Placements: placements, CodeSize: len(data) - opt.BSSSize, BSSOff: opt.BSSOff, BSSSize: opt.BSSSize, EntryHookRVA: entryHookRVA, EntryHookLen: entryHookLen, ImgTableRVA: imgTableRVA, ImgTableLen: imgTableLen, ImgHookRVA: imgHookRVA, ImgTlsArrayRVA: imgTlsArrayRVA, TlsDirRVA: tlsDirRVA}
 	return pl, nil
 }
 

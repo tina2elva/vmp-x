@@ -539,6 +539,11 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		// 目标入口页不在映射里 → 校验读不到补丁字节 → trap），现在夹具会补映射补丁页，故两边一致。
 		args = append(args, "-DVM_INVM_PATCHCHECK=1")
 		if compilerIsWindows {
+			// 同一个 vm_interp.c 会为目标平台各编一份：运行期能力（改页保护）必须按**目标 OS** 选，
+			// 不能按编译宿主的 ABI 选 —— 否则 Linux 载荷里会编进 PEB/VirtualProtect 那一套。
+			if strings.Contains(filepath.ToSlash(src), "linux") {
+				args = append(args, "-DVM_BLOB_TARGET_LINUX=1")
+			}
 			args = append(args, "-DVM_BLOB_USES_WIN64=1")
 		}
 		args = append(args, "-o", objName, srcPath)

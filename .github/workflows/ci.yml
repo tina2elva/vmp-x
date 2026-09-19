@@ -159,6 +159,10 @@ jobs:
             echo "::error title=bash tools/e2e.sh (exit $rc)::$msg"
           fi
           exit $rc
+      - name: ELF image encryption e2e (entry self-decrypt, Linux)
+        run: |
+          set -o pipefail
+          bash tools/e2e_elf_image.sh --strict 2>&1 | tee build/elf_image_e2e.log
 
   # ---------------------------------------------------------------- Linux/arm64 (qemu-user)
   linux-arm64:
