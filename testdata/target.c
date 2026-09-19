@@ -459,14 +459,16 @@ static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
 }
 
 /* 把 mt 的一轮抽成函数：mt 与 mt_many 共用。 */
-static int run_mt_once(void) {
+static int run_mt_once_ex(DWORD stackSize) {
     enum { NT = 4 };
     HANDLE th[NT];
     mt_arg args[NT];
     for (int i = 0; i < NT; i++) {
         args[i].seed = (unsigned long long)(i + 1);
         args[i].acc = 0;
-        th[i] = CreateThread(NULL, 0, mt_worker, &args[i], 0, NULL);
+        /* stackSize==0 用默认栈；否则用指定大小 —— 用来在本机制造"栈紧张"，
+         * 因为我们的设计是"客户机栈固定下探 VM_MARGIN"，小栈上应当很快暴露问题。 */
+        th[i] = CreateThread(NULL, stackSize, mt_worker, &args[i], 0, NULL);
         if (!th[i]) { fprintf(stderr, "CreateThread failed\n"); return 2; }
     }
     for (int i = 0; i < NT; i++) {
@@ -477,6 +479,8 @@ static int run_mt_once(void) {
     printf("bump=%llu\n", g_bump);
     return 0;
 }
+
+static int run_mt_once(void) { return run_mt_once_ex(0); }
 
 int main(int argc, char **argv) {
     AddVectoredExceptionHandler(1, vmp_veh);   /* 更早、更广：CI 上那个 AV 只有它能抓到 */
@@ -515,6 +519,17 @@ int main(int argc, char **argv) {
         return run_mt_once();
     }
     /* 反复跑 mt：每一轮都新建线程（最容易命中"新线程首次调用"那一类问题），用于本地/CI 加压复现。 */
+    /* 小栈模式：mt_smallstack <KB> [rounds] —— 本机制造"栈紧张"，验证栈余量类假设。 */
+    if (argc >= 2 && strcmp(argv[1], "mt_smallstack") == 0) {
+        int kb = (argc >= 3) ? atoi(argv[2]) : 64;
+        int rounds = (argc >= 4) ? atoi(argv[3]) : 1;
+        for (int r = 0; r < rounds; r++) {
+            int rc = run_mt_once_ex((DWORD)kb * 1024u);
+            if (rc != 0) return rc;
+        }
+        printf("mt_smallstack kb=%d rounds=%d ok\n", kb, rounds);
+        return 0;
+    }
     if (argc >= 2 && strcmp(argv[1], "mt_many") == 0) {
         int rounds = (argc >= 3) ? atoi(argv[2]) : 20;
         for (int r = 0; r < rounds; r++) {
