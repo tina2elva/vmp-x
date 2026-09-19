@@ -684,6 +684,34 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 新目标（回归修复）第 53 轮：framed 的破坏确认由第 50 轮掩码引入；两个实验的数字如下
+>
+> ### 563. 现象（提交状态 f1c0149，本地）
+> ```
+> framed(0):      native=10      protected=1864734918   ← 垃圾值
+> framed(1):      native=15      protected=1864734922
+> framed(1000):   native=5010    protected=1864738918
+> ```
+> `framed` 正是依赖 `VM_FRAME_SKEW`（第 5 个参数在调用方栈帧里）的用例。
+>
+> ### 564. 已证明：掩码让客户机 RSP 比原设计低 8 字节
+> 原设计：入口 rsp≡0（thunk 的 call）⇒ 减 FRAME_SIZE(≡0)、减 8、减 MARGIN(≡0) ⇒ 客户机 RSP≡8；
+> 加掩码后 ⇒ 客户机 RSP≡0 ⇒ **低了 8** ⇒ 与调用方帧的定长关系被破坏 ⇒ framed 的第 5 参数读错。
+>
+> ### 565. 两个实验（都没有提交，工作区已恢复到 f1c0149）
+> ```
+> 实验 A：删掉四平台的 and 行
+>   ⇒ 桩整段失效：protected 输出为空、e2e 0 passed / 147 failed。
+>      推测与汇编布局/对齐有关（掩码版 vm_entry @+0x2B00，去掩码版 @+0x2AE0，差 0x20），待把 vm_entry 前后整体读一遍再动。
+> 实验 B：保留掩码，把 VM_FRAME_SKEW_EXTRA 16→8（frameSkew=17032）
+>   ⇒ framed 从垃圾值变成"差 a+1"：native=10 protected=9、native=15 protected=13、native=45 protected=37。
+>      方向对、但没完全修好 ⇒ 已回退。
+> ```
+>
+> ### 566. 教训（写给下一轮的我）
+> * `build/` 是 gitignore 的：用 `build/commit_msg*.txt` 写提交说明**不会**产生改动（本轮就因此白跑一次提交）；
+> * asm 相关改动前，先把 `vm_entry` 整段读完（含 `.p2align` 与周围指令），再一次成patch —— 本轮两次手改都引入了新故障。
+>
 > ### 562. 把"对齐"这件事的算术彻底理清（第 49–50 轮终于自洽）
 > ```
 > 调用方 call 被保护函数(入口已被改成 E9 jmp)  ⇒ 入口处 rsp ≡ 8 (mod 16)
