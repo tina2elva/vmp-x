@@ -538,12 +538,17 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		// 运行期补丁比对：所有目标都打开。ELF 上"对不上"的两次都是测量/夹具问题（夹具只映射 payload 段，
 		// 目标入口页不在映射里 → 校验读不到补丁字节 → trap），现在夹具会补映射补丁页，故两边一致。
 		args = append(args, "-DVM_INVM_PATCHCHECK=1")
+		// 同一个 vm_interp.c 会为目标平台各编一份：运行期能力（改页保护）必须按**目标 OS** 选，
+		// 不能按编译宿主的 ABI 选 —— 否则 Linux 载荷里会编进 PEB/VirtualProtect 那一套。
+		//
+		// 注意：这个判断**不能**放进下面的 compilerIsWindows 分支里。第一版就是那样写的，
+		// 于是**在 Linux 上用原生 gcc 编** Linux 载荷时 VM_BLOB_TARGET_LINUX 根本没定义，
+		// 编进去的是 #else 的桩（返回 -9）→ 入口蹦床 fail-fast 命中 ud2 → 加密后的 ELF 直接
+		// SIGILL（CI run #289 现场；线索是构建期那条 "'vm_img_done' defined but not used" 警告）。
+		if strings.Contains(filepath.ToSlash(src), "linux") {
+			args = append(args, "-DVM_BLOB_TARGET_LINUX=1")
+		}
 		if compilerIsWindows {
-			// 同一个 vm_interp.c 会为目标平台各编一份：运行期能力（改页保护）必须按**目标 OS** 选，
-			// 不能按编译宿主的 ABI 选 —— 否则 Linux 载荷里会编进 PEB/VirtualProtect 那一套。
-			if strings.Contains(filepath.ToSlash(src), "linux") {
-				args = append(args, "-DVM_BLOB_TARGET_LINUX=1")
-			}
 			args = append(args, "-DVM_BLOB_USES_WIN64=1")
 		}
 		args = append(args, "-o", objName, srcPath)
