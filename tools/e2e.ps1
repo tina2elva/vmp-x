@@ -110,8 +110,8 @@ $cases = @(
     @{ f = "calls_protected"; args = @(0, 1, 10, 1000) },
     @{ f = "callptr";        args = @(0, 1, 7, 12345) },
     @{ f = "mt";             args = @(0) },
-    # 加硬版：同一进程内连跑 8 轮（每轮新建 4 线程）。单个进程命中偶发的概率约 1/2，8 轮后接近必现 ——
-    # 这样"修好了"与"没修好"都能给出可信的颜色，而不是靠运气的一次绿/一次红。
+    # Hardened variant: 8 rounds in one process (fresh 4 threads each). Single-process hit rate is about 1/2,
+    # so 8 rounds make both "fixed" and "not fixed" give a trustworthy colour. ASCII only: PS 5.1 reads ANSI.
     @{ f = "mt_many";        args = @(8) },
     @{ f = "dispatch";       args = @(0, 1, 2, 3, 4, 5, 6, 7, 10, 100, 12345) },
     @{ f = "mul128";         args = @(0, 1, 7, 255, 12345, 1000000, 18446744073709551615, 9223372036854775808) },
@@ -135,7 +135,7 @@ $cases = @(
 
 $pass = 0; $fail = 0
 $failLines = @()
-Write-Output "[*] differential test (native vs protected)..."
+Write-Output ("[*] differential test (native vs protected)... cases=" + $cases.Count + " 名称=" + (($cases | ForEach-Object { $_.f }) -join ","))
 if ((Get-Item build\target_vmp.exe).LastWriteTime -ne $packTime) { Write-Host "[FAIL] target_vmp.exe changed after packing"; exit 1 }
 foreach ($c in $cases) {
     foreach ($a in $c.args) {
