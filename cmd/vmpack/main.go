@@ -60,7 +60,7 @@ func main() {
 	noEncImage := flag.Bool("no-enc-image", false, "关闭原镜像整体加密（默认对 x86-64 EXE 开启）")
 	encImageSections := flag.String("enc-image-sections", "", "只整体加密这些节（逗号分隔；留空=默认 .text,.rdata,.data）")
 	noEncImageDLL := flag.Bool("no-enc-image-dll", false, "对 DLL 关闭原镜像整体加密（默认对 DLL 也开）")
-	encImageELF := flag.Bool("enc-image-elf", false, "对 ET_EXEC 的 x86-64 ELF 也做整体加密（默认关：入口路径需 Linux/CI 验证）")
+	noEncImageELF := flag.Bool("no-enc-image-elf", false, "对 ET_EXEC 的 x86-64 ELF 关闭原镜像整体加密（默认开；CI 已验证入口自解密）")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
@@ -73,7 +73,7 @@ func main() {
 	wipeEnabled = *wipe
 	encImageEnabled = !*noEncImage
 	encImageDLLEnabled = !*noEncImageDLL
-	encImageELFEnabled = *encImageELF
+	encImageELFEnabled = !*noEncImageELF
 	encImageSectionList = *encImageSections
 
 	if *exe == "" || len(funcs) == 0 {
@@ -695,7 +695,8 @@ var encImageEnabled bool
 // encImageSectionList：-enc-image-sections 的取值（空 = 用默认候选集）。
 var encImageSectionList string
 
-// encImageELFEnabled：是否对 ELF 也整体加密（默认关；只支持 ET_EXEC，见 docs/STATUS.md）。
+// encImageELFEnabled：是否对 ELF 也整体加密（**默认开**，只支持 ET_EXEC/x86-64；
+// 入口路径已在 CI 的 linux-amd64 上真机验证过：见 tools/e2e_elf_image.sh 与 docs/STATUS.md）。
 var encImageELFEnabled bool
 
 // encImageDLLEnabled：是否对 DLL 也加密（默认**开**；-no-enc-image-dll 关闭）。
