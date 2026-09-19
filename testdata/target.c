@@ -306,6 +306,21 @@ __attribute__((noinline)) long dispatch(int op, long x) {
 }
 
 /* 通过函数指针调用：覆盖间接 CALL（CALLR）——虚调用/回调的真实形态 */
+/* ---- 嵌套/大帧实验：验证"内层受保护调用会不会踩掉外层的客户机栈" ----
+ * outer 的 volatile 局部强制它占用栈上的一个较大区域（4KB）；inner 是另一个被保护函数。
+ * 如果内层入口把客户机栈放在了外层的用区之内，外层返回后校验就会失败。 */
+__attribute__((noinline)) long nest_inner(long x) { return x * 2 + 1; }
+__attribute__((noinline)) long nest_outer(long x) {
+    volatile unsigned char buf[384];   /* 用 384 字节：gcc 会走静态帧，不会触发 and rsp,-N 那种不可跟踪形态 */
+    for (int i = 0; i < 384; i++) buf[i] = (unsigned char)(i ^ (int)x);
+    long r = nest_inner(x);
+    long bad = 0;
+    for (int i = 0; i < 384; i++) {
+        if (buf[i] != (unsigned char)(i ^ (int)x)) bad++;
+    }
+    return r + bad * 1000000;
+}
+
 __attribute__((noinline)) long square_helper(long x) { return x * x + 3; }
 
 __attribute__((noinline)) long via_ptr(long (*f)(long), long x) {
@@ -435,6 +450,16 @@ static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
 int main(int argc, char **argv) {
     AddVectoredExceptionHandler(1, vmp_veh);   /* 更早、更广：CI 上那个 AV 只有它能抓到 */
     SetUnhandledExceptionFilter(vmp_crash_filter);
+    if (argc >= 2 && strcmp(argv[1], "nest_test") == 0) {
+        long bad = 0;
+        for (long x = 1; x <= 200; x++) {
+            long got = nest_outer(x);
+            long want = x * 2 + 1;
+            if (got != want) bad++;
+        }
+        printf("nest_test bad=%ld\n", bad);
+        return bad ? 1 : 0;
+    }
     if (argc >= 2 && strcmp(argv[1], "framed_mt") == 0) {
         enum { NT = 8 };
         HANDLE th[NT];
