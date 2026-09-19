@@ -392,9 +392,18 @@ static void vmp_crash_line(EXCEPTION_POINTERS *ep) {
     }
     /* 访问违例时 ExceptionInformation[1] 就是**出错的数据地址** —— 这比任何反汇编偏移都直接。 */
     if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && ep->ExceptionRecord->NumberParameters >= 2) {
-        fprintf(stderr, " fault=%p op=%s",
-                (void *)ep->ExceptionRecord->ExceptionInformation[1],
+        void *fa = (void *)ep->ExceptionRecord->ExceptionInformation[1];
+        MEMORY_BASIC_INFORMATION mbi;
+        memset(&mbi, 0, sizeof(mbi));
+        fprintf(stderr, " fault=%p op=%s", fa,
                 ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
+        /* 出错地址落在什么区域？(未映射 / 栈 / 堆 / 模块) —— 这一条能直接把"野指针"与"栈用尽"分开。 */
+        if (VirtualQuery(fa, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            fprintf(stderr, " region=%p size=0x%llX state=%s protect=0x%X",
+                    mbi.BaseAddress, (unsigned long long)mbi.RegionSize,
+                    mbi.State == MEM_FREE ? "FREE" : (mbi.State == MEM_COMMIT ? "COMMIT" : "RESERVE"),
+                    (unsigned)mbi.Protect);
+        }
     }
     fprintf(stderr, "\n");
     /* 再把 GPR 打出来：偶发崩溃往往只差一个寄存器的值就能定性（尤其/疑似缓存/原子路径）。 */
