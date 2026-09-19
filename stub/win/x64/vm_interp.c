@@ -437,6 +437,18 @@ static void vm_keep_verify_ref(vm_ctx_t *vm);
 static u8 vm_bc_cache[VM_BC_CACHE_SLOTS][VM_BC_SLOT_SIZE];
 /* 打包端要按这个值做校验：const 会落到 .rdata（可读、且不会被写），打包时从 blob 字节里读出真实值。 */
 const u64 vm_bc_slot_size = VM_BC_SLOT_SIZE;
+#ifndef VM_RELEASE
+/* 缓存槽里字节码的校验和：装载时记录，**每次命中该槽时复核**。
+ * 目的很直接：如果"偶发错值"真的是字节码在缓存里被写坏，这个检查会当场把它变成可观测的信号
+ * （非 release 构建里直接 trap ⇒ E2E 报出的退出码会是 0xC000001D(ud2)，一眼可辨，而不是含混的 AV）。 */
+static u32 vm_bc_sum[VM_BC_CACHE_SLOTS];
+static u32 vm_bc_sum_len[VM_BC_CACHE_SLOTS];
+static u32 vm_bc_fnv(const u8 *p, u32 n) {
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+#endif
 static const void *vm_bc_key[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_inuse[VM_BC_CACHE_SLOTS];
 static u32 vm_bc_tick[VM_BC_CACHE_SLOTS];
@@ -691,6 +703,13 @@ int vm_run(vm_ctx_t *vm) {
                 vm_last_pc = 0xAA000007u; /* 缓存查找完成 */
 #endif
                 if (slot >= 0) {
+#ifndef VM_RELEASE
+                    /* 命中即复核：槽里的字节码应当与装载时逐字节一致。不一致 ⇒ 有人写了它（缓存竞争/越界写）。 */
+                    if (vm_bc_sum_len[slot] == d->codeLen &&
+                        vm_bc_fnv(vm_bc_cache[slot], d->codeLen) != vm_bc_sum[slot]) {
+                        __builtin_trap();
+                    }
+#endif
                     vm_bc_inuse[slot]++;
                     dst = vm_bc_cache[slot];
                     vm_bc_leave();
@@ -712,6 +731,10 @@ int vm_run(vm_ctx_t *vm) {
                             return 3;
                         }
                         vm_bc_key[c] = vm->desc;
+#ifndef VM_RELEASE
+                        vm_bc_sum[c] = vm_bc_fnv(dst, d->codeLen);
+                        vm_bc_sum_len[c] = d->codeLen;
+#endif
                         vm_bc_inuse[c]++;
                         slot = c;
                         vm_bc_leave();
