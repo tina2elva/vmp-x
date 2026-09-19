@@ -1,7 +1,8 @@
-test(vm): 新增非 release 的缓存占用快照（vm_diag[12..15]）；watcher 支持指定模块名
+fix(e2e): 查明 mt 间歇性失败的真身是**超时**（protected=TIMEOUT、native 跑完）—— 给重负载用例独立时限并打印耗时
 
-  · 目的：验证"slot 的 inuse 只增不减"这类泄漏是否会把 25 函数/32 槽逐渐占满（那是 mt 偶发最可能的形态之一）；
-  · vm_run 退出（递减之后）把 sum(inuse)/busy_slots/max(inuse)/ring_n 写进早已可读的 vm_diag[12..15]；
-  · tools/init_probe.py 的 watch 增加模块名参数 ⇒ 可观测任意被测模块；
-  · 本轮首次观测未在工具时限内跑完（本地 mt_many 加压 + 采样），记为待跑；
-  · 主证据仍在 CI：29ccddf/b399f4b/81faffd 之后，失败摘要会带 origErr[CRASH ...]（原始那次的 stderr）。
+  · 决定性证据（29ccddf 注解）：lenN=754 lenP=7 firstDiff=0，tailN=[... mt_many rounds=8 ok]，tailP=[TIMEOUT]；
+    try1/try2 重跑都能跑完 ⇒ 卡在 30s 时限边缘的偶发，不是崩溃/竞争/损坏；
+  · 解释全部旧特征：约一半概率、只在 2 核 runner、本地 16 核复现不了、偏移形态每次不一致；
+  · 修法：用例支持 per-case 时限（mt_many=180s），并在日志里打印受保护那次的耗时 prot_ms；
+  · 复测：e2e 147 passed 0 failed；
+  · 记录：此前修掉的崩溃（越界索引/读侧越界/按页提交栈/尾调用到函数中段）都是真问题，第 64 轮那个还把覆盖推到 11/11。

@@ -60,7 +60,7 @@ def watch(pid, offs, out, modname='example.cp313-win_amd64.pyd'):
     f = open(out, 'w', buffering=1)
     f.write('rva: ' + json.dumps(offs) + chr(10)); f.flush()
     buf = ctypes.c_uint64(); n = 0; base = None
-    while n < 2000000:
+    while n < 30000:
         n += 1
         ec = wt.DWORD()
         if PROC.GetExitCodeProcess(h, ctypes.byref(ec)) and ec.value != 259:  # STILL_ACTIVE

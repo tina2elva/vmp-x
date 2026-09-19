@@ -69,6 +69,7 @@ function Run-FileOnce([string]$exe, [string[]]$a, [int]$sec) {
     $outFile = Join-Path $env:TEMP ("vmpe2e_" + $tag + ".out")
     $errFile = Join-Path $env:TEMP ("vmpe2e_" + $tag + ".err")
     try {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
         $p = Start-Process -FilePath $path -ArgumentList $a -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
         $null = Wait-Process -Id $p.Id -Timeout $sec -ErrorAction SilentlyContinue
         if (-not $p.HasExited) { try { Stop-Process -Id $p.Id -Force } catch {}; return "TIMEOUT" }
@@ -81,6 +82,7 @@ function Run-FileOnce([string]$exe, [string[]]$a, [int]$sec) {
         if (Test-Path $errFile) { $err = (Get-Content $errFile -Raw -ErrorAction SilentlyContinue) }
         if ($null -eq $err) { $err = "" }
         $script:LastStderr = ($err -replace "[\r\n]+", " ").Trim()
+        $script:LastMs = [int]$sw.Elapsed.TotalMilliseconds
         return $out.Trim()
     } catch {
         return "STARTFAIL: " + $_.Exception.Message
@@ -116,9 +118,11 @@ $cases = @(
     @{ f = "calls_protected"; args = @(0, 1, 10, 1000) },
     @{ f = "callptr";        args = @(0, 1, 7, 12345) },
     @{ f = "mt";             args = @(0) },
+    # 注：mt 系列是**吞吐**压测（4 线程 × N 轮 × 20000 次），在 2 核 runner 上 30s 会偶发超时 ——
+    # 第 68 轮查明"mt 间歇性失败"的真身就是它（protected=TIMEOUT、native 正常跑完）。
     # Hardened variant: 8 rounds in one process (fresh 4 threads each). Single-process hit rate is about 1/2,
     # so 8 rounds make both "fixed" and "not fixed" give a trustworthy colour. ASCII only: PS 5.1 reads ANSI.
-    @{ f = "mt_many";        args = @(8) },
+    @{ f = "mt_many";        args = @(8); sec = 180 },
     @{ f = "dispatch";       args = @(0, 1, 2, 3, 4, 5, 6, 7, 10, 100, 12345) },
     @{ f = "mul128";         args = @(0, 1, 7, 255, 12345, 1000000, 18446744073709551615, 9223372036854775808) },
     @{ f = "disp128run";     args = @(0, 1, 7, 255, 12345, 1000000, 18446744073709551615) },
@@ -145,8 +149,11 @@ Write-Output ("[*] differential test (native vs protected)... cases=" + $cases.C
 if ((Get-Item build\target_vmp.exe).LastWriteTime -ne $packTime) { Write-Host "[FAIL] target_vmp.exe changed after packing"; exit 1 }
 foreach ($c in $cases) {
     foreach ($a in $c.args) {
-        $n = Run-File "build/target.exe" @($c.f, "$a") 30
-        $v = Run-File "build/target_vmp.exe" @($c.f, "$a") 30
+        $secs = 30
+        if ($c.ContainsKey("sec")) { $secs = [int]$c.sec }
+        $n = Run-File "build/target.exe" @($c.f, "$a") $secs
+        $v = Run-File "build/target_vmp.exe" @($c.f, "$a") $secs
+        $ms = $script:LastMs
         $ok = ($n -notmatch "TIMEOUT|STARTFAIL") -and ($n -ne "") -and ($n -eq $v)
         if ($ok) {
             $pass++
@@ -181,7 +188,7 @@ foreach ($c in $cases) {
             $failLines += ("E2EFAIL " + $c.f + "(" + $a + ") origErr[" + $oe + "] " + $sum + " try1[" + $d1 + "] try2[" + $d2 + "]")
         }
         $tag = if ($ok) { "OK  " } else { "FAIL" }
-        Write-Output ("  [{0}] {1}({2}): native={3} protected={4}" -f $tag, $c.f, $a, $n, $v)
+        Write-Output ("  [{0}] {1}({2}): native={3} protected={4} prot_ms={5}" -f $tag, $c.f, $a, $n, $v, $ms)
     }
 }
 
