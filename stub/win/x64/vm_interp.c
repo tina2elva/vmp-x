@@ -346,7 +346,12 @@ static void write_reg(vm_ctx_t *vm, u32 r, u32 width, u64 val) {
      * 所以"掩码"并不能保证在界内：一旦字节码损坏或解码失步，写入就会越界。
      * 读越界只是拿到错值，写越界会踩坏上下文（第 35 轮那个 adst 就是这么崩到栈守护页的）。
      * 写是危险动作 ⇒ 这里一律先校验；越界就不写（宁可算错也不破坏宿主内存）。 */
-    if (r >= (u32)VM_REG_COUNT) return;
+    if (r >= (u32)VM_REG_COUNT) {
+#ifndef VM_RELEASE
+        __builtin_trap();   /* 同上：写侧看到越界索引也当场 trap，便于 CI 判定 */
+#endif
+        return;
+    }
     if (width >= 64) { vm->regs[r] = val; return; }
     if (width == 32) { vm->regs[r] = val & 0xFFFFFFFFull; return; }
     u64 m = width_mask(width);
@@ -359,7 +364,15 @@ static void write_reg(vm_ctx_t *vm, u32 r, u32 width, u64 val) {
  * 写侧见 write_reg（第 36 轮已设防）。 */
 static u64 vm_rdreg(vm_ctx_t *vm, u32 i) {
     i &= VM_REG_MASK;
-    if (i >= (u32)(sizeof(vm->regs) / sizeof(vm->regs[0]))) return 0;
+    if (i >= (u32)(sizeof(vm->regs) / sizeof(vm->regs[0]))) {
+#ifndef VM_RELEASE
+        /* 非 release：看到越界索引就当场 trap（ud2）。
+         * 这样 CI 上"偶发错值/野地址"若起源于一个坏索引，会变成一眼可辨的 0xC000001D，
+         * 而不是含混的 0xC0000005 或纯错值 —— 这是这轮要的判定信号。 */
+        __builtin_trap();
+#endif
+        return 0;   /* release：读作 0，让地址立刻算错而不是野跳 */
+    }
     return vm->regs[i];
 }
 
