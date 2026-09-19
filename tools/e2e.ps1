@@ -146,9 +146,19 @@ foreach ($c in $cases) {
             $pass++
         } else {
             $fail++
+            # 偶发用例（mt/mt_many）单次重跑未必复现：多跑几次，直到抓到一次"带 CRASH 现场"的失败。
+            # 崩溃现场来自目标自带的 VEH 上报（code/addr/fault/region/寄存器），只在**失败那次**的 stderr 里。
             $d1 = Run-FileDiag "build/target_vmp.exe" @($c.f, "$a") 30
             $d2 = Run-FileDiag "build/target_vmp.exe" @($c.f, "$a") 30
-            Write-Output ("         diag: try1[" + $d1 + "] try2[" + $d2 + "]")
+            $d3 = ""
+            for ($t = 0; $t -lt 6; $t++) {
+                if ($d1 -match "CRASH") { break }
+                $probe = Run-FileDiag "build/target_vmp.exe" @($c.f, "$a") 30
+                $d3 = $probe
+                if ($probe -match "CRASH") { break }
+            }
+            if ($d3 -ne "" -and $d3 -match "CRASH") { $d1 = $d3 }
+            Write-Output ("         diag: try1[" + $d1 + "] try2[" + $d2 + "] extra[" + $d3 + "]")
             $n1 = ($n -replace "\s+", " ").Trim()
             $v1 = ($v -replace "\s+", " ").Trim()
             # 诊断放最前面：GitHub 注解会截断超长消息，而 try1/try2 里的 CRASH(fault/rva/寄存器) 才是最要紧的；
