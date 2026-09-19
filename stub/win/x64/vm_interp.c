@@ -684,8 +684,14 @@ int vm_run(vm_ctx_t *vm) {
                     }
                 }
                 vm_bc_leave(); /* 全忙：放锁让出，稍后重试 */
-                if (attempt > 2000000u) {
-                    return 2; /* 兜底：等了极久仍未空出（理论上不该发生） */
+                /* 兜底：等了很久仍抢不到槽（说明槽数 < 并发嵌套深度，属于配置错误）。
+                 * 这里**必须响亮地失败**：返回错误码会被桩当成被保护函数的返回值交回客户机，
+                 * 那正是这一整类"静默算错/偶发崩溃"的来源；直接 trap 至少让人立刻知道配置不对。 */
+                if (attempt > 200000u) {
+#ifndef VM_RELEASE
+                    vm_last_pc = 0xAA000009u; /* 缓存槽长期不可得 */
+#endif
+                    __builtin_trap();
                 }
                 for (volatile u32 spin = 0; spin < 200u; spin++) {
                 }
