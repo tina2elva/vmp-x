@@ -52,7 +52,7 @@ def modules_of(pid):
     PROC.CloseHandle(snap)
     return out
 
-def watch(pid, offs, out):
+def watch(pid, offs, out, modname='example.cp313-win_amd64.pyd'):
     PROCESS_QUERY_INFORMATION = 0x0400; PROCESS_VM_READ = 0x0010
     h = PROC.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
     if not h:
@@ -65,8 +65,9 @@ def watch(pid, offs, out):
         ec = wt.DWORD()
         if PROC.GetExitCodeProcess(h, ctypes.byref(ec)) and ec.value != 259:  # STILL_ACTIVE
             f.write('target exited, samples=%d' % n + chr(10)); f.flush(); break
+        time.sleep(0.0005)
         if base is None:
-            base = module_base_of(pid, 'example.cp313-win_amd64.pyd')
+            base = module_base_of(pid, modname)
             if base:
                 for nm, mb, ms in modules_of(pid):
                     f.write('mod %s base=0x%X size=0x%X' % (nm, mb or 0, ms) + chr(10))
@@ -86,7 +87,7 @@ def watch(pid, offs, out):
                     if k == 'vm_diag':
                         rd = (ctypes.c_uint64 * 16)()
                         if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(rd), 128, ctypes.byref(got)):
-                            vals['diag8_11'] = [hex(rd[i]) for i in range(8, 12)]
+                            vals['diag8_15'] = [hex(rd[i]) for i in range(8, 16)]
                     elif k == 'vm_last_call_args':
                         raw4 = (ctypes.c_uint64 * 4)()
                         if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(raw4), 32, ctypes.byref(got)):
@@ -138,6 +139,6 @@ def main():
             sys.argv[7] if len(sys.argv) > 7 else None)
     else:
         offs = rvas(man, rep)
-        watch(int(sys.argv[2]), offs, sys.argv[5])
+        watch(int(sys.argv[2]), offs, sys.argv[5], sys.argv[6] if len(sys.argv) > 6 else 'example.cp313-win_amd64.pyd')
 
 main()

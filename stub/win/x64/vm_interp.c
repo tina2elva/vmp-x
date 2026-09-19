@@ -810,6 +810,23 @@ int vm_run(vm_ctx_t *vm) {
         /* 原子递减：别的线程可能正在临界区里检查"这个槽有没有人在用" */
         __atomic_fetch_sub(&vm_bc_inuse[slot], 1u, __ATOMIC_RELEASE);
     }
+#ifndef VM_RELEASE
+    /* 缓存占用快照（放进早已可读的 vm_diag[12..15]）：用来判定"inuse 会不会只增不减"这类泄漏。
+     * 若有泄漏，mt_many 这种长跑用例里 sum/busy 会单调上升，最终把 32 个槽全"占满"。 */
+    {
+        u32 s = 0, busy = 0, mx = 0, i;
+        for (i = 0; i < VM_BC_CACHE_SLOTS; i++) {
+            u32 v = vm_bc_inuse[i];
+            s += v;
+            if (v) busy++;
+            if (v > mx) mx = v;
+        }
+        vm_diag[12] = s;
+        vm_diag[13] = busy;
+        vm_diag[14] = mx;
+        vm_diag[15] = vm_call_ring_n;
+    }
+#endif
     return rc;
 }
 

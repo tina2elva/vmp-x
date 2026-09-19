@@ -1,10 +1,7 @@
-fix(lift): 尾部 jmp 只在目标是函数入口时按尾调用翻译 —— 修好 __pyx_pymod_create，覆盖 10/11 → 11/11
+test(vm): 新增非 release 的缓存占用快照（vm_diag[12..15]）；watcher 支持指定模块名
 
-  · 根因（第 63 轮定位）：__pyx_pymod_create 的 `jmp 0x2D98` 被按"函数外=尾调用"翻成 CALLN+RET，
-    但 0x2D98 是别人函数的中段/尾声、其实是本函数的续段；原生调用由解释器发出，真实栈是解释器的，
-    那段按 [rsp+..] 恢复保存位必然错位 ⇒ 崩在 __Pyx_PyObject_CallMethO 区域；
-  · 修法：新增 looksLikeFuncEntry（入口前通常是 0xCC/0x90/0x00 填充）——目标是填充后起点才按尾调用翻，
-    否则当普通跳转翻，并让孤岛机制把该目标解码进来（孤岛收集同时接受 Jmp 目标）；
-  · 验证：__pyx_pymod_create 单独保护后 import 成功（OK 55 / Hello, vmp! / 5.0）；
-    e2e 147 passed 0 failed；coverage(10) 仍逐字节一致 ⇒ 无回归；
-  · coverage_pyd.py 默认函数表加入 __pyx_pymod_create，KNOWN_BAD 清空 ⇒ 口径 11/11。
+  · 目的：验证"slot 的 inuse 只增不减"这类泄漏是否会把 25 函数/32 槽逐渐占满（那是 mt 偶发最可能的形态之一）；
+  · vm_run 退出（递减之后）把 sum(inuse)/busy_slots/max(inuse)/ring_n 写进早已可读的 vm_diag[12..15]；
+  · tools/init_probe.py 的 watch 增加模块名参数 ⇒ 可观测任意被测模块；
+  · 本轮首次观测未在工具时限内跑完（本地 mt_many 加压 + 采样），记为待跑；
+  · 主证据仍在 CI：29ccddf/b399f4b/81faffd 之后，失败摘要会带 origErr[CRASH ...]（原始那次的 stderr）。
