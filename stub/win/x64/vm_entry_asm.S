@@ -64,6 +64,12 @@ vm_entry:
 
     /* ---- 模拟 RSP：放在 vm_run 栈帧之下 ---- */
     leaq    -(8 + VM_MARGIN)(%rsp), %rax
+    /* 客户机栈起点强制 16 字节对齐：不去假设调用方是怎么进来的。
+     * 之前这里是"假设调用方按 ABI 进入（rsp≡8 mod 16）"⇒ 被外部调用者（CPython 的导入机制）调用时
+     * 客户机栈是不对齐的，于是客户机发起的宿主调用也不对齐，被调方内部的对齐 SSE 行为异常
+     * （现场：PyThreadState_Get 返回 0x32、随后读 0x42 崩；pymod_exec 读 0x8 同理）。
+     * ABI 规范时这条掩码是空操作；不规范时正好把它纠回来。 */
+    andq    $-16, %rax
     movq    %rax, VM_CTX_RSP(%rsp)
 
     /* ---- 模块基址 = 描述符地址 - selfRVA ---- */

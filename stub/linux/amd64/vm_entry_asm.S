@@ -75,6 +75,7 @@ VM_ENTRY_SYMBOL:
 
     /* ---- 模拟 RSP：放在 vm_run 栈帧之下 ---- */
     leaq    -(8 + VM_MARGIN)(%rsp), %rax
+    andq    $-16, %rax              /* 客户机栈起点强制 16 字节对齐（不假设调用方怎么进来） */
     movq    %rax, VM_CTX_RSP(%rsp)
 
     /* ---- 从栈上反推描述符（必须在填完 ctx 之后：此时可以随便用寄存器） ----

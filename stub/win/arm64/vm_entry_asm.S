@@ -76,6 +76,7 @@ VM_ENTRY_SYMBOL:
     /* ---- 模拟 SP：放在 vm_run 栈帧之下 VM_MARGIN 处 ---- */
     mov     x9, #VM_MARGIN
     sub     x9, sp, x9
+    and     x9, x9, #-16            /* 客户机栈起点强制 16 字节对齐（A64 要求 SP 16 对齐） */
     str     x9, [sp, #(VM_CTX_OFF_REGS + 8*31)]
 
     /* ---- 状态清零 ---- */
