@@ -949,8 +949,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             u64 scale = c[pc + 5];
             i64 disp = (i64)(i32)rd32(&c[pc + 6]);
             u64 addr = (u64)disp;
-            if (base != VM_NO_REG) addr += vm->regs[base & VM_REG_MASK];
-            if (idx != VM_NO_REG) addr += vm->regs[idx & VM_REG_MASK] * scale;
+            if (base != VM_NO_REG) addr += vm_rdreg(vm, base);
+            if (idx != VM_NO_REG) addr += vm_rdreg(vm, idx) * scale;
             write_reg(vm, dst, width, addr);
             vm->pc = pc + 10;
             break;
@@ -1033,9 +1033,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             u32 kind = c[pc + 1], width = c[pc + 2], dst = c[pc + 3] & VM_REG_MASK, base = c[pc + 4] & VM_REG_MASK;
             u32 idx = c[pc + 5], scale = c[pc + 6];
             i64 disp = (i64)(i32)rd32(&c[pc + 7]);
-            u64 addr = vm->regs[base] + (u64)disp;
+            u64 addr = vm_rdreg(vm, base) + (u64)disp;
             if (idx != VM_NO_REG)
-                addr += vm->regs[idx & VM_REG_MASK] * (u64)scale;
+                addr += vm_rdreg(vm, idx) * (u64)scale;
             u64 v = 0;
             switch (width) {
             case 8:  v = *(volatile u8 *)addr; break;
@@ -1052,9 +1052,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             u32 idx = c[pc + 3], scale = c[pc + 4];
             i64 disp = (i64)(i32)rd32(&c[pc + 5]);
             u32 src = c[pc + 9] & VM_REG_MASK;
-            u64 addr = vm->regs[base] + (u64)disp;
+            u64 addr = vm_rdreg(vm, base) + (u64)disp;
             if (idx != VM_NO_REG)
-                addr += vm->regs[idx & VM_REG_MASK] * (u64)scale;
+                addr += vm_rdreg(vm, idx) * (u64)scale;
             u64 v = vm->regs[src];
 #ifndef VM_RELEASE
             vm_st_pcs[vm_st_i & 15u] = pc;
