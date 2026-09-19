@@ -81,13 +81,11 @@ def watch(pid, offs, out):
                 got = ctypes.c_size_t()
                 if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(buf), 8, ctypes.byref(got)):
                     if k == 'vm_call_ring':
-                        vals['ring'] = [hex(ctypes.c_uint64.from_address(base + o + 8*i).value) if False else None for i in range(0)]
-                        rv = []
-                        for i in range(16):
-                            rb = ctypes.c_uint64()
-                            if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o + 8*i), ctypes.byref(rb), 8, ctypes.byref(got)):
-                                rv.append(hex(rb.value))
-                        vals['ring'] = rv
+                        raw = (ctypes.c_uint64 * 16)()
+                        if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(raw), 128, ctypes.byref(got)):
+                            vals['ring'] = [hex(raw[i]) for i in range(16)]
+                        else:
+                            vals['ring'] = []
                     else:
                         vals[k] = hex(buf.value)
             if vals: f.write(json.dumps({'t': n, 'base': hex(base), 'v': vals}) + chr(10))
