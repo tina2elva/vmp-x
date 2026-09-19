@@ -14,7 +14,7 @@ PROC = ctypes.windll.kernel32
 
 def rvas(man, rep):
     sec = rep['sectionRVA']; sym = man['symbols']
-    ks = [k for k in ('vm_last_pc','vm_last_call','vm_last_call_rcx','vm_call_ring_n','vm_call_ring') if k in sym]
+    ks = [k for k in ('vm_last_pc','vm_last_call','vm_last_call_rcx','vm_call_ring_n','vm_call_ring','vm_last_call_args') if k in sym]
     return {k: sec + sym[k] for k in ks}
 
 def module_base_of(pid, name):
@@ -80,7 +80,11 @@ def watch(pid, offs, out):
             for k, o in offs.items():
                 got = ctypes.c_size_t()
                 if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(buf), 8, ctypes.byref(got)):
-                    if k == 'vm_call_ring':
+                    if k == 'vm_last_call_args':
+                        raw4 = (ctypes.c_uint64 * 4)()
+                        if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(raw4), 32, ctypes.byref(got)):
+                            vals['args'] = [hex(raw4[i]) for i in range(4)]
+                    elif k == 'vm_call_ring':
                         raw = (ctypes.c_uint64 * 16)()
                         if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(raw), 128, ctypes.byref(got)):
                             vals['ring'] = [hex(raw[i]) for i in range(16)]

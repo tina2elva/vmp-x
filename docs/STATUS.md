@@ -684,6 +684,38 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ## 继续（第 61 轮续）：init 类拿到**完整的命名调用序列**，崩溃点精确到 `__Pyx_PyObject_CallMethO+0x78`
+>
+> ### 585. 用 python313.dll 的导出表给 8 次调用全部点名
+> 自写的 PE 导出表解析器（`build/exports.py`、`build/name_all.py`）给 ring 里每个目标都定到了函数：
+> ```
+> #1 PyDict_SetItemString      ret=0x0          （成功）
+> #2 PyInterpreterState_GetID  ret=0x0          （合法 id）
+> #3 PyObject_GetAttrString    ret=0x127C099BE70
+> #4 PyModule_NewObject        ret=0x127C0DCCB80
+> #5 PyModule_GetDict          ret=0x127C0DD5CC0
+> #6 PyObject_GetAttrString    ret=0x127C0D69090
+> #7 PyDict_SetItemString      ret=0x0
+> #8 PyObject_GetAttrString    ret=0x127C0D6E790   ← 最后一次**完成**的调用
+> ```
+> 这就是 Cython 模块创建的标准序列（建 module → 取 dict → 取 "__name__" → 塞进字典 …），**全部成功**。
+>
+> ### 586. 崩溃点：一次 CALLN 到 `pyd+0x2D98`
+> `vm_last_call = pyd_base + 0x2D98`，而 `example.map` 显示：
+> ```
+> 0x2D20  __Pyx_PyObject_CallMethO
+> 0x2DC0  __Pyx_PyObject_FastCallDict
+> ```
+> ⇒ `0x2D98` 落在 **`__Pyx_PyObject_CallMethO + 0x78`** ⇒ **崩溃发生在这个"原生 Cython 辅助函数"内部**，
+> 它是被**受保护函数通过 CALLN 调用的**（不是 IAT 间接调用，所以 ring 里没有它 —— ring 是在调用**返回后**记录的）。
+>
+> ### 587. 下一步（工具已就位）
+> `__Pyx_PyObject_CallMethO(func, arg)` 会取 `func` 的 self 与 `ml_meth`；若传入的 `func` 不对，就会拿着垃圾函数指针去调。
+> 我刚在解释器里加了 `vm_last_call_args[4]`（在 CALLN/CALLR **调用前**记录 RCX/RDX/R8/R9）⇒ 下一次抓到它，
+> 把 **RCX 与第 8 次调用的返回值 0x127C0D6E790 比对**：
+> * 相等 ⇒ 传参没错，问题在被调方对 `func` 的解释（回到"翻译是否忠实"）；
+> * 不等 ⇒ **我们传错了参数寄存器** ⇒ 直接改 CALLN 的入参处理。
+>
 > ## 继续（第 61 轮）：init 类崩溃现场**可复现地取到了**，并给一次调用点上了名
 >
 > ### 582. 观测管线现在完整可用

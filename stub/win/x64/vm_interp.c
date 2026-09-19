@@ -573,6 +573,7 @@ u64 vm_call_diff_after;
 u64 vm_call_diffs;
 /* 最近 8 次 CALLN/CALLR 的 (目标, 调用后的 RAX) —— 用来看"某次间接调用到底返回了什么"。 */
 u64 vm_call_ring[16]; /* 8 组 (target, rax) */
+u64 vm_last_call_args[4]; /* 最近一次 CALLN/CALLR 的四个入参（RCX/RDX/R8/R9）—— 调用**前**记录 */
 u32 vm_call_ring_n;
 #endif
 
@@ -1291,6 +1292,10 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_last_call = addr; /* 探针：最后一次 CALLN 的目标 */
             vm_last_call_rcx = vm->regs[VRCX];
             vm_last_call_sp = vm->regs[VRSP];
+            vm_last_call_args[0] = vm->regs[VRCX];
+            vm_last_call_args[1] = vm->regs[VRDX];
+            vm_last_call_args[2] = vm->regs[VR8];
+            vm_last_call_args[3] = vm->regs[VR9];
 #endif
             typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fn_t fn = (fn_t)addr;
@@ -1340,6 +1345,10 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             u64 addr = vm_rdreg(vm, c[pc + 1]); /* 调用目标：越界读作 0 ⇒ 立刻走下面的空指针分支，不会野跳 */
 #ifndef VM_RELEASE
             vm_last_call = addr | 0x8000000000000000ull; /* 高位标记：来自 CALLR */
+            vm_last_call_args[0] = vm->regs[VRCX];
+            vm_last_call_args[1] = vm->regs[VRDX];
+            vm_last_call_args[2] = vm->regs[VR8];
+            vm_last_call_args[3] = vm->regs[VR9];
 #endif
             if (addr == 0) return 1;
             typedef u64 (*fnr_t)(u64, u64, u64, u64, u64, u64, u64, u64);
