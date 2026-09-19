@@ -50,22 +50,38 @@ def watch(pid, offs, out):
         if base:
             vals = {}
             for k, o in offs.items():
-                if k == 'vm_call_ring': continue
                 got = ctypes.c_size_t()
                 if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(buf), 8, ctypes.byref(got)):
-                    vals[k] = hex(buf.value)
+                    if k == 'vm_call_ring':
+                        vals['ring'] = [hex(ctypes.c_uint64.from_address(base + o + 8*i).value) if False else None for i in range(0)]
+                        rv = []
+                        for i in range(16):
+                            rb = ctypes.c_uint64()
+                            if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o + 8*i), ctypes.byref(rb), 8, ctypes.byref(got)):
+                                rv.append(hex(rb.value))
+                        vals['ring'] = rv
+                    else:
+                        vals[k] = hex(buf.value)
             if vals: f.write(json.dumps({'t': n, 'base': hex(base), 'v': vals}) + chr(10))
         else:
             time.sleep(0.0005)
     f.write('watch ended samples=%d' % n + chr(10))
 
-def run(d, man, rep, out):
+def run(d, man, rep, out, ready=None, go=None):
     offs = rvas(man, rep)
     f = open(out, 'w', buffering=1); f.write('rva: ' + json.dumps(offs) + chr(10)); f.flush()
     try:
         ctypes.WinDLL(os.path.join(d, 'example.cp313-win_amd64.pyd')); f.write('module loaded' + chr(10))
     except Exception as e:
         f.write('WinDLL failed: %r' % (e,) + chr(10))
+    # 握手：写 ready 文件并等 go 文件，让观测进程有时间找到我们的模块基址
+    if ready:
+        open(ready, 'w').write('ready')
+    if go:
+        while not os.path.exists(go):
+            time.sleep(0.002)
+    f.write('go' + chr(10))
+
     def worker():
         try:
             sys.path.insert(0, d); import example  # noqa
@@ -80,7 +96,9 @@ def main():
     man = json.load(open(sys.argv[3] if mode == 'run' else sys.argv[3]))
     rep = json.load(open(sys.argv[4] if mode == 'run' else sys.argv[4]))
     if mode == 'run':
-        run(sys.argv[2], man, rep, sys.argv[5])
+        run(sys.argv[2], man, rep, sys.argv[5],
+            sys.argv[6] if len(sys.argv) > 6 else None,
+            sys.argv[7] if len(sys.argv) > 7 else None)
     else:
         offs = rvas(man, rep)
         watch(int(sys.argv[2]), offs, sys.argv[5])
