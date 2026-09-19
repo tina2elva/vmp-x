@@ -1,14 +1,7 @@
-/* vm_entry_asm.S - Linux/amd64（System V）VM 入口封装
+/* vm_entry_asm.S - Linux/amd64??ystem V??M ??????
  *
- * 与 Windows 版的差别：
- *   - 宿主 ABI 是 System V：参数在 RDI/RSI/RDX/RCX/R8/R9，callee-saved 是 RBX/RBP/R12-R15，
- *     XMM0-XMM15 全是 volatile；
- *   - 仍然遵守“替换后的实现破坏的寄存器不多于原函数”：除返回值 RAX 外全部 GPR 保存/还原，
- *     XMM0-XMM15 也全部保存；
- *   - **blob 仍由 mingw 编译**（Windows ABI 内部约定），所以调用 vm_run 时必须按 Win64 约定：
- *     ctx 指针放 RCX，并在 call 前预留 32 字节 shadow space。
- *     这样做的好处：解释器主体只有一份源码，两个平台用 -include 选不同的 vm_abi.h 即可。
- */
+ * ??Windows ???????? *   - ??? ABI ??System V?????? RDI/RSI/RDX/RCX/R8/R9??allee-saved ??RBX/RBP/R12-R15?? *     XMM0-XMM15 ??? volatile?? *   - ?????????????????????????????????????????????RAX ?????GPR ???/????? *     XMM0-XMM15 ?????????
+ *   - **blob ??? mingw ???**??indows ABI ????????????????vm_run ?????? Win64 ????? *     ctx ?????RCX?????call ?????32 ??? shadow space?? *     ?????????????????????????????????????-include ?????? vm_abi.h ????? */
 #include "vm_abi.h"
 
     .text
@@ -20,7 +13,7 @@
 VM_ENTRY_SYMBOL:
     subq    $VM_FRAME_SIZE, %rsp
 
-    /* ---- 保存 callee-saved ---- */
+    /* ---- ??? callee-saved ---- */
     movq    %rbx, VM_SAVE_RBX(%rsp)
     movq    %rbp, VM_SAVE_RBP(%rsp)
     movq    %r12, VM_SAVE_R12(%rsp)
@@ -28,7 +21,7 @@ VM_ENTRY_SYMBOL:
     movq    %r14, VM_SAVE_R14(%rsp)
     movq    %r15, VM_SAVE_R15(%rsp)
 
-    /* ---- 保存 volatile GPR ---- */
+    /* ---- ??? volatile GPR ---- */
     movq    %rcx, VM_SAVE_RCX(%rsp)
     movq    %rdx, VM_SAVE_RDX(%rsp)
     movq    %rsi, VM_SAVE_RSI(%rsp)
@@ -38,7 +31,7 @@ VM_ENTRY_SYMBOL:
     movq    %r10, VM_SAVE_R10(%rsp)
     movq    %r11, VM_SAVE_R11(%rsp)
 
-    /* ---- 保存 volatile XMM ---- */
+    /* ---- ??? volatile XMM ---- */
     movups  %xmm0,  VM_SAVE_XMM0(%rsp)
     movups  %xmm1,  VM_SAVE_XMM1(%rsp)
     movups  %xmm2,  VM_SAVE_XMM2(%rsp)
@@ -56,7 +49,7 @@ VM_ENTRY_SYMBOL:
     movups  %xmm14, VM_SAVE_XMM14(%rsp)
     movups  %xmm15, VM_SAVE_XMM15(%rsp)
 
-    /* ---- 用宿主寄存器填 ctx（客户机与宿主同为 x86-64 SysV → 1:1） ---- */
+    /* ---- ???????????ctx??????????????x86-64 SysV ??1:1??---- */
     movq    %rax, VM_CTX_RAX(%rsp)
     movq    %rcx, VM_CTX_RCX(%rsp)
     movq    %rdx, VM_CTX_RDX(%rsp)
@@ -73,15 +66,14 @@ VM_ENTRY_SYMBOL:
     movq    %r14, VM_CTX_R14(%rsp)
     movq    %r15, VM_CTX_R15(%rsp)
 
-    /* ---- 模拟 RSP：放在 vm_run 栈帧之下 ---- */
+    /* ---- ??? RSP?????vm_run ?????? ---- */
     leaq    -(8 + VM_MARGIN)(%rsp), %rax
-    andq    $-16, %rax              /* 客户机栈起点强制 16 字节对齐（不假设调用方怎么进来） */
+    /* no alignment mask here: guest RSP%16==8 is the designed value; masking it shifts the
+     * fixed distance to the caller frame that VM_FRAME_SKEW depends on (E2E framed case). */
     movq    %rax, VM_CTX_RSP(%rsp)
 
-    /* ---- 从栈上反推描述符（必须在填完 ctx 之后：此时可以随便用寄存器） ----
-     * thunk 用 call 压入的返回地址在 [rsp + FRAME]（入口 RSP = E-8-FRAME），等于 thunk+5；
-     * 描述符位于 thunk 之前 16 字节 → 描述符 = 返回地址 - 5 - 16。
-     */
+    /* ---- ????????????????????? ctx ????????????????????? ----
+     * thunk ??call ?????????????[rsp + FRAME]?????RSP = E-8-FRAME?????? thunk+5??     * ????????thunk ??? 16 ??? ???????= ?????? - 5 - 16??     */
     movq    VM_FRAME_SIZE(%rsp), %r11
     subq    $(VM_THUNK_SIZE + VM_DESC_TO_THUNK), %r11
     movl    4(%r11), %eax
@@ -90,25 +82,25 @@ VM_ENTRY_SYMBOL:
     movq    %rcx, VM_CTX_VBASE(%rsp)
     movq    $0, VM_CTX_VSCRATCH(%rsp)
 
-    /* ---- 字节码指针与长度 ---- */
+    /* ---- ???????????? ---- */
     movl    8(%r11), %eax
     addq    %r11, %rax
     movq    %rax, VM_CTX_CODE(%rsp)
     movl    12(%r11), %eax
     movl    %eax, VM_CTX_CODELEN(%rsp)
 
-    /* ---- 加密支持：描述符指针 + 帧内的解密缓冲 ---- */
+    /* ---- ??????????????? + ???????????---- */
     movq    %r11, VM_CTX_DESC(%rsp)
 
-    /* ---- 状态清零 ---- */
+    /* ---- ???????---- */
     movl    $0, VM_CTX_FLAGS(%rsp)
     movl    $0, VM_CTX_PC(%rsp)
     movl    $0, VM_CTX_RESERVED(%rsp)
 
-    /* ---- 调用 vm_run ----
-     * blob 由谁编译，就按谁的调用约定：
-     *   mingw 编译（vmpbuild 会定义 VM_BLOB_USES_WIN64）→ RCX + 32B shadow
-     *   本机 Linux gcc 编译 → System V：RDI，无 shadow
+    /* ---- ??? vm_run ----
+     * blob ?????????????????????
+     *   mingw ?????mpbuild ?????VM_BLOB_USES_WIN64??? RCX + 32B shadow
+     *   ??? Linux gcc ??? ??System V??DI??? shadow
      */
 #ifdef VM_BLOB_USES_WIN64
     subq    $32, %rsp
@@ -120,7 +112,7 @@ VM_ENTRY_SYMBOL:
     call    vm_run
 #endif
 
-    /* ---- 还原 volatile GPR ---- */
+    /* ---- ??? volatile GPR ---- */
     movq    VM_SAVE_RCX(%rsp), %rcx
     movq    VM_SAVE_RDX(%rsp), %rdx
     movq    VM_SAVE_RSI(%rsp), %rsi
@@ -130,7 +122,7 @@ VM_ENTRY_SYMBOL:
     movq    VM_SAVE_R10(%rsp), %r10
     movq    VM_SAVE_R11(%rsp), %r11
 
-    /* ---- 还原 volatile XMM ---- */
+    /* ---- ??? volatile XMM ---- */
     movups  VM_SAVE_XMM0(%rsp),  %xmm0
     movups  VM_SAVE_XMM1(%rsp),  %xmm1
     movups  VM_SAVE_XMM2(%rsp),  %xmm2
@@ -148,7 +140,7 @@ VM_ENTRY_SYMBOL:
     movups  VM_SAVE_XMM14(%rsp), %xmm14
     movups  VM_SAVE_XMM15(%rsp), %xmm15
 
-    /* ---- 还原 callee-saved ---- */
+    /* ---- ??? callee-saved ---- */
     movq    VM_SAVE_RBX(%rsp), %rbx
     movq    VM_SAVE_RBP(%rsp), %rbp
     movq    VM_SAVE_R12(%rsp), %r12
@@ -156,7 +148,7 @@ VM_ENTRY_SYMBOL:
     movq    VM_SAVE_R14(%rsp), %r14
     movq    VM_SAVE_R15(%rsp), %r15
 
-    /* ---- 返回值 ---- */
+    /* ---- ?????---- */
     movq    VM_CTX_RAX(%rsp), %rax
     addq    $VM_FRAME_SIZE, %rsp
     addq    $8, %rsp

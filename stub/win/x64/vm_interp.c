@@ -624,15 +624,11 @@ static void vm_antidebug(void) { }
 int vm_run(vm_ctx_t *vm) {
     vm_antidebug();
     vm_selfcheck();
-#ifndef VM_RELEASE
-    /* 客户机栈起点应当 16 字节对齐：调用方按 ABI 进入时 rsp ≡ 8 (mod 16)，
-     * stub 再减 8 与 VM_MARGIN(0x4000) ⇒ 应当 ≡ 0。若不对齐，说明**调用方的进入条件与我们假设不符**
-     * —— 这正是"被外部调用者调用"那一类（pymod_create/exec 必崩）最缺的证据。
-     * 用写地址 1 报错：现场里是 fault=0x1 的 AV，与其它两种（fault=0x0、ud2）互不混淆。 */
-    if ((vm->regs[VRSP] & 15u) != 0) {
-        __asm__ __volatile__("int3"); /* 0x80000003：与 ud2(0xC000001D)、AV(0xC0000005) 三者互不混淆 */
-    }
-#endif
+    /* 第 49 轮这里曾放一条"客户机 RSP 应 16 字节对齐"的 int3 断言。第 55 轮查明它是**错误前提**：
+     * 客户机 RSP 该不该对齐是我们自己的约定，不是 ABI 要求；而 thunk 的 call 让 vm_entry 从 rsp%16==0
+     * 进入，减 FRAME_SIZE/8/MARGIN 后客户机 RSP 自然落在 %16==8 —— 这是原设计的正常值。
+     * 断言 + 第 50 轮那条对齐掩码是一对：掩码让 RSP 变成 %16==0 才"骗过"断言，却把与调用方帧的定长
+     * 关系挪了 8 字节，于是 E2E 的 framed（第 5 参数在调用方帧里）全错。两者一并撤除。 */
     /* 先把客户机栈要用的页"踩"一遍，逼宿主把它们提交出来。
      * Windows 的线程栈是"保留一大段、只提交头几页 + 一个守护页"，自动增长只在**碰到守护页**时发生；
      * 而客户机栈起点在宿主 rsp 下方 MARGIN(16KB) 处 —— 客户机第一次往里 push 时，可能一次性跨过守护页，
