@@ -1313,6 +1313,12 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
                         vm_call_diffs++;
                     }
                 }
+                /* 注意：非 release 走的是这一条分支，所以**这里也必须记 ring** ——
+                 * 否则最后几次 CALLN 不会出现在调用环里（第 60 轮就因为缺了它们，
+                 * 看到的"最后一次调用"与 vm_last_call 对不上）。 */
+                vm_call_ring[(vm_call_ring_n & 7u) * 2u] = addr;
+                vm_call_ring[(vm_call_ring_n & 7u) * 2u + 1u] = vm->regs[VRAX];
+                vm_call_ring_n++;
                 vm->pc = pc + 9;
                 break;
             }

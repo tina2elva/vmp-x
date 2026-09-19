@@ -35,6 +35,23 @@ def module_base_of(pid, name):
     PROC.CloseHandle(snap)
     return base
 
+def modules_of(pid):
+    TH32CS_SNAPMODULE = 0x8; TH32CS_SNAPMODULE32 = 0x10
+    class ME(ctypes.Structure):
+        _fields_ = [('dwSize', wt.DWORD), ('th32ModuleID', wt.DWORD), ('th32ProcessID', wt.DWORD),
+                    ('GlblcntUsage', wt.DWORD), ('ProccntUsage', wt.DWORD), ('modBaseAddr', ctypes.c_void_p),
+                    ('modBaseSize', wt.DWORD), ('hModule', wt.HMODULE), ('szModule', ctypes.c_char * 256),
+                    ('szExePath', ctypes.c_char * 260)]
+    snap = PROC.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+    if snap == -1: return []
+    me = ME(); me.dwSize = ctypes.sizeof(ME); out = []
+    ok = PROC.Module32First(snap, ctypes.byref(me))
+    while ok:
+        out.append((me.szModule.decode(errors='replace'), me.modBaseAddr, me.modBaseSize))
+        ok = PROC.Module32Next(snap, ctypes.byref(me))
+    PROC.CloseHandle(snap)
+    return out
+
 def watch(pid, offs, out):
     PROCESS_QUERY_INFORMATION = 0x0400; PROCESS_VM_READ = 0x0010
     h = PROC.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
@@ -47,6 +64,17 @@ def watch(pid, offs, out):
         n += 1
         if base is None:
             base = module_base_of(pid, 'example.cp313-win_amd64.pyd')
+            if base:
+                for nm, mb, ms in modules_of(pid):
+                    f.write('mod %s base=0x%X size=0x%X' % (nm, mb or 0, ms) + chr(10))
+                got0 = ctypes.c_size_t()
+                iat = []
+                for i in range(96):
+                    q = ctypes.c_uint64()
+                    if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + 0x8300 + 8*i), ctypes.byref(q), 8, ctypes.byref(got0)):
+                        if q.value: iat.append('0x%X:0x%X' % (0x8300 + 8*i, q.value))
+                f.write('iat ' + ' '.join(iat) + chr(10))
+                f.flush()
         if base:
             vals = {}
             for k, o in offs.items():
