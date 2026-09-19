@@ -14,7 +14,7 @@ PROC = ctypes.windll.kernel32
 
 def rvas(man, rep):
     sec = rep['sectionRVA']; sym = man['symbols']
-    ks = [k for k in ('vm_last_pc','vm_last_call','vm_last_call_rcx','vm_call_ring_n','vm_call_ring','vm_last_call_args') if k in sym]
+    ks = [k for k in ('vm_last_pc','vm_last_call','vm_last_call_rcx','vm_call_ring_n','vm_call_ring','vm_last_call_args','vm_diag') if k in sym]
     return {k: sec + sym[k] for k in ks}
 
 def module_base_of(pid, name):
@@ -62,6 +62,9 @@ def watch(pid, offs, out):
     buf = ctypes.c_uint64(); n = 0; base = None
     while n < 2000000:
         n += 1
+        ec = wt.DWORD()
+        if PROC.GetExitCodeProcess(h, ctypes.byref(ec)) and ec.value != 259:  # STILL_ACTIVE
+            f.write('target exited, samples=%d' % n + chr(10)); f.flush(); break
         if base is None:
             base = module_base_of(pid, 'example.cp313-win_amd64.pyd')
             if base:
@@ -80,7 +83,11 @@ def watch(pid, offs, out):
             for k, o in offs.items():
                 got = ctypes.c_size_t()
                 if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(buf), 8, ctypes.byref(got)):
-                    if k == 'vm_last_call_args':
+                    if k == 'vm_diag':
+                        rd = (ctypes.c_uint64 * 16)()
+                        if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(rd), 128, ctypes.byref(got)):
+                            vals['diag8_11'] = [hex(rd[i]) for i in range(8, 12)]
+                    elif k == 'vm_last_call_args':
                         raw4 = (ctypes.c_uint64 * 4)()
                         if PROC.ReadProcessMemory(h, ctypes.c_void_p(base + o), ctypes.byref(raw4), 32, ctypes.byref(got)):
                             vals['args'] = [hex(raw4[i]) for i in range(4)]

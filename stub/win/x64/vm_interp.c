@@ -1296,6 +1296,11 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_last_call_args[1] = vm->regs[VRDX];
             vm_last_call_args[2] = vm->regs[VR8];
             vm_last_call_args[3] = vm->regs[VR9];
+            /* 同时放进 vm_diag[8..11]（这个数组早已在 manifest 里、且被历史探针验证可读） */
+            vm_diag[8] = vm_last_call_args[0];
+            vm_diag[9] = vm_last_call_args[1];
+            vm_diag[10] = vm_last_call_args[2];
+            vm_diag[11] = vm_last_call_args[3];
 #endif
             typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
             fn_t fn = (fn_t)addr;
@@ -1349,6 +1354,11 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_last_call_args[1] = vm->regs[VRDX];
             vm_last_call_args[2] = vm->regs[VR8];
             vm_last_call_args[3] = vm->regs[VR9];
+            /* 同时放进 vm_diag[8..11]（这个数组早已在 manifest 里、且被历史探针验证可读） */
+            vm_diag[8] = vm_last_call_args[0];
+            vm_diag[9] = vm_last_call_args[1];
+            vm_diag[10] = vm_last_call_args[2];
+            vm_diag[11] = vm_last_call_args[3];
 #endif
             if (addr == 0) return 1;
             typedef u64 (*fnr_t)(u64, u64, u64, u64, u64, u64, u64, u64);

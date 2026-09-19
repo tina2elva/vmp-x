@@ -684,6 +684,25 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ### 588. **拿到了崩溃那次 CALLN 的入参** —— RCX 里是 dict，方法指针却在 R8
+> 探针 `vm_last_call_args` + `vm_diag[8..11]` 一起用，抓到的最后一条采样：
+> ```
+> vm_last_call = pyd + 0x2D98            （= __Pyx_PyObject_CallMethO + 0x78）
+> args = RCX=0x20B818C3440  RDX=0x7FFF04F186E0(pyd 内 +0x86E0，像静态对象)  R8=0x20B81C7E790  R9=0
+> ring 的对应关系：
+>   #5 PyModule_GetDict        ret=0x20B818C3440   ← **等于 RCX**
+>   #8 PyObject_GetAttrString  ret=0x20B81C7E790   ← **等于 R8**
+> ```
+> `__Pyx_PyObject_CallMethO(func, arg)` 只有两个参数（RCX=func, RDX=arg）。
+> 而 RCX 里放的是**模块 dict**、真正的"方法对象"却在 **R8** ⇒
+> 被调方于是把 dict 当成 C 函数对象去取 `m_self`/`ml_meth`，拿到垃圾函数指针去调 ⇒ 崩溃。
+>
+> ### 589. 结论与下一步
+> 这**不是**外部调用者的问题，也不是 IAT/翻译目标的问题，而是**调用前参数寄存器被摆错了位置**（至少这一个调用点）。
+> 下一步很明确：用 `vmpack -v` 把 `__pyx_pymod_create` 的 IR 打出来，看目标 `0x2D98` 那次 `CALLN` **之前几条**指令，
+> 核对是谁把 dict 放进了 RCX、本该放进去的方法指针为什么留在 R8 —— 定位到 lifter 的某条 MOV/寄存器分配规则后修掉，
+> 再跑 `import example` 验证 ⇒ 覆盖口径 10/11 → 11/11。
+>
 > ## 继续（第 61 轮续）：init 类拿到**完整的命名调用序列**，崩溃点精确到 `__Pyx_PyObject_CallMethO+0x78`
 >
 > ### 585. 用 python313.dll 的导出表给 8 次调用全部点名
