@@ -32,9 +32,22 @@ import json, struct, sys
 rep = json.load(open("build/elf_enc.json"))
 d = open("build/elf_target.enc","rb").read()
 entry = struct.unpack_from("<Q", d, 0x18)[0]
+phoff = struct.unpack_from("<Q", d, 0x20)[0]
+phentsize = struct.unpack_from("<H", d, 0x36)[0]
+phnum = struct.unpack_from("<H", d, 0x38)[0]
+base = None
+for i in range(phnum):
+    o = phoff + i * phentsize
+    t, _fl = struct.unpack_from("<II", d, o)
+    _off, va = struct.unpack_from("<QQ", d, o + 8)
+    if t == 1:
+        base = va if base is None else min(base, va)
+if base is None:
+    base = 0
+rva = entry - base
 lo, hi = rep["sectionRVA"], rep["sectionRVA"] + rep["sectionSize"]
-print("    e_entry=0x%X payload=[0x%X,0x%X)" % (entry, lo, hi))
-sys.exit(0 if lo <= entry < hi else 1)
+print("    e_entry=0x%X 基址=0x%X -> RVA=0x%X，payload=[0x%X,0x%X)" % (entry, base, rva, lo, hi))
+sys.exit(0 if lo <= rva < hi else 1)
 ' || fail "e_entry 没有指到 payload"
 
 echo "[*] 文件级：原执行段在打包文件里应 0 残留（非零 64B 块）"
