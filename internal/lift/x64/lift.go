@@ -17,6 +17,31 @@ import (
 )
 
 // Lifter 持有模块级信息与“当前函数”的栈跟踪状态
+// looksLikeFuncEntry 判断某 RVA 是否"像函数入口"：函数入口前通常是填充（0xCC/0x90/0x00），
+// 而"函数中段"前面一定是一条会流进来的指令（非填充）。用于区分真正的尾调用与函数续段。
+func (l *Lifter) looksLikeFuncEntry(rva uint32) bool {
+	if l.ReadImage == nil {
+		return true
+	}
+	if rva == 0 {
+		return true
+	}
+	n := uint32(8)
+	if rva < n {
+		n = rva
+	}
+	b := l.ReadImage(rva-n, int(n))
+	if len(b) == 0 {
+		return true
+	}
+	for _, x := range b {
+		if x != 0xCC && x != 0x90 && x != 0x00 {
+			return false
+		}
+	}
+	return true
+}
+
 type Lifter struct {
 	ImageBase uint64
 	// FrameSkew = 模拟栈比原生栈低多少（来自 vm_abi.h / manifest）。
@@ -180,7 +205,7 @@ func (l *Lifter) LiftFunc(name string, code []byte, rva uint32) (*ir.Func, error
 			in := &f.Insns[i]
 			// 只把**条件分支**的目标当冷块：无条件 jmp 大多是尾调用/跳到别处，
 			// 把它们的落地代码当成本函数的一部分会拖进无关代码（实测会显著拉低可保护率）。
-			if in.Op != ir.Jcc || in.TargetOff == irTargetFixed {
+			if (in.Op != ir.Jcc && in.Op != ir.Jmp) || in.TargetOff == irTargetFixed {
 				continue
 			}
 			if _, ok := offToIR[in.TargetOff]; ok {
@@ -689,6 +714,13 @@ func (l *Lifter) liftOne(f *ir.Func, ins x64dec.Insn, off uint32) error {
 			if target < f.Addr || target >= f.Addr+uint64(f.Size) {
 				if target < l.ImageBase {
 					return fmt.Errorf("尾调用目标 0x%X 低于镜像基址", target)
+				}
+				// 目标在镜像内、但**不像函数入口**（前面不是填充/对齐字节）⇒ 它其实是本函数的续段：
+				// 必须当普通跳转翻译，并交给孤岛机制去解码目标；若翻成原生调用，那段"函数中段"会在
+				// **解释器的栈**上跑（客户的帧内保存位全部错位）—— 实测必崩（__pyx_pymod_create 那例）。
+				if l.ReadImage != nil && !l.looksLikeFuncEntry(uint32(target-l.ImageBase)) {
+					em(ir.Insn{Op: ir.Jmp, TargetOff: uint32(target - f.Addr)})
+					return nil
 				}
 				em(ir.Insn{Op: ir.CallN, Imm: target - l.ImageBase})
 				em(ir.Insn{Op: ir.Ret})

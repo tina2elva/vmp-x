@@ -14,8 +14,9 @@ DEFAULT_FUNCS = [
     '__pyx_pw_7example_7current_time_str', '__pyx_pf_7example_6current_time_str',
     '__pyx_pw_7example_9add_dly', '__pyx_pf_7example_8add_dly',
     '__pyx_bisect_code_objects',
+    '__pyx_pymod_create',   # 第 64 轮修复后可保护（尾调用规则的前提校验）
 ]
-KNOWN_BAD = ['__pyx_pymod_create']  # 见 STATUS 489：外部调用者这一类还没解决
+KNOWN_BAD = []  # 第 64 轮起：原先最后一块（__pyx_pymod_create）已修好
 
 EXPR = ('import example, numpy as np; '
         'print("fib", example.fibonacci(10), example.fibonacci(15)); '
