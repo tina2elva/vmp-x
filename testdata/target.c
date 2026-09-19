@@ -458,6 +458,26 @@ static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+/* 把 mt 的一轮抽成函数：mt 与 mt_many 共用。 */
+static int run_mt_once(void) {
+    enum { NT = 4 };
+    HANDLE th[NT];
+    mt_arg args[NT];
+    for (int i = 0; i < NT; i++) {
+        args[i].seed = (unsigned long long)(i + 1);
+        args[i].acc = 0;
+        th[i] = CreateThread(NULL, 0, mt_worker, &args[i], 0, NULL);
+        if (!th[i]) { fprintf(stderr, "CreateThread failed\n"); return 2; }
+    }
+    for (int i = 0; i < NT; i++) {
+        WaitForSingleObject(th[i], INFINITE);
+        CloseHandle(th[i]);
+    }
+    for (int i = 0; i < NT; i++) printf("%lld\n", args[i].acc);
+    printf("bump=%llu\n", g_bump);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     AddVectoredExceptionHandler(1, vmp_veh);   /* 更早、更广：CI 上那个 AV 只有它能抓到 */
     SetUnhandledExceptionFilter(vmp_crash_filter);
@@ -492,21 +512,15 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc >= 2 && strcmp(argv[1], "mt") == 0) {
-        enum { NT = 4 };
-        HANDLE th[NT];
-        mt_arg args[NT];
-        for (int i = 0; i < NT; i++) {
-            args[i].seed = (unsigned long long)(i + 1);
-            args[i].acc = 0;
-            th[i] = CreateThread(NULL, 0, mt_worker, &args[i], 0, NULL);
-            if (!th[i]) { fprintf(stderr, "CreateThread failed\n"); return 2; }
+        return run_mt_once();
+    }
+    /* 反复跑 mt：每一轮都新建线程（最容易命中"新线程首次调用"那一类问题），用于本地/CI 加压复现。 */
+    if (argc >= 2 && strcmp(argv[1], "mt_many") == 0) {
+        int rounds = (argc >= 3) ? atoi(argv[2]) : 20;
+        for (int r = 0; r < rounds; r++) {
+            if (run_mt_once() != 0) return 1;
         }
-        for (int i = 0; i < NT; i++) {
-            WaitForSingleObject(th[i], INFINITE);
-            CloseHandle(th[i]);
-        }
-        for (int i = 0; i < NT; i++) printf("%lld\n", args[i].acc);
-        printf("bump=%llu\n", g_bump);
+        printf("mt_many rounds=%d ok\n", rounds);
         return 0;
     }
     if (argc < 3) {
