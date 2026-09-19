@@ -75,6 +75,12 @@ function Run-FileOnce([string]$exe, [string[]]$a, [int]$sec) {
         $out = ""
         if (Test-Path $outFile) { $out = (Get-Content $outFile -Raw -ErrorAction SilentlyContinue) }
         if ($null -eq $out) { $out = "" }
+        # 关键：stderr 别丢 —— 目标自带的崩溃上报（CRASH code/addr/fault/region/寄存器）只在**失败那次**的
+        # stderr 里；重跑（try1/try2）往往是好的，所以以前一直看不到现场。
+        $err = ""
+        if (Test-Path $errFile) { $err = (Get-Content $errFile -Raw -ErrorAction SilentlyContinue) }
+        if ($null -eq $err) { $err = "" }
+        $script:LastStderr = ($err -replace "[\r\n]+", " ").Trim()
         return $out.Trim()
     } catch {
         return "STARTFAIL: " + $_.Exception.Message
@@ -171,7 +177,8 @@ foreach ($c in $cases) {
             $tn = if ($n1.Length -gt 60) { $n1.Substring($n1.Length - 60) } else { $n1 }
             $tv = if ($v1.Length -gt 60) { $v1.Substring($v1.Length - 60) } else { $v1 }
             $sum = "lenN=$($n1.Length) lenP=$($v1.Length) firstDiff=$fd tailN=[$tn] tailP=[$tv]"
-            $failLines += ("E2EFAIL " + $c.f + "(" + $a + ") " + $sum + " try1[" + $d1 + "] try2[" + $d2 + "]")
+            $oe = if ($script:LastStderr) { $script:LastStderr } else { "" }
+            $failLines += ("E2EFAIL " + $c.f + "(" + $a + ") origErr[" + $oe + "] " + $sum + " try1[" + $d1 + "] try2[" + $d2 + "]")
         }
         $tag = if ($ok) { "OK  " } else { "FAIL" }
         Write-Output ("  [{0}] {1}({2}): native={3} protected={4}" -f $tag, $c.f, $a, $n, $v)
