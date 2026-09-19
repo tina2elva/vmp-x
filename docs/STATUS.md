@@ -684,6 +684,28 @@ VM 执行失败 rc=1 err=参考实现拒绝越界写: 0x6CD7C2BA (w=8)
 
 > 诚实说明两件事：
 >
+> ### 592. 原生代码的对应段：**`RCX ← RSI`**，而我们的 IR 是 `RCX ← RDI`
+> `__pyx_pymod_create` 的原生汇编（0x2BC0 起）关键几行：
+> ```
+> 2bc6: mov %rcx,%rsi          ← 入口把第一个参数（def）存进 RSI
+> ...（若干 IAT 间接调用：PyThreadState_Get / PyInterpreterState_GetID …）
+> 2c36: mov %rbx,0x40(%rsp)
+> 2c3b: lea …,%rdx             ← 静态对象
+> 2c47: mov %rsi,%rcx          ← **RCX ← RSI（= 保存的 def）**
+> 2c4f: mov %r14,0x20(%rsp)
+> 2c54: call *…                ← IAT 0x8270（PyModule_NewObject 一类）
+> ```
+> 而我们在**同一位置**的 IR 是 `IR[142] MOV_RR dst=1 a=7`，按 x64 寄存器编号（0=RAX,1=RCX,…,6=RSI,7=RDI）
+> 这条是 **`RCX ← RDI`** —— 与原生 `RCX ← RSI` **不一致**。
+> 崩溃瞬间实测 `RCX = PyModule_GetDict 的返回值（dict）`，也和"应当是 def 或最新方法对象"对不上。
+>
+> ### 593. 候选结论与下一轮动作（要严谨，不能凭一条 IR 就下结论）
+> 候选：**lifter 在寄存器映射/别名跟踪上把某个寄存器认错了**（RSI ↔ RDI 这一类），于是尾调用前的参数寄存器摆错。
+> 下一轮要做的是**把 IR 与源指令一一对应**（现在的 `-v` 输出不带地址，所以还不能断定 IR[142] 就对应 0x2c47）：
+> 1. 让 `-v` 在每条 IR 后带上"源 RVA"（或按 `-dumpbytecode` + map 交叉核对）；
+> 2. 对齐后逐条比对 0x2c36..0x2c9c 与 IR[138..148]，确认是否真的映射错了寄存器；
+> 3. 若确认 ⇒ 改 lifter 的寄存器映射；若并非如此 ⇒ 继续沿"值从哪来"往上追（`def` 在 RSI 里是否被谁改过）。
+>
 > ### 590. IR 层面：崩溃点是**尾调用**，被翻成 `CALL` + `RET`
 > `vmpack -v` 的输出里，`0x2D98`（`__Pyx_PyObject_CallMethO`）出现在两处，前后完全相同：
 > ```
