@@ -309,6 +309,17 @@ __attribute__((noinline)) long dispatch(int op, long x) {
 /* ---- 嵌套/大帧实验：验证"内层受保护调用会不会踩掉外层的客户机栈" ----
  * outer 的 volatile 局部强制它占用栈上的一个较大区域（4KB）；inner 是另一个被保护函数。
  * 如果内层入口把客户机栈放在了外层的用区之内，外层返回后校验就会失败。 */
+/* ---- 机制实验：新线程里直接写 rsp-16KB，会不会 AV？
+ * Windows 的线程栈是"保留 1MB、只提交头几页 + 一个守护页"；栈自动增长只在**碰到守护页**时发生。
+ * 如果一次性跳到 rsp 下方 16KB 去写（正是我们给客户机栈设的起点），就会越过守护页直接 AV。 */
+static DWORD WINAPI stack_probe_worker(LPVOID p) {
+    volatile unsigned char local = 0;
+    (void)local; (void)p;
+    volatile unsigned char *q = (volatile unsigned char *)((char *)&local - 0x4000);
+    *q = 1;
+    return 0;
+}
+
 __attribute__((noinline)) long nest_inner(long x) { return x * 2 + 1; }
 __attribute__((noinline)) long nest_outer(long x) {
     volatile unsigned char buf[384];   /* 用 384 字节：gcc 会走静态帧，不会触发 and rsp,-N 那种不可跟踪形态 */
@@ -450,6 +461,13 @@ static LONG WINAPI vmp_crash_filter(EXCEPTION_POINTERS *ep) {
 int main(int argc, char **argv) {
     AddVectoredExceptionHandler(1, vmp_veh);   /* 更早、更广：CI 上那个 AV 只有它能抓到 */
     SetUnhandledExceptionFilter(vmp_crash_filter);
+    if (argc >= 2 && strcmp(argv[1], "stack_probe") == 0) {
+        HANDLE th = CreateThread(NULL, 0, stack_probe_worker, NULL, 0, NULL);
+        WaitForSingleObject(th, 10000);
+        DWORD rc = 0; GetExitCodeThread(th, &rc); CloseHandle(th);
+        printf("stack_probe exit=0x%lX %s\n", (unsigned long)rc, rc == 0 ? "(写成功：该页已提交或守护页机制生效)" : "(线程异常退出)");
+        return 0;
+    }
     if (argc >= 2 && strcmp(argv[1], "nest_test") == 0) {
         long bad = 0;
         for (long x = 1; x <= 200; x++) {
