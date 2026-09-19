@@ -321,8 +321,8 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 		if verbose {
 			for i := range irFunc.Insns {
 				in := &irFunc.Insns[i]
-				fmt.Printf("      IR[%02d] %-8s w=%-2d kind=%d dst=%d a=%d b=%d imm=0x%X disp=%d target=%d",
-					i, in.Op.String(), in.Width, in.Kind, in.Dst, in.A, in.B, in.Imm, in.Disp, in.Target)
+				fmt.Printf("      IR[%02d] %-8s w=%-2d kind=%d dst=%d a=%d b=%d imm=0x%X disp=%d target=%d src=+0x%X",
+					i, in.Op.String(), in.Width, in.Kind, in.Dst, in.A, in.B, in.Imm, in.Disp, in.Target, in.SrcOff)
 				fmt.Println()
 			}
 		}
