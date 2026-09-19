@@ -390,6 +390,12 @@ static void vmp_crash_line(EXCEPTION_POINTERS *ep) {
         fprintf(stderr, " module=%p rva=0x%llX", (void *)mod,
                 (unsigned long long)((unsigned char *)addr - (unsigned char *)mod));
     }
+    /* 访问违例时 ExceptionInformation[1] 就是**出错的数据地址** —— 这比任何反汇编偏移都直接。 */
+    if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && ep->ExceptionRecord->NumberParameters >= 2) {
+        fprintf(stderr, " fault=%p op=%s",
+                (void *)ep->ExceptionRecord->ExceptionInformation[1],
+                ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
+    }
     fprintf(stderr, "\n");
     /* 再把 GPR 打出来：偶发崩溃往往只差一个寄存器的值就能定性（尤其/疑似缓存/原子路径）。 */
     if (ep->ContextRecord) {
