@@ -25,3 +25,30 @@ func KDFEntry(master []byte, rva uint32, salt uint32) [32]byte {
 	c.XORKeyStream(out[:], out[:]) // 密钥流 ^ 0 = 密钥流
 	return out
 }
+
+// KDFSaltForPlacement 给"字节码条目"算一个派生用 salt。
+//
+// 背景（STATUS #378 里记的那个待定点）：PE/ELF 的整体加密表有 salt 字段，
+// 但**函数描述符没有** —— 而 KDF 需要一个两侧一致的 salt。这里不改描述符格式，
+// 直接用描述符里本来就有的三个字段派生（FNV-1a-32，与运行期补丁校验同一套常量）：
+//
+//	salt_f = FNV1a32("VMPXKDF\x00" || le32(selfRVA) || le32(codeRVA) || le32(codeLen))
+//
+// 这样每条目 salt 互不相同（同一镜像里不会有两条 selfRVA 相同），且两侧都能独立算出来。
+func KDFSaltForPlacement(selfRVA, codeRVA, codeLen uint32) uint32 {
+	const (
+		off = 2166136261
+		pri = 16777619
+	)
+	h := uint32(off)
+	mix := func(b byte) { h ^= uint32(b); h *= pri }
+	for _, c := range []byte("VMPXKDF\x00") {
+		mix(c)
+	}
+	for _, v := range []uint32{selfRVA, codeRVA, codeLen} {
+		for i := 0; i < 4; i++ {
+			mix(byte(v >> (8 * i)))
+		}
+	}
+	return h
+}

@@ -28,3 +28,27 @@ func TestKDFEntryMatchesC(t *testing.T) {
 		}
 	}
 }
+
+// 逐条目的 salt 必须互不相同（这是"一把密钥解全部"被打断的前提之一）。
+func TestKDFSaltDistinctAndStable(t *testing.T) {
+	seen := map[uint32]uint32{}
+	rv := []uint32{0x1670, 0x16A0, 0x1700, 0x1730, 0x93000}
+	for _, r := range rv {
+		s := KDFSaltForPlacement(r, 0x90, 40)
+		if prev, dup := seen[s]; dup {
+			t.Fatalf("salt 撞车: rva=0x%X 与 0x%X 都是 0x%X", r, prev, s)
+		}
+		seen[s] = r
+		t.Logf("rva=0x%-6X salt=0x%08X key=%s", r, s,
+			hex.EncodeToString(func() []byte { k := KDFEntry(master32(), r, s); return k[:] }()))
+	}
+}
+
+// master32 是 KAT 统一用的测试主密钥（0x10..0x2F）。
+func master32() []byte {
+	m := make([]byte, 32)
+	for i := range m {
+		m[i] = byte(0x10 + i)
+	}
+	return m
+}
