@@ -1400,7 +1400,95 @@ static void vm_keep_verify_ref(vm_ctx_t *vm) {
  * TLS 回调 -> 入口点）。放在 .bss（不能有初始化器，否则落进只读的 .data 段）。 */
 static u32 vm_img_done;
 
-#if defined(VM_BLOB_TARGET_LINUX) && defined(__x86_64__)
+#if defined(VM_BLOB_TARGET_LINUX) && defined(__aarch64__)
+/* ---- Linux/aarch64：与 x86-64 那条同构（只验签 + 原地解密），差别只在 syscall 约定：
+ * 号放 x8、参数 x0..x2、svc #0；mprotect = 226、write = 64。基址同样用「表地址 - selfRVA」反推。 ---- */
+u64 vm_img_diag[4];
+
+static long vm_syscall3_a64(long n, long a, long b, long c) {
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+
+static void vm_dbg_trace(const char *tag, long v) {
+    char buf[96];
+    u32 n = 0;
+    while (tag[n] && n < 60) {
+        buf[n] = tag[n];
+        n++;
+    }
+    char tmp[24];
+    u32 m = 0;
+    int neg = v < 0;
+    unsigned long u = neg ? (unsigned long)(-v) : (unsigned long)v;
+    if (u == 0) tmp[m++] = '0';
+    while (u != 0) {
+        tmp[m++] = (char)('0' + (u % 10));
+        u /= 10;
+    }
+    if (neg) buf[n++] = '-';
+    while (m != 0) buf[n++] = tmp[--m];
+    buf[n++] = 10;
+    vm_syscall3_a64(64 /* SYS_write */, 2 /* stderr */, (long)buf, (long)n);
+}
+
+int vm_unpack_image(const void *tblp) {
+    if (vm_img_done) return 0;
+    const u8 *t = (const u8 *)tblp;
+    u64 wantBase = *(const u64 *)(t + 0);
+    u32 salt = *(const u32 *)(t + 8);
+    u32 count = *(const u32 *)(t + 12);
+    u32 selfRVA = *(const u32 *)(t + 16);
+    if (!selfRVA) return -1;
+    u64 base = (u64)(const void *)t - (u64)selfRVA;
+    vm_img_diag[0] = 0;
+    vm_img_diag[1] = base;
+    vm_img_diag[2] = wantBase;
+    vm_img_diag[3]++;
+    if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; vm_dbg_trace("VMPELF badmagic base=", (long)base); return -1; }
+    if (wantBase && base != wantBase) { vm_img_diag[0] = 2; vm_dbg_trace("VMPELF basemismatch base=", (long)base); return -2; }
+    u8 key[32] = VM_KEY_BYTES;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *e = t + 24 + (u64)i * 32;
+        u32 rva = *(const u32 *)(e + 0), size = *(const u32 *)(e + 4), flags = *(const u32 *)(e + 8);
+        const u8 *tag = e + 16;
+        u8 *dst = (u8 *)(base + rva);
+        u8 nonce[12];
+        *(u32 *)(nonce + 0) = rva;
+        *(u32 *)(nonce + 4) = size;
+        *(u32 *)(nonce + 8) = salt;
+        u8 aad[8];
+        *(u32 *)(aad + 0) = rva;
+        *(u32 *)(aad + 4) = size;
+        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) {
+            vm_img_diag[0] = 4;
+            vm_dbg_trace("VMPELF verifyfail rva=", (long)rva);
+            return -4;
+        }
+        u64 page = 0x1000;
+        u64 pstart = (u64)dst & ~(page - 1);
+        u64 pend = ((u64)dst + size + page - 1) & ~(page - 1);
+        long mr = vm_syscall3_a64(226 /* SYS_mprotect */, (long)pstart, (long)(pend - pstart), 1 | 2 | 4);
+        if (mr != 0) {
+            vm_img_diag[0] = 5;
+            vm_dbg_trace("VMPELF mprotectfail rva=", (long)rva);
+            vm_dbg_trace("VMPELF mprotect errno=", -mr);
+            return -5;
+        }
+        vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        long prot = (flags & 1u) ? (1 | 4) : 1;
+        if (flags & 2u) prot |= 2;
+        vm_syscall3_a64(226, (long)pstart, (long)(pend - pstart), prot);
+    }
+    vm_img_done = 1;
+    vm_img_diag[0] = 0;
+    return 0;
+}
+#elif defined(VM_BLOB_TARGET_LINUX) && defined(__x86_64__)
 /* ---- Linux/amd64：同样"只验签 + 原地解密"，但改页保护走 mprotect(2) 系统调用（无 libc），
  * 基址用"表地址 - selfRVA"反推（和 Windows 侧同一套表格式）。 ---- */
 u64 vm_img_diag[4];

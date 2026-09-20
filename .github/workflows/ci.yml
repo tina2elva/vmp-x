@@ -189,6 +189,12 @@ jobs:
           fi
           exit $rc
 
+      - name: ELF image encryption e2e (aarch64, entry self-decrypt, qemu)
+        run: |
+          set -o pipefail
+          BLOB_SRC=stub/linux/arm64 BLOB_CC=aarch64-linux-gnu-gcc GOARCH_TARGET=arm64 QEMU=qemu-aarch64 TAG=a64 \
+            bash tools/e2e_elf_image.sh --strict 2>&1 | tee build/elf_image_e2e_a64.log
+
   # ---------------------------------------------------------------- Windows/arm64: blob build（clang + aarch64-w64-windows-gnu）
   # 以前这里找的是 aarch64-w64-mingw32-gcc（apt 里没有）→ 长期是「已知缺口」。
   # clang/LLVM 自带 aarch64 的 COFF 后端，而 blob 是 freestanding（不 include 任何系统头），

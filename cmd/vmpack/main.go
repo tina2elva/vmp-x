@@ -574,8 +574,8 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 	var imgSecs []inject.ImgSection
 	if encImageELFEnabled {
 		switch {
-		case f.Machine != elfload.EM_X86_64:
-			fmt.Println("[*] ELF 整体加密：跳过（只支持 x86-64）")
+		case f.Machine != elfload.EM_X86_64 && f.Machine != elfload.EM_AARCH64:
+			fmt.Println("[*] ELF 整体加密：跳过（只支持 x86-64 与 aarch64）")
 		case f.EType != 2:
 			fmt.Println("[*] ELF 整体加密：跳过（只支持 ET_EXEC；PIE 会被重定位破坏密文）")
 		case imgAEAD == nil:
