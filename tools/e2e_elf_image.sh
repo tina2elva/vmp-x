@@ -19,6 +19,7 @@ GOARCH_TARGET=${GOARCH_TARGET:-amd64}
 QEMU=${QEMU:-}
 TAG=${TAG:-x64}
 BLOB_GUEST=${BLOB_GUEST:-}
+EXPOSE_SECTIONS=${EXPOSE_SECTIONS:-.text,.rodata,.gopclntab}
 BLOB_EXTRA=${BLOB_EXTRA:-}
 VMP_FUNCS=${VMP_FUNCS:--func main.checkKey -func main.sumTo}
 
@@ -68,7 +69,7 @@ python3 tools/image_residue_elf.py build/elf_target build/elf_target_$TAG.enc ||
 # 等那条查清、并且暴露面数字在 CI 上也解释得通之后再接回来。
 
 echo "[*] 语义级：打包后 >=12 字节的可读串应降到原始的 5% 以内"
-python3 tools/expose_report.py --img build/elf_target --compare build/elf_target_$TAG.enc --sections .text,.rodata,.gopclntab --max-ratio 0.05 || fail "packed image still exposes readable strings"
+python3 tools/expose_report.py --img build/elf_target --compare build/elf_target_$TAG.enc --sections $EXPOSE_SECTIONS --max-ratio 0.05 || fail "packed image still exposes readable strings"
 
 echo "[*] 运行期：原生 vs 加密后逐字节比对"
 NATIVE_OUT="$($QEMU ./build/elf_target 2>&1)"
