@@ -56,3 +56,19 @@ void vm_kdf_entry(const u8 master[32], u32 rva, u32 salt, u8 out[32]) {
         out[4 * i + 3] = (u8)((v >> 24) & 0xff);
     }
 }
+
+/* 与 Go 侧 internal/inject/kdf.go 的 KDFSaltForPlacement 逐字节一致：
+ *   salt = FNV1a32("VMPXKDF\x00" || le32(selfRVA) || le32(codeRVA) || le32(codeLen))
+ * （描述符里没有 salt 字段，用它自己已有的三个字段派生；两侧必须一致，故单独钉 KAT。） */
+u32 vm_kdf_salt(u32 selfRVA, u32 codeRVA, u32 codeLen) {
+    u32 h = 2166136261u;
+    const char *tag = "VMPXKDF";
+    for (const char *p = tag; *p; p++) { h ^= (u32)(u8)*p; h *= 16777619u; }
+    h ^= 0u; h *= 16777619u; /* 结尾的 \x00 */
+    u32 v[3];
+    v[0] = selfRVA; v[1] = codeRVA; v[2] = codeLen;
+    for (int i = 0; i < 3; i++) {
+        for (int b = 0; b < 4; b++) { h ^= (u32)((v[i] >> (8 * b)) & 0xff); h *= 16777619u; }
+    }
+    return h;
+}
