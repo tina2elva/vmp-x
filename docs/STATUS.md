@@ -4056,3 +4056,10 @@ main.sumTo    patch=[F0 03 1E AA 44 2D 04 14]
   而 image_residue.py 把"缺节"当用法错误 → 加 --allow-missing（有节仍严格检查）；
   随后我新加的跳过提示写了中文，Windows runner 的 python stdout 是 **cp1252** →
   UnicodeEncodeError 被误报成"残留" → 工具输出改回纯 ASCII（本仓库既有约定）。
+
+### 371. 收口复核（本机，当前 HEAD）
+- `tools/gates.ps1` 在本机当前 HEAD 上跑完整套：**11 gates / 0 failed**（gofmt / vet / test / blob /
+  e2e 147 例 / 残留三项门禁 / DLL / arm64 客户机 / linux 载荷）。
+- README 新增「加固分层与四平台证据」一节（三层各自的机制与门禁、四平台 CI 证据含 run 号），
+  并如实列出 7 条仍未做项（首选基址约束、ELF 仅 ET_EXEC、ELF 未加密 .rodata/.data、
+  arm64 blob 依赖 CI、解释器 -O1、指令子集、无反调试纵深）。
