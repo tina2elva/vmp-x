@@ -405,8 +405,8 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 		imgSkip = "已用 -no-enc-image 关闭"
 	case imgAEAD == nil:
 		imgSkip = "-no-encrypt（没有主密钥，无法验签/解密）"
-	case f.Machine != pe.MachineAMD64:
-		imgSkip = "只支持 x86-64 的 PE"
+	case f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64:
+		imgSkip = "只支持 x86-64 / arm64 的 PE"
 	case f.Characteristics&0x2000 != 0 && !encImageDLLEnabled:
 		imgSkip = "目标是 DLL（已用 -no-enc-image-dll 关闭）"
 	}
