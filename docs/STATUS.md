@@ -4506,3 +4506,40 @@ kernelbase，所以只有 CI 会崩；现有镜像自解密只用 VirtualProtect
 
 **未做**：(3) 容器加密/混淆、(4) 反调试多路径、(6) 重定位/ASLR；以及 #385 里登记的 1b 边界项
 （外部文件源走 ntdll、授权回调、TPM/TEE、DLL/Linux/arm64 取钥）。
+
+### 387. 目标项 (3)：容器/记录明文收口 —— 魔数默认随机 + 描述符/两张表的标量字段混淆
+
+**做了什么**
+- **魔数默认每次构建随机**：原来只有 `-release` 才随机，非 release 是固定的 `"VMPK"`（0x4B504D56）——
+  那正是一个可被签名/扫描的 4 字节特征。运行期根本不读这个字段（只给打包器/manifest 用），
+  所以随时随机化零风险。
+- **描述符标量字段加掩码**（`internal/inject/fields.go` + `vm_interp.c` 的 `vm_desc_fields()`）：
+  偏移 **8..32** 那 6 个 u32（codeRVA / codeLen / encLen / flags / reserved1=funcRVA / reserved2=补丁偏移）
+  与 `KDFEntry(master, 0xC0DE0003, FieldMaskSalt)` 逐字节异或。这样静态读者不再能一眼读出
+  "哪个函数被虚拟化、它的原始 RVA、字节码多长、哪些节被整体加密"。
+- **原镜像解密表加掩码**：表头 12..24（count / selfRVA / 保留）与每条目 0..12（rva / size / flags）
+  分别与 `KDFEntry(master, 0xC0DE0004, ·)` 的两段异或；**位置在加密之后**（那几段循环要读明文 rva/size 定位节）。
+- **加载期校验表加掩码**：每条 24 字节（delta / len / check / selfRVA / funcRVA / codeLen）整体异或
+  `KDFEntry(master, 0xC0DE0005, ·)`。**只蒙 funcRVA 而留着 delta 是自欺欺人** —— delta 就等于
+  `funcRVA - 表首RVA`，所以整条一起蒙。
+- 域常量由 `vmpbuild` 从 `internal/inject/fields.go` 发进构建头（单一来源），C 侧只做异或。
+- 掩码种子 `FieldMaskSalt` 每构建随机，随 manifest 传给打包端；**没有主密钥推不出掩码**。
+
+**一个刻意的"不做"（值得写下来）**：没有断言"掩码后 flags 的 bit0 必须为 0"。
+异或掩码下每个比特都以 1/2 概率被翻转，**单个比特看起来"对"不构成泄漏** ——
+攻击者分不清 plain=1/mask=1 与 plain=0/mask=0；只有**确切值**匹配才带信息。
+所以门禁只查"确切常量不再出现"，不查比特。
+
+**门禁（新工具 + 校准）**
+- `tools/field_mask_check.py`：在**打包产物**上断言
+  ① 描述符魔数 ≠ 固定值 0x4B504D56；② `codeLen` 与 `reserved1(funcRVA)` 不再等于报告里的真值；
+  ③ 解密表的 count 不再等于真实条目数。
+- **校准**（探针必须先证明会失败）：把 `XorMask` 临时改成空操作重新打包，同一工具报
+  `5 check(s) failed`（两个函数的 codeLen/funcRVA + 表 count 全中）；恢复后 `[OK]`。
+- e2e 新增 1 条用例（154 → **155**）：上面那个检查。
+
+**证据**
+- 本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e **155 passed / 0 failed**）。
+- CI：（待填）
+
+**未做**：(4) 反调试多路径、(6) 重定位/ASLR；以及 #385 里登记的 1b 边界项。

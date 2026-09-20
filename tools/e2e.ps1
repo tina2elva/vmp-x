@@ -334,6 +334,13 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
+# ---- (3) container/record scalars must not be readable in the artifact ----
+# The report's P1.1-5: magic / RVA / length / flags sitting in plaintext. See tools/field_mask_check.py
+# for exactly what is asserted (and why single bits are deliberately NOT asserted).
+python tools/field_mask_check.py --packed build/target_vmp.exe --report build/target_vmp.json 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { $pass++ }
+else { $fail++; $failLines += "E2EFAIL field-mask: container scalars (magic/RVA/length/flags) are still plaintext" }
+
 Write-Output ""
 if ($failLines.Count -gt 0) {
     Write-Output "--- failure summary (one line per case, for CI annotations) ---"

@@ -69,18 +69,21 @@ type manifest struct {
 	MaxStubFrame int    `json:"maxStubStackFrame"`
 	// DescMagic：本 blob 期望的描述符魔数。release 构建里它是**每次构建随机**的，
 	// 这样发布产物里不存在固定 4 字节特征（原来那个特征就是字符串 "VMPK"）。
-	DescMagic    uint32         `json:"descMagic"`
-	BSSOff       int            `json:"bssOff"`  // blob 里可写数据（.bss）的起始偏移
-	BSSSize      int            `json:"bssSize"` // 可写数据大小：这一段必须单独映射成 RW
-	RelocsTotal  int            `json:"relocsTotal"`
-	RelocsPatch  int            `json:"relocsPatched"`
-	Sections     []sectInfo     `json:"sections"`
-	Symbols      map[string]int `json:"symbols"`
-	OpcodeMap    map[string]int `json:"opcodeMap"` // 逻辑操作码名 -> 本 blob 的实际编码
-	Key          string         `json:"key"`       // AEAD 主密钥（hex）；M2.2 用，定位见 DESIGN §2
-	Guest        string         `json:"guest"`     // 客户机 ISA：x86-64 / arm64
-	RegCount     int            `json:"regCount"`  // ctx 的寄存器槽位数：18（x86-64）/ 35（arm64）
-	UndefinedSym []string       `json:"undefinedSymbols,omitempty"`
+	DescMagic uint32 `json:"descMagic"`
+	// FieldMaskSalt：描述符/解密表/校验表里那些标量字段（RVA、长度、标志）的**混淆掩码**种子，
+	// 掩码由 KDFEntry(master, 域常量, FieldMaskSalt) 现推（见 internal/inject/fields.go）。
+	FieldMaskSalt uint32         `json:"fieldMaskSalt"`
+	BSSOff        int            `json:"bssOff"`  // blob 里可写数据（.bss）的起始偏移
+	BSSSize       int            `json:"bssSize"` // 可写数据大小：这一段必须单独映射成 RW
+	RelocsTotal   int            `json:"relocsTotal"`
+	RelocsPatch   int            `json:"relocsPatched"`
+	Sections      []sectInfo     `json:"sections"`
+	Symbols       map[string]int `json:"symbols"`
+	OpcodeMap     map[string]int `json:"opcodeMap"` // 逻辑操作码名 -> 本 blob 的实际编码
+	Key           string         `json:"key"`       // AEAD 主密钥（hex）；M2.2 用，定位见 DESIGN §2
+	Guest         string         `json:"guest"`     // 客户机 ISA：x86-64 / arm64
+	RegCount      int            `json:"regCount"`  // ctx 的寄存器槽位数：18（x86-64）/ 35（arm64）
+	UndefinedSym  []string       `json:"undefinedSymbols,omitempty"`
 }
 
 func main() {
@@ -107,8 +110,11 @@ func main() {
 	// 之前放在 measureMaxFrame 旁边导致 -DVM_RELEASE 根本没进编译（.text 反而更大）。
 	if *release {
 		releaseBuild = true
-		releaseMagic = rand.Uint32()
 	}
+	// 描述符魔数**默认每次构建随机**（原来只有 -release 才随机，非 release 是固定的 "VMPK"，
+	// 那正是一个可被签名/扫描的 4 字节特征）。运行期不读这个字段（只在 manifest 里给打包器用），
+	// 所以随时随机化不影响任何行为。
+	releaseMagic = rand.Uint32()
 
 	tmp, err := os.MkdirTemp(*tmpRoot, "vmpbuild-")
 	must(err)
@@ -131,7 +137,7 @@ func main() {
 	if *keyExternal && targetRel != "win/x64" {
 		fatalf("-key-external 目前只有 win/x64 的取钥实现（收到目标 %s）", targetRel)
 	}
-	keyPath, keyHex, err := generateKeyFile(tmp, *keyExternal)
+	keyPath, keyHex, fieldMaskSalt, err := generateKeyFile(tmp, *keyExternal)
 	must(err)
 	if *keyOut != "" {
 		// 写的是 64 位 hex **文本**：部署时把它设成环境变量 VMPX_KEY（运行期的取钥路径
@@ -276,26 +282,27 @@ func main() {
 
 	sum := sha256.Sum256(blob)
 	m := manifest{
-		Source:       *src,
-		Entry:        *entry,
-		EntryOff:     entryOff,
-		FrameSize:    frameSize,
-		Margin:       margin,
-		FrameSkew:    frameSkew,
-		Guest:        *guest,
-		RegCount:     regCountFor(*guest),
-		MaxStubFrame: maxFrame,
-		DescMagic:    releaseMagic,
-		BlobSize:     len(blob),
-		SHA256:       fmt.Sprintf("%x", sum[:]),
-		RelocsTotal:  nReloc,
-		RelocsPatch:  nReloc,
-		Sections:     sections,
-		Symbols:      syms,
-		OpcodeMap:    opMap,
-		BSSOff:       bssOff,
-		BSSSize:      bssSize,
-		Key:          keyHex,
+		Source:        *src,
+		Entry:         *entry,
+		EntryOff:      entryOff,
+		FrameSize:     frameSize,
+		Margin:        margin,
+		FrameSkew:     frameSkew,
+		Guest:         *guest,
+		RegCount:      regCountFor(*guest),
+		MaxStubFrame:  maxFrame,
+		DescMagic:     releaseMagic,
+		FieldMaskSalt: fieldMaskSalt,
+		BlobSize:      len(blob),
+		SHA256:        fmt.Sprintf("%x", sum[:]),
+		RelocsTotal:   nReloc,
+		RelocsPatch:   nReloc,
+		Sections:      sections,
+		Symbols:       syms,
+		OpcodeMap:     opMap,
+		BSSOff:        bssOff,
+		BSSSize:       bssSize,
+		Key:           keyHex,
 	}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	must(os.WriteFile(*man, b, 0o644))
@@ -388,11 +395,11 @@ func generateOpcodeValues(tmp string, random bool) (string, map[string]int, erro
 // 变形 —— 否则等于把真密钥泄露出去），真主密钥只出现在 manifest 里（vmpack 要用）+ 可选的 -key-out。
 // 无论哪种模式都写一个 16 字节密钥校验值（KCV）= KDFEntry(真主密钥, "KEYK", 每构建随机 salt)[0:16]：
 // 运行期在**任何解密之前**用它判定"手里这把主密钥对不对"，不对就走专用退出码 0xC0DE0007。
-func generateKeyFile(tmp string, external bool) (string, string, error) {
+func generateKeyFile(tmp string, external bool) (string, string, uint32, error) {
 	nl := string(rune(10))
 	outDir := filepath.Join(tmp, "opcodes")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	key := make([]byte, 32)
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano() ^ 0x5DEECE66D))
@@ -400,6 +407,7 @@ func generateKeyFile(tmp string, external bool) (string, string, error) {
 		key[i] = byte(rnd.Intn(256))
 	}
 	checkSalt := rnd.Uint32()
+	fieldMaskSalt := rnd.Uint32()
 	kcv := inject.KDFEntry(key, vmKeyCheckRVA, checkSalt)
 
 	baked := key
@@ -424,6 +432,14 @@ func generateKeyFile(tmp string, external bool) (string, string, error) {
 		fmt.Fprintf(&sb, "0x%02X", b)
 	}
 	sb.WriteString("}" + nl)
+	// 字段混淆掩码的种子（描述符/解密表/校验表里的 RVA、长度、标志都用它派生掩码）。
+	// 放 manifest 是为了让 vmpack 与运行期各自能现推出同一组掩码；它本身不是秘密，
+	// 但没有主密钥就推不出掩码（真正的秘密仍是主密钥）。
+	sb.WriteString(fmt.Sprintf("#define VM_FIELD_MASK_SALT 0x%08Xu"+nl, fieldMaskSalt))
+	// 三个域常量集中在这里发出去（单一来源是 internal/inject/fields.go），C 侧只做异或。
+	sb.WriteString(fmt.Sprintf("#define VM_FIELD_MASK_DESC   0x%08Xu"+nl, inject.FieldMaskDomainDesc))
+	sb.WriteString(fmt.Sprintf("#define VM_FIELD_MASK_IMAGE  0x%08Xu"+nl, inject.FieldMaskDomainImage))
+	sb.WriteString(fmt.Sprintf("#define VM_FIELD_MASK_VERIFY 0x%08Xu"+nl, inject.FieldMaskDomainVerify))
 	// KCV：不泄露主密钥（ChaCha20 块输出的截断 + 随机 salt），但足以判定密钥对不对。
 	sb.WriteString(fmt.Sprintf("#define VM_KEY_CHECK_SALT 0x%08Xu"+nl, checkSalt))
 	sb.WriteString(fmt.Sprintf("#define VM_KEY_CHECK_RVA 0x%08Xu"+nl, vmKeyCheckRVA))
@@ -446,9 +462,9 @@ func generateKeyFile(tmp string, external bool) (string, string, error) {
 	sb.WriteString("#endif" + nl)
 	p := filepath.Join(outDir, "vm_crypto_key.h")
 	if err := os.WriteFile(p, []byte(sb.String()), 0o644); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
-	return p, fmt.Sprintf("%x", key), nil
+	return p, fmt.Sprintf("%x", key), fieldMaskSalt, nil
 }
 
 // appendUnique 只在列表里还没有这个名字时才追加（BLOB.sources 与内置追加可能重叠）。

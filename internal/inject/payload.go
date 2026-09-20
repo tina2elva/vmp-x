@@ -139,6 +139,8 @@ type Options struct {
 	// 全 0 表示不启用校验（例如 -no-encrypt 的调试构建）。
 	// Master 非空时，实际参与 FNV 的是**每条目派生密钥**的前 8 字节（见 payload 里 patchChecks 的注释）。
 	PatchKey [8]byte
+	// FieldMaskSalt：描述符/表里标量字段的混淆掩码种子（见 fields.go）。0 = 不加掩码（单测路径）。
+	FieldMaskSalt uint32
 	// Master：blob 主密钥（必须 32 字节）。非空时条目/节密钥由 KDF 现推：
 	//
 	//	K_e = KDFEntry(master, rva = funcRVA, salt = KDFSaltForPlacement(descSelfRVA, funcRVA, codeLen))
@@ -400,6 +402,13 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			patchLens[i] = len(patch)
 		}
 
+		// (3) 字段混淆：把描述符里"直接可读就有价值"的 6 个 u32（codeRVA/codeLen/encLen/flags/
+		// reserved1/reserved2，偏移 8..32）整体异或上掩码。**必须放在所有字段都写完之后**。
+		if len(opt.Master) == 32 {
+			md := FieldMask(opt.Master, FieldMaskDomainDesc, opt.FieldMaskSalt)
+			XorMask(data, d+8, 24, md[:24])
+		}
+
 		placements = append(placements, Placement{
 			Name:          fn.Name,
 			FuncRVA:       fn.RVA,
@@ -429,6 +438,7 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			binary.LittleEndian.PutUint32(b[:], v)
 			data = append(data, b[:]...)
 		}
+		vmEntriesAt := len(data)
 		w32(uint32(len(opt.Funcs)))
 		for i, fn := range opt.Funcs {
 			w32(uint32(int32(fn.RVA) - int32(tableRVA))) // delta（有符号）
@@ -439,6 +449,14 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			w32(baseRVA + uint32(slots[i].descOff)) // selfRVA（描述符自身的 RVA）
 			w32(fn.RVA)                             // funcRVA
 			w32(uint32(len(fn.Code)))               // codeLen（明文长度）
+		}
+		// (3) 校验表每条 24 字节整体加掩码（delta/len/check/selfRVA/funcRVA/codeLen）：
+		// 只蒙 funcRVA 而留着 delta 是自欺欺人 —— delta 就等于 funcRVA - tableRVA。
+		if len(opt.Master) == 32 {
+			mv := FieldMask(opt.Master, FieldMaskDomainVerify, opt.FieldMaskSalt)
+			for i := range opt.Funcs {
+				XorMask(data, vmEntriesAt+4+i*24, 24, mv[:24])
+			}
 		}
 		align(16)
 		trampRVA := baseRVA + uint32(len(data))

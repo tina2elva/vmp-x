@@ -38,10 +38,12 @@ type stubManifest struct {
 	Key       string `json:"key"`
 	BlobSize  int    `json:"blobSize"`
 	FrameSkew int    `json:"frameSkew"`
-	// DescMagic：blob 期望的描述符魔数（release 构建每次不同，见 vmpbuild -release）。
-	DescMagic uint32         `json:"descMagic"`
-	Symbols   map[string]int `json:"symbols"`
-	OpcodeMap map[string]int `json:"opcodeMap"` // 本 blob 的操作码编码（M2 起每 blob 随机）
+	// DescMagic：blob 期望的描述符魔数（现在**每次构建都随机**，见 vmpbuild）。
+	DescMagic uint32 `json:"descMagic"`
+	// FieldMaskSalt：描述符/表的字段混淆掩码种子（见 internal/inject/fields.go）。
+	FieldMaskSalt uint32         `json:"fieldMaskSalt"`
+	Symbols       map[string]int `json:"symbols"`
+	OpcodeMap     map[string]int `json:"opcodeMap"` // 本 blob 的操作码编码（M2 起每 blob 随机）
 }
 
 type multiFlag []string
@@ -213,7 +215,7 @@ func main() {
 		if !hasVerifyELF {
 			verifyFnELF = -1
 		}
-		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, verifyFnELF, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
+		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, man.FieldMaskSalt, verifyFnELF, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
 	} else {
 		scratchOff, hasCache := man.Symbols["vm_bc_cache"]
 		scratchEnd, hasLock := man.Symbols["vm_bc_lock"]
@@ -227,7 +229,7 @@ func main() {
 		}
 		*section = sectionNamesFor(*section)
 		bytecodeLimitFlag = bytecodeLimit(man.Symbols, stub)
-		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
+		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, man.FieldMaskSalt, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
 	for _, p := range res.Placements {
@@ -345,7 +347,7 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 	return specs, nil
 }
 
-func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
+func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, fieldMaskSalt uint32, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
 	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
@@ -489,7 +491,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	}
 	entryRVA, _ := inject.EntryRVA(f)
 	res, err := inject.Apply(f, inject.Options{SectionName: section, SectionNameB: sectionNames[1], SectionNameC: sectionNames[2], Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
-		DescMagic: descMagic, PatchKey: patchKey, Master: master, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
+		DescMagic: descMagic, PatchKey: patchKey, Master: master, FieldMaskSalt: fieldMaskSalt, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
 		ImgSections: imgSecs, ImageBase: f.ImageBase, UnpackFn: unpackFn, ImgTlsCallbacks: imgTLS, TlsDirCopy: tlsDirCopy, LoadCfgCopy: loadCfgCopy,
 		Wipe:      wipeEnabled,
 		EntryHook: patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0,
@@ -500,7 +502,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 		if imgMaster == nil {
 			fatalf("-enc-image 需要主密钥（不能与 -no-encrypt 同时用）")
 		}
-		if err := encryptImageSections(f, res, imgMaster); err != nil {
+		if err := encryptImageSections(f, res, imgMaster, fieldMaskSalt); err != nil {
 			fatalf("原镜像加密失败: %v", err)
 		}
 		clearDynamicBase(f)
@@ -536,7 +538,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	return res
 }
 
-func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
+func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, fieldMaskSalt uint32, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
 	f, err := elfload.Open(exe)
 	must(err)
 	imageBase := f.ImageBase()
@@ -659,7 +661,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 		}
 	}
 	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
-		DescMagic: descMagic, PatchKey: patchKey, Master: master, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize,
+		DescMagic: descMagic, PatchKey: patchKey, Master: master, FieldMaskSalt: fieldMaskSalt, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize,
 		ImgSections: imgSecs, ImageBase: 0, UnpackFn: unpackFn,
 		Wipe:          wipeEnabled,
 		EntryHook:     patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0 && f.Machine == elfload.EM_X86_64,
@@ -668,7 +670,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 		EntryRVA:      entryRVA})
 	must(err)
 	if len(imgSecs) > 0 {
-		if err := encryptImageSectionsELF(f, imageBase, res, imgMaster); err != nil {
+		if err := encryptImageSectionsELF(f, imageBase, res, imgMaster, fieldMaskSalt); err != nil {
 			fatalf("ELF 原镜像加密失败: %v", err)
 		}
 	}
@@ -860,7 +862,7 @@ func fatalf(format string, a ...any) {
 // encryptImageSections 按解密表把原镜像的节**原地**加密，并把 AEAD 标签回填进表里。
 // 与 blob 里的 vm_unpack_image 逐字节对齐：nonce = rva||size||salt，AAD = rva||size，
 // AEAD 的数据流从 counter=1 开始（Go 的 chacha20poly1305 正是这个约定）。
-func encryptImageSections(f *pe.File, res *inject.Result, master []byte) error {
+func encryptImageSections(f *pe.File, res *inject.Result, master []byte, fieldMaskSalt uint32) error {
 	off, err := f.RVAtoOffset(res.ImgTableRVA)
 	if err != nil {
 		return err
@@ -902,6 +904,15 @@ func encryptImageSections(f *pe.File, res *inject.Result, master []byte) error {
 		copy(f.Data[so:so+int(size)], sealed[:size])
 		copy(e[16:32], sealed[size:])
 	}
+	// (3) 字段混淆：表头的 count/selfRVA/保留（偏移 12..24）与每条目的 rva/size/flags（0..12）。
+	// 必须放在**加密之后** —— 上面的循环要读明文 rva/size 去定位节。
+	if len(master) == 32 {
+		mimg := inject.FieldMask(master, inject.FieldMaskDomainImage, fieldMaskSalt)
+		inject.XorMask(tbl, 12, 12, mimg[0:12])
+		for i := uint32(0); i < count; i++ {
+			inject.XorMask(tbl[24+i*32:], 0, 12, mimg[12:24])
+		}
+	}
 	return nil
 }
 
@@ -942,7 +953,7 @@ func stripRelocations(f *pe.File) {
 
 // encryptImageSectionsELF 与 PE 版逐字节等价，只是按 ELF 的 VA 读/写。
 // ImageBase 传 0 表示"运行期不强制校验基址"（ET_EXEC 下基址就是链接地址；PIE 我们不支持）。
-func encryptImageSectionsELF(f *elfload.File, imageBase uint64, res *inject.Result, master []byte) error {
+func encryptImageSectionsELF(f *elfload.File, imageBase uint64, res *inject.Result, master []byte, fieldMaskSalt uint32) error {
 	off, err := f.VAtoOffset(imageBase + uint64(res.ImgTableRVA))
 	if err != nil {
 		return err
@@ -982,6 +993,14 @@ func encryptImageSectionsELF(f *elfload.File, imageBase uint64, res *inject.Resu
 			return err
 		}
 		copy(e[16:32], sealed[size:])
+	}
+	// 同 PE 版：表头 12..24 与每条目 0..12 加掩码，位置同样在加密之后。
+	if len(master) == 32 {
+		mimg := inject.FieldMask(master, inject.FieldMaskDomainImage, fieldMaskSalt)
+		inject.XorMask(tbl, 12, 12, mimg[0:12])
+		for i := uint32(0); i < count; i++ {
+			inject.XorMask(tbl[24+i*32:], 0, 12, mimg[12:24])
+		}
 	}
 	return nil
 }

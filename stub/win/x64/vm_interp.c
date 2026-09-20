@@ -530,9 +530,35 @@ u32 vm_kdf_salt(u32 selfRVA, u32 codeRVA, u32 codeLen);
 u32 vm_patch_mac(const u8 master[32], u32 salt, u32 selfRVA, u32 funcRVA, u32 codeLen,
                  const u8 *patch, u32 len);
 
-/* 描述符 → 本条目的派生密钥（打包端 internal/inject 用同一算式，否则全量 trap）。 */
-static void vm_desc_key(const vm_desc_t *d, const u8 master[32], u8 out[32]) {
-    vm_kdf_entry(master, d->reserved1, vm_kdf_salt(d->selfRVA, d->reserved1, d->codeLen), out);
+/* (3) 描述符里 6 个标量字段（偏移 8..32：codeRVA/codeLen/encLen/flags/reserved1/reserved2）
+ * 在打包时与一段掩码异或了 —— 目的是让静态读者无法直接读出"哪个函数被虚拟化、它的原始 RVA、
+ * 字节码长度、哪些节被整体加密"。掩码 = vm_kdf_entry(master, VM_FIELD_MASK_DESC, VM_FIELD_MASK_SALT)
+ * （域常量由 internal/inject/fields.go 经构建头发过来，两侧同一来源）。 */
+typedef struct {
+    u32 codeRVA, codeLen, encLen, flags, reserved1, reserved2;
+} vm_dfields_t;
+
+static u32 vm_xor32(const u8 *p, const u8 *m) {
+    return (u32)(p[0] ^ m[0]) | ((u32)(p[1] ^ m[1]) << 8) |
+           ((u32)(p[2] ^ m[2]) << 16) | ((u32)(p[3] ^ m[3]) << 24);
+}
+
+static void vm_desc_fields(const vm_desc_t *d, const u8 master[32], vm_dfields_t *o) {
+    const u8 *p = (const u8 *)d + 8;
+    u8 m[32];
+    vm_kdf_entry(master, VM_FIELD_MASK_DESC, VM_FIELD_MASK_SALT, m);
+    o->codeRVA = vm_xor32(p + 0, m + 0);
+    o->codeLen = vm_xor32(p + 4, m + 4);
+    o->encLen = vm_xor32(p + 8, m + 8);
+    o->flags = vm_xor32(p + 12, m + 12);
+    o->reserved1 = vm_xor32(p + 16, m + 16);
+    o->reserved2 = vm_xor32(p + 20, m + 20);
+}
+
+/* 描述符 → 本条目的派生密钥（打包端 internal/inject 用同一算式，否则全量 trap）。
+ * 只吃**已解掩码**的字段，所以调用方必须先 vm_desc_fields()。 */
+static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 master[32], u8 out[32]) {
+    vm_kdf_entry(master, f->reserved1, vm_kdf_salt(d->selfRVA, f->reserved1, f->codeLen), out);
 }
 
 /* ---- (1b) 主密钥来源：外置取钥 + 密钥校验值（KCV） ----
@@ -688,11 +714,16 @@ static inline void vm_bcs_init(vm_bcs_t *s, const vm_ctx_t *vm) {
     s->ks_block = 0xFFFFFFFFu;
     s->key = 0;
     s->nonce = 0;
-    if (d && (d->flags & VM_DESC_FLAG_ENC)) {
+    vm_dfields_t f;
+    if (d) {
         const u8 *master = vm_master(); /* 1b：外置模式下这里会先取钥+校验，不通就硬门退出 */
+        vm_desc_fields(d, master, &f);  /* (3)：先解掩码，后面一律用 f.* */
+    }
+    if (d && (f.flags & VM_DESC_FLAG_ENC)) {
+        const u8 *master = vm_master();
         s->enc = 1;
-        s->ct = (const u8 *)d + d->codeRVA;
-        vm_desc_key(d, master, s->keybuf); /* 每条目一把：与 vm_run 的验签/解密用同一把 */
+        s->ct = (const u8 *)d + f.codeRVA;
+        vm_desc_key(d, &f, master, s->keybuf); /* 每条目一把：与 vm_run 的验签/解密用同一把 */
         s->key = s->keybuf;
         s->nonce = d->nonce;
     } else {
@@ -770,10 +801,13 @@ int vm_run(vm_ctx_t *vm) {
      * 验签失败返回 3，绝不执行未经验证的字节码。 */
     if (vm->desc) {
         const vm_desc_t *d = (const vm_desc_t *)vm->desc;
+        const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
+        vm_dfields_t f;
+        vm_desc_fields(d, master, &f); /* (3)：描述符标量字段先解掩码 */
 #ifndef VM_RELEASE
         vm_last_pc = 0xAA000002u; /* 拿到描述符 */
 #endif
-        if (d->flags & VM_DESC_FLAG_ENC) {
+        if (f.flags & VM_DESC_FLAG_ENC) {
             /* (c) 防回填完整性校验：入口补丁的字节 + 构建密钥做 FNV-1a，与描述符里的值比对。
              * 静态分析报告里那条绕过 —— 按函数尾声把被覆盖的 5 字节推回来 —— 会撞在这里。
              * 地址全部相对描述符算（base = d - selfRVA），因此与 ASLR 无关。 */
@@ -784,18 +818,17 @@ int vm_run(vm_ctx_t *vm) {
              * （vm_verify_table，PE 上已验证能拒绝回填）。 */
 #ifdef VM_INVM_PATCHCHECK
             {
-                u32 plen = (d->flags >> 8) & 0xFFu;
+                u32 plen = (f.flags >> 8) & 0xFFu;
                 if (plen) {
                     /* 补丁位置用「相对描述符的偏移」(reserved2) 定位：
                      * 之前用 d - selfRVA + reserved1，在 PE 上成立，但 ELF 的 selfRVA 语义不同，
                      * 于是校验必然失败、载荷被拒绝执行（CI 自第 3 轮起一直红就是这个原因）。 */
-                    const u8 *pb = (const u8 *)d + (i32)rd32((const u8 *)d + 28);
-                    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
+                    const u8 *pb = (const u8 *)d + (i32)f.reserved2;
                     /* 同一个 vm_patch_mac（打包端 PatchMAC 同式），不是无盐 FNV：
                      * key = KDFEntry(master, funcRVA, salt ^ 0x9E3779B9)（与加解密密钥域分离），
                      * msg = patch || le32(selfRVA) || le32(funcRVA) || le32(codeLen)。 */
-                    u32 got = vm_patch_mac(master, vm_kdf_salt(d->selfRVA, d->reserved1, d->codeLen),
-                                           d->selfRVA, d->reserved1, d->codeLen, pb, plen);
+                    u32 got = vm_patch_mac(master, vm_kdf_salt(d->selfRVA, f.reserved1, f.codeLen),
+                                           d->selfRVA, f.reserved1, f.codeLen, pb, plen);
                     u32 want = (u32)rd32((const u8 *)d + 60);
                     if (got != want) {
                         __builtin_trap(); /* 被篡改：直接崩，不给"还原后继续跑"的机会 */
@@ -803,7 +836,7 @@ int vm_run(vm_ctx_t *vm) {
                 }
             }
 #endif /* VM_INVM_PATCHCHECK */
-            if (d->encLen < d->codeLen) return 2;
+            if (f.encLen < f.codeLen) return 2;
 #ifndef VM_RELEASE
             vm_last_pc = 0xAA000005u; /* 补丁校验通过 */
 #endif
@@ -811,20 +844,19 @@ int vm_run(vm_ctx_t *vm) {
              * Poly1305 认证的是**密文**，所以完整性可以在不解密的前提下校验；
              * 字节码在执行期始终以密文留在镜像里，取指时按块取 ChaCha20 密钥流逐字节还原，
              * 明文只以"寄存器里的一个字节"存在 —— 内存里不再有整份明文。 */
-            const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
             u8 key[32];
-            vm_desc_key(d, master, key); /* 本条目的派生密钥（打包端 KDFEntry 同式现推） */
-            const u8 *ct = (const u8 *)d + d->codeRVA;
+            vm_desc_key(d, &f, master, key); /* 本条目的派生密钥（打包端 KDFEntry 同式现推） */
+            const u8 *ct = (const u8 *)d + f.codeRVA;
             u8 aad[8];
             aad[0] = (u8)(d->selfRVA); aad[1] = (u8)(d->selfRVA >> 8);
             aad[2] = (u8)(d->selfRVA >> 16); aad[3] = (u8)(d->selfRVA >> 24);
-            aad[4] = (u8)(d->reserved1); aad[5] = (u8)(d->reserved1 >> 8);
-            aad[6] = (u8)(d->reserved1 >> 16); aad[7] = (u8)(d->reserved1 >> 24);
-            if (!vm_aead_verify_aad(key, d->nonce, aad, 8, ct, d->encLen, d->tag)) {
+            aad[4] = (u8)(f.reserved1); aad[5] = (u8)(f.reserved1 >> 8);
+            aad[6] = (u8)(f.reserved1 >> 16); aad[7] = (u8)(f.reserved1 >> 24);
+            if (!vm_aead_verify_aad(key, d->nonce, aad, 8, ct, f.encLen, d->tag)) {
                 return 3; /* 验签失败：绝不执行未经验证的字节码 */
             }
             vm->code = (u8 *)ct;   /* 注意：这里存的是**密文**基址，取指经 vmb_byte 还原 */
-            vm->codeLen = d->codeLen;
+            vm->codeLen = f.codeLen;
         }
     }
 #ifndef VM_RELEASE
@@ -1483,13 +1515,22 @@ void vm_verify_table(const u32 *t) {
     const u8 *base = (const u8 *)t;
     const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     if (!t) return;
+    u8 m[32];
+    vm_kdf_entry(master, VM_FIELD_MASK_VERIFY, VM_FIELD_MASK_SALT, m);
     n = t[0];
     for (i = 0; i < n; i++) {
-        const u32 *e = t + 1 + i * 6;
-        const u8 *p = base + (i32)e[0];
-        u32 len = e[1], want = e[2];
+        /* (3)：每条 24 字节（delta/len/check/selfRVA/funcRVA/codeLen）整体加了掩码 ——
+         * 只蒙 funcRVA 而留着 delta 是自欺欺人（delta 就等于 funcRVA - 表首 RVA）。 */
+        const u8 *e = (const u8 *)(t + 1 + i * 6);
+        u32 delta = vm_xor32(e + 0, m + 0);
+        u32 len = vm_xor32(e + 4, m + 4);
+        u32 want = vm_xor32(e + 8, m + 8);
+        u32 selfRVA = vm_xor32(e + 12, m + 12);
+        u32 funcRVA = vm_xor32(e + 16, m + 16);
+        u32 codeLen = vm_xor32(e + 20, m + 20);
         if (!len) continue; /* 没写校验值的条目（例如未接 KDF 的单测载荷）直接跳过 */
-        u32 got = vm_patch_mac(master, vm_kdf_salt(e[3], e[4], e[5]), e[3], e[4], e[5], p, len);
+        const u8 *p = base + (i32)delta;
+        u32 got = vm_patch_mac(master, vm_kdf_salt(selfRVA, funcRVA, codeLen), selfRVA, funcRVA, codeLen, p, len);
         if (got != want) __builtin_trap();
     }
 }
@@ -1581,8 +1622,13 @@ int vm_unpack_image(const void *tblp) {
     const u8 *t = (const u8 *)tblp;
     u64 wantBase = *(const u64 *)(t + 0);
     u32 salt = *(const u32 *)(t + 8);
-    u32 count = *(const u32 *)(t + 12);
-    u32 selfRVA = *(const u32 *)(t + 16);
+    /* (3)：表头的 count/selfRVA/保留 加了掩码 —— 静态读者不再能直接从表里读出"哪些节被
+     * 整体加密、加密表在哪"。掩码与 Go 侧 inject.FieldMask 同式。 */
+    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
+    u8 mi[32];
+    vm_kdf_entry(master, VM_FIELD_MASK_IMAGE, VM_FIELD_MASK_SALT, mi);
+    u32 count = vm_xor32(t + 12, mi + 0);
+    u32 selfRVA = vm_xor32(t + 16, mi + 4);
     if (!selfRVA) return -1;
     u64 base = (u64)(const void *)t - (u64)selfRVA;
     vm_img_diag[0] = 0;
@@ -1591,10 +1637,11 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[3]++;
     if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; vm_dbg_trace("VMPELF badmagic base=", (long)base); return -1; }
     if (wantBase && base != wantBase) { vm_img_diag[0] = 2; vm_dbg_trace("VMPELF basemismatch base=", (long)base); return -2; }
-    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;
-        u32 rva = *(const u32 *)(e + 0), size = *(const u32 *)(e + 4), flags = *(const u32 *)(e + 8);
+        u32 rva = vm_xor32(e + 0, mi + 12);
+        u32 size = vm_xor32(e + 4, mi + 16);
+        u32 flags = vm_xor32(e + 8, mi + 20);
         const u8 *tag = e + 16;
         u8 *dst = (u8 *)(base + rva);
         u8 key[32];
@@ -1673,8 +1720,13 @@ int vm_unpack_image(const void *tblp) {
     const u8 *t = (const u8 *)tblp;
     u64 wantBase = *(const u64 *)(t + 0);
     u32 salt = *(const u32 *)(t + 8);
-    u32 count = *(const u32 *)(t + 12);
-    u32 selfRVA = *(const u32 *)(t + 16);
+    /* (3)：表头的 count/selfRVA/保留 加了掩码 —— 静态读者不再能直接从表里读出"哪些节被
+     * 整体加密、加密表在哪"。掩码与 Go 侧 inject.FieldMask 同式。 */
+    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
+    u8 mi[32];
+    vm_kdf_entry(master, VM_FIELD_MASK_IMAGE, VM_FIELD_MASK_SALT, mi);
+    u32 count = vm_xor32(t + 12, mi + 0);
+    u32 selfRVA = vm_xor32(t + 16, mi + 4);
     if (!selfRVA) return -1;
     u64 base = (u64)(const void *)t - (u64)selfRVA;
     vm_img_diag[0] = 0;
@@ -1683,10 +1735,11 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[3]++;
     if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; vm_dbg_trace("VMPELF badmagic base=", (long)base); return -1; }
     if (wantBase && base != wantBase) { vm_img_diag[0] = 2; vm_dbg_trace("VMPELF basemismatch base=", (long)base); vm_dbg_trace("VMPELF want=", (long)wantBase); return -2; }
-    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;
-        u32 rva = *(const u32 *)(e + 0), size = *(const u32 *)(e + 4), flags = *(const u32 *)(e + 8);
+        u32 rva = vm_xor32(e + 0, mi + 12);
+        u32 size = vm_xor32(e + 4, mi + 16);
+        u32 flags = vm_xor32(e + 8, mi + 20);
         const u8 *tag = e + 16;
         u8 *dst = (u8 *)(base + rva);
         u8 key[32];
@@ -1867,11 +1920,15 @@ int vm_unpack_image(const void *tblp) {
     const u8 *t = (const u8 *)tblp;
     u64 wantBase = *(const u64 *)(t + 0);
     u32 salt = *(const u32 *)(t + 8);
-    u32 count = *(const u32 *)(t + 12);
+    /* (3)：表头的 count/selfRVA/保留 加了掩码（与 Go 侧 inject.FieldMask 同式）。 */
+    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
+    u8 mi[32];
+    vm_kdf_entry(master, VM_FIELD_MASK_IMAGE, VM_FIELD_MASK_SALT, mi);
+    u32 count = vm_xor32(t + 12, mi + 0);
     /* 基址不能用 PEB->ImageBaseAddress：那是**宿主 EXE** 的基址。DLL 在被加载时，
      * 那个字段指向宿主进程的主镜像，于是 base != wantBase 永远成立（实测直接 -2）。
      * 正确做法：表就在 payload 里，用"表的地址 - 表自身的 RVA"反推本镜像基址。 */
-    u32 selfRVA = *(const u32 *)(t + 16);
+    u32 selfRVA = vm_xor32(t + 16, mi + 4);
     if (!selfRVA) return -1;
     u64 base = (u64)(const void *)t - (u64)selfRVA;
     vm_img_diag[0] = 0;
@@ -1883,12 +1940,11 @@ int vm_unpack_image(const void *tblp) {
     typedef int (*vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
     if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }
-    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;   /* 表头 24 字节（imageBase/salt/count/selfRVA/保留） */
-        u32 rva = *(const u32 *)(e + 0);
-        u32 size = *(const u32 *)(e + 4);
-        u32 flags = *(const u32 *)(e + 8);
+        u32 rva = vm_xor32(e + 0, mi + 12);
+        u32 size = vm_xor32(e + 4, mi + 16);
+        u32 flags = vm_xor32(e + 8, mi + 20);
         const u8 *tag = e + 16;
         u8 *dst = (u8 *)(base + rva);
         u8 key[32];
