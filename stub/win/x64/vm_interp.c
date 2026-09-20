@@ -1573,11 +1573,20 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[0] = 0;
     return 0;
 }
-#elif defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
+#elif defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(__aarch64__))
+/* Windows 上取模块列表的入口：x86-64 走 gs:[0x60]，arm64 走 TEB(x18)+0x60（都是 PEB）。
+ * Ldr 链表偏移、导出表解析两边完全一致，所以共用这一整段；只有取 PEB 这一行分架构。 */
 static u64 vm_peb_base(void) {
+#if defined(__aarch64__)
+    u64 teb;
+    __asm__ volatile("mov %0, x18" : "=r"(teb));
+    if (!teb) return 0;
+    return *(const u64 *)(teb + 0x60);
+#else
     u64 p;
     __asm__ volatile("movq %%gs:0x60, %0" : "=r"(p));
     return p;
+#endif
 }
 
 /* ASCII 大小写不敏感比较（blob 没有 libc） */
@@ -1712,5 +1721,5 @@ int vm_unpack_image(const void *tblp) {
     return 0;
 }
 #else
-int vm_unpack_image(const void *tblp) { (void)tblp; return -9; } /* 目前只做 Windows/x64 */
+int vm_unpack_image(const void *tblp) { (void)tblp; return -9; } /* 只做了 Linux x86-64/aarch64 与 Windows x86-64/arm64 */
 #endif
