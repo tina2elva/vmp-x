@@ -46,7 +46,7 @@ def main():
                     help="comma separated section names to check")
     ap.add_argument("--chunk", type=int, default=64)
     ap.add_argument("--allow-missing", action="store_true",
-                    help="原始镜像里没有该节就跳过（freestanding 目标没有 .data 属正常）；有节但仍有残留照旧报错")
+                    help="skip a section that the ORIGINAL does not have (freestanding targets often have no .data); a section that exists is still checked strictly")
     a = ap.parse_args()
 
     orig = open(a.src, "rb").read()
@@ -56,7 +56,7 @@ def main():
         body, rva, size = section_bytes(orig, name)
         if body is None:
             if a.allow_missing:
-                print("[*] %-8s 原始镜像里没有这个节 -> 跳过（--allow-missing）" % name)
+                print("[*] %-8s not present in the original -> skipped (--allow-missing)" % name)  # ASCII only: Windows runners are cp1252
                 continue
             print("[!] %s: no section %s" % (a.src, name))
             sys.exit(2)
