@@ -4038,3 +4038,21 @@ main.sumTo    patch=[F0 03 1E AA 44 2D 04 14]
 - 本轮补上：packPE 的机器类型判断从"仅 AMD64"改成"AMD64 或 ARM64"。
 - 教训记一条：改代码时**先看锚点是否命中再写提交信息**——这次是"信息跑在事实前面"，
   和前面几轮"以为改好了其实没落上"是同一类问题。
+
+### 370. 两项收尾都在 CI 上转绿：ELF 默认开 + PE/arm64 三段证据
+- **ELF 整体加密默认开**（run 35482334570，提交 15fd718）：linux-amd64 上没传任何 flag，
+  打包出的是加密过的 ET_EXEC，且
+  ```
+  [*] ELF 整体加密：PT_LOAD(X) va=0x400000 跳过头部 4096 字节，加密 597393 字节（入口自解密）
+  [*] chunks=9334 all-zero(excluded)=0 NON-ZERO FOUND=0 → [+] no ELF code readable in the packed file
+  [*] 运行期：原生 vs 加密后逐字节比对 → [OK  ] ELF 整体加密：输出一致
+  ```
+  前置改造（extractpayload 由「函数入口 RVA + thunk RVA」**合成**补丁字节，不再从 .text 读）经此验证。
+- **PE/arm64 三段证据**（run 35483191384，提交 e3eab92）：windows-arm64-run 上
+  ① 结构：补丁 `F0 03 1E AA …`（mov x16,x30 ; b thunk）；
+  ② 文件级：`.text` 熵 2.87→7.55、`.rdata` 0.20→7.62，两节非零 64B 块 **0 命中**；
+  ③ 运行期：`native=… protected=…` 退出码一致。
+- 路上又踩两个自己的坑（都已修并记录）：freestanding arm64 目标**没有 .data 节**，
+  而 image_residue.py 把"缺节"当用法错误 → 加 --allow-missing（有节仍严格检查）；
+  随后我新加的跳过提示写了中文，Windows runner 的 python stdout 是 **cp1252** →
+  UnicodeEncodeError 被误报成"残留" → 工具输出改回纯 ASCII（本仓库既有约定）。
