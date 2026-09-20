@@ -20,6 +20,7 @@ QEMU=${QEMU:-}
 TAG=${TAG:-x64}
 BLOB_GUEST=${BLOB_GUEST:-}
 BLOB_EXTRA=${BLOB_EXTRA:-}
+VMP_FUNCS=${VMP_FUNCS:--func main.checkKey -func main.sumTo}
 
 mkdir -p build
 go build -o build/vmpbuild ./cmd/vmpbuild || fail "build vmpbuild"
@@ -32,7 +33,7 @@ GUESTARG=""
 if [ -n "$BLOB_GUEST" ]; then GUESTARG="-guest $BLOB_GUEST"; fi
 ./build/vmpbuild -src "$BLOB_SRC" $CCARG $GUESTARG $BLOB_EXTRA -out build/vm_interp_elf.bin -manifest build/vm_interp_elf.json -entry vm_entry >/dev/null || fail "build blob"
 
-./build/vmpack -exe build/elf_target -func main.checkKey -func main.sumTo \
+./build/vmpack -exe build/elf_target $VMP_FUNCS \
     -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
     -out build/elf_target_$TAG.enc -report build/elf_enc_$TAG.json -enc-image-elf || fail "pack -enc-image-elf"
 
