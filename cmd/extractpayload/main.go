@@ -55,15 +55,53 @@ func main() {
 		rel := int32(binary.LittleEndian.Uint32(data[descOff+28:]))
 		if *patchOut != "" && plen > 0 {
 			off := int32(descOff) + rel
-			patch, perr := f.ReadVA(base+*rva+uint64(int64(off)), plen)
+			funcRVA := *rva + uint64(int64(off))
+			// 优先**合成**补丁字节：镜像可能被整体加密（-enc-image-elf），
+			// 从 .text 里读出来的是密文，会让探针的运行期校验误判（CI run #294 的现场）。
+			patch, perr := synthPatch(funcRVA, *thunkRVA, plen)
 			if perr != nil {
-				must(perr)
+				// 退路：老办法，从不加密的镜像里读。
+				patch, perr = f.ReadVA(base+funcRVA, plen)
+				if perr != nil {
+					must(perr)
+				}
 			}
 			var sb []string
 			sb = append(sb, fmt.Sprintf("%d %s", off, hex.EncodeToString(patch)))
 			must(os.WriteFile(*patchOut, []byte(strings.Join(sb, "\n")+"\n"), 0o644))
 			fmt.Printf("patch off=0x%X bytes=%X\n", off, patch)
 		}
+	}
+}
+
+// synthPatch 由「函数入口 RVA + thunk RVA」算出入口补丁，语义与 vmpack 写进镜像的完全一致。
+// 为什么需要它：整体加密之后 .text 在磁盘上是密文，探针要的补丁字节不能从镜像里读。
+func synthPatch(funcRVA, thunkRVA uint64, plen int) ([]byte, error) {
+	switch plen {
+	case 5: // x86-64：E9 rel32（相对下一条指令）
+		rel := int64(thunkRVA) - int64(funcRVA) - 5
+		if rel < -0x80000000 || rel > 0x7FFFFFFF {
+			return nil, fmt.Errorf("rel32 越界")
+		}
+		b := make([]byte, 5)
+		b[0] = 0xE9
+		binary.LittleEndian.PutUint32(b[1:], uint32(int32(rel)))
+		return b, nil
+	case 8: // arm64：mov x16, x30 ; B imm26（相对本指令 +4 处的那条）
+		delta := int64(thunkRVA) - (int64(funcRVA) + 4)
+		if delta%4 != 0 {
+			return nil, fmt.Errorf("arm64 分支目标未 4 字节对齐")
+		}
+		imm := delta / 4
+		if imm < -(1<<25) || imm >= (1<<25) {
+			return nil, fmt.Errorf("arm64 分支超出 ±128MB")
+		}
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint32(b, 0xAA1E03F0) // mov x16, x30
+		binary.LittleEndian.PutUint32(b[4:], 0x14000000|(uint32(imm)&0x03FFFFFF))
+		return b, nil
+	default:
+		return nil, fmt.Errorf("未知的入口补丁长度 %d", plen)
 	}
 }
 

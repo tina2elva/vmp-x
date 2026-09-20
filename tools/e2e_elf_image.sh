@@ -35,7 +35,7 @@ if [ -n "$BLOB_GUEST" ]; then GUESTARG="-guest $BLOB_GUEST"; fi
 
 ./build/vmpack -exe build/elf_target $VMP_FUNCS \
     -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
-    -out build/elf_target_$TAG.enc -report build/elf_enc_$TAG.json -enc-image-elf || fail "pack -enc-image-elf"
+    -out build/elf_target_$TAG.enc -report build/elf_enc_$TAG.json || fail "pack (default -enc-image-elf)"
 
 echo "[*] 结构：e_entry 必须落在 payload 新段里"
 ELF_REPORT=build/elf_enc_$TAG.json ELF_PACKED=build/elf_target_$TAG.enc python3 -c '
