@@ -342,6 +342,14 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
+# ---- (6) relocations kept + ASLR: the image must be relocated by the loader ----
+# Static: RELOCS_STRIPPED clear / DYNAMIC_BASE set / BASERELOC present.
+# Dynamic: start suspended and read PEB->ImageBaseAddress -- it must NOT be the preferred base
+# (i.e. the loader really applied our relocations, including the payload's absolute VAs).
+python tools/aslr_probe.py --exe build/target_vmp.exe --runs 3 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { $pass++ }
+else { $fail++; $failLines += "E2EFAIL aslr: packed image is not relocated (relocs stripped or ignored)" }
+
 # ---- (4) anti-debug: one path alone must NOT flip the verdict ----
 # Start the artifact suspended, set PEB.BeingDebugged (exactly what a debugger does), resume, and
 # compare with a plain run. The rule is ">= 2 different paths" so a single flag must change NOTHING

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"sort"
 	"strings"
 
 	arm64dec "github.com/vmpx/vmp-x/internal/decode/arm64"
@@ -61,6 +62,7 @@ func main() {
 	noEncImage := flag.Bool("no-enc-image", false, "关闭原镜像整体加密（默认对 x86-64 EXE 开启）")
 	encImageSections := flag.String("enc-image-sections", "", "只整体加密这些节（逗号分隔；留空=默认 .text,.rdata,.data）")
 	noEncImageDLL := flag.Bool("no-enc-image-dll", false, "对 DLL 关闭原镜像整体加密（默认对 DLL 也开）")
+	stripRelocs := flag.Bool("strip-relocs", false, "退回旧行为：拆掉重定位表 + 清 DYNAMIC_BASE（放弃 ASLR）。默认**保留**，运行期按「先减回去→解密→再加回来」处理")
 	flag.BoolVar(&encImageELFData, "enc-image-elf-data", false, "ELF 侧把 .rodata/.gopclntab 也纳入整体加密（实验：CI 上 aarch64 会 SIGSEGV，默认关）")
 	noEncImageELF := flag.Bool("no-enc-image-elf", false, "对 ET_EXEC 的 ELF 关闭原镜像整体加密（默认开；探针已改为合成补丁字节，不再依赖明文）")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
@@ -229,7 +231,7 @@ func main() {
 		}
 		*section = sectionNamesFor(*section)
 		bytecodeLimitFlag = bytecodeLimit(man.Symbols, stub)
-		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, man.FieldMaskSalt, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
+		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, man.FieldMaskSalt, *stripRelocs, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
 	for _, p := range res.Placements {
@@ -347,7 +349,7 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 	return specs, nil
 }
 
-func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, fieldMaskSalt uint32, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
+func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, fieldMaskSalt uint32, stripRelocs bool, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
 	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
@@ -401,6 +403,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	// 原镜像整体加密：默认对 x86-64 的 EXE 开启；不支持/不合适的情形**跳过并说明**，
 	// 绝不 fatalf —— 它是默认开的功能，不能把 ARM64 或 DLL 这类目标直接卡死。
 	var imgSecs []inject.ImgSection
+	var origTLSRVA uint32 // 原镜像 TLS 目录的 RVA（搬进 payload 之后要用它平移重定位项）
 	var imgTLS []uint64
 	var tlsDirCopy []byte
 	var loadCfgCopy []byte
@@ -475,7 +478,8 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 			fmt.Println()
 		}
 		// TLS 目录如果落在被加密的节里，加载器会在我们之前读它 —— 搬到 payload 并把数据目录指过来。
-		if dir := tlsDirectoryRVA(f); dir != 0 {
+		origTLSRVA = tlsDirectoryRVA(f)
+		if dir := origTLSRVA; dir != 0 {
 			for _, s := range imgSecs {
 				if s.RVA <= dir && dir < s.RVA+s.Size {
 					to, err := f.RVAtoOffset(dir)
@@ -505,8 +509,39 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 		if err := encryptImageSections(f, res, imgMaster, fieldMaskSalt); err != nil {
 			fatalf("原镜像加密失败: %v", err)
 		}
-		clearDynamicBase(f)
-		stripRelocations(f)
+		// (6) 默认**保留**重定位与 ASLR：加载器会在入口点之前按 delta 重定位镜像，而那些位置
+		// 此刻还是密文 —— 运行期按 #381 的方案「先减回去 → 解密 → 再加回来」（见 vm_unpack_image）。
+		// -strip-relocs 可以退回旧行为（拆表 + 清 DYNAMIC_BASE，代价是失去 ASLR）。
+		if stripRelocs {
+			clearDynamicBase(f)
+			stripRelocations(f)
+			fmt.Println("[*] -strip-relocs：重定位表已拆、DYNAMIC_BASE 已清（本产物失去 ASLR）")
+		} else {
+			fmt.Println("[*] 重定位与 DYNAMIC_BASE 保留（ASLR 生效；运行期自解密会把加载器的重定位搬回明文）")
+			// (6) payload 里那些**绝对 VA** 也必须让加载器重定位，否则它们仍指向首选基址。
+			// 实测漏掉它们：加载器按 TLS 回调数组跳到"首选基址 + rva"的旧地址 -> 0xC0000005。
+			// payload 节不参与整体加密，所以运行期不需要对它们做"先减后加"。
+			var items [][2]uint32
+			if origTLSRVA != 0 && res.TlsDirRVA != 0 {
+				for _, e := range origRelocEntries(f) {
+					if e[1] >= origTLSRVA && e[1] < origTLSRVA+40 {
+						items = append(items, [2]uint32{e[0], res.TlsDirRVA + (e[1] - origTLSRVA)})
+					}
+				}
+			}
+			if res.ImgTlsArrayRVA != 0 {
+				for i := 0; i < 1+len(imgTLS); i++ { // 终止项是 0，不需要（也不该）重定位
+					items = append(items, [2]uint32{10, res.ImgTlsArrayRVA + uint32(i*8)})
+				}
+			}
+			if len(items) > 0 {
+				if err := appendRelocs(f, items); err != nil {
+					fatalf("补 payload 重定位项失败: %v", err)
+				}
+				fmt.Printf("[*] payload 里的绝对 VA 补了 %d 个重定位项（ASLR 下必须）", len(items))
+				fmt.Println()
+			}
+		}
 		tlsDir := tlsDirectoryRVA(f)
 		if len(loadCfgCopy) > 0 && res.LoadCfgRVA != 0 {
 			if err := setLoadConfigDirectoryRVA(f, res.LoadCfgRVA); err != nil {
@@ -526,7 +561,11 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 				fatalf("改写 TLS 回调数组失败: %v", err)
 			}
 		}
-		fmt.Println("[*] 原镜像 .text 已原地加密，并清除 DYNAMIC_BASE（加载器因此不做重定位）")
+		if stripRelocs {
+			fmt.Println("[*] 原镜像已原地加密，并清除 DYNAMIC_BASE（加载器因此不做重定位）")
+		} else {
+			fmt.Println("[*] 原镜像已原地加密（重定位保留：运行期先减回去、解密、再加回来）")
+		}
 	}
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新节 %s: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",
@@ -912,6 +951,109 @@ func encryptImageSections(f *pe.File, res *inject.Result, master []byte, fieldMa
 		for i := uint32(0); i < count; i++ {
 			inject.XorMask(tbl[24+i*32:], 0, 12, mimg[12:24])
 		}
+	}
+	return nil
+}
+
+// origRelocEntries 读出原镜像的重定位项（type, rva）。stripRelocations 之后就再也读不到了。
+func origRelocEntries(f *pe.File) [][2]uint32 {
+	const relocDir = 5
+	o := f.OptHeaderOffset + 112 + relocDir*8
+	if o+8 > len(f.Data) {
+		return nil
+	}
+	rva := binary.LittleEndian.Uint32(f.Data[o:])
+	size := binary.LittleEndian.Uint32(f.Data[o+4:])
+	if rva == 0 || size < 8 {
+		return nil
+	}
+	off, err := f.RVAtoOffset(rva)
+	if err != nil || off < 0 || off+int(size) > len(f.Data) {
+		return nil
+	}
+	var out [][2]uint32
+	end := off + int(size)
+	for p := off; p+8 <= end; {
+		page := binary.LittleEndian.Uint32(f.Data[p:])
+		blk := binary.LittleEndian.Uint32(f.Data[p+4:])
+		if blk < 8 || p+int(blk) > end {
+			break
+		}
+		for q := p + 8; q+2 <= p+int(blk); q += 2 {
+			v := binary.LittleEndian.Uint16(f.Data[q:])
+			t := uint32(v >> 12)
+			if t == 0 {
+				continue
+			}
+			out = append(out, [2]uint32{t, page + uint32(v&0xFFF)})
+		}
+		p += int(blk)
+	}
+	return out
+}
+
+// appendRelocs 往 .reloc 尾部追加 DIR64 重定位项（按页分组），并同步数据目录 Size 与节 VirtualSize。
+// 只用于 payload 自己的绝对 VA —— 它们在**不被加密**的节里，加载器改了就是对的。
+func appendRelocs(f *pe.File, items [][2]uint32) error {
+	if len(items) == 0 {
+		return nil
+	}
+	const relocDir = 5
+	do := f.OptHeaderOffset + 112 + relocDir*8
+	rva := binary.LittleEndian.Uint32(f.Data[do:])
+	size := binary.LittleEndian.Uint32(f.Data[do+4:])
+	if rva == 0 {
+		return fmt.Errorf("没有 .reloc 目录")
+	}
+	off, err := f.RVAtoOffset(rva)
+	if err != nil || off < 0 {
+		return fmt.Errorf("没有 .reloc 目录")
+	}
+	var target *pe.Section
+	for i := range f.Sections {
+		if f.Sections[i].VirtualAddress == rva {
+			target = &f.Sections[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf(".reloc 不在独立节里，无法追加")
+	}
+	so, err := f.RVAtoOffset(target.VirtualAddress)
+	if err != nil || so < 0 {
+		return err
+	}
+	room := int(target.SizeOfRawData)
+	pos := off + int(size)
+	groups := map[uint32][]uint16{}
+	for _, it := range items {
+		if it[0] != 10 {
+			continue
+		}
+		groups[it[1]&^0xFFF] = append(groups[it[1]&^0xFFF], uint16(it[1]&0xFFF))
+	}
+	pages := make([]uint32, 0, len(groups))
+	for p := range groups {
+		pages = append(pages, p)
+	}
+	sort.Slice(pages, func(i, j int) bool { return pages[i] < pages[j] })
+	for _, pg := range pages {
+		offs := groups[pg]
+		blk := 8 + len(offs)*2
+		if pos+blk > so+room || pos+blk > len(f.Data) {
+			return fmt.Errorf(".reloc 空间不足（需要 %d 字节，剩 %d）", blk, so+room-pos)
+		}
+		binary.LittleEndian.PutUint32(f.Data[pos:], pg)
+		binary.LittleEndian.PutUint32(f.Data[pos+4:], uint32(blk))
+		for i, o2 := range offs {
+			binary.LittleEndian.PutUint16(f.Data[pos+8+i*2:], uint16(10<<12)|o2)
+		}
+		pos += blk
+	}
+	newSize := uint32(pos - off)
+	binary.LittleEndian.PutUint32(f.Data[do+4:], newSize)
+	if target.VirtualSize < newSize {
+		target.VirtualSize = newSize
 	}
 	return nil
 }

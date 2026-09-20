@@ -2133,6 +2133,53 @@ static void vm_img_fail(u32 code) {
     __builtin_trap();
 }
 
+/* ---- (6) 加载器重定位 ↔ 解密 的顺序问题 ----
+ * 保留重定位与 ASLR 之后，加载器会在**入口点之前**把 (实际基址 - 首选基址) 加进镜像里的
+ * 绝对地址字段。可那些位置此刻还是**密文** —— 直接解密会得到垃圾（这正是当初拆掉重定位表的原因）。
+ * 所以按 STATUS #381 的方案：对落在被解密节里的每个重定位项
+ *     ① 先减回去（还原出"当初被加密的字节"）→ ② 验签 → ③ 解密 → ④ 再把 delta 加回来。
+ * delta == 0（落在首选基址）时 ①④ 都是空操作。
+ * 重定位目录本身不会落在被加密的节里（vmpack 的 loaderDirConflict 把 BASERELOC 算作冲突）。 */
+static void vm_reloc_dir(const u8 *img, u32 *rvaOut, u32 *sizeOut) {
+    *rvaOut = 0;
+    *sizeOut = 0;
+    const u8 *pe = img + *(const u32 *)(img + 0x3C);
+    const u8 *opt = pe + 24;
+    u32 rva = *(const u32 *)(opt + 112 + 5 * 8);
+    u32 size = *(const u32 *)(opt + 112 + 5 * 8 + 4);
+    if (!rva || size < 8) return;
+    *rvaOut = rva;
+    *sizeOut = size;
+}
+
+static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
+    u32 rva, size;
+    vm_reloc_dir(img, &rva, &size);
+    if (!rva) return;
+    const u8 *p = img + rva;
+    const u8 *end = p + size;
+    while (p + 8 <= end) {
+        u32 page = *(const u32 *)p;
+        u32 blk = *(const u32 *)(p + 4);
+        if (blk < 8 || p + blk > end) break;
+        for (u32 o = 8; o + 2 <= blk; o += 2) {
+            u16 v = *(const u16 *)(p + o);
+            u32 type = (u32)(v >> 12), off = (u32)(v & 0xFFFu);
+            if (!type) continue; /* ABSOLUTE：填充项 */
+            u64 tgt = (u64)(img + page + off);
+            if (tgt < lo || tgt + (type == 10 ? 8u : 4u) > hi) continue;
+            if (type == 10) { /* IMAGE_REL_BASED_DIR64 */
+                u64 *q = (u64 *)tgt;
+                *q = (u64)((long long)*q + delta);
+            } else if (type == 3) { /* IMAGE_REL_BASED_HIGHLOW（32 位镜像用） */
+                u32 *q = (u32 *)tgt;
+                *q = (u32)((long long)(int)*q + delta);
+            }
+        }
+        p += blk;
+    }
+}
+
 int vm_unpack_image(const void *tblp) {
     if (vm_img_done) return 0;
     const u8 *t = (const u8 *)tblp;
@@ -2154,7 +2201,15 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[2] = wantBase;
     vm_img_diag[3]++;
     if (*(const u16 *)base != 0x5A4D) { vm_img_diag[0] = 1; vm_img_fail(1); return -1; } /* 反推出来的基址没有 MZ */
-    if (base != wantBase) { vm_img_diag[0] = 2; vm_img_fail(2); return -2; }             /* 不是首选基址 */
+    /* (6)：以前是"实际基址 != 首选基址就拒绝执行"。现在保留重定位（ASLR 生效），
+     * 基址不同是**正常**的：算出 delta，解密前后各做一次逆/正变换。只有"需要重定位却没有重定位表"
+     * （被人为剥掉）才继续 fail-fast —— 那种情况下我们无法把加载器写进密文的增量还原出来。 */
+    long long delta = wantBase ? (long long)(base - wantBase) : 0;
+    if (delta != 0) {
+        u32 rr, rs;
+        vm_reloc_dir((const u8 *)base, &rr, &rs);
+        if (!rr) { vm_img_diag[0] = 2; vm_img_fail(2); return -2; } /* 需要重定位但表没了 */
+    }
     typedef int (*vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
     if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }
@@ -2174,10 +2229,15 @@ int vm_unpack_image(const void *tblp) {
         u8 aad[8];
         *(u32 *)(aad + 0) = rva;
         *(u32 *)(aad + 4) = size;
-        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_img_fail(4); return -4; }
         u32 old = 0;
         if (!vp(dst, size, (flags & 1u) ? 0x40u : 0x04u /* 执行节 RWX，数据节 RW */, &old)) { vm_img_diag[0] = 5; vm_img_fail(5); return -5; }
+        /* ① 先把加载器写进密文的 delta 减回去 —— 否则下面的验签必然失败、解密出来的也是垃圾。
+         * 必须在 VirtualProtect 之后做：加载器已经把这些页设成了最终保护属性。 */
+        if (delta) vm_reloc_apply((const u8 *)base, -delta, (u64)dst, (u64)dst + size);
+        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_img_fail(4); return -4; }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        /* ④ 解密之后再把 delta 加回来（等价于加载器对明文做的那次重定位）。 */
+        if (delta) vm_reloc_apply((const u8 *)base, delta, (u64)dst, (u64)dst + size);
         /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）
          * PAGE_READONLY=0x02 / PAGE_READWRITE=0x04 / PAGE_EXECUTE_READ=0x20 / PAGE_EXECUTE_READWRITE=0x40 */
         u32 prot;
