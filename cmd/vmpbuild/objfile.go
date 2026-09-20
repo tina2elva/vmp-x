@@ -47,10 +47,15 @@ type objReloc struct {
 	Off       uint64
 	TargetSec int
 	SymName   string
-	Kind      relKind
-	RawType   uint32
-	Addend    int64
-	PlusN     int // PC 相对基准的额外偏移（COFF REL32_1..5）
+	// SymValue：被引用符号在**它所在节内**的偏移，解析时按**符号索引**取。
+	// 不能事后按名字查：ld -r 合并多个目标文件后，同一节会有多个同名节符号
+	// （实测 .rdata 值 0 与 .rdata 值 0x80），按名字取会命中第一个 —— 于是
+	// "本目标文件里不是第一份只读数据"的字符串被解析到节的起点（VMPXKDF 落到 .rdata+0）。
+	SymValue uint64
+	Kind     relKind
+	RawType  uint32
+	Addend   int64
+	PlusN    int // PC 相对基准的额外偏移（COFF REL32_1..5）
 }
 
 type objFile struct {
@@ -114,9 +119,11 @@ func readCOFFObject(path string) (*objFile, error) {
 		for _, r := range s.Relocs {
 			sym := -1
 			name := ""
+			var symValue uint64
 			if int(r.SymbolTableIndex) < len(out.Symbols) {
 				sym = out.Symbols[r.SymbolTableIndex].Sec
 				name = out.Symbols[r.SymbolTableIndex].Name
+				symValue = out.Symbols[r.SymbolTableIndex].Value
 			}
 			// COFF 的加数存在字段里
 			var addend int64
@@ -127,7 +134,7 @@ func readCOFFObject(path string) (*objFile, error) {
 			if int(r.VirtualAddress)+4 <= len(data) {
 				addend = int64(int32(binary.LittleEndian.Uint32(data[r.VirtualAddress:])))
 			}
-			rel := objReloc{SecIdx: i, Off: uint64(r.VirtualAddress), TargetSec: sym, SymName: name, RawType: uint32(r.Type), Addend: addend}
+			rel := objReloc{SecIdx: i, Off: uint64(r.VirtualAddress), TargetSec: sym, SymName: name, SymValue: symValue, RawType: uint32(r.Type), Addend: addend}
 			if out.IsARM64 {
 				// ARM64 COFF：只接受 26 位分支（BL/B），其余一律失败
 				// COFF 没有 RELA：加数都藏在**字段**里。而 AArch64 的这些字段是**指令**，
@@ -330,6 +337,7 @@ func makeELFReloc(out *objFile, target int, rOff, info uint64, addend int64, imp
 	if symIdx < len(out.Symbols) {
 		rel.TargetSec = out.Symbols[symIdx].Sec
 		rel.SymName = out.Symbols[symIdx].Name
+		rel.SymValue = out.Symbols[symIdx].Value
 	}
 	if implicit {
 		// SHT_REL：加数在字段里

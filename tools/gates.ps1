@@ -31,6 +31,20 @@ Step "vmpbuild (blob builds)" {
     if ($LASTEXITCODE -ne 0) { Write-Host "[!] blob build failed (stub/win/x64 has compile errors)"; $script:stepCode = 1 }
     & ".\build\vmpbuild.exe" -src "stub/win/x64" -out "build/gates_blob_rel.bin" -manifest "build/gates_blob_rel.json" -entry vm_entry -release 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Host "[!] release blob build failed"; $script:stepCode = 1 }
+    # Blob-level KDF KAT: load the BUILT blob into executable memory and call the functions
+    # inside it. The single-file KAT (stub/win/x64/kdf_kat.c) cannot see "layout inside the
+    # merged blob" defects -- once a string in vm_kdf.c was resolved to the START of .rdata
+    # instead of its real offset, so the salt was wrong. Only calling the blob's own code
+    # catches that class of bug.
+    & gcc -O2 -o "build\kdf_blob_kat.exe" stub\win\x64\kdf_blob_kat.c 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "[!] kdf_blob_kat.exe build failed"; $script:stepCode = 1 }
+    else {
+        foreach ($pair in @(@("build\gates_blob.json", "build\gates_blob.bin"), @("build\gates_blob_rel.json", "build\gates_blob_rel.bin"))) {
+            $mj = Get-Content $pair[0] -Raw | ConvertFrom-Json
+            & ".\build\kdf_blob_kat.exe" $pair[1] $mj.symbols.vm_kdf_salt $mj.symbols.vm_kdf_entry
+            if ($LASTEXITCODE -ne 0) { Write-Host ("[!] blob KDF KAT failed for " + $pair[1] + " (vmpbuild relocation/layout bug?)"); $script:stepCode = 1 }
+        }
+    }
     Pop-Location
 }
 Step "e2e.ps1 (x86-64)"  { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e.ps1") }

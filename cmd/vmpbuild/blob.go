@@ -96,13 +96,9 @@ func applyRelocsObj(obj *objFile, blob []byte, secBlobOff map[int]int, verbose b
 		if field+4 > len(blob) {
 			return 0, fmt.Errorf("%s+0x%X: 重定位位置越界", secName, r.Off)
 		}
-		var symValue uint64
-		for _, s := range obj.Symbols {
-			if s.Name == r.SymName && s.Sec == r.TargetSec {
-				symValue = s.Value
-				break
-			}
-		}
+		// 只认解析期按**符号索引**取到的值：合并后同名的节符号不止一个，
+		// 按名字查会命中错的那个（见 objReloc.SymValue 的注释）。
+		symValue := r.SymValue
 		target := tgtBase + int(symValue) + int(r.Addend)
 
 		switch r.Kind {
@@ -251,14 +247,8 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 				if !ok {
 					return 0, fmt.Errorf("%s+0x%X: 引用了 blob 之外的节 %q", o.Sections[r.SecIdx].Name, r.Off, o.Sections[r.TargetSec].Name)
 				}
-				var symValue int
-				for _, s := range o.Symbols {
-					if s.Name == r.SymName && s.Sec == r.TargetSec {
-						symValue = int(s.Value)
-						break
-					}
-				}
-				target = tb + symValue + int(r.Addend)
+				// 与 applyRelocsObj 同理：按索引取，不按名字查。
+				target = tb + int(r.SymValue) + int(r.Addend)
 			} else {
 				off, ok := m.symOff[r.SymName]
 				if !ok {

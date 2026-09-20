@@ -4320,3 +4320,40 @@ Poly1305 是**一次性** MAC，所以按键/消息分离：
 - vmpbuild 的重定位缺陷本身没修（只绕开），上面已写清修法与建议的门禁。
 - 1b（主密钥外置 + 硬门）、(2) 带密钥 MAC、(3) 容器加密/混淆、(4) 反调试多路径、(6) 重定位/ASLR 仍未动。
 - `tools/preflight.ps1` 在 a83a4ad 里被移除（脚本自检不过），本轮验收用的是 HANDOFF 附录 B 的逐条命令。
+
+### 384. 修掉 vmpbuild 的符号解析缺陷（#383 里"只绕开"的那条），并加一条 blob 级 KDF 门禁
+
+**#383 的诊断要更正一处**：根因不是"丢掉字段里的节内加数"（加数一直是从字段里读的），
+而是**应用重定位时按符号名字回查符号值**。`ld -r` 合并多个目标文件后，同一个节会有**多个同名节符号**：
+
+```
+[ 34](sec 3) 0x0000000000000000 .rdata
+[ 76](sec 3) 0x0000000000000080 .rdata
+```
+
+合并后的目标文件里那条重定位是 `6c07: IMAGE_REL_AMD64_REL32 .rdata`（字段为 0，真正的 +0x80 在符号索引 [76] 的值里），
+而 `applyRelocsObj`（以及 `-merge go` 的 `applyAllRelocs`）用 `s.Name == r.SymName && s.Sec == r.TargetSec`
+遍历符号表**取第一个匹配** → 命中值 0 的那个 → 字符串被解析到 `.rdata+0`。
+
+**修法**：解析期就按**符号索引**取值存进 `objReloc.SymValue`（COFF 与 ELF 两处），应用重定位时只认它。
+
+**门禁**：新增 `stub/win/x64/kdf_blob_kat.c` —— 把**编好的 blob** 用 `VirtualAlloc(PAGE_EXECUTE_READWRITE)`
+（POSIX 走 mmap）载入**可执行内存**，调用 blob 里的 `vm_kdf_salt`（5 组）与 `vm_kdf_entry`（3 组）对 KAT。
+`stub/win/x64/kdf_kat.c` 编的是单个源文件（只有一份只读数据），永远发现不了"blob 内布局"这类缺陷。
+已接进 `tools/gates.ps1` 的 "vmpbuild (blob builds)" 一步（debug 与 release 两个 blob 都查；门禁总数仍是 11）。
+
+**校准**（探针必须先证明它会失败）：用同一工具跑**修复前**的 blob →
+`[FAIL] vm_kdf_salt(0x1670,0x90,40) = 0xD92F191C, want 0xAB20EB8B`（5 条全红）；修复后 `[OK] ... x5 + x3 match`。
+一个有信息量的细节：`vm_kdf_entry` 的 3 条在修复前**也是过的**（它不引用只读数据）—— 正好说明为什么必须专门检 `vm_kdf_salt`。
+
+**单测**：`cmd/vmpbuild/blob_test.go` 两条 aarch64 重定位用例补上 `SymValue`（原来靠名字查），
+并新增 `TestApplyRelocsUsesSymbolValueNotName`：构造"两个同名 `.rdata` 符号（值 0 与 0x80）"，
+断言解析用 +0x80 —— 谁把解析改回按名字查，这条就红。
+
+**把 #383 的绕开改回去**：`vm_kdf.c` 的标签回到字符串字面量；`vm_crypto.c` 的 sigma 掩码回到 `static const volatile`。
+两处都复验：宿主 KAT 数值不变、blob KAT 通过、e2e 147/0。
+
+**证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（含新门禁）；隔离 worktree 全量 e2e = 147 passed / 0 failed；CI run（待填）。
+
+**未做**：无（这条就是 #383"下一步建议"的落地）。#383 里其余"未做"项 —— 1b（主密钥外置 + 硬门）、
+(2) 带密钥 MAC、(3) 容器加密/混淆、(4) 反调试多路径、(6) 重定位/ASLR —— 照旧未动。
