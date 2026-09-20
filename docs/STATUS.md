@@ -4146,3 +4146,19 @@ PH[3] LOAD R   off=0xA0000 va=0xB0000  filesz=0xBE668 memsz=0xBE668 end=0x16E668
 处置：解密时的临时权限从"一律 R|W|X"改成"执行节 R|W|X、数据节 R|W"（三条分支：Linux x86-64、Linux aarch64、
 Windows 的 VirtualProtect 同理）。这是**待验证**的假设 —— 下一轮在 `linux-arm64` 上只为那一步打开
 `-enc-image-elf-data` 复现，并抓 `build/ci_step.log` 里的打包/运行输出。
+
+### 377. 目标项 (B) 收官：按架构分流 + 语义门禁接线（x86-64 默认开，aarch64 登记不支持）
+**两个假设先后被否**（记录在 #376）："只读数据节超出映射 / 与已加密段重叠"（本机 aarch64 布局数据否掉）、
+"解密时对数据页多要了 X"（c408230 改成数据节 R|W 后仍崩，run 35485789797）。
+**aarch64 现象**：带数据节加密的 aarch64 目标在 qemu 下 `protected rc=139`（SIGSEGV），根因未定。
+
+**按架构分流**（ce0b382 + 3912af5 + 5bc10be/dfe4907 两次阈值修正）：
+- **x86-64：默认开**（依据：同一改动在 CI 上真跑成功，run 35484769361 的 ELF end-to-end 通过）；
+- **aarch64：默认关**，打包时打印理由并保留 `-enc-image-elf-data` 供继续排查；
+- **语义级门禁接回 e2e**：`tools/expose_report.py --max-ratio 0.05 --max-abs 256`（**单行**）；
+- **判据修正**：只查 `.text` 时原始基线可能只有几百字节，而随机密文本身会产生零星可打印串
+  （aarch64 实测 69 字节/590KB），比例判据会误报 —— 改为"比例达标 **或** 绝对量 <= 256 字节"。
+- 本机复验：三节 `packed 66 / 137566` 通过；只查 `.text` `packed 54 / 37` 亦通过（正是上次误报的形态）。
+
+**仍未做（如实）**：aarch64 的只读数据节整体加密不可用（根因未定，下一步需要 `VMPELF prot rva=... rc=...`
+无条件诊断把崩溃点变成读数）；PE 侧 CI 尚未接 expose_report 语义门禁。
