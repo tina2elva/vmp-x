@@ -29,7 +29,7 @@ p = [x for x in d['placements'] if x['name'] == 'main.checkKey'][0]
 print(d['sectionRVA'], d['sectionSize'], p['thunkRVA'])
 PY
 read -r sec_rva sec_size thunk_rva < build/payload_args.txt
-./build/extractpayload -elf build/linux_target.vmp -rva "$sec_rva" -size "$sec_size" -thunk "$thunk_rva" -out build/linux_payload.bin -patchout build/linux_payload_patch.txt | tee build/payload_meta.txt
+./build/extractpayload -elf build/linux_target.vmp -rva "$sec_rva" -size "$sec_size" -thunk "$thunk_rva" -manifest build/vm_interp_linux.json -out build/linux_payload.bin -patchout build/linux_payload_patch.txt | tee build/payload_meta.txt
 echo "[*] running the payload probe (payload mapped at its original VA)..."
 thunk_off=$(printf '0x%x' $((thunk_rva - sec_rva)))
 va=$(grep -o 'payloadVA=0x[0-9A-Fa-f]*' build/payload_meta.txt | head -n1 | cut -d= -f2)

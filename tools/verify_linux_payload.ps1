@@ -31,7 +31,7 @@ Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
 $m = Get-Content build/linux_vmp.json | ConvertFrom-Json
 $p = $m.placements | Where-Object { $_.name -eq "main.checkKey" }
 $thunkOff = '{0:X}' -f ($p.thunkRVA - $m.sectionRVA)
-$meta = & .\build\extractpayload.exe -elf build/linux_target.vmp -rva $m.sectionRVA -size $m.sectionSize -thunk $p.thunkRVA -out build/linux_payload.bin -patchout build/linux_payload_patch.txt
+$meta = & .\build\extractpayload.exe -elf build/linux_target.vmp -rva $m.sectionRVA -size $m.sectionSize -thunk $p.thunkRVA -manifest build/vm_interp_linux.json -out build/linux_payload.bin -patchout build/linux_payload_patch.txt
 $meta | ForEach-Object { Write-Host "    $_" }
 $va = ($meta | Select-String -Pattern 'payloadVA=(0x[0-9A-Fa-f]+)').Matches[0].Groups[1].Value
 
@@ -68,7 +68,7 @@ if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] PIE packing failed"; exit 1 }
 $mp = Get-Content build/linux_pie.json | ConvertFrom-Json
 $pp = $mp.placements | Where-Object { $_.name -eq "main.checkKey" }
 $pthunkOff = '{0:X}' -f ($pp.thunkRVA - $mp.sectionRVA)
-$pmeta = & .\build\extractpayload.exe -elf build/linux_pie.vmp -rva $mp.sectionRVA -size $mp.sectionSize -thunk $pp.thunkRVA -out build/linux_pie_payload.bin -patchout build/linux_pie_payload_patch.txt
+$pmeta = & .\build\extractpayload.exe -elf build/linux_pie.vmp -rva $mp.sectionRVA -size $mp.sectionSize -thunk $pp.thunkRVA -manifest build/vm_interp_linux.json -out build/linux_pie_payload.bin -patchout build/linux_pie_payload_patch.txt
 $pmeta | ForEach-Object { Write-Host "    $_" }
 $pva = ($pmeta | Select-String -Pattern 'payloadVA=(0x[0-9A-Fa-f]+)').Matches[0].Groups[1].Value
 

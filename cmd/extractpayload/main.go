@@ -7,11 +7,13 @@ package main
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
 
+	"github.com/vmpx/vmp-x/internal/inject"
 	elfload "github.com/vmpx/vmp-x/internal/load/elf"
 )
 
@@ -22,6 +24,7 @@ func main() {
 	thunkRVA := flag.Uint64("thunk", 0, "thunk 的 RVA")
 	out := flag.String("out", "payload.bin", "输出文件")
 	patchOut := flag.String("patchout", "", "把入口补丁字节（及它相对 payload 起点的偏移）写成文本，供探针在读到\"未映射的目标页\"时也能满足运行期校验")
+	manPath := flag.String("manifest", "", "blob manifest：用于解描述符的**字段掩码**（(3) 起描述符标量不再是明文）")
 	flag.Parse()
 
 	f, err := elfload.Open(*elfPath)
@@ -37,6 +40,25 @@ func main() {
 	// 顺带把描述符内容打出来（描述符在 thunk 之前 VM_DESC_SIZE=64 字节）
 	descOff := int(thunkOff) - 64
 	if descOff >= 0 && descOff+64 <= len(data) {
+		// (3) 起描述符的 8..32 是加了掩码的（codeRVA/codeLen/encLen/flags/reserved1/reserved2）。
+		// 本工具是**诊断工具**，所以拿 manifest 里的主密钥 + 掩码种子把这一段解回来再打印；
+		// 不传 -manifest 就只能打印密文 —— 这也顺便证明了"静态读不出来"。
+		if *manPath != "" {
+			mb, rerr := os.ReadFile(*manPath)
+			must(rerr)
+			var m struct {
+				Key           string `json:"key"`
+				FieldMaskSalt uint32 `json:"fieldMaskSalt"`
+			}
+			must(json.Unmarshal(mb, &m))
+			key, kerr := hex.DecodeString(m.Key)
+			must(kerr)
+			md := inject.FieldMask(key, inject.FieldMaskDomainDesc, m.FieldMaskSalt)
+			inject.XorMask(data, descOff+8, 24, md[:24])
+			fmt.Println("[*] descriptor scalars decoded with the manifest field mask")
+		} else {
+			fmt.Println("[!] no -manifest: descriptor scalars below are still masked (not plaintext)")
+		}
 		fmt.Printf("desc magic=0x%X selfRVA=0x%X codeRVA=0x%X codeLen=%d flags=0x%X encLen=%d\n",
 			binary.LittleEndian.Uint32(data[descOff:]),
 			binary.LittleEndian.Uint32(data[descOff+4:]),

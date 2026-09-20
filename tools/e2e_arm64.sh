@@ -100,7 +100,7 @@ print("MISMATCH 解码: len=%d maxFrame=%s margin=%s %s" % (len(code), m.get("ma
       print("MISMATCH sum_to 字节码(%d): %s" % (len(c2), c2.hex()))
       print("MISMATCH sum_to 循环 op: " + " ".join("0x%X=%s" % (c2[p], inv.get(c2[p], "?")) for p in (0x20, 0x26, 0x2F) if p < len(c2)))
 PY
-        ./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -out build/arm64_payload.bin >build/extract.log 2>&1 || echo "[!] extractpayload 失败: $(tail -n1 build/extract.log)"
+        ./build/extractpayload -elf build/arm64_target.vmp -rva "$sec_rva" -size "$sec_sz" -thunk "$thunk_rva" -manifest build/vm_interp_arm64.json -out build/arm64_payload.bin >build/extract.log 2>&1 || echo "[!] extractpayload 失败: $(tail -n1 build/extract.log)"
         ring_off=$(grep -o '"vm_ring_hdr": *[0-9]*' build/vm_interp_arm64.json | head -n1 | sed 's/.*: *//' || true)
         diag_off=$(grep -o '"vm_diag": *[0-9]*' build/vm_interp_arm64.json | head -n1 | sed 's/.*: *//' || true)
         probe_out=$(timeout 60 $QEMU ./build/payload_probe_arm64 build/arm64_payload.bin "$(printf 0x%x $va)" "$(printf 0x%x $thunk_off)" "${ring_off:-0}" "${diag_off:-0}" 0 1 10 255 2>&1) || true
