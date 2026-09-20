@@ -382,9 +382,27 @@ func (l *Lifter) liftLogicalImm(f *ir.Func, ins *dec.Insn) error {
 			SrcOff: uint32(ins.PC), Text: ins.Text()})
 		return nil
 	}
-	rnSlot, ok := slotLe31((ins.Raw >> 5) & 31)
+	rnReg := (ins.Raw >> 5) & 31
+	rnSlot, ok := slotLe31(rnReg)
 	if !ok {
-		return fmt.Errorf("Rn=XZR 的逻辑形式暂不支持")
+		// Rn == XZR（寄存器号 31）：逻辑立即数的 "0 op imm" 形式。
+		// ORR/EOR 结果就是 imm；AND 结果是 0。带标志位的形式（ANDS/TST）走 AluRR(And) 一遍，
+		// 这样 NZCV（逻辑运算 C=0、V=0、N/Z 由结果定）与硬件一致。
+		// 实测来源：Go 给 main.sumTo 编出的第一条就是 ORR X1, XZR, #0x1（CI run 35481040253）。
+		if setFlags {
+			f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRI, Width: ir.W64, Dst: SCR, Imm: 0,
+				SrcOff: uint32(ins.PC), Text: ins.Text()})
+			f.Insns = append(f.Insns, ir.Insn{Op: ir.AluRR, Kind: aluKind(ir.And, true),
+				Width: w, Dst: dst, A: SCR, B: SCR, SrcOff: uint32(ins.PC), Text: ins.Text()})
+			return nil
+		}
+		imm := mask
+		if kind == ir.And {
+			imm = 0
+		}
+		f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRI, Width: w, Dst: dst, Imm: imm,
+			SrcOff: uint32(ins.PC), Text: ins.Text()})
+		return nil
 	}
 	f.Insns = append(f.Insns, ir.Insn{Op: ir.MovRI, Width: ir.W64, Dst: SCR, Imm: mask,
 		SrcOff: uint32(ins.PC), Text: ins.Text()})
