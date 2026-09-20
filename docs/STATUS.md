@@ -4305,6 +4305,10 @@ Poly1305 是**一次性** MAC，所以按键/消息分离：
 - 本机 `powershell -NoProfile -File tools/gates.ps1`：**total 11 gates, 0 failed**
   （gofmt / go vet / go test / vmpbuild（含 release blob）/ e2e.ps1 = 147 passed 0 failed / residue probe /
   字节码明文扫描 / 镜像残留 / e2e_dll.ps1 / arm64-guest differential / linux payload 全部 OK）。
+- **CI：run 35489931006（提交 b500bc7）五个作业全绿** —— windows-amd64 / windows-arm64-blob /
+  windows-arm64-run / linux-amd64 / linux-arm64。
+- 反证：接线第一次进主干时那三条 run（35488815092 = f44f639、35488960921 = 61364c0、35488985789 = a83a4ad）
+  **全红**；那正是本条目里两个缺陷都还在的状态。修好后同一条 CI 全绿 ⇒ 红绿分界就落在 b500bc7。
 - 隔离 worktree 全量 e2e：`e2e: 147 passed, 0 failed`。
 - `build/kdf_kat.exe`：七个向量（5 个 salt/KDF + desc + sect）与 Go 侧断言逐字节一致；改标签写法后数值不变。
 - 定位过程（可复用的手法）：镜像 AEAD 失败退出码 `0xC0DE0004` → 先用"在打包产物上重放运行期算式"的 Go 程序
