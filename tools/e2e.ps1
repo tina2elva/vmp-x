@@ -286,21 +286,23 @@ if ($LASTEXITCODE -ne 0) {
         # 2) the real key must NOT be in the external artifact
         if (Test-FileContains $extExe $realKey) { $fail++; $failLines += "E2EFAIL ext-key: master key IS present in the artifact" }
         else { $pass++ }
-        # 3) no key => hard gate, no output
+        # 3) no key => hard gate, no output (the loader reads VMPX_KEY from the PEB env block)
+        Remove-Item Env:\VMPX_KEY -ErrorAction SilentlyContinue
         $r1 = Get-ExitCode $extExe @("check_key", "10")
         if ((('{0:X8}' -f ($r1.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($r1.Out -eq "") -and ($r1.Err -eq "")) { $pass++ }
         else { $fail++; $failLines += ("E2EFAIL ext-key/none: code=0x{0:X8} out=[{1}] err=[{2}]" -f ($r1.Code -band 0xFFFFFFFF), $r1.Out.Trim(), $r1.Err.Trim()) }
         # 4) wrong key => same hard gate
-        [System.IO.File]::WriteAllBytes((Join-Path (Get-Location) $extKeyBeside), [byte[]]::new(32))
+        $env:VMPX_KEY = ("5A" * 32)
         $r2 = Get-ExitCode $extExe @("check_key", "10")
         if ((('{0:X8}' -f ($r2.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($r2.Out -eq "")) { $pass++ }
         else { $fail++; $failLines += ("E2EFAIL ext-key/wrong: code=0x{0:X8} out=[{1}]" -f ($r2.Code -band 0xFFFFFFFF), $r2.Out.Trim()) }
         # 5) correct key => identical to native
-        Copy-Item $extKey $extKeyBeside -Force
+        $env:VMPX_KEY = $extHex.ToUpper()
         $nOut = Run-File "build/target.exe" @("check_key", "10") 30
         $vOut = Run-File $extExe @("check_key", "10") 30
         if (($nOut -ne "") -and ($nOut -eq $vOut)) { $pass++ }
         else { $fail++; $failLines += ("E2EFAIL ext-key/ok: native=[{0}] protected=[{1}]" -f $nOut.Trim(), $vOut.Trim()) }
+        Remove-Item Env:\VMPX_KEY -ErrorAction SilentlyContinue
     }
 }
 

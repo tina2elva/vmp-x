@@ -535,9 +535,17 @@ static void vm_desc_key(const vm_desc_t *d, const u8 master[32], u8 out[32]) {
 /* ---- (1b) 主密钥来源：外置取钥 + 密钥校验值（KCV） ----
  * 兼容模式（默认）：blob 里就带主密钥（VM_KEY_BYTES），行为与 1b 之前完全一致。
  * 外置模式（vmpbuild -key-external）：blob 里只有**随机占位密钥**，真主密钥运行期从外部取；
- * 取不到、或与 KCV 不符 ⇒ 硬门：ExitProcess(0xC0DE0007)、不输出任何内容。
+ * 取不到、或与 KCV 不符 ⇒ 硬门：以专用退出码 0xC0DE0007 结束、不输出任何内容。
  * 所有需要主密钥的地方（字节码/镜像解密、加载期校验表、vm_crypto 的 sigma 掩码）都走
- * vm_master()，于是"第一次解密之前就把错密钥挡掉"是结构性保证，而不是靠调用顺序碰巧成立。 */
+ * vm_master()，于是"第一次解密之前就把错密钥挡掉"是结构性保证。
+ *
+ * 取钥路径刻意**不调用 kernel32 的取环境/文件 API**：kernel32 里这批 API 在部分 Windows
+ * 版本上是**转发导出**（导出项不是代码，而是指向 "KERNELBASE.xxx" 字符串的 RVA），要拿真地址
+ * 必须先正确识别转发器 —— 这条路在 CI 的 runner 上就踩崩过（0xC0000005，见 STATUS #385）。
+ * 改走两条完全绕开它的路：
+ *   1) 密钥从 **PEB 的环境块**直接读（纯内存读，零 API 调用）；
+ *   2) 硬门用 **ntdll!NtTerminateProcess**（ntdll 的导出从不转发）。
+ * 密钥形式：环境变量 VMPX_KEY = 64 个十六进制字符（32 字节原始密钥）。 */
 #ifdef VM_KEY_EXTERNAL
 
 #if !(defined(VM_BLOB_USES_WIN64) && defined(__x86_64__))
@@ -548,75 +556,84 @@ static u8 vm_master_buf[32];
 static u32 vm_master_ok; /* .bss：0 = 还没取，1 = 已取且 KCV 通过 */
 
 /* 这两个符号在本文件靠后的 Windows 段里定义 */
+static u64 vm_peb_base(void);
 static u64 vm_find_module(const char *name);
 static void *vm_get_proc(u64 mod, const char *fn);
 
+/* 硬门：走 ntdll!NtTerminateProcess(-1, code) —— ntdll 的导出不转发，地址一定有效；
+ * 万一取不到就 ud2（0xC000001D）。默认 code = 7 ⇒ 退出码 0xC0DE0007、无任何输出。 */
 static void vm_key_reject_code(u32 code) {
-    typedef void (*exitfn_t)(u32);
-    exitfn_t ex = (exitfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "ExitProcess");
-    if (ex) ex(0xC0DE0000u | code);
+    typedef long (*termfn_t)(void *, u32);
+    termfn_t tp = (termfn_t)vm_get_proc(vm_find_module("ntdll.dll"), "NtTerminateProcess");
+    if (tp) tp((void *)(long long)-1, 0xC0DE0000u | code);
     __builtin_trap();
 }
-/* 硬门：专用退出码 0xC0DE0007、无任何输出 */
 static void vm_key_reject(void) { vm_key_reject_code(7u); }
 
-/* 读 32 字节原始密钥（部署时文件叫 <产物全路径>.vmpkey）。成功返回 1。 */
-static int vm_key_read_file(const char *path) {
-    typedef void *(*createfn_t)(const char *, u32, u32, void *, u32, u32, void *);
-    typedef int (*readfn_t)(void *, void *, u32, u32 *, void *);
-    typedef int (*closefn_t)(void *);
-    u64 k32 = vm_find_module("KERNEL32.DLL");
-    createfn_t cf = (createfn_t)vm_get_proc(k32, "CreateFileA");
-    readfn_t rf = (readfn_t)vm_get_proc(k32, "ReadFile");
-    closefn_t xf = (closefn_t)vm_get_proc(k32, "CloseHandle");
-    if (!cf || !rf || !xf) {
-        vm_key_reject_code(0x105u);                /* TEMP-DIAG: 文件 API 取不到 */
-        return 0;
-    }
-    void *h = cf(path, 0x80000000u /* GENERIC_READ */, 1u /* FILE_SHARE_READ */, 0,
-                 3u /* OPEN_EXISTING */, 0, 0);
-    if (!h || h == (void *)(long long)-1) {
-        vm_key_reject_code(0x106u);                /* TEMP-DIAG: 打不开密钥文件 */
-        return 0;
-    }
-    u32 got = 0;
-    int ok = rf(h, vm_master_buf, 32, &got, 0);
-    xf(h);
-    return ok && got == 32;
+/* PEB -> ProcessParameters(+0x20) -> Environment(+0x80)：UTF-16 块 "NAME=VALUE\0...\0\0"。 */
+static const u16 *vm_env_block(void) {
+    u64 peb = vm_peb_base();
+    if (!peb) return 0;
+    const u8 *pp = *(const u8 *const *)(peb + 0x20);
+    if (!pp) return 0;
+    return *(const u16 *const *)(pp + 0x80);
 }
 
-/* 路径 = <本模块全路径>.vmpkey；环境变量 VMPX_KEY_FILE 可覆盖（部署更灵活）。 */
-static void vm_key_path(char *buf, u32 cap) {
-    typedef u32 (*genvfn_t)(const char *, char *, u32);
-    typedef u32 (*gmfn_t)(void *, char *, u32);
-    u64 k32 = vm_find_module("KERNEL32.DLL");
-    u32 room = cap - 8u;
-    genvfn_t genv = (genvfn_t)vm_get_proc(k32, "GetEnvironmentVariableA");
-    if (!k32) vm_key_reject_code(0x101u);          /* TEMP-DIAG: 找不到 kernel32 */
-    if (!genv) vm_key_reject_code(0x102u);         /* TEMP-DIAG: GetEnvironmentVariableA 取不到 */
-    if (genv) {
-        u32 n = genv("VMPX_KEY_FILE", buf, room);
-        if (n > 0 && n < room) { buf[n] = 0; return; }
+/* 在环境块里按名字取右值（名字是 ASCII，大小写不敏感）。 */
+static const u16 *vm_env_get(const char *name) {
+    const u16 *p = vm_env_block();
+    if (!p) return 0;
+    for (u32 n = 0; n < 8192; n++) {
+        if (!*p) {
+            if (!p[1]) return 0; /* 双 NUL = 环境块结束 */
+            p++;
+            continue;
+        }
+        const u16 *q = p;
+        const char *a = name;
+        int same = 1;
+        while (*a) {
+            u16 c = *q++;
+            if (c >= 'a' && c <= 'z') c = (u16)(c - 32);
+            char b = *a++;
+            if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+            if (c > 127 || (char)c != b) { same = 0; break; }
+        }
+        if (same && *q == '=') return q + 1;
+        while (*p) p++;
+        p++;
     }
-    gmfn_t gm = (gmfn_t)vm_get_proc(k32, "GetModuleFileNameA");
-    if (!gm) vm_key_reject_code(0x103u);           /* TEMP-DIAG: GetModuleFileNameA 取不到 */
-    u32 n = gm ? gm(0, buf, room) : 0;
-    if (n == 0 || n >= room) vm_key_reject_code(0x104u); /* TEMP-DIAG: 取模块路径失败 */
-    const char *suf = ".vmpkey";
-    for (u32 i = 0; i < 8; i++) buf[n + i] = (u8)suf[i];
+    return 0;
+}
+
+static u32 vm_hexval(u16 c) {
+    if (c >= '0' && c <= '9') return (u32)(c - '0');
+    if (c >= 'a' && c <= 'f') return (u32)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return (u32)(c - 'A' + 10);
+    return 0xFFFFFFFFu;
+}
+
+/* VMPX_KEY = 64 个十六进制字符 -> 32 字节主密钥。 */
+static int vm_key_from_env(void) {
+    const u16 *v = vm_env_get("VMPX_KEY");
+    if (!v) return 0;
+    for (u32 i = 0; i < 32; i++) {
+        u32 hi = vm_hexval(v[2 * i]), lo = vm_hexval(v[2 * i + 1]);
+        if (hi > 15 || lo > 15) return 0;
+        vm_master_buf[i] = (u8)((hi << 4) | lo);
+    }
+    return 1;
 }
 
 const u8 *vm_master(void) {
     if (vm_master_ok) return vm_master_buf;
-    char path[512];
-    vm_key_path(path, (u32)sizeof(path));
-    if (!vm_key_read_file(path)) vm_key_reject();
+    if (!vm_key_from_env()) vm_key_reject();
     {   /* KCV 自检：在任何解密之前判定"手里这把主密钥对不对" */
         static const u8 want[VM_KEY_CHECK_LEN] = VM_KEY_CHECK_BYTES;
         u8 kcv[32];
         vm_kdf_entry(vm_master_buf, VM_KEY_CHECK_RVA, VM_KEY_CHECK_SALT, kcv);
         for (u32 i = 0; i < (u32)VM_KEY_CHECK_LEN; i++) {
-            if (kcv[i] != want[i]) vm_key_reject_code(0x107u); /* TEMP-DIAG: KCV 不符 */
+            if (kcv[i] != want[i]) vm_key_reject();
         }
     }
     vm_master_ok = 1;
