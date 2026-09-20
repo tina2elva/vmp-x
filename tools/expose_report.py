@@ -84,9 +84,9 @@ def main():
     ap.add_argument("--sections", default="", help="only these sections (comma separated)")
     ap.add_argument("--minlen", type=int, default=6)
     ap.add_argument("--max-ratio", type=float, default=1.0,
+                    help="with --compare: fail (exit 2) if the packed image keeps more than this fraction of the original >=12-byte readable strings")
     ap.add_argument("--max-abs", type=int, default=256,
                     help="absolute allowance for >=12-char readable bytes in the packed image; a tiny original makes the ratio meaningless (random data yields short printable runs)")
-                    help="with --compare: fail (exit 2) if the packed image keeps more than this fraction of the original >=12-byte readable strings")
     a = ap.parse_args()
     only = [s.strip() for s in a.sections.split(",") if s.strip()]
 
