@@ -1,3 +1,4 @@
 # Windows/amd64 blob 源文件（路径相对 stub/）
 win/x64/vm_interp.c
 win/x64/vm_entry_asm.S
+vm_kdf.c
