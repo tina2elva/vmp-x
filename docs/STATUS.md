@@ -4377,11 +4377,32 @@ CI run **35494537015** 的 **linux-arm64** 立刻红：
   同时**总是**写一个 16 字节**密钥校验值**（KCV）= `KDFEntry(真主密钥, "KEYK" = 0x4B45594B, 每次构建随机 salt)[0:16]`。
   真主密钥仍然进 manifest（vmpack 要用），并可由 `-key-out <path>` 落成 32 字节原始文件供部署。
 - **运行期**：`vm_interp.c` 新增 `vm_master()`；所有需要主密钥的地方（字节码/镜像解密、加载期校验表、
-  `vm_crypto.c` 的 sigma 掩码）都走它。首次调用时取钥 + KCV 自检，**取不到或对不上 ⇒ `ExitProcess(0xC0DE0007)`、
-  不输出任何内容**。取钥路径（Windows/x64，只用 KERNEL32 导出、不依赖 CRT）：默认 `<模块全路径>.vmpkey`
-  （32 字节原始密钥），环境变量 `VMPX_KEY_FILE` 可覆盖。
+  `vm_crypto.c` 的 sigma 掩码）都走它。首次调用时取钥 + KCV 自检，**取不到或对不上 ⇒ 以专用退出码
+  `0xC0DE0007` 结束、不输出任何内容**。
+- **取钥路径刻意不调用 kernel32 的取环境/文件 API**（原因见下面的踩坑记录）：
+  密钥从 **PEB 的环境块**直接读（`PEB->ProcessParameters(+0x20)->Environment(+0x80)`，纯内存读、
+  零 API），形式是环境变量 `VMPX_KEY` = 64 位 hex；硬门走 **`ntdll!NtTerminateProcess(-1, 0xC0DE0007)`**
+  （ntdll 的导出从不转发，地址必然有效），取不到就 `ud2`。部署时 `vmpbuild -key-out <file>` 写出的
+  就是那 64 位 hex 文本，设成环境变量即可。
 - **不支持的平台直接构建失败**：`-key-external` 目前只有 win/x64 的取钥实现，别的目标 `fatalf`
   —— 宁可构建期报错，也不要产出"注定起不来"的产物。
+
+**踩坑记录：这一条在 CI 上死了三次才通（值得留档，因为都是"本机看不见"的类型）**
+1. CI **35497237045**：windows-amd64 报 `code=0xC0000005`，本机全绿。根因是 `vm_get_proc` **不处理
+   转发导出（forwarder）**：kernel32 里一批 API 的导出项不是代码，而是指向 `"KERNELBASE.CreateFileA"`
+   字符串的 RVA；把它当函数地址调过去 = 跳进只读字符串页。**本机 kernel32 这 5 个 API 恰好是真实桩**
+   （写了个小工具逐个查导出项，`fwd=0`），所以只有 CI 崩；现有镜像自解密只用 VirtualProtect/ExitProcess，
+   两边都是真实导出，因此这个洞一直没被踩到。修法：识别转发器并按 `<DLL>.<Func>` 递归解析，
+   判定用"RVA 在导出目录范围内 **或** 不在可执行节里"两条并集。算法用本机真实转发器校准：
+   `kernel32!AppPolicyGetClrCompat` 确实是转发导出，同一套逻辑解析它 == `GetProcAddress`。
+2. CI **35497628714**：加了转发器识别后**仍然** `0xC0000005`（不是分支码 ⇒ 崩在"调用已解析到的地址"上）；
+   同时暴露出 e2e 自己的探针缺陷：**Windows PowerShell 5.1 的 `ConvertFrom-Json` 遇到空的 JSON 属性名
+   会抛 "the value of argument name is not valid"**，而 blob 的符号表里可能有空名 —— 报错被吞掉后
+   needle 变空串，"搜不到密钥"就会被判成 PASS。改成**正则取 key**，并保留"必须是 64 位 hex"的校准断言。
+3. CI **35497946766**：给每个分支加临时退出码（`0xC0DE01xx`）定位，结果仍是裸 `0xC0000005`，
+   说明地址解析"成功"但调用崩 —— 判断转发这条路在 runner 的不同 Windows 版本上不可靠。
+   **于是不再绕**：把取钥整体改到 PEB 环境块（零 API），硬门改到 ntdll。
+4. CI **35498251605**：**五个作业全绿**，e2e 在 runner 上也是 152/0。
 
 **设计要点**：把"第一次解密之前就把错密钥挡掉"做成**结构性保证**（所有路径都必须过 `vm_master()`），
 而不是靠调用顺序碰巧成立；KCV 复用已有 KDF，不新增密码学原语；KCV 是 ChaCha20 块输出的截断 + 随机 salt，
@@ -4401,9 +4422,12 @@ CI run **35494537015** 的 **linux-arm64** 立刻红：
 - 兼容模式（不带 `-key-external`）行为不变：本机 gates 11/0、e2e 152/0。
 
 **边界（如实登记）**
-- 取钥来源目前只有两种：**外部文件**（默认路径）与 `VMPX_KEY_FILE` 覆盖。
-  **env 内联密钥 / 授权回调 / TPM-TEE 封印（L3）**都未做 —— 那是 DESIGN §2 里 `KeyProvider` 的 L3/L4 部分。
-- **DLL + 外置密钥未做**：`GetModuleFileNameA(NULL,…)` 拿到的是宿主 EXE 的路径。EXE 路径已验证。
+- 取钥来源目前只有一种：**环境变量 `VMPX_KEY`（64 位 hex）**。
+  **外部文件源**本轮试过（`CreateFileA/ReadFile`）但被上面那条转发导出问题挡下、先撤回；
+  要做的话正确路子是 **ntdll 的 `NtCreateFile/NtReadFile`**（ntdll 不转发）或直接从 PEB 读
+  `ImagePathName` 拼路径 —— 都能零 kernel32 依赖。**授权回调 / TPM-TEE 封印（L3）**同样未做，
+  那是 DESIGN §2 里 `KeyProvider` 的 L3/L4 部分。
+- **DLL + 外置密钥未做**（EXE 路径已验证）。
 - **Linux/arm64 的取钥路径未做**（`-key-external` 在这些目标上直接构建失败）。
 - 本条的防护等级是 **L1.5**：产物不再自足（拿不到密钥就解不出任何字节码），但密钥仍在进程内，
   挡不住运行期抓取 —— 要那一档需要 (4) 反调试/反 dump 配套。
@@ -4420,6 +4444,12 @@ kernelbase，所以只有 CI 会崩；现有镜像自解密只用 VirtualProtect
 顺带把 e2e 里的探针按"先校准"改了：**先断言 manifest 里的 key 是 64 位 hex**，
 不合格就报 `manifest key hex is not 64 chars`，而不是让错误 needle 把"没找到"变成假 PASS。
 
-**证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e **152 passed / 0 failed**）；CI run（待填）。
+**证据**
+- `tools/e2e.ps1` 从 **147 → 152** 条用例（新增 5 条 1b 用例）；门禁总数仍 **11**。
+- 本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e **152 passed / 0 failed**、dll 3/3、arm64 客户机 OK）。
+- 兼容模式（不带 `-key-external`）行为不变：本机与 CI 都是全绿。
+- CI：**35498251605（5620143）五个作业全绿**。反证：同一条用例在 35497237045 / 35497628714 /
+  35497946766 三次都是 windows-amd64 红（原因见上面的踩坑记录）。
 
-**未做**：(2) 带密钥 MAC、(3) 容器加密/混淆、(4) 反调试多路径、(6) 重定位/ASLR。
+**未做**：外部文件源（走 ntdll，见"边界"）、授权回调、TPM/TEE、(2) 带密钥 MAC、(3) 容器加密/混淆、
+(4) 反调试多路径、(6) 重定位/ASLR。
