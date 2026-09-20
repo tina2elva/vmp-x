@@ -23,10 +23,20 @@ static u32 load32le(const u8 *p) {
 static void chacha20_block(const u8 key[32], u32 counter, const u8 nonce[12], u8 out[64]) {
     u32 st[16];
 #if defined(VM_SIGMA_MASK)
-    /* sigma 常量按构建随机化：存的字是 (规范值 ^ 主密钥前 4 字节)，掩码在**运行期**从 key 取。
-     * 关键点：掩码必须是运行期的 —— 如果两边都是编译期常量，编译器会把异或折回规范值，
-     * 静态分析照样一眼认出 ChaCha（我第一次就是这么写的，实测规范字仍在 blob 里）。 */
-    u32 sm = load32le(key);
+    /* sigma 常量按构建随机化：存的字是 (规范值 ^ 主密钥前 4 字节)。
+     * 关键点 1：掩码必须是**运行期**取到的 —— 两边都是编译期常量时编译器会把异或折回规范值，
+     * 静态分析照样一眼认出 ChaCha（第一次就是这么写的，实测规范字仍在 blob 里）；这里用
+     * volatile 读主密钥，逼出真正的运行期加载。
+     * 关键点 2（KDF 接线后必须改）：掩码只能来自**主密钥**，不能来自当前 working key。
+     * 每条目/每节现在用的都是派生密钥 K_f；若还拿 key[0..4] 当掩码，sigma 就不再是规范值，
+     * C 侧不再等于标准 ChaCha20 —— 现象是两侧 KDF KAT 全绿、密文/标签/nonce 逐字节一致，
+     * 但 AEAD 验签 100% 失败（PE 上是退出码 0xC0DE0004，极难定位）。
+     * 关键点 3：这个数组必须是**栈上局部**，不能是 static const —— vmpbuild 的重定位解析
+     * 会丢掉 COFF 字段里的节内加数（见 vm_kdf.c 顶部说明），本文件新增的只读数据会被
+     * 解析到所在节的起点，掩码就变成别的字节。 */
+    volatile u8 sigma_master[32] = VM_KEY_BYTES;
+    u32 sm = (u32)sigma_master[0] | ((u32)sigma_master[1] << 8) |
+             ((u32)sigma_master[2] << 16) | ((u32)sigma_master[3] << 24);
     st[0] = VM_SIGMA_OBF0 ^ sm;
     st[1] = VM_SIGMA_OBF1 ^ sm;
     st[2] = VM_SIGMA_OBF2 ^ sm;

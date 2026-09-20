@@ -62,9 +62,19 @@ void vm_kdf_entry(const u8 master[32], u32 rva, u32 salt, u8 out[32]) {
  * （描述符里没有 salt 字段，用它自己已有的三个字段派生；两侧必须一致，故单独钉 KAT。） */
 u32 vm_kdf_salt(u32 selfRVA, u32 codeRVA, u32 codeLen) {
     u32 h = 2166136261u;
-    const char *tag = "VMPXKDF";
-    for (const char *p = tag; *p; p++) { h ^= (u32)(u8)*p; h *= 16777619u; }
-    h ^= 0u; h *= 16777619u; /* 结尾的 \x00 */
+    /* 标签 "VMPXKDF\0" 用**立即数字节**展开，不用字符串字面量：vmpbuild 的重定位解析
+     * 对 COFF 只按 -4 补偿、不看字段里已有的节内加数，于是"本目标文件里不是第一份只读数据"
+     * 的字符串会被解析到它所在节的**起点**（实测：vm_kdf_salt 里的 lea 指向 .rdata+0，
+     * 而 "VMPXKDF" 实际在 .rdata+0x80）—— 派生出的 salt 全错，表现为 AEAD 验签与
+     * 完整性校验全灭。展开成立即数后本文件不再贡献只读数据，绕开该缺陷。 */
+    h ^= 0x56u; h *= 16777619u; /* 'V' */
+    h ^= 0x4Du; h *= 16777619u; /* 'M' */
+    h ^= 0x50u; h *= 16777619u; /* 'P' */
+    h ^= 0x58u; h *= 16777619u; /* 'X' */
+    h ^= 0x4Bu; h *= 16777619u; /* 'K' */
+    h ^= 0x44u; h *= 16777619u; /* 'D' */
+    h ^= 0x46u; h *= 16777619u; /* 'F' */
+    h ^= 0x00u; h *= 16777619u; /* 结尾的 \x00 */
     u32 v[3];
     v[0] = selfRVA; v[1] = codeRVA; v[2] = codeLen;
     for (int i = 0; i < 3; i++) {

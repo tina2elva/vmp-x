@@ -4260,3 +4260,59 @@ Poly1305 是**一次性** MAC，所以按键/消息分离：
 
 **写在最前的前提**：这条要等 (1) 接线完成后再做 —— 因为 `key_mac` 依赖 `KDFEntry` 的接线，
 否则又是"两侧各改一半"。本条目先作为设计登记，避免下一段重新推导选型。
+
+### 383. 目标项 (1) 接线完成（每条目派生密钥）；顺带挖出并修掉两个只有接线才会暴露的真问题
+
+**做了什么（打包端）**
+- `internal/inject/payload.go`：`EncryptFunc` 增加 `key [32]byte` 参数（交给回调的就是**本条目的派生密钥**）；
+  `Options.Master`（32 字节主密钥）驱动派生：字节码条目
+  `K_e = KDFEntry(master, rva = funcRVA, salt = KDFSaltForPlacement(descSelfRVA, funcRVA, codeLen))`。
+- `patchChecks` 的 8 字节密钥前缀改用**条目派生密钥**（不再用主密钥前 8 字节）；
+  加载期校验表条目 **12 → 24 字节**，追加 `selfRVA/funcRVA/codeLen` 三个 KDF 输入，运行期据此现推同一把密钥。
+- `cmd/vmpack/main.go`：三处接线 —— 字节码 Seal 闭包按条目现建 AEAD；PE/ELF 整体加密每个节
+  `K_s = KDFEntry(master, 节 RVA, 表头 salt)`（nonce/aad 不变）；`Master` 经 `packPE/packELF` 传到 `inject.Options`。
+
+**做了什么（运行期）**
+- `stub/win/x64/vm_interp.c` 七处 `VM_KEY_BYTES` 全部改成"按条目现推"：
+  新增 `vm_desc_key(d, master, out) = vm_kdf_entry(master, d->reserved1, vm_kdf_salt(d->selfRVA, d->reserved1, d->codeLen))`；
+  `vm_bcs_t` 增加 `keybuf[32]`（流式取指原来的 `key` 直接指向主密钥常量，现在指向这份派生密钥）；
+  字节码 AEAD 验签、`VM_INVM_PATCHCHECK` 块、`vm_verify_table`、三条 `vm_unpack_image`
+  （Linux x86-64 / Linux aarch64 / Windows x86-64）各自现推。
+
+**KAT 与单测**
+- `stub/win/x64/kdf_kat.c` 增加两行**接线约定**向量（desc：selfRVA/funcRVA/codeLen → salt+key；sect：节 RVA+表头 salt → key）。
+- Go：`TestKDFDescriptorKeyMatchesC`、`TestKDFSectionKeyMatchesC`、`TestKDFEntryDistinctPerFunc`（不同 RVA ⇒ 不同密钥），
+  以及新文件 `internal/inject/payload_kdf_test.go`：直接断言 `BuildPayload` 交给 `EncryptFunc` 的键**就是**
+  按上述算式现推的值，且两条目拿到的键不相同（这条断言盯的是"接线本身"，不是 KDF 函数）。
+
+**接线暴露出的两个真问题（都不是 KDF 设计的问题）**
+1. **ChaCha20 的 sigma 掩码不能再从 working key 取**（已修）。`vm_crypto.c` 把"规范 sigma ^ 主密钥前 4 字节"
+   存成常量、运行期用**传入的 key** 前 4 字节异或还原。以前 key 就是主密钥所以自洽；KDF 之后传进来的是派生密钥，
+   sigma 不再是规范值，C 侧不再等于标准 ChaCha20 → **AEAD 验签 100% 失败**（PE 上是退出码 `0xC0DE0004`），
+   而两侧 KDF KAT、密文、标签、nonce 逐字节全一致，极难定位。改成从 `VM_KEY_BYTES`（主密钥）取掩码。
+   掩码数组必须是**栈上局部**（原因见下一条）。
+2. **vmpbuild 的 COFF 重定位会丢掉字段里的节内加数 —— 未修，只绕开**。`cmd/vmpbuild/blob.go:applyRelocsObj`
+   对非 ELF 只按 `+4` 补偿，不读字段里已有的加数，于是"**不是第一份**只读数据"的常量/字符串会被解析到
+   它所在节的**起点**。实测（接线后第一次跑门禁）：`vm_kdf_salt` 里 `lea disp(%rip)` 指向 `.rdata+0`
+   （0x6B80，那里是 "KERNEL32.DLL"），而 "VMPXKDF" 实际在 `.rdata+0x80`（0x6C00）——
+   salt 全错 ⇒ 派生的条目密钥全错 ⇒ 补丁校验/校验表全灭。
+   绕开办法（两处，都验证过 KAT 数值不变）：`vm_kdf.c` 的标签用**立即数字节**展开（该文件不再贡献只读数据）；
+   `vm_crypto.c` 的 sigma 掩码用**栈上** `volatile` 数组（新增 static const 会变成"第二份只读数据"，掩码就被解析错）。
+   建议下一步在 `applyRelocsObj` 里对 COFF 读取字段内加数，并加一条"blob 里 `vm_kdf_salt` 结果 == KAT"的门禁；
+   这次没动它，是遵守"两侧一致性改动同一轮做完、不在余量不足时重构主干"的纪律。
+
+**证据**
+- 本机 `powershell -NoProfile -File tools/gates.ps1`：**total 11 gates, 0 failed**
+  （gofmt / go vet / go test / vmpbuild（含 release blob）/ e2e.ps1 = 147 passed 0 failed / residue probe /
+  字节码明文扫描 / 镜像残留 / e2e_dll.ps1 / arm64-guest differential / linux payload 全部 OK）。
+- 隔离 worktree 全量 e2e：`e2e: 147 passed, 0 failed`。
+- `build/kdf_kat.exe`：七个向量（5 个 salt/KDF + desc + sect）与 Go 侧断言逐字节一致；改标签写法后数值不变。
+- 定位过程（可复用的手法）：镜像 AEAD 失败退出码 `0xC0DE0004` → 先用"在打包产物上重放运行期算式"的 Go 程序
+  证明**文件是自洽的**（能解出明文）→ 再把运行期中间量编进**故障地址**（故意写野地址，崩溃报告会打出完整地址）
+  逐个读出 key/salt/描述符字段 → 最后用 `objdump` 看 blob 里 `vm_kdf_salt` 的 `lea` 目标与
+  "VMPXKDF" 的实际偏移，锁定重定位缺陷。
+
+**未做**
+- vmpbuild 的重定位缺陷本身没修（只绕开），上面已写清修法与建议的门禁。
+- 1b（主密钥外置 + 硬门）、(2) 带密钥 MAC、(3) 容器加密/混淆、(4) 反调试多路径、(6) 重定位/ASLR 仍未动。
+- `tools/preflight.ps1` 在 a83a4ad 里被移除（脚本自检不过），本轮验收用的是 HANDOFF 附录 B 的逐条命令。

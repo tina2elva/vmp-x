@@ -16,5 +16,26 @@ int main(void) {
         for (int i = 0; i < 32; i++) printf("%02x", out[i]);
         printf("\n");
     }
+    /* 接线约定：描述符 → 条目密钥。C 侧运行期是 vm_interp.c 的 vm_desc_key，
+     * Go 侧是 internal/inject/payload.go 里 KDFEntry(master, fn.RVA, KDFSaltForPlacement(descSelfRVA, fn.RVA, len(code)))。
+     * 这里把"哪三个字段喂进 salt、哪个字段当 rva"钉死（改任何一处都会让这条 KAT 变）。 */
+    {
+        u32 selfRVA = 0x3140u, funcRVA = 0x1670u, codeLen = 40u;
+        u32 salt = vm_kdf_salt(selfRVA, funcRVA, codeLen);
+        u8 out[32];
+        vm_kdf_entry(master, funcRVA, salt, out);
+        printf("desc selfRVA=0x%X funcRVA=0x%X codeLen=%u salt=0x%08X key=", selfRVA, funcRVA, codeLen, salt);
+        for (int i = 0; i < 32; i++) printf("%02x", out[i]);
+        printf("\n");
+    }
+    /* 接线约定：镜像节 → 节密钥（KDFEntry(master, rva = 节 RVA, salt = 表头 salt)；nonce/aad 不变）。 */
+    {
+        u32 secRVA = 0x1000u, tblSalt = 0xDEADBEEFu;
+        u8 out[32];
+        vm_kdf_entry(master, secRVA, tblSalt, out);
+        printf("sect rva=0x%X salt=0x%08X key=", secRVA, tblSalt);
+        for (int i = 0; i < 32; i++) printf("%02x", out[i]);
+        printf("\n");
+    }
     return 0;
 }

@@ -44,6 +44,46 @@ func TestKDFSaltDistinctAndStable(t *testing.T) {
 	}
 }
 
+// 接线约定 KAT：描述符 → 条目密钥。C 侧是 vm_interp.c 的 vm_desc_key（输入与 kdf_kat.c 的 desc 行相同），
+// Go 侧是 payload.go 里 KDFEntry(master, fn.RVA, KDFSaltForPlacement(descSelfRVA, fn.RVA, len(code)))。
+// 期望值来自 kdf_kat.exe 实测输出 —— 改任何一侧的"用哪三个字段算 salt / 哪个字段当 rva"都会让它失败。
+func TestKDFDescriptorKeyMatchesC(t *testing.T) {
+	const (
+		selfRVA = 0x3140
+		funcRVA = 0x1670
+		codeLen = 40
+	)
+	salt := KDFSaltForPlacement(selfRVA, funcRVA, codeLen)
+	if salt != 0x95EA2DB0 {
+		t.Fatalf("salt = 0x%08X，期望 0x95EA2DB0", salt)
+	}
+	got := KDFEntry(master32(), funcRVA, salt)
+	if hexs := hex.EncodeToString(got[:]); hexs != "f5ca3224112b1132be4f2d763ac738230936e67c8f34d4b168b4fadb6b5886c3" {
+		t.Fatalf("描述符条目密钥 = %s", hexs)
+	}
+}
+
+// 接线约定 KAT：镜像节 → 节密钥（KDFEntry(master, rva = 节 RVA, salt = 表头 salt)；nonce/aad 不变）。
+func TestKDFSectionKeyMatchesC(t *testing.T) {
+	got := KDFEntry(master32(), 0x1000, 0xDEADBEEF)
+	if hexs := hex.EncodeToString(got[:]); hexs != "1e6e3b42e39a2a70e7763b95f5c88c3fbb90d9cba23eefedf08710b23e9b7aeb" {
+		t.Fatalf("节密钥 = %s", hexs)
+	}
+}
+
+// "不同条目 ⇒ 不同密钥"：这是 1a 接线要买到的东西（第三方报告 P3.13）。
+func TestKDFEntryDistinctPerFunc(t *testing.T) {
+	seen := map[string]uint32{}
+	for _, r := range []uint32{0x1670, 0x16A0, 0x1700, 0x1730, 0x93000} {
+		k := KDFEntry(master32(), r, KDFSaltForPlacement(r, 0x90, 40))
+		h := hex.EncodeToString(k[:])
+		if prev, dup := seen[h]; dup {
+			t.Fatalf("密钥撞车: funcRVA=0x%X 与 0x%X 派生出了同一把密钥", r, prev)
+		}
+		seen[h] = r
+	}
+}
+
 // master32 是 KAT 统一用的测试主密钥（0x10..0x2F）。
 func master32() []byte {
 	m := make([]byte, 32)
