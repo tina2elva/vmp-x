@@ -60,6 +60,7 @@ func main() {
 	noEncImage := flag.Bool("no-enc-image", false, "关闭原镜像整体加密（默认对 x86-64 EXE 开启）")
 	encImageSections := flag.String("enc-image-sections", "", "只整体加密这些节（逗号分隔；留空=默认 .text,.rdata,.data）")
 	noEncImageDLL := flag.Bool("no-enc-image-dll", false, "对 DLL 关闭原镜像整体加密（默认对 DLL 也开）")
+	flag.BoolVar(&encImageELFData, "enc-image-elf-data", false, "ELF 侧把 .rodata/.gopclntab 也纳入整体加密（实验：CI 上 aarch64 会 SIGSEGV，默认关）")
 	noEncImageELF := flag.Bool("no-enc-image-elf", false, "对 ET_EXEC 的 ELF 关闭原镜像整体加密（默认开；探针已改为合成补丁字节，不再依赖明文）")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
@@ -620,6 +621,9 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 			//   .gopclntab -- Go 运行期元数据（同样只在入口点之后才被读）
 			// 动态链接器/初始化器在入口点之前要用的节一律排除（见 elfLoaderBlockedNames）。
 			for _, sc := range elfSections(elfRawBytes(exe)) {
+				if !encImageELFData {
+					break // 默认关：CI 实测 aarch64 SIGSEGV（docs/STATUS.md 374），先退回已验证状态
+				}
 				if !elfDataCandidates[sc.name] || elfLoaderBlockedNames[sc.name] || sc.size == 0 {
 					continue
 				}
@@ -719,6 +723,9 @@ func sectionNamesFor(base string) string {
 
 // keepSelfChecksFlag：由 main 里 flag.Parse 设定，packPE/packELF 里读取。
 var keepSelfChecksFlag *bool
+
+// encImageELFData：ELF 侧是否连 .rodata/.gopclntab 一起加密（实验开关，见 -enc-image-elf-data）。
+var encImageELFData bool
 
 // wipeEnabled：是否抹除被保护函数的原生机器码（-wipe，默认开）。
 var wipeEnabled bool
