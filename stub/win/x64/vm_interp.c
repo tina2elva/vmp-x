@@ -518,12 +518,27 @@ u32 vm_call_ring_n;
 u64 vm_code_off;
 u64 vm_self_len;
 u32 vm_self_hash;
+/* ---- 每条目密钥派生（KDF） ----
+ * 实现见 vm_kdf.c（标准 ChaCha20 块；与 Go 侧 internal/inject/kdf.go 逐字节一致）：
+ *   K_e = ChaCha20_block(key = master(32B), counter = 0, nonce = le32(rva) || le32(salt) || 0^8)[0..32)
+ *   salt = FNV1a32("VMPXKDF\0" || le32(selfRVA) || le32(codeRVA) || le32(codeLen))
+ * 描述符格式不变：salt 的三个输入本来就在描述符里（selfRVA / reserved1=funcRVA / codeLen），
+ * 所以两侧都能独立算出来，不需要额外的 salt 字段。 */
+void vm_kdf_entry(const u8 master[32], u32 rva, u32 salt, u8 out[32]);
+u32 vm_kdf_salt(u32 selfRVA, u32 codeRVA, u32 codeLen);
+
+/* 描述符 → 本条目的派生密钥（打包端 internal/inject 用同一算式，否则全量 trap）。 */
+static void vm_desc_key(const vm_desc_t *d, const u8 master[32], u8 out[32]) {
+    vm_kdf_entry(master, d->reserved1, vm_kdf_salt(d->selfRVA, d->reserved1, d->codeLen), out);
+}
+
 /* ---- 流式取指：字节码在内存里始终是密文 ----
  * ks 缓存的是 ChaCha20 **密钥流**（不是明文）。解释器取指只向前走，所以单块缓存就够：
  * 跨块时重取一次（一块 64 字节，约合 8-16 条指令），回跳自然落到新块。 */
 typedef struct {
     const u8 *ct;     /* 密文基址（就在镜像里） */
-    const u8 *key;    /* 32 字节主密钥 */
+    const u8 *key;    /* 32 字节**条目**密钥（指向 keybuf：KDF 现推，不再是主密钥） */
+    u8  keybuf[32];   /* 派生密钥的存储（栈上的 vm_bcs_t 自带一份，嵌套调用互不干扰） */
     const u8 *nonce;  /* 12 字节 nonce（指向描述符） */
     u32 ks_block;     /* 当前密钥流块号；0xFFFFFFFF = 未装载 */
     u8  ks[64];
@@ -555,10 +570,11 @@ static inline void vm_bcs_init(vm_bcs_t *s, const vm_ctx_t *vm) {
     s->key = 0;
     s->nonce = 0;
     if (d && (d->flags & VM_DESC_FLAG_ENC)) {
-        static const u8 k[32] = VM_KEY_BYTES;
+        static const u8 master[32] = VM_KEY_BYTES;
         s->enc = 1;
         s->ct = (const u8 *)d + d->codeRVA;
-        s->key = k;
+        vm_desc_key(d, master, s->keybuf); /* 每条目一把：与 vm_run 的验签/解密用同一把 */
+        s->key = s->keybuf;
         s->nonce = d->nonce;
     } else {
         s->enc = 0;
@@ -656,7 +672,9 @@ int vm_run(vm_ctx_t *vm) {
                      * 于是校验必然失败、载荷被拒绝执行（CI 自第 3 轮起一直红就是这个原因）。 */
                     const u8 *pb = (const u8 *)d + (i32)rd32((const u8 *)d + 28);
                     u32 want;
-                    u8 key[32] = VM_KEY_BYTES;
+                    u8 master[32] = VM_KEY_BYTES;
+                    u8 key[32];
+                    vm_desc_key(d, master, key); /* 与打包端 patchChecks 同式现推 */
                     u32 h = 2166136261u;
                     u32 i;
                     for (i = 0; i < 8; i++) { h ^= (u32)key[i]; h *= 16777619u; }
@@ -676,7 +694,9 @@ int vm_run(vm_ctx_t *vm) {
              * Poly1305 认证的是**密文**，所以完整性可以在不解密的前提下校验；
              * 字节码在执行期始终以密文留在镜像里，取指时按块取 ChaCha20 密钥流逐字节还原，
              * 明文只以"寄存器里的一个字节"存在 —— 内存里不再有整份明文。 */
-            u8 key[32] = VM_KEY_BYTES;
+            u8 master[32] = VM_KEY_BYTES;
+            u8 key[32];
+            vm_desc_key(d, master, key); /* 本条目的派生密钥（打包端 KDFEntry 同式现推） */
             const u8 *ct = (const u8 *)d + d->codeRVA;
             u8 aad[8];
             aad[0] = (u8)(d->selfRVA); aad[1] = (u8)(d->selfRVA >> 8);
@@ -1333,22 +1353,25 @@ u64 vm_selftest(void *ctxp) {
 
 /* ---- (c) 加载期完整性校验 ----
  * 由 internal/inject 放进 payload 的入口蹦床调用。
- * 表格式：u32 count；随后每项 { i32 delta; u32 len; u32 check; }，delta 相对表首。
- * 算法与打包端一致：FNV-1a，先喂 key[0..8)，再喂被保护函数的入口字节。
+ * 表格式：u32 count；随后每项 { i32 delta; u32 len; u32 check; u32 selfRVA; u32 funcRVA; u32 codeLen }，
+ * delta 相对表首。算法与打包端一致：FNV-1a，先喂 key[0..8)，再喂被保护函数的入口字节；
+ * 这里的 key 是**每条目的派生密钥**（后三个 u32 就是 KDF 的输入，运行期现推，见 vm_desc_key）。
  *
  * 为什么必须在**加载期**做：回填（把被覆盖的几字节补回原生代码）之后，被保护函数
  * 根本不再进入 VM —— 放在解释器里的校验永远不会执行。只有加载期的检查能拦住它。 */
 void vm_verify_table(const u32 *t) {
     u32 n, i, j;
     const u8 *base = (const u8 *)t;
-    u8 key[32] = VM_KEY_BYTES;
+    u8 master[32] = VM_KEY_BYTES;
     if (!t) return;
     n = t[0];
     for (i = 0; i < n; i++) {
-        const u32 *e = t + 1 + i * 3;
+        const u32 *e = t + 1 + i * 6;
         const u8 *p = base + (i32)e[0];
         u32 len = e[1], want = e[2], h = 2166136261u;
-        for (j = 0; j < 8; j++) { h ^= (u32)key[j]; h *= 16777619u; }
+        u8 kf[32];
+        vm_kdf_entry(master, e[4], vm_kdf_salt(e[3], e[4], e[5]), kf);
+        for (j = 0; j < 8; j++) { h ^= (u32)kf[j]; h *= 16777619u; }
         for (j = 0; j < len; j++) { h ^= (u32)p[j]; h *= 16777619u; }
         if (h != want) __builtin_trap();
     }
@@ -1451,12 +1474,14 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[3]++;
     if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; vm_dbg_trace("VMPELF badmagic base=", (long)base); return -1; }
     if (wantBase && base != wantBase) { vm_img_diag[0] = 2; vm_dbg_trace("VMPELF basemismatch base=", (long)base); return -2; }
-    u8 key[32] = VM_KEY_BYTES;
+    u8 master[32] = VM_KEY_BYTES;
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;
         u32 rva = *(const u32 *)(e + 0), size = *(const u32 *)(e + 4), flags = *(const u32 *)(e + 8);
         const u8 *tag = e + 16;
         u8 *dst = (u8 *)(base + rva);
+        u8 key[32];
+        vm_kdf_entry(master, rva, salt, key); /* 每节一把派生密钥（打包端 encryptImageSections 同式现推） */
         u8 nonce[12];
         *(u32 *)(nonce + 0) = rva;
         *(u32 *)(nonce + 4) = size;
@@ -1541,12 +1566,14 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[3]++;
     if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; vm_dbg_trace("VMPELF badmagic base=", (long)base); return -1; }
     if (wantBase && base != wantBase) { vm_img_diag[0] = 2; vm_dbg_trace("VMPELF basemismatch base=", (long)base); vm_dbg_trace("VMPELF want=", (long)wantBase); return -2; }
-    u8 key[32] = VM_KEY_BYTES;
+    u8 master[32] = VM_KEY_BYTES;
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;
         u32 rva = *(const u32 *)(e + 0), size = *(const u32 *)(e + 4), flags = *(const u32 *)(e + 8);
         const u8 *tag = e + 16;
         u8 *dst = (u8 *)(base + rva);
+        u8 key[32];
+        vm_kdf_entry(master, rva, salt, key); /* 每节一把派生密钥（打包端 encryptImageSections 同式现推） */
         u8 nonce[12];
         *(u32 *)(nonce + 0) = rva;
         *(u32 *)(nonce + 4) = size;
@@ -1692,7 +1719,7 @@ int vm_unpack_image(const void *tblp) {
     typedef int (*vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
     if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }
-    u8 key[32] = VM_KEY_BYTES;
+    u8 master[32] = VM_KEY_BYTES;
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;   /* 表头 24 字节（imageBase/salt/count/selfRVA/保留） */
         u32 rva = *(const u32 *)(e + 0);
@@ -1700,6 +1727,8 @@ int vm_unpack_image(const void *tblp) {
         u32 flags = *(const u32 *)(e + 8);
         const u8 *tag = e + 16;
         u8 *dst = (u8 *)(base + rva);
+        u8 key[32];
+        vm_kdf_entry(master, rva, salt, key); /* 每节一把派生密钥（打包端 encryptImageSections 同式现推） */
         u8 nonce[12];
         *(u32 *)(nonce + 0) = rva;
         *(u32 *)(nonce + 4) = size;

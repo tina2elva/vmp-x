@@ -20,7 +20,7 @@ import (
 //	E9 <rel32>            jmp 下一跳（有校验蹦床就跳它，否则跳原始入口）
 func TestSysVUnpackTrampoline(t *testing.T) {
 	const baseRVA = uint32(0x3000)
-	enc := func(plain []byte, aad []byte) ([]byte, [12]byte, [16]byte, error) {
+	enc := func(plain []byte, aad []byte, key [32]byte) ([]byte, [12]byte, [16]byte, error) {
 		var n [12]byte
 		var tag [16]byte
 		return plain, n, tag, nil
@@ -107,7 +107,7 @@ func TestSysVUnpackTrampoline(t *testing.T) {
 
 // Win64 那条也不能被改坏：寄存器搬运必须是 rcx（PE 的入口参数寄存器）。
 func TestWin64UnpackTrampolineKeepsRcx(t *testing.T) {
-	enc := func(plain []byte, aad []byte) ([]byte, [12]byte, [16]byte, error) {
+	enc := func(plain []byte, aad []byte, key [32]byte) ([]byte, [12]byte, [16]byte, error) {
 		var n [12]byte
 		var v [16]byte
 		return plain, n, v, nil

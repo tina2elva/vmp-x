@@ -9,7 +9,6 @@
 package main
 
 import (
-	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -124,10 +123,12 @@ func main() {
 		if len(key) != 32 {
 			fatalf("manifest 里的 key 长度不对（%d 字节）", len(key))
 		}
-		aead, err := chacha20poly1305.New(key)
-		must(err)
-		imgAEAD = aead
-		enc = func(plain []byte, aad []byte) ([]byte, [12]byte, [16]byte, error) {
+		imgMaster = key
+		enc = func(plain []byte, aad []byte, entryKey [32]byte) ([]byte, [12]byte, [16]byte, error) {
+			// 每条目一把派生密钥（KDF 见 internal/inject/kdf.go）：AEAD 在闭包里按条目现建，
+			// 主密钥本身不再直接用于密封字节码。
+			aead, err := chacha20poly1305.New(entryKey[:])
+			must(err)
 			var nonce [12]byte
 			if _, err := rand.Read(nonce[:]); err != nil {
 				return nil, nonce, [16]byte{}, err
@@ -212,7 +213,7 @@ func main() {
 		if !hasVerifyELF {
 			verifyFnELF = -1
 		}
-		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFnELF, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
+		res = packELF(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, verifyFnELF, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *reportPath)
 	} else {
 		scratchOff, hasCache := man.Symbols["vm_bc_cache"]
 		scratchEnd, hasLock := man.Symbols["vm_bc_lock"]
@@ -226,7 +227,7 @@ func main() {
 		}
 		*section = sectionNamesFor(*section)
 		bytecodeLimitFlag = bytecodeLimit(man.Symbols, stub)
-		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
+		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
 	for _, p := range res.Placements {
@@ -344,7 +345,7 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 	return specs, nil
 }
 
-func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
+func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
 	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
@@ -405,7 +406,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	switch {
 	case !encImageEnabled:
 		imgSkip = "已用 -no-enc-image 关闭"
-	case imgAEAD == nil:
+	case imgMaster == nil:
 		imgSkip = "-no-encrypt（没有主密钥，无法验签/解密）"
 	case f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64:
 		imgSkip = "只支持 x86-64 / arm64 的 PE"
@@ -488,7 +489,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	}
 	entryRVA, _ := inject.EntryRVA(f)
 	res, err := inject.Apply(f, inject.Options{SectionName: section, SectionNameB: sectionNames[1], SectionNameC: sectionNames[2], Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
-		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
+		DescMagic: descMagic, PatchKey: patchKey, Master: master, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
 		ImgSections: imgSecs, ImageBase: f.ImageBase, UnpackFn: unpackFn, ImgTlsCallbacks: imgTLS, TlsDirCopy: tlsDirCopy, LoadCfgCopy: loadCfgCopy,
 		Wipe:      wipeEnabled,
 		EntryHook: patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0,
@@ -496,10 +497,10 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 		EntryRVA:  entryRVA})
 	must(err)
 	if len(imgSecs) > 0 {
-		if imgAEAD == nil {
+		if imgMaster == nil {
 			fatalf("-enc-image 需要主密钥（不能与 -no-encrypt 同时用）")
 		}
-		if err := encryptImageSections(f, res, imgAEAD); err != nil {
+		if err := encryptImageSections(f, res, imgMaster); err != nil {
 			fatalf("原镜像加密失败: %v", err)
 		}
 		clearDynamicBase(f)
@@ -535,7 +536,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	return res
 }
 
-func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
+func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, report string) *inject.Result {
 	f, err := elfload.Open(exe)
 	must(err)
 	imageBase := f.ImageBase()
@@ -587,7 +588,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 			fmt.Println("[*] ELF 整体加密：跳过（只支持 x86-64 与 aarch64）")
 		case f.EType != 2:
 			fmt.Println("[*] ELF 整体加密：跳过（只支持 ET_EXEC；PIE 会被重定位破坏密文）")
-		case imgAEAD == nil:
+		case imgMaster == nil:
 			fmt.Println("[*] ELF 整体加密：跳过（没有主密钥）")
 		default:
 			for _, p := range f.Progs {
@@ -658,7 +659,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 		}
 	}
 	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
-		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize,
+		DescMagic: descMagic, PatchKey: patchKey, Master: master, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize,
 		ImgSections: imgSecs, ImageBase: 0, UnpackFn: unpackFn,
 		Wipe:          wipeEnabled,
 		EntryHook:     patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0 && f.Machine == elfload.EM_X86_64,
@@ -667,7 +668,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 		EntryRVA:      entryRVA})
 	must(err)
 	if len(imgSecs) > 0 {
-		if err := encryptImageSectionsELF(f, imageBase, res, imgAEAD); err != nil {
+		if err := encryptImageSectionsELF(f, imageBase, res, imgMaster); err != nil {
 			fatalf("ELF 原镜像加密失败: %v", err)
 		}
 	}
@@ -755,8 +756,9 @@ var encImageELFEnabled bool
 // DLL 只有在"落在首选基址"时才成立：打包端已拆掉重定位表，落不下会明确失败。
 var encImageDLLEnabled bool
 
-// imgAEAD：原镜像加密用的 AEAD（与字节码同一个主密钥；-no-encrypt 时为空）。
-var imgAEAD cipher.AEAD
+// imgMaster：blob 主密钥（-no-encrypt 时为空）。原镜像每个节的加解密密钥由它按 KDF 现推：
+// K_s = KDFEntry(master, rva = 节 RVA, salt = 表头 salt)，运行期 vm_unpack_image 同样现推。
+var imgMaster []byte
 
 func reportOrDevNull(p string) string { return p }
 
@@ -858,7 +860,7 @@ func fatalf(format string, a ...any) {
 // encryptImageSections 按解密表把原镜像的节**原地**加密，并把 AEAD 标签回填进表里。
 // 与 blob 里的 vm_unpack_image 逐字节对齐：nonce = rva||size||salt，AAD = rva||size，
 // AEAD 的数据流从 counter=1 开始（Go 的 chacha20poly1305 正是这个约定）。
-func encryptImageSections(f *pe.File, res *inject.Result, aead cipher.AEAD) error {
+func encryptImageSections(f *pe.File, res *inject.Result, master []byte) error {
 	off, err := f.RVAtoOffset(res.ImgTableRVA)
 	if err != nil {
 		return err
@@ -890,6 +892,12 @@ func encryptImageSections(f *pe.File, res *inject.Result, aead cipher.AEAD) erro
 		var aad [8]byte
 		binary.LittleEndian.PutUint32(aad[0:], rva)
 		binary.LittleEndian.PutUint32(aad[4:], size)
+		// 每个节一把派生密钥（与运行期 vm_unpack_image 现推的算式一致；nonce/aad 不变）。
+		k := inject.KDFEntry(master, rva, salt)
+		aead, err := chacha20poly1305.New(k[:])
+		if err != nil {
+			return err
+		}
 		sealed := aead.Seal(nil, nonce[:], f.Data[so:so+int(size)], aad[:])
 		copy(f.Data[so:so+int(size)], sealed[:size])
 		copy(e[16:32], sealed[size:])
@@ -934,7 +942,7 @@ func stripRelocations(f *pe.File) {
 
 // encryptImageSectionsELF 与 PE 版逐字节等价，只是按 ELF 的 VA 读/写。
 // ImageBase 传 0 表示"运行期不强制校验基址"（ET_EXEC 下基址就是链接地址；PIE 我们不支持）。
-func encryptImageSectionsELF(f *elfload.File, imageBase uint64, res *inject.Result, aead cipher.AEAD) error {
+func encryptImageSectionsELF(f *elfload.File, imageBase uint64, res *inject.Result, master []byte) error {
 	off, err := f.VAtoOffset(imageBase + uint64(res.ImgTableRVA))
 	if err != nil {
 		return err
@@ -963,6 +971,12 @@ func encryptImageSectionsELF(f *elfload.File, imageBase uint64, res *inject.Resu
 		var aad [8]byte
 		binary.LittleEndian.PutUint32(aad[0:], rva)
 		binary.LittleEndian.PutUint32(aad[4:], size)
+		// 与 PE 版逐字节同构：每个节一把派生密钥。
+		k := inject.KDFEntry(master, rva, salt)
+		aead, err := chacha20poly1305.New(k[:])
+		if err != nil {
+			return err
+		}
 		sealed := aead.Seal(nil, nonce[:], buf, aad[:])
 		if err := f.WriteVA(imageBase+uint64(rva), sealed[:size]); err != nil {
 			return err

@@ -36,7 +36,9 @@ type FuncSpec struct {
 // EncryptFunc 加密钩子：把明文字节码密封成密文 + nonce + tag。
 // 返回的密文长度必须等于明文长度（ChaCha20 是流密码），这样 payload 布局不受影响。
 // aad 把密文绑定到**具体槽位**（selfRVA || funcRVA）：把一段合法密文换到另一个函数位置会验签失败。
-type EncryptFunc func(plain []byte, aad []byte) (ct []byte, nonce [12]byte, tag [16]byte, err error)
+// key 是**本条目的派生密钥**：Options.Master 非空时由 KDFEntry 现推（见 kdf.go），
+// 否则是零值 —— 调用方这时应回退到主密钥（-no-encrypt / 老测试路径）。
+type EncryptFunc func(plain []byte, aad []byte, key [32]byte) (ct []byte, nonce [12]byte, tag [16]byte, err error)
 
 // ImgSection 一个需要入口自解密的原镜像节
 type ImgSection struct {
@@ -135,7 +137,15 @@ type Options struct {
 	ImgTlsCallbacks []uint64
 	// PatchKey：入口补丁完整性校验用的密钥前缀（通常取 blob 主密钥前 8 字节）。
 	// 全 0 表示不启用校验（例如 -no-encrypt 的调试构建）。
+	// Master 非空时，实际参与 FNV 的是**每条目派生密钥**的前 8 字节（见 payload 里 patchChecks 的注释）。
 	PatchKey [8]byte
+	// Master：blob 主密钥（必须 32 字节）。非空时条目/节密钥由 KDF 现推：
+	//
+	//	K_e = KDFEntry(master, rva = funcRVA, salt = KDFSaltForPlacement(descSelfRVA, funcRVA, codeLen))
+	//
+	// 这样"一把主密钥解全部条目"（第三方报告 P3.13）不再成立；C 侧由 vm_kdf.c 独立复现同一算式。
+	// 为空 = 单密钥老行为（只用于不接 KDF 的单测/调试路径）。
+	Master []byte
 	// Wipe：抹除被保护函数的原生机器码（入口补丁之外的部分全部填成伪随机字节）。
 	// 不抹除时，产物里除了 5/8 字节跳板，整段原生函数体仍原样保留 ——
 	// 拿到同源的另一份构建即可按 RVA 差分拼回，等于没有保护。
@@ -235,6 +245,9 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 	if len(opt.Funcs) == 0 {
 		return nil, fmt.Errorf("没有要保护的函数")
 	}
+	if len(opt.Master) != 0 && len(opt.Master) != 32 {
+		return nil, fmt.Errorf("Master 必须是 32 字节（当前 %d）", len(opt.Master))
+	}
 
 	thunkSize, patchLen, err := opt.Arch.info()
 	if err != nil {
@@ -262,13 +275,19 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 	codeOffs := make([]int, len(opt.Funcs))
 	tags := make([][16]byte, len(opt.Funcs))
 	nonces := make([][12]byte, len(opt.Funcs))
+	entryKeys := make([][32]byte, len(opt.Funcs)) // 每条目的派生密钥（KDF 未接线时保持全 0）
 	for i := range opt.Funcs {
 		body := opt.Funcs[i].Code
 		if opt.Encrypt != nil {
+			selfRVA := baseRVA + uint32(slots[i].descOff)
 			aad := make([]byte, 8)
-			binary.LittleEndian.PutUint32(aad[0:], baseRVA+uint32(slots[i].descOff)) // selfRVA
-			binary.LittleEndian.PutUint32(aad[4:], opt.Funcs[i].RVA)                 // funcRVA
-			ct, nonce, tag, err := opt.Encrypt(opt.Funcs[i].Code, aad)
+			binary.LittleEndian.PutUint32(aad[0:], selfRVA)          // selfRVA
+			binary.LittleEndian.PutUint32(aad[4:], opt.Funcs[i].RVA) // funcRVA
+			if len(opt.Master) == 32 {
+				entryKeys[i] = KDFEntry(opt.Master, opt.Funcs[i].RVA,
+					KDFSaltForPlacement(selfRVA, opt.Funcs[i].RVA, uint32(len(opt.Funcs[i].Code))))
+			}
+			ct, nonce, tag, err := opt.Encrypt(opt.Funcs[i].Code, aad, entryKeys[i])
 			if err != nil {
 				return nil, fmt.Errorf("%s 加密失败: %w", opt.Funcs[i].Name, err)
 			}
@@ -368,8 +387,14 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			// 补丁位置写成「相对描述符的偏移」，运行期据此直接定位（跨 PE/ELF 一致）。
 			binary.LittleEndian.PutUint32(data[d+28:], uint32(int32(fn.RVA)-int32(baseRVA+uint32(d))))
 			binary.LittleEndian.PutUint32(data[d+20:], binary.LittleEndian.Uint32(data[d+20:])|uint32(len(patch)&0xFF)<<8)
+			// 密钥前缀：接了 KDF 就用**本条目的派生密钥**（运行期同样现推，见 VM_INVM_PATCHCHECK 块），
+			// 否则回退到主密钥前 8 字节。
+			key8 := opt.PatchKey
+			if len(opt.Master) == 32 {
+				copy(key8[:], entryKeys[i][:8])
+			}
 			h := uint32(2166136261)
-			for _, b := range opt.PatchKey {
+			for _, b := range key8 {
 				h = (h ^ uint32(b)) * 16777619
 			}
 			for _, b := range patch {
@@ -393,7 +418,9 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		})
 	}
 	// ---- (c) 加载期校验：校验表 + 入口蹦床 ----
-	// 表：u32 count，随后每项 { i32 delta(funcRVA-表首RVA); u32 len; u32 check }。
+	// 表：u32 count，随后每项 { i32 delta(funcRVA-表首RVA); u32 len; u32 check;
+	//                             u32 selfRVA; u32 funcRVA; u32 codeLen } —— 后三个是 KDF 的输入，
+	// 运行期靠它们现推本条目的派生密钥（见 vm_interp.c 的 vm_verify_table）。
 	// 蹦床：push rcx/rdx/r8 → lea r11,[rip+表] → call vm_verify_table → pop → jmp 原入口。
 	// 三个 cdecl/win64 参数寄存器是 DLL entry 的 (HINSTANCE, reason, reserved)，必须原样传下去；
 	// 所有跳转都是 rel32 相对距离，因此与 ASLR 无关。
@@ -412,6 +439,11 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			w32(uint32(int32(fn.RVA) - int32(tableRVA))) // delta（有符号）
 			w32(uint32(patchLens[i]))
 			w32(patchChecks[i])
+			// 运行期要用**本条目的派生密钥**重算 FNV，所以把 KDF 的三个输入一并钉进表里
+			// （条目从 12 字节扩到 24 字节；格式说明见 vm_interp.c 的 vm_verify_table）。
+			w32(baseRVA + uint32(slots[i].descOff)) // selfRVA（描述符自身的 RVA）
+			w32(fn.RVA)                             // funcRVA
+			w32(uint32(len(fn.Code)))               // codeLen（明文长度）
 		}
 		align(16)
 		trampRVA := baseRVA + uint32(len(data))
