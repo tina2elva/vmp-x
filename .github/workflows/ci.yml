@@ -313,6 +313,11 @@ jobs:
             }
           }
           Get-Item build/vm_interp_win_arm64.bin, build/target_arm64.exe, build/target_arm64.vmp | ForEach-Object { "$($_.Name): $($_.Length) bytes" }
+            # 文件级断言（这就是 PE/arm64 的专属 e2e 两半之一；另一半是下面 native vs protected 的退出码比对）：
+            # 原镜像 .text/.rdata/.data 的非零 64B 块必须 0 命中 —— 与 ELF 侧 tools/e2e_elf_image.sh 同义。
+            python tools/image_residue.py --src build/target_arm64.exe --packed build/target_arm64.vmp --section .text,.rdata,.data
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error title=Windows/arm64 image residue::original code still readable"; exit 1 }
+            Write-Host "[+] Windows/arm64 文件级残留检查通过（0 命中）"
       - name: run native vs protected
         shell: pwsh
         run: |
