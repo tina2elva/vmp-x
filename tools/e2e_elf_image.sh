@@ -67,6 +67,9 @@ python3 tools/image_residue_elf.py build/elf_target build/elf_target_$TAG.enc ||
 # 语义级断言的接线先撤下：ELF 数据节加密在 CI 上暴露了 aarch64 SIGSEGV（docs/STATUS.md 374），
 # 等那条查清、并且暴露面数字在 CI 上也解释得通之后再接回来。
 
+echo "[*] 语义级：打包后 >=12 字节的可读串应降到原始的 5% 以内"
+python3 tools/expose_report.py --img build/elf_target --compare build/elf_target_$TAG.enc --sections .text,.rodata,.gopclntab --max-ratio 0.05 || fail "packed image still exposes readable strings"
+
 echo "[*] 运行期：原生 vs 加密后逐字节比对"
 NATIVE_OUT="$($QEMU ./build/elf_target 2>&1)"
 PACKED_OUT="$($QEMU ./build/elf_target_$TAG.enc 2>&1)"

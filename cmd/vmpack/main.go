@@ -620,9 +620,16 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 			//   .rodata    -- 字符串/常量表（"文件里读到程序在干什么"的最大来源）
 			//   .gopclntab -- Go 运行期元数据（同样只在入口点之后才被读）
 			// 动态链接器/初始化器在入口点之前要用的节一律排除（见 elfLoaderBlockedNames）。
-			for _, sc := range elfSections(elfRawBytes(exe)) {
-				if !encImageELFData {
-					break // 默认关：CI 实测 aarch64 SIGSEGV（docs/STATUS.md 374），先退回已验证状态
+			elfRaw := elfRawBytes(exe)
+			// aarch64 上默认不做只读数据节：CI 实测必然 SIGSEGV（两个假设都被否，见 docs/STATUS.md 376）。
+			// x86-64 上这条路径经 CI 真跑验证可用，故默认打开；要试 aarch64 用 -enc-image-elf-data。
+			a64 := len(elfRaw) > 0x14 && binary.LittleEndian.Uint16(elfRaw[0x12:]) == 0xB7
+			if a64 && !encImageELFData {
+				fmt.Println("[*] ELF 整体加密：跳过只读数据节（aarch64 尚不支持，见 docs/STATUS.md 376）")
+			}
+			for _, sc := range elfSections(elfRaw) {
+				if a64 && !encImageELFData {
+					break
 				}
 				if !elfDataCandidates[sc.name] || elfLoaderBlockedNames[sc.name] || sc.size == 0 {
 					continue

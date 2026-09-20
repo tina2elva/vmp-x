@@ -56,7 +56,7 @@ echo "[*] packing check_key / sum_to..."
 ./build/vmpack -exe build/arm64_target -func check_key -func sum_to \
     -blob build/vm_interp_arm64.bin -manifest build/vm_interp_arm64.json \
     -dumpbytecode build/bcdump \
-    -out build/arm64_target.vmp -report build/arm64_vmp.json -enc-image-elf-data
+    -out build/arm64_target.vmp -report build/arm64_vmp.json
 
 # 入口补丁检查：在打包产物里反汇编被保护函数开头，确认 8 字节补丁真的写进去了
 # （期望 F0 03 1E AA = mov x16,x30，紧跟一条 B）。x86-64 侧正是靠这一步排除/确认了补丁问题。
