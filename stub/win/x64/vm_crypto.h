@@ -12,6 +12,12 @@
 
 #include "vm_types.h"
 
+/* 主密钥来源（1b）。默认就是编译进 blob 的 VM_KEY_BYTES；外置模式（vmpbuild -key-external）
+ * 下由 vm_interp.c 实现为"运行期取钥 + 密钥校验值（KCV）自检"，取不到/不对就硬门退出
+ * （0xC0DE0007，无输出）。这里只声明 —— crypto_probe 那种单独编译 vm_crypto.c 的宿主工具
+ * 不定义 VM_KEY_EXTERNAL，因此不会去链接它。 */
+const u8 *vm_master(void);
+
 /* ChaCha20 流加密：in/out 可以相同；counter 从 1 开始用于 AEAD 的密文部分 */
 void vm_chacha20_xor(const u8 key[32], u32 counter, const u8 nonce[12], const u8 *in, u8 *out, u32 len);
 

@@ -31,12 +31,17 @@ static void chacha20_block(const u8 key[32], u32 counter, const u8 nonce[12], u8
      * 每条目/每节现在用的都是派生密钥 K_f；若还拿 key[0..4] 当掩码，sigma 就不再是规范值，
      * C 侧不再等于标准 ChaCha20 —— 现象是两侧 KDF KAT 全绿、密文/标签/nonce 逐字节一致，
      * 但 AEAD 验签 100% 失败（PE 上是退出码 0xC0DE0004，极难定位）。
-     * 关键点 3：掩码来自主密钥，因此这个常量可以放在只读数据里（vmpbuild 现在按符号索引
-     * 解析重定位，本文件再贡献一份只读数据也不会被解析错 —— 那条缺陷的门禁见
-     * stub/win/x64/kdf_blob_kat.c；sigma 这条路本身由 e2e 的 AEAD 验签兜底）。 */
+     * 关键点 3：掩码必须来自**真主密钥**。默认模式它就是编译进来的 VM_KEY_BYTES；
+     * 1b 外置模式下 blob 里只有占位密钥，必须向 vm_master() 要（它同时做 KCV 自检）。
+     * 这个常量可以放在只读数据里：vmpbuild 现在按符号索引解析重定位（缺陷门禁见
+     * stub/win/x64/kdf_blob_kat.c），sigma 这条路本身由 e2e 的 AEAD 验签兜底。 */
+#if defined(VM_KEY_EXTERNAL)
+    u32 sm = load32le(vm_master());
+#else
     static const volatile u8 sigma_master[32] = VM_KEY_BYTES;
     u32 sm = (u32)sigma_master[0] | ((u32)sigma_master[1] << 8) |
              ((u32)sigma_master[2] << 16) | ((u32)sigma_master[3] << 24);
+#endif
     st[0] = VM_SIGMA_OBF0 ^ sm;
     st[1] = VM_SIGMA_OBF1 ^ sm;
     st[2] = VM_SIGMA_OBF2 ^ sm;

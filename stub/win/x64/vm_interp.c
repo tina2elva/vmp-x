@@ -532,6 +532,94 @@ static void vm_desc_key(const vm_desc_t *d, const u8 master[32], u8 out[32]) {
     vm_kdf_entry(master, d->reserved1, vm_kdf_salt(d->selfRVA, d->reserved1, d->codeLen), out);
 }
 
+/* ---- (1b) 主密钥来源：外置取钥 + 密钥校验值（KCV） ----
+ * 兼容模式（默认）：blob 里就带主密钥（VM_KEY_BYTES），行为与 1b 之前完全一致。
+ * 外置模式（vmpbuild -key-external）：blob 里只有**随机占位密钥**，真主密钥运行期从外部取；
+ * 取不到、或与 KCV 不符 ⇒ 硬门：ExitProcess(0xC0DE0007)、不输出任何内容。
+ * 所有需要主密钥的地方（字节码/镜像解密、加载期校验表、vm_crypto 的 sigma 掩码）都走
+ * vm_master()，于是"第一次解密之前就把错密钥挡掉"是结构性保证，而不是靠调用顺序碰巧成立。 */
+#ifdef VM_KEY_EXTERNAL
+
+#if !(defined(VM_BLOB_USES_WIN64) && defined(__x86_64__))
+#error "VM_KEY_EXTERNAL 目前只有 Windows/x64 的取钥实现（vmpbuild 会先拦住别的目标）"
+#endif
+
+static u8 vm_master_buf[32];
+static u32 vm_master_ok; /* .bss：0 = 还没取，1 = 已取且 KCV 通过 */
+
+/* 这两个符号在本文件靠后的 Windows 段里定义 */
+static u64 vm_find_module(const char *name);
+static void *vm_get_proc(u64 mod, const char *fn);
+
+static void vm_key_reject(void) {
+    typedef void (*exitfn_t)(u32);
+    exitfn_t ex = (exitfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "ExitProcess");
+    if (ex) ex(0xC0DE0007u); /* 硬门：专用退出码、无任何输出 */
+    __builtin_trap();
+}
+
+/* 读 32 字节原始密钥（部署时文件叫 <产物全路径>.vmpkey）。成功返回 1。 */
+static int vm_key_read_file(const char *path) {
+    typedef void *(*createfn_t)(const char *, u32, u32, void *, u32, u32, void *);
+    typedef int (*readfn_t)(void *, void *, u32, u32 *, void *);
+    typedef int (*closefn_t)(void *);
+    u64 k32 = vm_find_module("KERNEL32.DLL");
+    createfn_t cf = (createfn_t)vm_get_proc(k32, "CreateFileA");
+    readfn_t rf = (readfn_t)vm_get_proc(k32, "ReadFile");
+    closefn_t xf = (closefn_t)vm_get_proc(k32, "CloseHandle");
+    if (!cf || !rf || !xf) return 0;
+    void *h = cf(path, 0x80000000u /* GENERIC_READ */, 1u /* FILE_SHARE_READ */, 0,
+                 3u /* OPEN_EXISTING */, 0, 0);
+    if (!h || h == (void *)(long long)-1) return 0;
+    u32 got = 0;
+    int ok = rf(h, vm_master_buf, 32, &got, 0);
+    xf(h);
+    return ok && got == 32;
+}
+
+/* 路径 = <本模块全路径>.vmpkey；环境变量 VMPX_KEY_FILE 可覆盖（部署更灵活）。 */
+static void vm_key_path(char *buf, u32 cap) {
+    typedef u32 (*genvfn_t)(const char *, char *, u32);
+    typedef u32 (*gmfn_t)(void *, char *, u32);
+    u64 k32 = vm_find_module("KERNEL32.DLL");
+    u32 room = cap - 8u;
+    genvfn_t genv = (genvfn_t)vm_get_proc(k32, "GetEnvironmentVariableA");
+    if (genv) {
+        u32 n = genv("VMPX_KEY_FILE", buf, room);
+        if (n > 0 && n < room) { buf[n] = 0; return; }
+    }
+    gmfn_t gm = (gmfn_t)vm_get_proc(k32, "GetModuleFileNameA");
+    u32 n = gm ? gm(0, buf, room) : 0;
+    if (n == 0 || n >= room) vm_key_reject();
+    const char *suf = ".vmpkey";
+    for (u32 i = 0; i < 8; i++) buf[n + i] = (u8)suf[i];
+}
+
+const u8 *vm_master(void) {
+    if (vm_master_ok) return vm_master_buf;
+    char path[512];
+    vm_key_path(path, (u32)sizeof(path));
+    if (!vm_key_read_file(path)) vm_key_reject();
+    {   /* KCV 自检：在任何解密之前判定"手里这把主密钥对不对" */
+        static const u8 want[VM_KEY_CHECK_LEN] = VM_KEY_CHECK_BYTES;
+        u8 kcv[32];
+        vm_kdf_entry(vm_master_buf, VM_KEY_CHECK_RVA, VM_KEY_CHECK_SALT, kcv);
+        for (u32 i = 0; i < (u32)VM_KEY_CHECK_LEN; i++) {
+            if (kcv[i] != want[i]) vm_key_reject();
+        }
+    }
+    vm_master_ok = 1;
+    return vm_master_buf;
+}
+
+#else
+/* 兼容模式：blob 里就带主密钥 */
+const u8 *vm_master(void) {
+    static const u8 k[32] = VM_KEY_BYTES;
+    return k;
+}
+#endif
+
 /* ---- 流式取指：字节码在内存里始终是密文 ----
  * ks 缓存的是 ChaCha20 **密钥流**（不是明文）。解释器取指只向前走，所以单块缓存就够：
  * 跨块时重取一次（一块 64 字节，约合 8-16 条指令），回跳自然落到新块。 */
@@ -570,7 +658,7 @@ static inline void vm_bcs_init(vm_bcs_t *s, const vm_ctx_t *vm) {
     s->key = 0;
     s->nonce = 0;
     if (d && (d->flags & VM_DESC_FLAG_ENC)) {
-        static const u8 master[32] = VM_KEY_BYTES;
+        const u8 *master = vm_master(); /* 1b：外置模式下这里会先取钥+校验，不通就硬门退出 */
         s->enc = 1;
         s->ct = (const u8 *)d + d->codeRVA;
         vm_desc_key(d, master, s->keybuf); /* 每条目一把：与 vm_run 的验签/解密用同一把 */
@@ -672,7 +760,7 @@ int vm_run(vm_ctx_t *vm) {
                      * 于是校验必然失败、载荷被拒绝执行（CI 自第 3 轮起一直红就是这个原因）。 */
                     const u8 *pb = (const u8 *)d + (i32)rd32((const u8 *)d + 28);
                     u32 want;
-                    u8 master[32] = VM_KEY_BYTES;
+                    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
                     u8 key[32];
                     vm_desc_key(d, master, key); /* 与打包端 patchChecks 同式现推 */
                     u32 h = 2166136261u;
@@ -694,7 +782,7 @@ int vm_run(vm_ctx_t *vm) {
              * Poly1305 认证的是**密文**，所以完整性可以在不解密的前提下校验；
              * 字节码在执行期始终以密文留在镜像里，取指时按块取 ChaCha20 密钥流逐字节还原，
              * 明文只以"寄存器里的一个字节"存在 —— 内存里不再有整份明文。 */
-            u8 master[32] = VM_KEY_BYTES;
+            const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
             u8 key[32];
             vm_desc_key(d, master, key); /* 本条目的派生密钥（打包端 KDFEntry 同式现推） */
             const u8 *ct = (const u8 *)d + d->codeRVA;
@@ -1362,7 +1450,7 @@ u64 vm_selftest(void *ctxp) {
 void vm_verify_table(const u32 *t) {
     u32 n, i, j;
     const u8 *base = (const u8 *)t;
-    u8 master[32] = VM_KEY_BYTES;
+    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     if (!t) return;
     n = t[0];
     for (i = 0; i < n; i++) {
@@ -1474,7 +1562,7 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[3]++;
     if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; vm_dbg_trace("VMPELF badmagic base=", (long)base); return -1; }
     if (wantBase && base != wantBase) { vm_img_diag[0] = 2; vm_dbg_trace("VMPELF basemismatch base=", (long)base); return -2; }
-    u8 master[32] = VM_KEY_BYTES;
+    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;
         u32 rva = *(const u32 *)(e + 0), size = *(const u32 *)(e + 4), flags = *(const u32 *)(e + 8);
@@ -1566,7 +1654,7 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[3]++;
     if (*(const u32 *)base != 0x464C457Fu) { vm_img_diag[0] = 1; vm_dbg_trace("VMPELF badmagic base=", (long)base); return -1; }
     if (wantBase && base != wantBase) { vm_img_diag[0] = 2; vm_dbg_trace("VMPELF basemismatch base=", (long)base); vm_dbg_trace("VMPELF want=", (long)wantBase); return -2; }
-    u8 master[32] = VM_KEY_BYTES;
+    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;
         u32 rva = *(const u32 *)(e + 0), size = *(const u32 *)(e + 4), flags = *(const u32 *)(e + 8);
@@ -1719,7 +1807,7 @@ int vm_unpack_image(const void *tblp) {
     typedef int (*vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
     if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }
-    u8 master[32] = VM_KEY_BYTES;
+    const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;   /* 表头 24 字节（imageBase/salt/count/selfRVA/保留） */
         u32 rva = *(const u32 *)(e + 0);

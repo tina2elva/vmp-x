@@ -16,6 +16,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -29,7 +30,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/vmpx/vmp-x/internal/inject"
 )
+
+// vmKeyCheckRVA：密钥校验值（KCV）派生时用的"槽位"常量，与 VM_KEY_CHECK_SALT（每次构建随机）
+// 一起做域分离 —— KCV 只是主密钥的函数，拿不到主密钥就推不出来。
+const vmKeyCheckRVA = uint32(0x4B45594B) // "KEYK"
 
 const (
 	relAMD64Addr64   = 0x0001
@@ -92,6 +99,8 @@ func main() {
 	randomOpcodes := flag.Bool("random-opcodes", true, "为本次构建生成随机的 VM 操作码映射（默认开启）")
 	guest := flag.String("guest", "x86-64", "客户机 ISA：x86-64（默认）或 arm64")
 	merge := flag.String("merge", "ld", "目标文件合并方式：ld（GNU ld -r）或 go（内置直拼，COFF 用它）")
+	keyExternal := flag.Bool("key-external", false, "主密钥外置（1b）：blob 里只放占位密钥 + 密钥校验值，真主密钥运行期从外部取")
+	keyOut := flag.String("key-out", "", "配合 -key-external：把真主密钥以 32 字节原始形式写到该文件")
 	verbose := flag.Bool("v", false, "打印符号与重定位详情")
 	flag.Parse()
 
@@ -116,8 +125,24 @@ func main() {
 	// 于是解释器里的 OP_* 常量就是本 blob 的实际编码（编译期常量，零运行时开销）。
 	opcodeValuesPath, opMap, err := generateOpcodeValues(tmp, *randomOpcodes)
 	must(err)
-	keyPath, keyHex, err := generateKeyFile(tmp)
+	// 主密钥外置（1b）：只实现了 Windows/x64 的取钥路径（PEB → KERNEL32 → CreateFileA /
+	// GetEnvironmentVariableA）。别的目标一律**构建失败** —— 宁可现在报错，也不要产出一个
+	// 注定起不来的产物（那会在部署现场变成"程序莫名其妙退出"）。
+	targetRel := filepath.ToSlash(strings.TrimPrefix(filepath.ToSlash(*src), "stub/"))
+	if *keyExternal && targetRel != "win/x64" {
+		fatalf("-key-external 目前只有 win/x64 的取钥实现（收到目标 %s）", targetRel)
+	}
+	keyPath, keyHex, err := generateKeyFile(tmp, *keyExternal)
 	must(err)
+	if *keyOut != "" {
+		kb, herr := hex.DecodeString(keyHex)
+		must(herr)
+		if werr := os.WriteFile(*keyOut, kb, 0o600); werr != nil {
+			fatalf("写主密钥文件失败: %v", werr)
+		}
+		fmt.Printf("[*] 主密钥已写到 %s（32 字节原始形式，部署时放到 <产物>.vmpkey）", *keyOut)
+		fmt.Println()
+	}
 	_ = keyPath
 	keyRel := ""
 	_ = keyRel
@@ -360,7 +385,11 @@ func generateOpcodeValues(tmp string, random bool) (string, map[string]int, erro
 //
 // 定位：密钥最终在 blob 里，因此这不是密码学级保护（见 docs/DESIGN.md §2）——
 // 它挡住静态分析，真正的级别需要 KeyProvider 的 TPM/TEE/远程证明。
-func generateKeyFile(tmp string) (string, string, error) {
+// external=true 时（1b）：blob 里放的 VM_KEY_BYTES 是**独立的随机占位密钥**（不是真密钥的任何
+// 变形 —— 否则等于把真密钥泄露出去），真主密钥只出现在 manifest 里（vmpack 要用）+ 可选的 -key-out。
+// 无论哪种模式都写一个 16 字节密钥校验值（KCV）= KDFEntry(真主密钥, "KEYK", 每构建随机 salt)[0:16]：
+// 运行期在**任何解密之前**用它判定"手里这把主密钥对不对"，不对就走专用退出码 0xC0DE0007。
+func generateKeyFile(tmp string, external bool) (string, string, error) {
 	nl := string(rune(10))
 	outDir := filepath.Join(tmp, "opcodes")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -371,15 +400,41 @@ func generateKeyFile(tmp string) (string, string, error) {
 	for i := range key {
 		key[i] = byte(rnd.Intn(256))
 	}
+	checkSalt := rnd.Uint32()
+	kcv := inject.KDFEntry(key, vmKeyCheckRVA, checkSalt)
+
+	baked := key
+	if external {
+		baked = make([]byte, 32)
+		for i := range baked {
+			baked[i] = byte(rnd.Intn(256))
+		}
+	}
 	var sb strings.Builder
 	sb.WriteString("/* 由 cmd/vmpbuild 生成：本 blob 的 AEAD 主密钥 */" + nl)
 	sb.WriteString("#ifndef __ASSEMBLER__" + nl)
+	if external {
+		sb.WriteString("/* 1b：blob 里不放真主密钥，只有一个随机占位密钥；真密钥运行期从外部取 */" + nl)
+		sb.WriteString("#define VM_KEY_EXTERNAL 1" + nl)
+	}
 	sb.WriteString("#define VM_KEY_BYTES {")
-	for i, b := range key {
+	for i, b := range baked {
 		if i > 0 {
 			sb.WriteString(",")
 		}
 		fmt.Fprintf(&sb, "0x%02X", b)
+	}
+	sb.WriteString("}" + nl)
+	// KCV：不泄露主密钥（ChaCha20 块输出的截断 + 随机 salt），但足以判定密钥对不对。
+	sb.WriteString(fmt.Sprintf("#define VM_KEY_CHECK_SALT 0x%08Xu"+nl, checkSalt))
+	sb.WriteString(fmt.Sprintf("#define VM_KEY_CHECK_RVA 0x%08Xu"+nl, vmKeyCheckRVA))
+	sb.WriteString("#define VM_KEY_CHECK_LEN 16" + nl)
+	sb.WriteString("#define VM_KEY_CHECK_BYTES {")
+	for i := 0; i < 16; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, "0x%02X", kcv[i])
 	}
 	sb.WriteString("}" + nl)
 	// ChaCha 的 sigma 常量按**本次构建**随机化：规范值就是那 16 个 ASCII 字节，

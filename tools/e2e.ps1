@@ -215,6 +215,76 @@ foreach ($p in $perf) {
     }
 }
 
+# ---- 1b: external master key (-key-external) + hard gate ----
+# Three things must hold at the same time:
+#   1. the real master key CANNOT be found anywhere in the artifact
+#      (control: the compat-mode artifact DOES contain its own key);
+#   2. missing key or wrong key => exactly 0xC0DE0007 and NO output at all;
+#   3. correct key => byte-identical to the native binary.
+function Get-ExitCode([string]$exe, [string[]]$a) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = (Resolve-Path $exe).Path
+    $psi.Arguments = ($a -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEnd()
+    $err = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+    return @{ Code = $p.ExitCode; Out = $out; Err = $err }
+}
+function Get-BytesFromHex([string]$hex) {
+    $b = [byte[]]::new($hex.Length / 2)
+    for ($i = 0; $i -lt $b.Length; $i++) { $b[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
+    return $b
+}
+function Test-FileContains([string]$path, [byte[]]$needle) {
+    $d = [System.IO.File]::ReadAllBytes((Resolve-Path $path).Path)
+    return ([System.BitConverter]::ToString($d)).Replace('-', '').Contains(([System.BitConverter]::ToString($needle)).Replace('-', ''))
+}
+$extBlob = "build\e2e_ext_blob.bin"
+$extMan = "build\e2e_ext_blob.json"
+$extKey = "build\e2e_ext_key.vmpkey"
+$extExe = "build\target_ext.exe"
+$extKeyBeside = "build\target_ext.exe.vmpkey"
+Remove-Item $extExe, $extKeyBeside -ErrorAction SilentlyContinue
+& .\build\vmpbuild.exe -src stub/win/x64 -out $extBlob -manifest $extMan -entry vm_entry -key-external -key-out $extKey 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    $fail++
+    $failLines += "E2EFAIL ext-key: vmpbuild -key-external failed"
+} else {
+    & .\build\vmpack.exe -exe build\target.exe -func check_key -func sum_to -out $extExe -blob $extBlob -manifest $extMan 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $fail++
+        $failLines += "E2EFAIL ext-key: packing with the external blob failed"
+    } else {
+        $compatKey = Get-BytesFromHex (Get-Content build\vm_interp.json -Raw | ConvertFrom-Json).key
+        $realKey = Get-BytesFromHex (Get-Content $extMan -Raw | ConvertFrom-Json).key
+        # 1) control: the compat artifact really does carry its key (proves the search works)
+        if (Test-FileContains "build\target_vmp.exe" $compatKey) { $pass++ }
+        else { $fail++; $failLines += "E2EFAIL ext-key: control failed - compat artifact does not contain its key (search broken?)" }
+        # 2) the real key must NOT be in the external artifact
+        if (Test-FileContains $extExe $realKey) { $fail++; $failLines += "E2EFAIL ext-key: master key IS present in the artifact" }
+        else { $pass++ }
+        # 3) no key => hard gate, no output
+        $r1 = Get-ExitCode $extExe @("check_key", "10")
+        if ((('{0:X8}' -f ($r1.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($r1.Out -eq "") -and ($r1.Err -eq "")) { $pass++ }
+        else { $fail++; $failLines += ("E2EFAIL ext-key/none: code=0x{0:X8} out=[{1}] err=[{2}]" -f ($r1.Code -band 0xFFFFFFFF), $r1.Out.Trim(), $r1.Err.Trim()) }
+        # 4) wrong key => same hard gate
+        [System.IO.File]::WriteAllBytes((Join-Path (Get-Location) $extKeyBeside), [byte[]]::new(32))
+        $r2 = Get-ExitCode $extExe @("check_key", "10")
+        if ((('{0:X8}' -f ($r2.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($r2.Out -eq "")) { $pass++ }
+        else { $fail++; $failLines += ("E2EFAIL ext-key/wrong: code=0x{0:X8} out=[{1}]" -f ($r2.Code -band 0xFFFFFFFF), $r2.Out.Trim()) }
+        # 5) correct key => identical to native
+        Copy-Item $extKey $extKeyBeside -Force
+        $nOut = Run-File "build/target.exe" @("check_key", "10") 30
+        $vOut = Run-File $extExe @("check_key", "10") 30
+        if (($nOut -ne "") -and ($nOut -eq $vOut)) { $pass++ }
+        else { $fail++; $failLines += ("E2EFAIL ext-key/ok: native=[{0}] protected=[{1}]" -f $nOut.Trim(), $vOut.Trim()) }
+    }
+}
+
 Write-Output ""
 if ($failLines.Count -gt 0) {
     Write-Output "--- failure summary (one line per case, for CI annotations) ---"
