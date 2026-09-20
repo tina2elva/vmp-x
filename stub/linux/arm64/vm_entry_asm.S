@@ -40,8 +40,12 @@ VM_ENTRY_SYMBOL:
     /* ---- ??LR ?????????X30 = thunk + 4 ---- */
     ldr     x11, [sp, #VM_SAVE_LR]
     sub     x11, x11, #(VM_THUNK_SIZE + VM_DESC_TO_THUNK)
-    movz    w10, #0x4D56
-    movk    w10, #0x4B50, lsl #16
+    /* 描述符魔数由 vmpbuild 每次构建随机（-include desc_magic.h 发 VM_DESC_MAGIC_*）。
+     * 这里以前把 "VMPK" = 0x4B504D56 **写死**在汇编里 —— 一旦魔数随机化，入口就会把
+     * 描述符判成"没有"，于是 vm_run 跳过解密分支（现象：被保护函数直接返回入参、
+     * vm_diag 里 code=0 len=0）。必须用宏。 */
+    movz    w10, #VM_DESC_MAGIC_LO
+    movk    w10, #VM_DESC_MAGIC_HI, lsl #16
     ldr     w9, [x11]
     cmp     w9, w10
     csel    x11, x11, xzr, eq

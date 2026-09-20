@@ -68,6 +68,8 @@ typedef struct {
  * 这样发布产物里不存在固定的 4 字节特征（原来它就是「VMPK」）。 */
 #ifndef VM_DESC_MAGIC
 #define VM_DESC_MAGIC 0x4B504D56u /* "VMPK" */
+#define VM_DESC_MAGIC_LO 0x4D56
+#define VM_DESC_MAGIC_HI 0x4B50
 #endif
 
 /* ---- thunk：4 字节 BL 到 vm_entry（描述符在其前 64 字节） ---- */

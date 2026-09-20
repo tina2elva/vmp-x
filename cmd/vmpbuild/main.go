@@ -569,7 +569,12 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		// 描述符却是随机值 → 校验失败 → 按"没有描述符"走 → 空指针访问违例。
 		descHdr := filepath.Join(tmp, "desc_magic.h")
 		if _, err := os.Stat(descHdr); err != nil {
-			if werr := os.WriteFile(descHdr, []byte(fmt.Sprintf("#ifndef VM_DESC_MAGIC\n#define VM_DESC_MAGIC 0x%Xu\n#endif\n", releaseMagic)), 0o644); werr != nil {
+			// 同时发出高低 16 位：aarch64 的入口汇编只能用 movz/movk 拼常数，
+			// 不能再像以前那样把 "VMPK" 写死在汇编里（魔数现在每次构建都随机）。
+			if werr := os.WriteFile(descHdr, []byte(fmt.Sprintf(
+				// LO/HI 不带 u 后缀：它们是给**汇编器**（aarch64 的 movz/movk 立即数）吃的。
+				"#ifndef VM_DESC_MAGIC\n#define VM_DESC_MAGIC 0x%Xu\n#define VM_DESC_MAGIC_LO 0x%X\n#define VM_DESC_MAGIC_HI 0x%X\n#endif\n",
+				releaseMagic, releaseMagic&0xFFFF, (releaseMagic>>16)&0xFFFF)), 0o644); werr != nil {
 				return nil, werr
 			}
 		}
