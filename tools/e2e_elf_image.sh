@@ -18,6 +18,7 @@ BLOB_CC=${BLOB_CC:-}
 GOARCH_TARGET=${GOARCH_TARGET:-amd64}
 QEMU=${QEMU:-}
 TAG=${TAG:-x64}
+BLOB_GUEST=${BLOB_GUEST:-}
 
 mkdir -p build
 go build -o build/vmpbuild ./cmd/vmpbuild || fail "build vmpbuild"
@@ -26,7 +27,9 @@ GOOS=linux GOARCH=$GOARCH_TARGET CGO_ENABLED=0 go build -o build/elf_target ./te
 
 CCARG=""
 if [ -n "$BLOB_CC" ]; then CCARG="-cc $BLOB_CC"; fi
-./build/vmpbuild -src "$BLOB_SRC" $CCARG -out build/vm_interp_elf.bin -manifest build/vm_interp_elf.json -entry vm_entry >/dev/null || fail "build blob"
+GUESTARG=""
+if [ -n "$BLOB_GUEST" ]; then GUESTARG="-guest $BLOB_GUEST"; fi
+./build/vmpbuild -src "$BLOB_SRC" $CCARG $GUESTARG -out build/vm_interp_elf.bin -manifest build/vm_interp_elf.json -entry vm_entry >/dev/null || fail "build blob"
 
 ./build/vmpack -exe build/elf_target -func main.checkKey -func main.sumTo \
     -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
