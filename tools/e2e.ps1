@@ -342,6 +342,14 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
+# ---- (4) anti-debug: one path alone must NOT flip the verdict ----
+# Start the artifact suspended, set PEB.BeingDebugged (exactly what a debugger does), resume, and
+# compare with a plain run. The rule is ">= 2 different paths" so a single flag must change NOTHING
+# (that is the calibration: no single point can silently corrupt results in production).
+python tools/antidebug_flag_test.py --exe build/target_vmp.exe --args "bench check_key 4" --expect-unchanged 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { $pass++ }
+else { $fail++; $failLines += "E2EFAIL antidebug: a single BeingDebugged signal flipped the verdict" }
+
 # ---- (3) container/record scalars must not be readable in the artifact ----
 # The report's P1.1-5: magic / RVA / length / flags sitting in plaintext. See tools/field_mask_check.py
 # for exactly what is asserted (and why single bits are deliberately NOT asserted).

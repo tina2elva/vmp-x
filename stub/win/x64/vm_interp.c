@@ -865,7 +865,38 @@ static void vm_selfcheck(void) {
     if (h != vm_self_hash) __builtin_trap();
 }
 
+/* ---- (4) 反调试：多路径判定 + 失败**静默延后** ----
+ * 改造前只看 PEB.BeingDebugged（一条 cmp 就能 patch 掉），而且命中就 __builtin_trap()
+ * —— "跳转点即指纹"：攻击者崩在哪里就知道校验在哪里。现在改成多路径 + 静默延后：
+ *   ① PEB.BeingDebugged（每次调用都查，最便宜）
+ *   ② ntdll!NtQueryInformationProcess(ProcessDebugPort / ProcessDebugObjectHandle)（进程级）
+ *   ③ ntdll!NtGetContextThread(NtCurrentThread, CONTEXT_DEBUG_REGISTERS)：硬件断点会在
+ *      Dr0..Dr3 / Dr7 留痕。（**不看 Dr6**：它复位时本来就不是 0，看了必误报。）
+ *   ④ 时间差：一次性、极保守的 rdtsc 检查（阈值很松，只贡献 1 个信号）
+ * ②③④ 只探一次（进程级/一次性状态），① 每次都查。
+ * 判据：**累计 >= 2 个信号**才定性 —— 单点误判不动手；真实调试器会同时踩中 ① 与 ②
+ * （Windows 调试 API 必然设置这两者），所以并不会漏。
+ * 定性后**不 trap**：置延后计数器，接下来 VM_DBG_DEFER_CALLS 次 vm_run 直接返回错误结果，
+ * 攻击者看到的是"偶尔算错"，而不是一个可以一眼定位的崩点。 */
+#define VM_DBG_DEFER_CALLS 3
+u32 vm_dbg_defer; /* .bss；非 Windows 也定义（vm_run 里统一判断） */
+
+/* 这两个符号定义在本文件靠后的 Windows 段里。**必须在 VM_KEY_EXTERNAL 之外也声明**：
+ * 兼容模式（baked）下反调试同样要用它们（上一版把声明放在外置分支里 -> baked 编不过 ->
+ * blob 构建失败，而我只 grep 'blob:' 没看出来，于是打包用的还是旧 blob）。 */
 #if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
+static u64 vm_find_module(const char *name);
+static void *vm_get_proc(u64 mod, const char *fn);
+#endif
+
+#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
+/* 信号按**路径**记位，而不是计数：同一个路径被两个调用点各查一次（入口蹦床的 vm_verify_table
+ * 与 vm_run）不该算两个信号 —— 那会把"≥2 条不同路径"退化成"同一条路径查了两次"。 */
+static u32 vm_dbg_mask;       /* bit0=①BeingDebugged bit1=②调试端口/对象 bit2=③DR bit3=④时间差 */
+static u32 vm_dbg_probe_mask;
+static u32 vm_dbg_verdict;
+static u32 vm_dbg_probed;
+
 static int vm_debugger_present(void) {
     const u8 *peb;
     __asm__ volatile("movq %%gs:0x60, %0" : "=r"(peb));
@@ -873,8 +904,69 @@ static int vm_debugger_present(void) {
     if (!peb) return 0;
     return *(const u8 *)(peb + 0x02) ? 1 : 0;
 }
+
+static u64 vm_rdtsc(void) {
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+static u32 vm_antidebug_probe(void) {
+    u32 hits = 0;
+    u64 nt = vm_find_module("ntdll.dll");
+
+    /* ② 调试端口 / 调试对象句柄（进程级；真实调试器必然把它们置上） */
+    typedef long (*qip_t)(void *, u32, void *, u32, void *);
+    qip_t qip = (qip_t)vm_get_proc(nt, "NtQueryInformationProcess");
+    if (qip) {
+        u64 out = 0;
+        if (qip((void *)(long long)-1, 7u /* ProcessDebugPort */, &out, 8, 0) >= 0 && out) hits |= 1u;
+        out = 0;
+        if (qip((void *)(long long)-1, 30u /* ProcessDebugObjectHandle */, &out, 8, 0) >= 0 && out) hits |= 2u;
+    }
+
+    /* ③ 硬件断点寄存器的影子（Dr0..Dr3 / Dr7） */
+    typedef long (*gct_t)(void *, void *);
+    gct_t gct = (gct_t)vm_get_proc(nt, "NtGetContextThread");
+    if (gct) {
+        static u8 ctx[1232]; /* CONTEXT 全尺寸：API 会把整块写满 */
+        for (u32 i = 0; i < sizeof(ctx); i++) ctx[i] = 0;
+        *(u32 *)(ctx + 0x30) = 0x00100010u; /* CONTEXT_AMD64 | CONTEXT_DEBUG_REGISTERS */
+        if (gct((void *)(long long)-2 /* NtCurrentThread */, ctx) >= 0) {
+            u64 dr0 = *(const u64 *)(ctx + 0x48), dr1 = *(const u64 *)(ctx + 0x50);
+            u64 dr2 = *(const u64 *)(ctx + 0x58), dr3 = *(const u64 *)(ctx + 0x60);
+            u64 dr7 = *(const u64 *)(ctx + 0x70);
+            if (dr0 || dr1 || dr2 || dr3 || dr7) hits |= 4u;
+        }
+    }
+
+    /* ④ 时间差：先热身，然后取三次测量里的**最小值**再比阈值。
+     * 为什么不是单次测量：冷启动的页错误/调度抖动会让单次值偶尔 >3ms（实测第一次调用就能），
+     * 那样这条"宽松"路径反而成了误报源。单步调试会让**每一次**测量都巨大，所以取最小值不会漏。 */
+    u64 best = ~(u64)0;
+    for (u32 k = 0; k < 4; k++) {
+        u64 t0 = vm_rdtsc();
+        volatile u64 acc = 0;
+        for (u32 i = 0; i < 64; i++) acc += (u64)i;
+        u64 t1 = vm_rdtsc();
+        if (k && (t1 - t0) < best) best = t1 - t0; /* 第 0 次当热身丢弃 */
+    }
+    if (best != ~(u64)0 && best > 10000000ull) hits |= 8u;
+    return hits;
+}
+
 static void vm_antidebug(void) {
-    if (vm_debugger_present()) __builtin_trap();
+    if (vm_debugger_present()) vm_dbg_mask |= 1u;
+    if (!vm_dbg_probed) {
+        vm_dbg_probed = 1;
+        vm_dbg_probe_mask = vm_antidebug_probe() << 1; /* ②③④ 各占一位（bit1..bit3） */
+    }
+    vm_dbg_mask |= vm_dbg_probe_mask;
+    /* ≥2 条**不同**路径命中才定性：单点误判不动手；真实调试器必然同时踩中 ① 与 ②。 */
+    if (!vm_dbg_verdict && (vm_dbg_mask & (vm_dbg_mask - 1)) != 0) {
+        vm_dbg_verdict = 1;
+        vm_dbg_defer = VM_DBG_DEFER_CALLS; /* 静默延后：不 trap */
+    }
 }
 #else
 static void vm_antidebug(void) { }
@@ -882,6 +974,11 @@ static void vm_antidebug(void) { }
 
 int vm_run(vm_ctx_t *vm) {
     vm_antidebug();
+    /* (4) 反调试定性后走**静默延后**：接下来几次直接给错结果，不给一个可定位的崩点。 */
+    if (vm_dbg_defer) {
+        vm_dbg_defer--;
+        return 3;
+    }
     vm_selfcheck();
     /* 第 49 轮这里曾放一条"客户机 RSP 应 16 字节对齐"的 int3 断言。第 55 轮查明它是**错误前提**：
      * 客户机 RSP 该不该对齐是我们自己的约定，不是 ABI 要求；而 thunk 的 call 让 vm_entry 从 rsp%16==0
@@ -1629,7 +1726,7 @@ u64 vm_selftest(void *ctxp) {
  * 为什么必须在**加载期**做：回填（把被覆盖的几字节补回原生代码）之后，被保护函数
  * 根本不再进入 VM —— 放在解释器里的校验永远不会执行。只有加载期的检查能拦住它。 */
 void vm_verify_table(const u32 *t) {
-    u32 n, i, j;
+    u32 n, i;
     const u8 *base = (const u8 *)t;
     const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
     if (!t) return;
