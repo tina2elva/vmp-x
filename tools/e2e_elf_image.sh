@@ -64,6 +64,10 @@ sys.exit(0 if lo <= rva < hi else 1)
 echo "[*] 文件级：原执行段在打包文件里应 0 残留（非零 64B 块）"
 python3 tools/image_residue_elf.py build/elf_target build/elf_target_$TAG.enc || fail "ELF code still readable"
 
+echo "[*] 语义级：打包后不应再有成串的可读字符串（.text/.rodata/.gopclntab）"
+python3 tools/expose_report.py --img build/elf_target --compare build/elf_target_$TAG.enc \\
+    --sections .text,.rodata,.gopclntab --max-ratio 0.05 || fail "packed image still exposes readable strings"
+
 echo "[*] 运行期：原生 vs 加密后逐字节比对"
 NATIVE_OUT="$($QEMU ./build/elf_target 2>&1)"
 PACKED_OUT="$($QEMU ./build/elf_target_$TAG.enc 2>&1)"

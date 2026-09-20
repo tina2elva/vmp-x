@@ -607,6 +607,32 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				fmt.Println()
 				break
 			}
+			// 只读数据节也一起加密（PE 侧的 .rdata/.data 早就做了，ELF 侧要对齐）：
+			//   .rodata    -- 字符串/常量表（"文件里读到程序在干什么"的最大来源）
+			//   .gopclntab -- Go 运行期元数据（同样只在入口点之后才被读）
+			// 动态链接器/初始化器在入口点之前要用的节一律排除（见 elfLoaderBlockedNames）。
+			for _, sc := range elfSections(elfRawBytes(exe)) {
+				if !elfDataCandidates[sc.name] || elfLoaderBlockedNames[sc.name] || sc.size == 0 {
+					continue
+				}
+				if sc.addr < imageBase {
+					continue
+				}
+				overlap := false
+				for _, s0 := range imgSecs {
+					lo, hi := imageBase+uint64(s0.RVA), imageBase+uint64(s0.RVA+s0.Size)
+					if sc.addr < hi && sc.addr+sc.size > lo {
+						overlap = true
+						break
+					}
+				}
+				if overlap {
+					continue
+				}
+				imgSecs = append(imgSecs, inject.ImgSection{RVA: uint32(sc.addr - imageBase), Size: uint32(sc.size), Flags: 0})
+				fmt.Printf("[*] ELF 整体加密：%s RVA=0x%X size=0x%X（只读数据）", sc.name, sc.addr-imageBase, sc.size)
+				fmt.Println()
+			}
 			if len(imgSecs) == 0 {
 				fmt.Println("[*] ELF 整体加密：跳过（找不到可加密的可执行段）")
 			}
@@ -987,6 +1013,83 @@ func setTLSCallbacks(f *pe.File, dirRVA uint32, va uint64) error {
 	}
 	binary.LittleEndian.PutUint64(f.Data[to+24:], va)
 	return nil
+}
+
+// elfRawBytes 读原始镜像文件：挑候选节要按**原始布局**，不能用注入流程里的缓冲区。
+func elfRawBytes(path string) []byte {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// elfDataCandidates：ELF 侧额外纳入整体加密的"只读数据"节。
+var elfDataCandidates = map[string]bool{".rodata": true, ".gopclntab": true}
+
+// elfLoaderBlockedNames：这些节在**入口点之前**就被动态链接器/初始化器读或调用，绝不能加密。
+// （当前候选集里本来不含它们，这里显式列出是为了"以后加候选时不会误踩"。）
+var elfLoaderBlockedNames = map[string]bool{
+	".dynamic": true, ".dynsym": true, ".dynstr": true, ".hash": true,
+	".gnu.hash": true, ".gnu.version": true, ".gnu.version_d": true, ".gnu.version_r": true,
+	".rela.dyn": true, ".rela.plt": true, ".rel.dyn": true, ".rel.plt": true,
+	".got": true, ".got.plt": true, ".plt": true, ".interp": true,
+	".init_array": true, ".fini_array": true, ".init": true, ".fini": true,
+	".ctors": true, ".dtors": true,
+}
+
+// elfSection 是 ELF 侧加密候选需要的最小信息。
+type elfSection struct {
+	name string
+	addr uint64
+	size uint64
+}
+
+// elfSections 只读节头表里的名字/地址/大小（ELF64 节头：name@0 type@4 flags@8 addr@16 off@24 size@32）。
+func elfSections(d []byte) []elfSection {
+	// 必须喂**原始镜像文件**的字节：f.Data 是注入流程改写过的缓冲区。
+	// 第一版从这里读节名字符串表 -> 名字是垃圾 -> 候选节一个都没进去（实测暴露面 0 变化）；
+	// 第二版连节头表都读不到，直接返回 nil。
+	if len(d) < 0x40 {
+		return nil
+	}
+	shoff := binary.LittleEndian.Uint64(d[0x28:])
+	shentsize := binary.LittleEndian.Uint16(d[0x3A:])
+	shnum := binary.LittleEndian.Uint16(d[0x3C:])
+	shstrndx := binary.LittleEndian.Uint16(d[0x3E:])
+	if shoff == 0 || shnum == 0 || shentsize == 0 || int(shstrndx) >= int(shnum) {
+		return nil
+	}
+	if int(shoff)+int(shnum)*int(shentsize) > len(d) {
+		return nil
+	}
+	// 注意第五个返回值是 sh_offset：section name 字符串表的**文件偏移**要用它。
+	// 第一版这里只取了 (name, addr, size, type)，于是 strOff 拿到的是 shstrtab 的 sh_name（通常是 0），
+	// 解析出来的节名全是空串 -> 候选集一个都没命中（实测"暴露面 0 变化"）。
+	get := func(i int) (uint32, uint64, uint64, uint64, uint32) {
+		o := int(shoff) + i*int(shentsize)
+		return binary.LittleEndian.Uint32(d[o:]), binary.LittleEndian.Uint64(d[o+16:]),
+			binary.LittleEndian.Uint64(d[o+24:]), binary.LittleEndian.Uint64(d[o+32:]),
+			binary.LittleEndian.Uint32(d[o+4:])
+	}
+	_, _, strOff, strSize, _ := get(int(shstrndx))
+	var out []elfSection
+	for i := 0; i < int(shnum); i++ {
+		nameOff, addr, _, size, typ := get(i)
+		if typ == 8 /* SHT_NOBITS */ || size == 0 || nameOff >= uint32(strSize) {
+			continue
+		}
+		off := int(strOff) + int(nameOff)
+		if off >= len(d) {
+			continue
+		}
+		e := off
+		for e < len(d) && d[e] != 0 {
+			e++
+		}
+		out = append(out, elfSection{name: string(d[off:e]), addr: addr, size: size})
+	}
+	return out
 }
 
 // loaderDirConflict 返回"加载器在入口点之前要用、且落在该节里"的数据目录名；空串 = 可以整节加密。
