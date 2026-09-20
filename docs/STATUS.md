@@ -4105,3 +4105,24 @@ main.sumTo    patch=[F0 03 1E AA 44 2D 04 14]
 \`.rdata\` 熵 2.46→7.99、>=12 字节可读串 1990→**0**、原生/被保护 17 行输出仅 2 行不同（base/地址）、
 \`tools/gates.ps1\` 11/0、e2e 147/147。另记一条风险（未解决）：**解密 \`.data\` 可能覆盖加载器在入口点之前写入的值**（/GS cookie、TLS 等），
 demo64 实测无害，但这是"整体加密 .data"的真实风险面。
+
+### 375. 目标项 (A) 完成并 CI 复绿；目标项 (B) 有意搁置
+CI run 35485036890（提交 c7c58fe，含 ELF 数据节回退 + PE LOAD_CONFIG 搬迁）**五个作业全绿**；
+随后的 docs 提交 55b3cc0（run 35485064094）同样全绿 —— 主干回到已验证状态。
+
+**(A) PE 侧 LOAD_CONFIG 搬迁：完成**（本机验收 + CI 双证据）
+- 本机：`.rdata` 熵 2.46→7.99、>=12 字节可读串 1990→0、原生/被保护 17 行输出仅 2 行不同（base/地址）、
+  `tools/gates.ps1` 11 gates/0 failed、e2e 147/0、dll 3/3、arm64 客户机 OK；
+- CI：windows-amd64 与 windows-arm64-run 全绿（PE/arm64 三段证据此前已单独验过）。
+- 遗留风险（未解决，已登记）：解密 `.data` 可能覆盖加载器在入口点之前写入的值（/GS cookie、TLS 等）。
+
+**(B) ELF 侧 .rodata/.gopclntab：实现完成但有意默认关（`-enc-image-elf-data`）**
+CI 上实测：aarch64 目标 `protected rc=139`（qemu SIGSEGV）；x86-64 上我新接的语义级门禁报残留可读串，
+而同一改动在本机是"4.22/5.95 → 8.00、>=12B 可读串 137566→78"。**本机与 CI 结论矛盾**，
+在解释清楚之前不启用、也不接线门禁 —— 这是本轮的主要判断。
+
+下一轮该做的（按序）：
+1. 用 `-enc-image-elf-data` + arm64 的 stderr 诊断（aarch64 分支已有 `VMPELF ...` 失败打印）复现并定位 SIGSEGV：
+   是"节超出行映射"、"mprotect 目标越界"，还是"某节与已加密段重叠"；
+2. 解释 CI 与本地暴露面数字的差异（先把两边的 `tools/expose_report.py` 明细并排打出来，再看节头在打包后是否仍指向同一位置）；
+3. 都解释通之后才把候选节默认打开 + 语义级门禁接回 e2e。
