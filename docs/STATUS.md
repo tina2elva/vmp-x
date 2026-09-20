@@ -4353,7 +4353,19 @@ Poly1305 是**一次性** MAC，所以按键/消息分离：
 **把 #383 的绕开改回去**：`vm_kdf.c` 的标签回到字符串字面量；`vm_crypto.c` 的 sigma 掩码回到 `static const volatile`。
 两处都复验：宿主 KAT 数值不变、blob KAT 通过、e2e 147/0。
 
-**证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（含新门禁）；隔离 worktree 全量 e2e = 147 passed / 0 failed；CI run（待填）。
+**顺带补掉 aarch64 ELF 的一个同类窟窿（CI 逼出来的）**：把 `vm_kdf.c` 的标签改回字符串字面量后，
+CI run **35494537015** 的 **linux-arm64** 立刻红：
+`[!] .text+0x50: 不支持的重定位类型 0x116`（= `R_AARCH64_LDST8_ABS_LO12_NC`）。
+按字节访问的字符串走 `ADRP + LDRB`，而**单目标路径（`-merge ld`）没有 `relAArch64LDSTLo12` 分支**
+（`-merge go` 路径早就有，且 `patchAArch64LDSTLo12` 已按指令 size 位缩放、宽度 1 也对）。
+补上常量 278 + 该分支后 CI 转绿。**本机没有 aarch64 工具链，这条只能由 CI 的 linux-arm64 作业验证。**
 
-**未做**：无（这条就是 #383"下一步建议"的落地）。#383 里其余"未做"项 —— 1b（主密钥外置 + 硬门）、
-(2) 带密钥 MAC、(3) 容器加密/混淆、(4) 反调试多路径、(6) 重定位/ASLR —— 照旧未动。
+**证据**
+- 本机 `tools/gates.ps1` = **11 gates / 0 failed**（含新门禁；e2e 147/0、dll 3/3、arm64 客户机 OK）。
+- 隔离 worktree 全量 e2e = 147 passed / 0 failed（用的是"修复 + 绕开已改回"的状态）。
+- CI：**35494728426（13df4d6）五个作业全绿**（windows-amd64 / windows-arm64-blob / windows-arm64-run /
+  linux-amd64 / **linux-arm64**）。反证：同一改动在补 LDST8 之前的 35494537015 是 **linux-arm64 红**。
+
+**未做**：无新开项（这条就是 #383"下一步建议"的落地，并顺带补了 aarch64 LDST8）。
+#383 里其余"未做"项 —— 1b（主密钥外置 + 硬门）、(2) 带密钥 MAC、(3) 容器加密/混淆、
+(4) 反调试多路径、(6) 重定位/ASLR —— 照旧未动。
