@@ -199,6 +199,7 @@ const (
 	R_AARCH64_ADD_ABS_LO12_NC    = 277
 	R_AARCH64_ADR_GOT_PAGE       = 311
 	R_AARCH64_LD64_GOT_LO12_NC   = 312
+	R_AARCH64_LDST8_ABS_LO12_NC  = 278
 	R_AARCH64_LDST16_ABS_LO12_NC = 284
 	R_AARCH64_LDST32_ABS_LO12_NC = 285
 	R_AARCH64_LDST64_ABS_LO12_NC = 286
@@ -357,7 +358,8 @@ func makeELFReloc(out *objFile, target int, rOff, info uint64, addend int64, imp
 			rel.Kind = relAArch64ADRPrelPGHi21
 		case R_AARCH64_ADD_ABS_LO12_NC:
 			rel.Kind = relAArch64AddAbsLo12
-		case R_AARCH64_LDST16_ABS_LO12_NC, R_AARCH64_LDST32_ABS_LO12_NC, R_AARCH64_LDST64_ABS_LO12_NC:
+		case R_AARCH64_LDST8_ABS_LO12_NC, R_AARCH64_LDST16_ABS_LO12_NC,
+			R_AARCH64_LDST32_ABS_LO12_NC, R_AARCH64_LDST64_ABS_LO12_NC:
 			// ldr/str x, [x, #:lo12:sym]：与 ADRP 配对使用，整体是 PC 相对，属于位置无关；
 			// 位域 21:10 存低 12 位，按访问宽度缩放（补丁函数从指令的 size 位读出宽度）。
 			rel.Kind = relAArch64LDSTLo12

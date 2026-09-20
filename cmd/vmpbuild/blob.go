@@ -133,6 +133,15 @@ func applyRelocsObj(obj *objFile, blob []byte, secBlobOff map[int]int, verbose b
 			binary.LittleEndian.PutUint32(blob[field:], insn)
 		case relAArch64AddAbsLo12:
 			binary.LittleEndian.PutUint32(blob[field:], patchAArch64AddLo12(binary.LittleEndian.Uint32(blob[field:]), target))
+		case relAArch64LDSTLo12:
+			// 与 applyAllRelocs（-merge go 路径）保持一致：单目标路径以前漏了这一条，
+			// 于是"任何按字节访问的字符串/常量"都会以"不支持的重定位类型 0x116"失败
+			// （CI 的 linux-arm64 实测：R_AARCH64_LDST8_ABS_LO12_NC）。
+			insn, err := patchAArch64LDSTLo12(binary.LittleEndian.Uint32(blob[field:]), target)
+			if err != nil {
+				return 0, fmt.Errorf("%s+0x%X: %w", secName, r.Off, err)
+			}
+			binary.LittleEndian.PutUint32(blob[field:], insn)
 		case relAbsolute32, relAbsolute64:
 			return 0, fmt.Errorf("%s+0x%X: 出现绝对重定位 (type 0x%X) — 拒绝注入（stub 必须位置无关）",
 				secName, r.Off, r.RawType)
