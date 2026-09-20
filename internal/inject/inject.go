@@ -178,6 +178,7 @@ func Apply(f *pe.File, opt Options) (*Result, error) {
 		ImgTableRVA:    pl.ImgTableRVA,
 		ImgTableLen:    pl.ImgTableLen,
 		ImgTlsArrayRVA: pl.ImgTlsArrayRVA,
+		LoadCfgRVA:     pl.LoadCfgRVA,
 		TlsDirRVA:      pl.TlsDirRVA,
 	}, nil
 }

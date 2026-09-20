@@ -123,6 +123,10 @@ type Options struct {
 	ImageBase uint64
 	// UnpackFn：vm_unpack_image 在 blob 内的偏移（manifest 的 symbols 里查）。
 	UnpackFn int
+	// LoadCfgCopy：LOAD_CONFIG 目录（IMAGE_LOAD_CONFIG_DIRECTORY）的副本。它几乎总是落在 .rdata 里，
+	// 而加载器在入口点之前就要读它（/GS cookie 地址、CFG 表等）—— 先把副本放进 payload、
+	// 再把数据目录指过来，.rdata 才能整体加密。做法与 TlsDirCopy 完全同构。
+	LoadCfgCopy []byte
 	// TlsDirCopy：TLS 目录（IMAGE_TLS_DIRECTORY64，40 字节）的副本。TLS 目录常常落在 .rdata 里，
 	// 而加载器在入口点之前必须读它 —— 整体加密 .rdata 时得把它搬到 payload（明文）并把数据目录指过来。
 	TlsDirCopy []byte
@@ -198,6 +202,7 @@ type Payload struct {
 	ImgTableLen    int
 	ImgHookRVA     uint32
 	ImgTlsArrayRVA uint32
+	LoadCfgRVA     uint32
 	TlsDirRVA      uint32
 }
 
@@ -212,7 +217,8 @@ type Result struct {
 	ImgTableRVA    uint32      `json:"imgTableRVA"`
 	ImgTableLen    int         `json:"imgTableLen"`
 	ImgTlsArrayRVA uint32      `json:"imgTlsArrayRVA"`
-	TlsDirRVA      uint32      `json:"tlsDirRVA"`
+	LoadCfgRVA     uint32
+	TlsDirRVA      uint32 `json:"tlsDirRVA"`
 }
 
 // BuildPayload 组装 payload；baseRVA 是 payload 将被放置的地址（相对镜像基址）
@@ -544,6 +550,13 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		tlsDirRVA = baseRVA + uint32(len(data))
 		data = append(data, opt.TlsDirCopy...)
 	}
+	// ---- LOAD_CONFIG 目录副本（它落在被整体加密的节里，加载器在入口点之前要读） ----
+	loadCfgRVA := uint32(0)
+	if len(opt.LoadCfgCopy) > 0 {
+		align(8)
+		loadCfgRVA = baseRVA + uint32(len(data))
+		data = append(data, opt.LoadCfgCopy...)
+	}
 	// ---- TLS 回调：把自己的回调放到数组最前面 ----
 	// 加载器在**入口点之前**依次调用 TLS 回调；mingw 的 exe 几乎都注册了回调
 	// （emutls 初始化 / pseudo-reloc），它们会先执行 .text —— 那时还是密文。
@@ -578,7 +591,7 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		}
 		data = append(data, make([]byte, 8)...) // 终止项
 	}
-	pl := &Payload{Data: data, Placements: placements, CodeSize: len(data) - opt.BSSSize, BSSOff: opt.BSSOff, BSSSize: opt.BSSSize, EntryHookRVA: entryHookRVA, EntryHookLen: entryHookLen, ImgTableRVA: imgTableRVA, ImgTableLen: imgTableLen, ImgHookRVA: imgHookRVA, ImgTlsArrayRVA: imgTlsArrayRVA, TlsDirRVA: tlsDirRVA}
+	pl := &Payload{Data: data, Placements: placements, CodeSize: len(data) - opt.BSSSize, BSSOff: opt.BSSOff, BSSSize: opt.BSSSize, EntryHookRVA: entryHookRVA, EntryHookLen: entryHookLen, ImgTableRVA: imgTableRVA, ImgTableLen: imgTableLen, ImgHookRVA: imgHookRVA, ImgTlsArrayRVA: imgTlsArrayRVA, TlsDirRVA: tlsDirRVA, LoadCfgRVA: loadCfgRVA}
 	return pl, nil
 }
 

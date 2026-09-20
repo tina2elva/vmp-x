@@ -399,6 +399,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	var imgSecs []inject.ImgSection
 	var imgTLS []uint64
 	var tlsDirCopy []byte
+	var loadCfgCopy []byte
 	imgSkip := ""
 	switch {
 	case !encImageEnabled:
@@ -440,7 +441,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 				if s.Name != c.name || s.SizeOfRawData == 0 {
 					continue
 				}
-				if why := loaderDirConflict(f, s); why != "" {
+				if why := resolveLoaderConflict(&loadCfgCopy, f, s); why != "" {
 					fmt.Printf("[*] 原镜像整体加密：跳过 %s（%s）", s.Name, why)
 					fmt.Println()
 					continue
@@ -487,7 +488,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	entryRVA, _ := inject.EntryRVA(f)
 	res, err := inject.Apply(f, inject.Options{SectionName: section, SectionNameB: sectionNames[1], SectionNameC: sectionNames[2], Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
 		DescMagic: descMagic, PatchKey: patchKey, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
-		ImgSections: imgSecs, ImageBase: f.ImageBase, UnpackFn: unpackFn, ImgTlsCallbacks: imgTLS, TlsDirCopy: tlsDirCopy,
+		ImgSections: imgSecs, ImageBase: f.ImageBase, UnpackFn: unpackFn, ImgTlsCallbacks: imgTLS, TlsDirCopy: tlsDirCopy, LoadCfgCopy: loadCfgCopy,
 		Wipe:      wipeEnabled,
 		EntryHook: patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0,
 		VerifyFn:  verifyFn,
@@ -503,6 +504,13 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 		clearDynamicBase(f)
 		stripRelocations(f)
 		tlsDir := tlsDirectoryRVA(f)
+		if len(loadCfgCopy) > 0 && res.LoadCfgRVA != 0 {
+			if err := setLoadConfigDirectoryRVA(f, res.LoadCfgRVA); err != nil {
+				fatalf("重指 LOAD_CONFIG 数据目录失败: %v", err)
+			}
+			fmt.Printf("[*] LOAD_CONFIG 数据目录已重指到 payload RVA=0x%X", res.LoadCfgRVA)
+			fmt.Println()
+		}
 		if len(tlsDirCopy) > 0 && res.TlsDirRVA != 0 {
 			if err := setTLSDirectoryRVA(f, res.TlsDirRVA); err != nil {
 				fatalf("重指 TLS 数据目录失败: %v", err)
@@ -1119,6 +1127,47 @@ func loaderDirConflict(f *pe.File, s pe.Section) string {
 		}
 	}
 	return ""
+}
+
+// resolveLoaderConflict 判断"这一节能不能整体加密"。返回空串=可以。
+// LOAD_CONFIG（索引 10）是唯一可以就地解决的冲突：它只是"加载器在入口点之前读一次"的结构，
+// 把副本搬进 payload、再把数据目录指过去，这一节就能加密了（与 TLS 目录同一套做法）。
+func resolveLoaderConflict(loadCfgCopy *[]byte, f *pe.File, s pe.Section) string {
+	why := loaderDirConflict(f, s)
+	if why == "" || !strings.HasPrefix(why, "LOADCONFIG") || *loadCfgCopy != nil {
+		return why
+	}
+	rva, size := loadConfigDirRVASize(f)
+	if rva == 0 || size < 4 {
+		return why
+	}
+	to, err := f.RVAtoOffset(rva)
+	if err != nil || to < 0 || to+int(size) > len(f.Data) {
+		return why
+	}
+	*loadCfgCopy = append([]byte(nil), f.Data[to:to+int(size)]...)
+	fmt.Printf("[*] LOAD_CONFIG 目录（%d 字节）落在 %s 里：搬到 payload，%s 一并整体加密", size, s.Name, s.Name)
+	fmt.Println()
+	return ""
+}
+
+// loadConfigDirRVASize 返回 LOAD_CONFIG 数据目录（索引 10）的 (RVA, size)。
+func loadConfigDirRVASize(f *pe.File) (uint32, uint32) {
+	o := f.OptHeaderOffset + 112 + 10*8
+	if o+8 > len(f.Data) {
+		return 0, 0
+	}
+	return binary.LittleEndian.Uint32(f.Data[o:]), binary.LittleEndian.Uint32(f.Data[o+4:])
+}
+
+// setLoadConfigDirectoryRVA 把 LOAD_CONFIG 数据目录重新指向 payload 里的那份副本。
+func setLoadConfigDirectoryRVA(f *pe.File, rva uint32) error {
+	o := f.OptHeaderOffset + 112 + 10*8
+	if o+8 > len(f.Data) {
+		return fmt.Errorf("没有 LOAD_CONFIG 目录项")
+	}
+	binary.LittleEndian.PutUint32(f.Data[o:], rva)
+	return nil
 }
 
 // tlsDirectoryRVA 返回 TLS 数据目录指向的 RVA（0 = 没有）。
