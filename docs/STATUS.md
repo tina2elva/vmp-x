@@ -4086,3 +4086,22 @@ main.sumTo    patch=[F0 03 1E AA 44 2D 04 14]
 因为 `get()` 少返回了 `sh_offset`，于是拿 shstrtab 的 `sh_name`（通常是 0）当文件偏移用了。
 教训：**结构体解析里"少返回一个字段"不会报错，只会静默地把所有名字变成空串**；
 以及"先打一行调试输出"比连猜三轮快得多。
+
+### 374. 回退：ELF 数据节加密默认关（保留 \`-enc-image-elf-data\` 供排查）
+把 \`.rodata\`/\`.gopclntab\` 纳入整体加密的改动（提交 98c3caa）在 CI 上暴露两个问题，
+**已退回默认关**（代码与语义级门禁工具都保留，等查清再启用）：
+
+| 现象 | 原始证据 |
+|---|---|
+| aarch64 目标**直接崩** | run 35484769361 / linux-arm64：\`[!] arm64 end-to-end: MISMATCH (native rc=0, protected rc=139)\`、\`protected= qemu: uncaught target signal 11 (Segmentation fault) - core dumped\` |
+| CI 上语义级门禁报残留 | run 35484769361 / linux-amd64：\`[FAIL] packed image still exposes readable strings\` —— CI 上"打包文件里这些节残留的可读串比例"远高于本机测到的 0.06% |
+
+本机数字（同一改动）是好的：\`.rodata\` 熵 4.22→8.00、\`.gopclntab\` 5.95→8.00、>=12 字节可读串 137566→78。
+**本机过、CI 不过**，而且 aarch64 会崩 ⇒ 说明"打包后节头/布局"与"aarch64 上的解密/映射"还有没搞清的地方，
+不能靠放宽阈值或只留 x86-64 糊过去。当前状态：默认路径与 run #293/#35482334570 验证过的行为一致；
+\`-enc-image-elf-data\` 打开才走新路径。
+
+同时确认（PE 侧，目标项 (A)）：**LOAD_CONFIG 搬迁已生效且本机验收通过**（提交 0efba2e）：
+\`.rdata\` 熵 2.46→7.99、>=12 字节可读串 1990→**0**、原生/被保护 17 行输出仅 2 行不同（base/地址）、
+\`tools/gates.ps1\` 11/0、e2e 147/147。另记一条风险（未解决）：**解密 \`.data\` 可能覆盖加载器在入口点之前写入的值**（/GS cookie、TLS 等），
+demo64 实测无害，但这是"整体加密 .data"的真实风险面。
