@@ -4015,3 +4015,18 @@ qemu-aarch64 上真跑，输出与原生逐字节一致**。目标项 (2) 的 EL
   解析导出表拿 VirtualProtect）；CI 的 windows-arm64-run 是原生 arm64 Windows，可作验证环境。
 - **lifter 的 `ORR Xd, XZR, #imm`**（第 5 条）：修好后 main.sumTo 也能被保护，VMP_FUNCS 的临时收紧可撤。
 - **ELF 整体加密转默认**：前置是让载荷探针不再依赖"打包文件里的明文补丁字节"。
+
+### 368. 第十一轮：lifter 补上 "逻辑立即数 + Rn=XZR"，aarch64 两个函数全链路在 qemu 下验证通过
+CI run 35481622554（提交 7a3fd82）：
+```
+main.checkKey: native=20B -> 8 IR -> 52B bytecode
+main.sumTo:   native=40B -> 10 IR -> 56B bytecode      ← 修复前："ORR X1, XZR, #0x1 ... 暂不支持"，打包被拒
+main.checkKey patch=[F0 03 1E AA 3B 2D 04 14]          ← arm64 的 8 字节入口补丁（mov x16,x30 ; b thunk）
+main.sumTo    patch=[F0 03 1E AA 44 2D 04 14]
+[*] ELF 整体加密：PT_LOAD(X) va=0x10000 跳过头部 4096 字节，加密 589924 字节（入口自解密）
+[*] chunks=9217 all-zero(excluded)=0 NON-ZERO FOUND=0 → [+] no ELF code readable in the packed file
+[*] 运行期：原生 vs 加密后逐字节比对 → [OK  ] ELF 整体加密：输出一致 → [+] e2e_elf_image: OK
+```
+结论：**aarch64（Linux/ELF）上的"原镜像整体加密 + 入口自解密"闭环**，且验证的是**两个被保护函数**的完整链路
+（含刚补上的逻辑立即数形式）。至此目标项 (2) 的 ELF/x86-64 与 Linux/aarch64 两半都有真机证据；
+只剩 PE/arm64（Windows/arm64）与"ELF 整体加密转默认"的前置改造。
