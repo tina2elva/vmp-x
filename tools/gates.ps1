@@ -41,7 +41,7 @@ Step "vmpbuild (blob builds)" {
     else {
         foreach ($pair in @(@("build\gates_blob.json", "build\gates_blob.bin"), @("build\gates_blob_rel.json", "build\gates_blob_rel.bin"))) {
             $mj = Get-Content $pair[0] -Raw | ConvertFrom-Json
-            & ".\build\kdf_blob_kat.exe" $pair[1] $mj.symbols.vm_kdf_salt $mj.symbols.vm_kdf_entry
+            & ".\build\kdf_blob_kat.exe" $pair[1] $mj.symbols.vm_kdf_salt $mj.symbols.vm_kdf_entry $mj.symbols.vm_patch_mac
             if ($LASTEXITCODE -ne 0) { Write-Host ("[!] blob KDF KAT failed for " + $pair[1] + " (vmpbuild relocation/layout bug?)"); $script:stepCode = 1 }
         }
     }

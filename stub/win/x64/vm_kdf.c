@@ -57,6 +57,35 @@ void vm_kdf_entry(const u8 master[32], u32 rva, u32 salt, u8 out[32]) {
     }
 }
 
+/* 与 vm_crypto.c 的 Poly1305 实现对接（同一个 blob；单独编主机 KAT 时把 vm_crypto.c 一起编进来）。
+ * 这里只做声明，保持 vm_kdf.c 对头文件没有额外依赖。 */
+void vm_poly1305(const u8 key[32], const u8 *m, u32 len, u8 tag[16]);
+
+/* 入口补丁的**带密钥 MAC**（与 Go 侧 internal/inject/patchmac.go 的 PatchMAC 逐字节一致）：
+ *   key   = KDFEntry(master, funcRVA, salt ^ 0x9E3779B9)   <- 与加解密密钥域分离
+ *   msg   = patch || le32(selfRVA) || le32(funcRVA) || le32(codeLen)
+ *   check = le32(Poly1305(key, msg)[0:4])
+ * 打包端（写进描述符 pad 与加载期校验表的 check）与运行期两个使用点都走这一个函数，
+ * 所以只要它在，两边就不可能各改一半。 */
+u32 vm_patch_mac(const u8 master[32], u32 salt, u32 selfRVA, u32 funcRVA, u32 codeLen,
+                 const u8 *patch, u32 len) {
+    u8 mk[32];
+    vm_kdf_entry(master, funcRVA, salt ^ 0x9E3779B9u, mk);
+    u8 msg[64];
+    u32 n = 0;
+    if (len > 48u) len = 48u;
+    for (u32 i = 0; i < len; i++) msg[n++] = patch[i];
+    msg[n++] = (u8)(selfRVA);        msg[n++] = (u8)(selfRVA >> 8);
+    msg[n++] = (u8)(selfRVA >> 16);  msg[n++] = (u8)(selfRVA >> 24);
+    msg[n++] = (u8)(funcRVA);        msg[n++] = (u8)(funcRVA >> 8);
+    msg[n++] = (u8)(funcRVA >> 16);  msg[n++] = (u8)(funcRVA >> 24);
+    msg[n++] = (u8)(codeLen);        msg[n++] = (u8)(codeLen >> 8);
+    msg[n++] = (u8)(codeLen >> 16);  msg[n++] = (u8)(codeLen >> 24);
+    u8 tag[16];
+    vm_poly1305(mk, msg, n, tag);
+    return (u32)tag[0] | ((u32)tag[1] << 8) | ((u32)tag[2] << 16) | ((u32)tag[3] << 24);
+}
+
 /* 与 Go 侧 internal/inject/kdf.go 的 KDFSaltForPlacement 逐字节一致：
  *   salt = FNV1a32("VMPXKDF\x00" || le32(selfRVA) || le32(codeRVA) || le32(codeLen))
  * （描述符里没有 salt 字段，用它自己已有的三个字段派生；两侧必须一致，故单独钉 KAT。） */

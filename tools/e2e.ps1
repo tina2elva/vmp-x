@@ -306,6 +306,34 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
+# ---- (2) keyed-MAC integrity: the "refill" bypass must be refused ----
+# Put the native entry bytes back (the bypass the static-analysis report describes). We use an
+# artifact packed with -no-enc-image on purpose: with image encryption on, the entry patch lives
+# inside the encrypted .text, so the image AEAD already catches any file edit and the MAC check
+# would never be exercised. With plaintext entry patches, only the keyed MAC can catch it.
+$neExe = "build\target_neimg.exe"
+$neMan = "build\target_neimg.json"
+$neRefill = "build\target_neimg_refill.exe"
+Remove-Item $neExe, $neRefill -ErrorAction SilentlyContinue
+& .\build\vmpack.exe -exe build\target.exe -func check_key -func sum_to -out $neExe -report $neMan -no-enc-image 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    $fail++
+    $failLines += "E2EFAIL refill: packing with -no-enc-image failed"
+} else {
+    $c0 = Run-File $neExe @("check_key", "10") 30
+    if ($c0.Trim() -eq "143") { $pass++ }
+    else { $fail++; $failLines += ("E2EFAIL refill/control: untouched artifact should answer 143, got [{0}]" -f $c0.Trim()) }
+    python tools/patch_refill.py --orig build/target.exe --packed $neExe --report $neMan --out $neRefill 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $fail++
+        $failLines += "E2EFAIL refill: tools/patch_refill.py failed"
+    } else {
+        $rr = Get-ExitCode $neRefill @("check_key", "10")
+        if (($rr.Code -ne 0) -and ($rr.Out -eq "")) { $pass++ }
+        else { $fail++; $failLines += ("E2EFAIL refill: refilled image was NOT refused (code=0x{0:X8} out=[{1}])" -f ($rr.Code -band 0xFFFFFFFF), $rr.Out.Trim()) }
+    }
+}
+
 Write-Output ""
 if ($failLines.Count -gt 0) {
     Write-Output "--- failure summary (one line per case, for CI annotations) ---"

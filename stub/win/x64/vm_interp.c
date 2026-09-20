@@ -526,6 +526,9 @@ u32 vm_self_hash;
  * 所以两侧都能独立算出来，不需要额外的 salt 字段。 */
 void vm_kdf_entry(const u8 master[32], u32 rva, u32 salt, u8 out[32]);
 u32 vm_kdf_salt(u32 selfRVA, u32 codeRVA, u32 codeLen);
+/* 入口补丁的带密钥 MAC（实现在 vm_kdf.c；打包端 internal/inject/patchmac.go 同式）。 */
+u32 vm_patch_mac(const u8 master[32], u32 salt, u32 selfRVA, u32 funcRVA, u32 codeLen,
+                 const u8 *patch, u32 len);
 
 /* 描述符 → 本条目的派生密钥（打包端 internal/inject 用同一算式，否则全量 trap）。 */
 static void vm_desc_key(const vm_desc_t *d, const u8 master[32], u8 out[32]) {
@@ -787,16 +790,14 @@ int vm_run(vm_ctx_t *vm) {
                      * 之前用 d - selfRVA + reserved1，在 PE 上成立，但 ELF 的 selfRVA 语义不同，
                      * 于是校验必然失败、载荷被拒绝执行（CI 自第 3 轮起一直红就是这个原因）。 */
                     const u8 *pb = (const u8 *)d + (i32)rd32((const u8 *)d + 28);
-                    u32 want;
                     const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
-                    u8 key[32];
-                    vm_desc_key(d, master, key); /* 与打包端 patchChecks 同式现推 */
-                    u32 h = 2166136261u;
-                    u32 i;
-                    for (i = 0; i < 8; i++) { h ^= (u32)key[i]; h *= 16777619u; }
-                    for (i = 0; i < plen; i++) { h ^= (u32)pb[i]; h *= 16777619u; }
-                    want = (u32)rd32((const u8 *)d + 60);
-                    if (h != want) {
+                    /* 同一个 vm_patch_mac（打包端 PatchMAC 同式），不是无盐 FNV：
+                     * key = KDFEntry(master, funcRVA, salt ^ 0x9E3779B9)（与加解密密钥域分离），
+                     * msg = patch || le32(selfRVA) || le32(funcRVA) || le32(codeLen)。 */
+                    u32 got = vm_patch_mac(master, vm_kdf_salt(d->selfRVA, d->reserved1, d->codeLen),
+                                           d->selfRVA, d->reserved1, d->codeLen, pb, plen);
+                    u32 want = (u32)rd32((const u8 *)d + 60);
+                    if (got != want) {
                         __builtin_trap(); /* 被篡改：直接崩，不给"还原后继续跑"的机会 */
                     }
                 }
@@ -1470,8 +1471,10 @@ u64 vm_selftest(void *ctxp) {
 /* ---- (c) 加载期完整性校验 ----
  * 由 internal/inject 放进 payload 的入口蹦床调用。
  * 表格式：u32 count；随后每项 { i32 delta; u32 len; u32 check; u32 selfRVA; u32 funcRVA; u32 codeLen }，
- * delta 相对表首。算法与打包端一致：FNV-1a，先喂 key[0..8)，再喂被保护函数的入口字节；
- * 这里的 key 是**每条目的派生密钥**（后三个 u32 就是 KDF 的输入，运行期现推，见 vm_desc_key）。
+ * delta 相对表首。check 是**带密钥 MAC**（与描述符 pad 用同一算式，见 internal/inject/patchmac.go）：
+ *   key = KDFEntry(master, funcRVA, salt ^ 0x9E3779B9)，msg = patch || selfRVA || funcRVA || codeLen，
+ *   check = le32(Poly1305(key,msg)[0:4])。改造前是**无盐** FNV-1a（key 只取主密钥前 8 字节）——
+ * 那种校验攻击者可以自己重算，等于没有完整性。"
  *
  * 为什么必须在**加载期**做：回填（把被覆盖的几字节补回原生代码）之后，被保护函数
  * 根本不再进入 VM —— 放在解释器里的校验永远不会执行。只有加载期的检查能拦住它。 */
@@ -1484,12 +1487,10 @@ void vm_verify_table(const u32 *t) {
     for (i = 0; i < n; i++) {
         const u32 *e = t + 1 + i * 6;
         const u8 *p = base + (i32)e[0];
-        u32 len = e[1], want = e[2], h = 2166136261u;
-        u8 kf[32];
-        vm_kdf_entry(master, e[4], vm_kdf_salt(e[3], e[4], e[5]), kf);
-        for (j = 0; j < 8; j++) { h ^= (u32)kf[j]; h *= 16777619u; }
-        for (j = 0; j < len; j++) { h ^= (u32)p[j]; h *= 16777619u; }
-        if (h != want) __builtin_trap();
+        u32 len = e[1], want = e[2];
+        if (!len) continue; /* 没写校验值的条目（例如未接 KDF 的单测载荷）直接跳过 */
+        u32 got = vm_patch_mac(master, vm_kdf_salt(e[3], e[4], e[5]), e[3], e[4], e[5], p, len);
+        if (got != want) __builtin_trap();
     }
 }
 

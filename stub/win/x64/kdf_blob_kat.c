@@ -7,7 +7,7 @@
  * stub/win/x64/kdf_kat.c 编的是**单个源文件**（只有一份只读数据），永远发现不了这类
  * "blob 内布局"缺陷；只有把**编好的 blob** 载入可执行内存、调用它里面的函数才能钉住。
  *
- * 用法: kdf_blob_kat <blob.bin> <vm_kdf_salt 偏移> <vm_kdf_entry 偏移>
+ * 用法: kdf_blob_kat <blob.bin> <vm_kdf_salt 偏移> <vm_kdf_entry 偏移> [<vm_patch_mac 偏移>]
  * 期望值与 stub/win/x64/kdf_kat.c、internal/inject/kdf_test.go 三处必须一致。
  * 输出全 ASCII（Windows runner 的编码问题）。
  */
@@ -50,7 +50,7 @@ static void show(const char *what, const u8 *got, int n) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        printf("usage: kdf_blob_kat <blob.bin> <vm_kdf_salt off> <vm_kdf_entry off>\n");
+        printf("usage: kdf_blob_kat <blob.bin> <vm_kdf_salt off> <vm_kdf_entry off> [<vm_patch_mac off>]\n");
         return 2;
     }
     /* 全局 KDF 掩码只影响 vm_crypto.c 的 ChaCha；这里两个函数都用规范 sigma，与构建无关。 */
@@ -112,10 +112,24 @@ int main(int argc, char **argv) {
         }
     }
 
+    int mac_cases = 0;
+    if (argc >= 5) {
+        /* (2) 入口补丁的带密钥 MAC：运行期两个使用点都调它，blob 里算错就全灭。 */
+        unsigned long macOff = strtoul(argv[4], NULL, 0);
+        typedef u32 (*macfn)(const u8 *, u32, u32, u32, u32, const u8 *, u32);
+        macfn pmac = (macfn)(void *)((u8 *)buf + macOff);
+        u8 patch[5] = {0xE9, 0x7B, 0x21, 0x12, 0x00};
+        u32 got = pmac(master, 0x95EA2DB0u, 0x3140u, 0x1670u, 40u, patch, 5);
+        mac_cases = 1;
+        if (got != 0x4DC8B8A6u) {
+            printf("[FAIL] vm_patch_mac(...) = 0x%08X, want 0x4DC8B8A6\n", got);
+            fails++;
+        }
+    }
     if (fails) {
         printf("[FAIL] blob KDF KAT: %d case(s) wrong (relocation/layout bug in vmpbuild?)\n", fails);
         return 1;
     }
-    printf("[OK  ] blob KDF KAT: vm_kdf_salt x5 + vm_kdf_entry x3 match\n");
+    printf("[OK  ] blob KDF KAT: vm_kdf_salt x5 + vm_kdf_entry x3 + patch_mac x%d match\n", mac_cases);
     return 0;
 }

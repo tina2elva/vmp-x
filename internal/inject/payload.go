@@ -276,6 +276,7 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 	tags := make([][16]byte, len(opt.Funcs))
 	nonces := make([][12]byte, len(opt.Funcs))
 	entryKeys := make([][32]byte, len(opt.Funcs)) // 每条目的派生密钥（KDF 未接线时保持全 0）
+	entrySalts := make([]uint32, len(opt.Funcs))
 	for i := range opt.Funcs {
 		body := opt.Funcs[i].Code
 		if opt.Encrypt != nil {
@@ -284,8 +285,8 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			binary.LittleEndian.PutUint32(aad[0:], selfRVA)          // selfRVA
 			binary.LittleEndian.PutUint32(aad[4:], opt.Funcs[i].RVA) // funcRVA
 			if len(opt.Master) == 32 {
-				entryKeys[i] = KDFEntry(opt.Master, opt.Funcs[i].RVA,
-					KDFSaltForPlacement(selfRVA, opt.Funcs[i].RVA, uint32(len(opt.Funcs[i].Code))))
+				entrySalts[i] = KDFSaltForPlacement(selfRVA, opt.Funcs[i].RVA, uint32(len(opt.Funcs[i].Code)))
+				entryKeys[i] = KDFEntry(opt.Master, opt.Funcs[i].RVA, entrySalts[i])
 			}
 			ct, nonce, tag, err := opt.Encrypt(opt.Funcs[i].Code, aad, entryKeys[i])
 			if err != nil {
@@ -380,26 +381,20 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			binary.LittleEndian.PutUint32(patch[1:], uint32(int32(rel)))
 		}
 
-		// (c) 防回填完整性校验：把入口补丁字节的密钥校验值写进描述符
-		// （flags 的 bit8..15 = 补丁长度，pad[0..3] = FNV-1a(key[0:8] ++ patch)）。
+		// (c) 防回填完整性校验：把入口补丁字节的**带密钥 MAC** 写进描述符
+		// （flags 的 bit8..15 = 补丁长度，pad[0..3] = Poly1305 截断到 4 字节）。
 		// 运行期由解释器用**实时读到的**入口字节重算，不一致直接崩 —— 堵住"按尾声补回 5 字节"。
-		if opt.Encrypt != nil && opt.PatchKey != ([8]byte{}) {
+		//
+		// 与旧的无盐 FNV-1a 相比（STATUS #382）：① MAC 密钥与加解密密钥**域分离**
+		// （salt ^ 0x9E3779B9）—— Poly1305 是一次性 MAC，绝不能和 ChaCha20 复用同一把密钥；
+		// ② 消息里绑定了描述符自身（selfRVA/funcRVA/codeLen），把校验值换到别的槽位无效；
+		// ③ 没有 FNV 那种可延展的代数结构。运行期两个使用点（描述符 pad 与加载期校验表的 check）
+		// 用**同一个算式**，因此打包端只算一次。
+		if opt.Encrypt != nil && len(opt.Master) == 32 {
 			// 补丁位置写成「相对描述符的偏移」，运行期据此直接定位（跨 PE/ELF 一致）。
 			binary.LittleEndian.PutUint32(data[d+28:], uint32(int32(fn.RVA)-int32(baseRVA+uint32(d))))
 			binary.LittleEndian.PutUint32(data[d+20:], binary.LittleEndian.Uint32(data[d+20:])|uint32(len(patch)&0xFF)<<8)
-			// 密钥前缀：接了 KDF 就用**本条目的派生密钥**（运行期同样现推，见 VM_INVM_PATCHCHECK 块），
-			// 否则回退到主密钥前 8 字节。
-			key8 := opt.PatchKey
-			if len(opt.Master) == 32 {
-				copy(key8[:], entryKeys[i][:8])
-			}
-			h := uint32(2166136261)
-			for _, b := range key8 {
-				h = (h ^ uint32(b)) * 16777619
-			}
-			for _, b := range patch {
-				h = (h ^ uint32(b)) * 16777619
-			}
+			h := PatchMAC(opt.Master, entrySalts[i], baseRVA+uint32(d), fn.RVA, uint32(len(fn.Code)), patch)
 			binary.LittleEndian.PutUint32(data[d+60:], h)
 			patchChecks[i] = h
 			patchLens[i] = len(patch)

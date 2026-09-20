@@ -4,6 +4,8 @@ typedef unsigned char u8;
 typedef unsigned int u32;
 void vm_kdf_entry(const u8 master[32], u32 rva, u32 salt, u8 out[32]);
 u32 vm_kdf_salt(u32 selfRVA, u32 codeRVA, u32 codeLen);
+u32 vm_patch_mac(const u8 master[32], u32 salt, u32 selfRVA, u32 funcRVA, u32 codeLen,
+                 const u8 *patch, u32 len);
 int main(void) {
     u8 master[32];
     for (int i = 0; i < 32; i++) master[i] = (u8)(0x10 + i);
@@ -27,6 +29,12 @@ int main(void) {
         printf("desc selfRVA=0x%X funcRVA=0x%X codeLen=%u salt=0x%08X key=", selfRVA, funcRVA, codeLen, salt);
         for (int i = 0; i < 32; i++) printf("%02x", out[i]);
         printf("\n");
+    }
+    /* (2) 带密钥 MAC：入口补丁 + 描述符身份的校验值（Go 侧 internal/inject/patchmac.go 同式）。 */
+    {
+        u8 patch[5] = {0xE9, 0x7B, 0x21, 0x12, 0x00};
+        u32 mac = vm_patch_mac(master, 0x95EA2DB0u, 0x3140u, 0x1670u, 40u, patch, 5);
+        printf("pmac salt=0x95EA2DB0 selfRVA=0x3140 funcRVA=0x1670 codeLen=40 -> 0x%08X\n", mac);
     }
     /* 接线约定：镜像节 → 节密钥（KDFEntry(master, rva = 节 RVA, salt = 表头 salt)；nonce/aad 不变）。 */
     {
