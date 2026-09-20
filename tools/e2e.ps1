@@ -296,12 +296,20 @@ if ($LASTEXITCODE -ne 0) {
         $r2 = Get-ExitCode $extExe @("check_key", "10")
         if ((('{0:X8}' -f ($r2.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($r2.Out -eq "")) { $pass++ }
         else { $fail++; $failLines += ("E2EFAIL ext-key/wrong: code=0x{0:X8} out=[{1}]" -f ($r2.Code -band 0xFFFFFFFF), $r2.Out.Trim()) }
-        # 5) correct key => identical to native
+        # 5) correct key delivered as a FILE next to the artifact (the deployment default form)
+        Remove-Item Env:\VMPX_KEY -ErrorAction SilentlyContinue
+        [System.IO.File]::WriteAllText((Join-Path (Get-Location) $extKeyBeside), $extHex.ToUpper())
+        $rf = Get-ExitCode $extExe @("check_key", "10")
+        if (($rf.Code -eq 0) -and ($rf.Out.Trim() -eq "143")) { $pass++ }
+        else { $fail++; $failLines += ("E2EFAIL ext-key/file: code=0x{0:X8} out=[{1}] (expect 143)" -f ($rf.Code -band 0xFFFFFFFF), $rf.Out.Trim()) }
+        Remove-Item $extKeyBeside -ErrorAction SilentlyContinue
+
+        # 6) correct key via the VMPX_KEY environment variable (fallback form) => identical to native
         $env:VMPX_KEY = $extHex.ToUpper()
         $nOut = Run-File "build/target.exe" @("check_key", "10") 30
         $vOut = Run-File $extExe @("check_key", "10") 30
         if (($nOut -ne "") -and ($nOut -eq $vOut)) { $pass++ }
-        else { $fail++; $failLines += ("E2EFAIL ext-key/ok: native=[{0}] protected=[{1}]" -f $nOut.Trim(), $vOut.Trim()) }
+        else { $fail++; $failLines += ("E2EFAIL ext-key/env: native=[{0}] protected=[{1}]" -f $nOut.Trim(), $vOut.Trim()) }
         Remove-Item Env:\VMPX_KEY -ErrorAction SilentlyContinue
     }
 }

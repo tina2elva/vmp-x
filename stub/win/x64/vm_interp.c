@@ -642,6 +642,120 @@ static u32 vm_hexval(u16 c) {
     return 0xFFFFFFFFu;
 }
 
+/* ---- 密钥来源①：外部**文件**（部署默认形态；将来换成硬件狗时换的就是这一个函数） ----
+ * 路径 = <产物全路径>.vmpkey（PEB -> ProcessParameters -> ImagePathName 拼出来，不调 API），
+ * 环境变量 VMPX_KEY_FILE 可覆盖。文件内容接受两种写法：32 字节原始密钥，或 64 位 hex 文本
+ * （vmpbuild -key-out 写的就是后者）。
+ *
+ * 为什么开文件用 **ntdll 的 NtCreateFile/NtReadFile/NtClose** 而不是 kernel32 的
+ * CreateFileA/ReadFile：kernel32 里那批 API 在部分 Windows 版本上是**转发导出**（导出项指向
+ * "KERNELBASE.xxx" 字符串），要么正确解转发、要么就崩/拿不到真地址 —— 这条在 CI 上踩过
+ * （见 STATUS #385）。ntdll 的导出从不转发，所以这里零风险。 */
+typedef struct { u16 Length, MaximumLength; u16 *Buffer; } vm_ustr_t;
+typedef struct {
+    u32 Length, Pad;
+    void *RootDirectory;
+    vm_ustr_t *ObjectName;
+    u32 Attributes, Pad2;
+    void *SecurityDescriptor;
+    void *SecurityQualityOfService;
+} vm_objattr_t;
+typedef struct { void *Status; u64 Information; } vm_iosb_t;
+
+static u16 vm_key_path_buf[360]; /* .bss：别在帧上放这么大一块 */
+
+static const u16 *vm_key_path(void) {
+    u16 *b = vm_key_path_buf;
+    u32 n = 0;
+    const u16 *ov = vm_env_get("VMPX_KEY_FILE");
+    if (ov && *ov) {
+        if (ov[0] != '\\' && ov[0] != '/') {
+            b[n++] = '\\'; b[n++] = '?'; b[n++] = '?'; b[n++] = '\\'; /* 原生 API 要 "\??\" 前缀 */
+        }
+        for (u32 i = 0; ov[i] && n < 344; i++) b[n++] = ov[i];
+        b[n] = 0;
+        return b;
+    }
+    u64 peb = vm_peb_base();
+    if (!peb) return 0;
+    const u8 *pp = *(const u8 *const *)(peb + 0x20);
+    if (!pp) return 0;
+    const vm_ustr_t *ip = (const vm_ustr_t *)(pp + 0x60); /* ImagePathName */
+    if (!ip || !ip->Buffer || ip->Length < 2) return 0;
+    u32 chars = (u32)(ip->Length / 2);
+    if (chars > 330) chars = 330;
+    b[n++] = '\\'; b[n++] = '?'; b[n++] = '?'; b[n++] = '\\';
+    for (u32 i = 0; i < chars; i++) b[n++] = ip->Buffer[i];
+    const char *suf = ".vmpkey";
+    for (u32 i = 0; i < 7; i++) b[n++] = (u16)(u8)suf[i];
+    b[n] = 0;
+    return b;
+}
+
+static int vm_key_read_nt(const u16 *path, u8 *out, u32 cap, u32 *got) {
+    typedef long (*create_t)(void **, u32, vm_objattr_t *, vm_iosb_t *, void *, u32, u32, u32, u32, void *, u32);
+    typedef long (*read_t)(void *, void *, void *, void *, vm_iosb_t *, void *, u32, void *, void *);
+    typedef long (*close_t)(void *);
+    u64 nt = vm_find_module("ntdll.dll");
+    create_t ncf = (create_t)vm_get_proc(nt, "NtCreateFile");
+    read_t nrf = (read_t)vm_get_proc(nt, "NtReadFile");
+    close_t ncl = (close_t)vm_get_proc(nt, "NtClose");
+    if (!ncf || !nrf || !ncl) return 0;
+    vm_ustr_t name;
+    u32 chars = 0;
+    while (path[chars]) chars++;
+    name.Length = (u16)(chars * 2);
+    name.MaximumLength = (u16)(chars * 2 + 2);
+    name.Buffer = (u16 *)path;
+    vm_objattr_t oa;
+    oa.Length = (u32)sizeof(oa); oa.Pad = 0; oa.RootDirectory = 0; oa.ObjectName = &name;
+    oa.Attributes = 0x40u; /* OBJ_CASE_INSENSITIVE */
+    oa.Pad2 = 0; oa.SecurityDescriptor = 0; oa.SecurityQualityOfService = 0;
+    vm_iosb_t iosb;
+    iosb.Status = 0; iosb.Information = 0;
+    void *h = 0;
+    long st = ncf(&h, 0x00120089u /* FILE_GENERIC_READ */, &oa, &iosb, 0, 0x80u /* FILE_ATTRIBUTE_NORMAL */,
+                  1u /* FILE_SHARE_READ */, 1u /* FILE_OPEN */, 0x40u | 0x20u, 0, 0);
+    if (st < 0 || !h) return 0;
+    long rs = nrf(h, 0, 0, 0, &iosb, out, cap, 0, 0);
+    ncl(h);
+    if (rs < 0) return 0;
+    *got = (u32)iosb.Information;
+    return 1;
+}
+
+/* 文件内容 -> 主密钥：32 字节原始，或 64 位 hex 文本（允许尾随空白）。 */
+static int vm_key_parse(const u8 *buf, u32 got) {
+    if (got == 32) {
+        for (u32 i = 0; i < 32; i++) vm_master_buf[i] = buf[i];
+        return 1;
+    }
+    u8 hex[64];
+    u32 n = 0;
+    for (u32 i = 0; i < got; i++) {
+        u8 c = buf[i];
+        if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
+        if (n >= 64) return 0;
+        hex[n++] = c;
+    }
+    if (n != 64) return 0;
+    for (u32 i = 0; i < 32; i++) {
+        u32 hi = vm_hexval(hex[2 * i]), lo = vm_hexval(hex[2 * i + 1]);
+        if (hi > 15 || lo > 15) return 0;
+        vm_master_buf[i] = (u8)((hi << 4) | lo);
+    }
+    return 1;
+}
+
+static int vm_key_from_file(void) {
+    const u16 *path = vm_key_path();
+    if (!path || !*path) return 0;
+    u8 buf[128];
+    u32 got = 0;
+    if (!vm_key_read_nt(path, buf, (u32)sizeof(buf), &got)) return 0;
+    return vm_key_parse(buf, got);
+}
+
 /* VMPX_KEY = 64 个十六进制字符 -> 32 字节主密钥。 */
 static int vm_key_from_env(void) {
     const u16 *v = vm_env_get("VMPX_KEY");
@@ -656,7 +770,11 @@ static int vm_key_from_env(void) {
 
 const u8 *vm_master(void) {
     if (vm_master_ok) return vm_master_buf;
-    if (!vm_key_from_env()) vm_key_reject();
+    /* 取钥顺序：① 外部文件（部署默认：与产物同目录的 <产物名>.vmpkey）
+     *           ② 环境变量 VMPX_KEY（64 位 hex，方便临时/CI 用）
+     * 两者都拿不到、或与 KCV 不符 -> 硬门 0xC0DE0007。将来上硬件狗时，
+     * 换掉的只是 ①（同一个函数接缝：把 vm_key_from_file 换成向狗询问即可）。 */
+    if (!vm_key_from_file() && !vm_key_from_env()) vm_key_reject();
     {   /* KCV 自检：在任何解密之前判定"手里这把主密钥对不对" */
         static const u8 want[VM_KEY_CHECK_LEN] = VM_KEY_CHECK_BYTES;
         u8 kcv[32];

@@ -102,7 +102,7 @@ func main() {
 	guest := flag.String("guest", "x86-64", "客户机 ISA：x86-64（默认）或 arm64")
 	merge := flag.String("merge", "ld", "目标文件合并方式：ld（GNU ld -r）或 go（内置直拼，COFF 用它）")
 	keyExternal := flag.Bool("key-external", false, "主密钥外置（1b）：blob 里只放占位密钥 + 密钥校验值，真主密钥运行期从外部取")
-	keyOut := flag.String("key-out", "", "配合 -key-external：把真主密钥以 64 位 hex 文本写到该文件（部署时设成环境变量 VMPX_KEY）")
+	keyOut := flag.String("key-out", "", "配合 -key-external：把真主密钥以 64 位 hex 文本写到该文件（部署时放到 <产物>.vmpkey 即可）")
 	verbose := flag.Bool("v", false, "打印符号与重定位详情")
 	flag.Parse()
 
@@ -145,7 +145,7 @@ func main() {
 		if werr := os.WriteFile(*keyOut, []byte(keyHex), 0o600); werr != nil {
 			fatalf("写主密钥文件失败: %v", werr)
 		}
-		fmt.Printf("[*] 主密钥已写到 %s（64 位 hex 文本；设成环境变量 VMPX_KEY 即可运行产物）", *keyOut)
+		fmt.Printf("[*] 主密钥已写到 %s（64 位 hex 文本；部署时改名为 <产物全路径>.vmpkey）", *keyOut)
 		fmt.Println()
 	}
 	_ = keyPath
