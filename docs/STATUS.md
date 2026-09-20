@@ -4162,3 +4162,34 @@ Windows 的 VirtualProtect 同理）。这是**待验证**的假设 —— 下�
 
 **仍未做（如实）**：aarch64 的只读数据节整体加密不可用（根因未定，下一步需要 `VMPELF prot rva=... rc=...`
 无条件诊断把崩溃点变成读数）；PE 侧 CI 尚未接 expose_report 语义门禁。
+
+### 378. 针对第三方报告【成立】批评的加固：范围、已落地前置、接线计划
+报告里**成立且值得做**的条目（我在 397 轮末尾逐条评估过价值/代价/可验证性）：
+P3.10 密钥不派生且随文件分发、P3.13 同密钥解全部、P2.7/8 无盐 FNV 与每调用全校验、
+P1.1-5 容器/记录明文（魔数、RVA、长度、标志）、P2.6 反调试仅 BeingDebugged、
+P4.14 固定基址/拆重定位、P4.15 加载时整段解密。**不在此列**：报告的 P0 机制判断
+（"解密后原生执行"）与"离线解密即得原函数体"——那两条由报告作者按同源对照去验证。
+
+**已落地的前置（提交 3b1adaa / 7346d91 / df6ebba）**
+- 每函数派生定义（两侧可独立复现，KAT 钉死）：
+  `K_f = ChaCha20_block(key = master, counter = 0, nonce = le32(rva) || le32(salt) || 0^8)[0..32)`
+  - C：`stub/win/x64/vm_kdf.c`（标准 ChaCha20 块，刻意不复用 vm_crypto.c 里 sigma 随机化那套）+ `kdf_kat.c` 主机 KAT；
+  - Go：`internal/inject/kdf.go` + `kdf_test.go`（期望值取自 C 侧实测，真断言）；
+  - KAT（master=0x10..0x2F）：0x1670/0x11223344 → 03504d6e…a04fc1；0x16A0 → 4bbdfb88…8538ce；0x93000/0xAABBCCDD → 1966610b…41e149（两侧逐字节一致）。
+- `vm_kdf.c` 进 blob 的正确方式：`cmd/vmpbuild/main.go:481` 那处 `appendUnique`（**不是** BLOB.sources，
+  那是相对 stub 的路径列表，只列 vm_interp.c 与入口汇编）；blob 重建通过即为证。
+- 两个自己的坑（都已修并记录）：往 BLOB.sources 加裸文件名**弄坏了 blob 构建**；
+  用"blob 里搜符号名"做验证**未做校准**（连 vm_entry 都搜不到，名字其实在 manifest 里）。
+
+**1a 接线计划（下一步）**
+1. 先定：字节码描述符只有 16 字节 nonce、**没有 salt 字段** → 二选一（加字段 / 从 nonce 派生 salt），两侧一致后再动手；
+2. 打包端 `cmd/vmpack/main.go:142 / 893 / 937`：单个 `aead` → 每条目 `aead_f = AEAD(KDFEntry(master, rva, salt))`；`patchKey` 改由 `K_f` 派生；
+3. 运行期 `stub/win/x64/vm_interp.c` 七处 `u8 key[32] = VM_KEY_BYTES`（558/659/679/1344/1454/1544/1695）→ 按条目现推 `K_f`；
+4. 补"不同 RVA ⇒ 不同密钥"用例，重建 blob，跑 `tools/gates.ps1` 11/0 + e2e 147/147 + CI。
+
+**1b（紧随）**：blob 不再含真实主密钥（编译占位），真密钥来源可切（env / 外部文件 / 授权），
+payload 里放**密钥校验 tag**；缺失或不匹配 ⇒ **硬门拒绝执行**（专用退出码 `0xC0DE0007`、无输出），
+默认 file 源保持兼容；CI 两次运行验证"不给密钥必须恰好以该码失败 / 给了必须与原生一致"。
+
+**其余条目**：P2 带密钥 MAC + 抽样校验（含开销前后数字）、P1 容器加密与混淆、
+P2.6 反调试多路径、P4.15 按需解密（先评估收益）、P4.14 重定位/ASLR（评估后实现或登记取舍）。
