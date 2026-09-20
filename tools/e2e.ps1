@@ -262,10 +262,17 @@ if ($LASTEXITCODE -ne 0) {
         # Calibrate the probe first: the needles must really be 32-byte keys.
         # (A wrong needle would silently turn "key not found" into a false PASS, so we
         #  assert the input instead of trusting the search.)
-        $compatMan = Get-Content build\vm_interp.json -Raw | ConvertFrom-Json
-        $compatHex = [string]$compatMan.key
-        $extManObj = Get-Content $extMan -Raw | ConvertFrom-Json
-        $extHex = [string]$extManObj.key
+        # NOTE: do NOT use ConvertFrom-Json here. Windows PowerShell 5.1 throws
+        # "the value of argument name is not valid" on manifests that contain an empty
+        # JSON property name (the blob symbol table can have one, depending on the
+        # toolchain), and the failure mode is silent: '' as the needle would make the
+        # "key not found" checks pass for the wrong reason. A regex cannot do that.
+        $compatRaw = Get-Content build\vm_interp.json -Raw
+        $compatHex = ""
+        if ($compatRaw -match '"key"\s*:\s*"([0-9a-fA-F]{64})"') { $compatHex = $Matches[1] }
+        $extRaw = Get-Content $extMan -Raw
+        $extHex = ""
+        if ($extRaw -match '"key"\s*:\s*"([0-9a-fA-F]{64})"') { $extHex = $Matches[1] }
         if (($compatHex.Length -ne 64) -or ($extHex.Length -ne 64)) {
             $fail++
             $failLines += ("E2EFAIL ext-key: manifest key hex is not 64 chars (compat={0} ext={1})" -f $compatHex.Length, $extHex.Length)

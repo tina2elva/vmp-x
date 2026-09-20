@@ -551,12 +551,14 @@ static u32 vm_master_ok; /* .bss：0 = 还没取，1 = 已取且 KCV 通过 */
 static u64 vm_find_module(const char *name);
 static void *vm_get_proc(u64 mod, const char *fn);
 
-static void vm_key_reject(void) {
+static void vm_key_reject_code(u32 code) {
     typedef void (*exitfn_t)(u32);
     exitfn_t ex = (exitfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "ExitProcess");
-    if (ex) ex(0xC0DE0007u); /* 硬门：专用退出码、无任何输出 */
+    if (ex) ex(0xC0DE0000u | code);
     __builtin_trap();
 }
+/* 硬门：专用退出码 0xC0DE0007、无任何输出 */
+static void vm_key_reject(void) { vm_key_reject_code(7u); }
 
 /* 读 32 字节原始密钥（部署时文件叫 <产物全路径>.vmpkey）。成功返回 1。 */
 static int vm_key_read_file(const char *path) {
@@ -567,10 +569,16 @@ static int vm_key_read_file(const char *path) {
     createfn_t cf = (createfn_t)vm_get_proc(k32, "CreateFileA");
     readfn_t rf = (readfn_t)vm_get_proc(k32, "ReadFile");
     closefn_t xf = (closefn_t)vm_get_proc(k32, "CloseHandle");
-    if (!cf || !rf || !xf) return 0;
+    if (!cf || !rf || !xf) {
+        vm_key_reject_code(0x105u);                /* TEMP-DIAG: 文件 API 取不到 */
+        return 0;
+    }
     void *h = cf(path, 0x80000000u /* GENERIC_READ */, 1u /* FILE_SHARE_READ */, 0,
                  3u /* OPEN_EXISTING */, 0, 0);
-    if (!h || h == (void *)(long long)-1) return 0;
+    if (!h || h == (void *)(long long)-1) {
+        vm_key_reject_code(0x106u);                /* TEMP-DIAG: 打不开密钥文件 */
+        return 0;
+    }
     u32 got = 0;
     int ok = rf(h, vm_master_buf, 32, &got, 0);
     xf(h);
@@ -584,13 +592,16 @@ static void vm_key_path(char *buf, u32 cap) {
     u64 k32 = vm_find_module("KERNEL32.DLL");
     u32 room = cap - 8u;
     genvfn_t genv = (genvfn_t)vm_get_proc(k32, "GetEnvironmentVariableA");
+    if (!k32) vm_key_reject_code(0x101u);          /* TEMP-DIAG: 找不到 kernel32 */
+    if (!genv) vm_key_reject_code(0x102u);         /* TEMP-DIAG: GetEnvironmentVariableA 取不到 */
     if (genv) {
         u32 n = genv("VMPX_KEY_FILE", buf, room);
         if (n > 0 && n < room) { buf[n] = 0; return; }
     }
     gmfn_t gm = (gmfn_t)vm_get_proc(k32, "GetModuleFileNameA");
+    if (!gm) vm_key_reject_code(0x103u);           /* TEMP-DIAG: GetModuleFileNameA 取不到 */
     u32 n = gm ? gm(0, buf, room) : 0;
-    if (n == 0 || n >= room) vm_key_reject();
+    if (n == 0 || n >= room) vm_key_reject_code(0x104u); /* TEMP-DIAG: 取模块路径失败 */
     const char *suf = ".vmpkey";
     for (u32 i = 0; i < 8; i++) buf[n + i] = (u8)suf[i];
 }
@@ -605,7 +616,7 @@ const u8 *vm_master(void) {
         u8 kcv[32];
         vm_kdf_entry(vm_master_buf, VM_KEY_CHECK_RVA, VM_KEY_CHECK_SALT, kcv);
         for (u32 i = 0; i < (u32)VM_KEY_CHECK_LEN; i++) {
-            if (kcv[i] != want[i]) vm_key_reject();
+            if (kcv[i] != want[i]) vm_key_reject_code(0x107u); /* TEMP-DIAG: KCV 不符 */
         }
     }
     vm_master_ok = 1;
@@ -1756,6 +1767,23 @@ static u64 vm_find_module(const char *name) {
  * 于是 0xC0000005。这个缺陷在**本机看不出来**（本机 kernel32 恰好是真实桩），
  * 只在 CI 的 runner（kernel32 把这些转发给 kernelbase）上暴露；现有的镜像自解密只用到
  * VirtualProtect/ExitProcess，恰好两边都是真实导出，所以一直没被踩到。 */
+/* rva 是否落在**可执行节**里：真实导出函数一定在可执行节，而转发器字符串在只读数据节。
+ * 用它兜住"导出目录的 Size 不覆盖转发器字符串"的情况 —— 只按 [expRva,expRva+expSize)
+ * 判转发器是标准做法，但那个 Size 各家链接器写法不一，实测就差在这里出过事。 */
+static int vm_rva_is_exec(const u8 *p, const u8 *pe, u32 rva) {
+    u32 nsec = *(const u16 *)(pe + 6);
+    u32 optSize = *(const u16 *)(pe + 20);
+    const u8 *sec = pe + 24 + optSize;
+    for (u32 i = 0; i < nsec && i < 96; i++) {
+        const u8 *s = sec + (u64)i * 40;
+        u32 vsz = *(const u32 *)(s + 8);
+        u32 va = *(const u32 *)(s + 12);
+        u32 chars = *(const u32 *)(s + 36);
+        if (rva >= va && rva < va + (vsz ? vsz : 1u)) return (chars & 0x20000000u) != 0;
+    }
+    return 0;
+}
+
 static void *vm_get_proc_d(u64 mod, const char *fn, int depth) {
     const u8 *p = (const u8 *)mod;
     if (!p || depth > 4 || *(const u16 *)p != 0x5A4D) return 0; /* "MZ" */
@@ -1777,7 +1805,7 @@ static void *vm_get_proc_d(u64 mod, const char *fn, int depth) {
             u16 o = ords[i];
             if (o >= nFuncs) return 0;
             u32 rva = funcs[o];
-            if (expSize && rva >= expRva && rva < expRva + expSize) {
+            if ((expSize && rva >= expRva && rva < expRva + expSize) || !vm_rva_is_exec(p, pe, rva)) {
                 const char *fwd = (const char *)(p + rva); /* "KERNELBASE.CreateFileA" */
                 char dll[64];
                 u32 k = 0;
