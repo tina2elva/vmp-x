@@ -4408,6 +4408,18 @@ CI run **35494537015** 的 **linux-arm64** 立刻红：
 - 本条的防护等级是 **L1.5**：产物不再自足（拿不到密钥就解不出任何字节码），但密钥仍在进程内，
   挡不住运行期抓取 —— 要那一档需要 (4) 反调试/反 dump 配套。
 
+**第一次上 CI 就被打回来，暴露一个一直存在但没人踩到的缺陷（已修）**：CI run **35497237045** 的 windows-amd64
+报 `E2EFAIL ext-key/none: code=0xC0000005`（本机全绿）。根因是 `vm_get_proc` **不处理转发导出（forwarder）**：
+kernel32 里一大批 API 的导出项不是代码，而是指向字符串 `"KERNELBASE.CreateFileA"` 的 RVA（判据：RVA 落在导出目录范围内），
+旧实现把它当函数地址返回 —— 调过去等于跳进只读的字符串页 ⇒ 0xC0000005。
+**本机 kernel32 这 5 个 API 恰好是真实桩**（写了个小工具逐个查导出项，`fwd=0`），而 runner 的 kernel32 把它们转发给
+kernelbase，所以只有 CI 会崩；现有镜像自解密只用 VirtualProtect/ExitProcess，两边都是真实导出，因此这个洞一直没被踩到。
+修法：识别转发器并按 `<DLL>.<Func>` 递归解析（`vm_find_module` 先试原名再补 `.DLL`，深度上限 4）。
+**算法校准**：本机 `kernel32!AppPolicyGetClrCompat` 确实是转发导出，用同一套逻辑解析它 == `GetProcAddress` 的结果；
+`VirtualProtect`（非转发）也相等 —— 两条都验过才敢说这个修改可信。
+顺带把 e2e 里的探针按"先校准"改了：**先断言 manifest 里的 key 是 64 位 hex**，
+不合格就报 `manifest key hex is not 64 chars`，而不是让错误 needle 把"没找到"变成假 PASS。
+
 **证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e **152 passed / 0 failed**）；CI run（待填）。
 
 **未做**：(2) 带密钥 MAC、(3) 容器加密/混淆、(4) 反调试多路径、(6) 重定位/ASLR。

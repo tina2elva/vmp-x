@@ -1748,14 +1748,22 @@ static u64 vm_find_module(const char *name) {
     return 0;
 }
 
-/* 从模块的导出表按名字取函数地址（PE32+：导出目录在可选头 +112） */
-static void *vm_get_proc(u64 mod, const char *fn) {
+/* 从模块的导出表按名字取函数地址（PE32+：导出目录在可选头 +112）。
+ *
+ * 必须处理**转发导出（forwarder）**：kernel32 里有一大批 API 的导出项不是代码，而是
+ * 指向字符串 "KERNELBASE.CreateFileA" 的 RVA（判据：该 RVA 落在导出目录范围之内）。
+ * 旧实现把那个 RVA 直接当函数地址返回 —— 调过去就是跳进一段字符串，页属性是只读，
+ * 于是 0xC0000005。这个缺陷在**本机看不出来**（本机 kernel32 恰好是真实桩），
+ * 只在 CI 的 runner（kernel32 把这些转发给 kernelbase）上暴露；现有的镜像自解密只用到
+ * VirtualProtect/ExitProcess，恰好两边都是真实导出，所以一直没被踩到。 */
+static void *vm_get_proc_d(u64 mod, const char *fn, int depth) {
     const u8 *p = (const u8 *)mod;
-    if (!p || *(const u16 *)p != 0x5A4D) return 0;              /* "MZ" */
+    if (!p || depth > 4 || *(const u16 *)p != 0x5A4D) return 0; /* "MZ" */
     u32 lfanew = *(const u32 *)(p + 0x3C);
     const u8 *pe = p + lfanew;
     if (*(const u32 *)pe != 0x00004550u) return 0;              /* "PE\0\0" */
     u32 expRva = *(const u32 *)(pe + 24 + 112);
+    u32 expSize = *(const u32 *)(pe + 24 + 116);
     if (!expRva) return 0;
     const u8 *exp = p + expRva;
     u32 nFuncs = *(const u32 *)(exp + 20);
@@ -1767,11 +1775,33 @@ static void *vm_get_proc(u64 mod, const char *fn) {
         const char *nm = (const char *)(p + names[i]);
         if (vm_name_eq(nm, fn)) {
             u16 o = ords[i];
-            return (o < nFuncs) ? (void *)(p + funcs[o]) : 0;
+            if (o >= nFuncs) return 0;
+            u32 rva = funcs[o];
+            if (expSize && rva >= expRva && rva < expRva + expSize) {
+                const char *fwd = (const char *)(p + rva); /* "KERNELBASE.CreateFileA" */
+                char dll[64];
+                u32 k = 0;
+                while (fwd[k] && fwd[k] != '.' && k < 56) { dll[k] = fwd[k]; k++; }
+                if (fwd[k] != '.') return 0;
+                dll[k] = 0;
+                u64 tgt = vm_find_module(dll); /* PEB 里的模块名带扩展名，先补 ".DLL" 试一次 */
+                if (!tgt) {
+                    const char *ext = ".DLL";
+                    u32 e = 0;
+                    while (ext[e] && k + e < 60) { dll[k + e] = ext[e]; e++; }
+                    dll[k + e] = 0;
+                    tgt = vm_find_module(dll);
+                }
+                if (!tgt) return 0;
+                return vm_get_proc_d(tgt, fwd + k + 1, depth + 1);
+            }
+            return (void *)(p + rva);
         }
     }
     return 0;
 }
+
+static void *vm_get_proc(u64 mod, const char *fn) { return vm_get_proc_d(mod, fn, 0); }
 
 /* 返回 0 = 成功；负数是可辨认的失败码（会以"被保护程序莫名退出"的形式暴露，便于定位） */
 /* 诊断：整体加密自解密的观测量（.bss；非 static 以便进 manifest 符号表）。

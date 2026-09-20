@@ -259,11 +259,23 @@ if ($LASTEXITCODE -ne 0) {
         $fail++
         $failLines += "E2EFAIL ext-key: packing with the external blob failed"
     } else {
-        $compatKey = Get-BytesFromHex (Get-Content build\vm_interp.json -Raw | ConvertFrom-Json).key
-        $realKey = Get-BytesFromHex (Get-Content $extMan -Raw | ConvertFrom-Json).key
+        # Calibrate the probe first: the needles must really be 32-byte keys.
+        # (A wrong needle would silently turn "key not found" into a false PASS, so we
+        #  assert the input instead of trusting the search.)
+        $compatMan = Get-Content build\vm_interp.json -Raw | ConvertFrom-Json
+        $compatHex = [string]$compatMan.key
+        $extManObj = Get-Content $extMan -Raw | ConvertFrom-Json
+        $extHex = [string]$extManObj.key
+        if (($compatHex.Length -ne 64) -or ($extHex.Length -ne 64)) {
+            $fail++
+            $failLines += ("E2EFAIL ext-key: manifest key hex is not 64 chars (compat={0} ext={1})" -f $compatHex.Length, $extHex.Length)
+        } else {
+            $compatKey = Get-BytesFromHex $compatHex
+            $realKey = Get-BytesFromHex $extHex
+        }
         # 1) control: the compat artifact really does carry its key (proves the search works)
-        if (Test-FileContains "build\target_vmp.exe" $compatKey) { $pass++ }
-        else { $fail++; $failLines += "E2EFAIL ext-key: control failed - compat artifact does not contain its key (search broken?)" }
+        if ($compatKey -and (Test-FileContains "build\target_vmp.exe" $compatKey)) { $pass++ }
+        elseif ($compatKey) { $fail++; $failLines += "E2EFAIL ext-key: control failed - compat artifact does not contain its key (search broken?)" }
         # 2) the real key must NOT be in the external artifact
         if (Test-FileContains $extExe $realKey) { $fail++; $failLines += "E2EFAIL ext-key: master key IS present in the artifact" }
         else { $pass++ }
