@@ -198,7 +198,9 @@ jobs:
           OBJDUMP: aarch64-linux-gnu-objdump
         run: |
           set -o pipefail
-          BLOB_SRC=stub/linux/arm64 BLOB_CC=aarch64-linux-gnu-gcc BLOB_GUEST=arm64 GOARCH_TARGET=arm64 QEMU=qemu-aarch64 TAG=a64 \
+          BLOB_SRC=stub/linux/arm64 BLOB_CC=aarch64-linux-gnu-gcc BLOB_GUEST=arm64 \
+          BLOB_EXTRA="-merge go -random-opcodes=false -objdump aarch64-linux-gnu-objdump" \
+          GOARCH_TARGET=arm64 QEMU=qemu-aarch64 TAG=a64 \
             bash tools/e2e_elf_image.sh --strict 2>&1 | tee build/elf_image_e2e_a64.log
 
   # ---------------------------------------------------------------- Windows/arm64: blob build（clang + aarch64-w64-windows-gnu）
