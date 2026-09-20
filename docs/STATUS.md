@@ -4126,3 +4126,23 @@ CI 上实测：aarch64 目标 `protected rc=139`（qemu SIGSEGV）；x86-64 上�
    是"节超出行映射"、"mprotect 目标越界"，还是"某节与已加密段重叠"；
 2. 解释 CI 与本地暴露面数字的差异（先把两边的 `tools/expose_report.py` 明细并排打出来，再看节头在打包后是否仍指向同一位置）；
 3. 都解释通之后才把候选节默认打开 + 语义级门禁接回 e2e。
+
+### 376. aarch64 数据节崩溃的排查（进行中）：布局已排除两个假设，怀疑"往只读页写"
+把 `.rodata`/`.gopclntab` 纳入整体加密后（提交 98c3caa，现已默认关）：
+- **x86-64 不受影响**：run 35484769361 里 linux-amd64 的 `ELF end-to-end` 那步是过的
+  （即打包后带着加密只读数据节的 x86-64 ELF 真跑成功）。该 run 里 linux-amd64 的**唯一**红是我 e2e 脚本的
+  续行转义 bug（`\` 变成字面参数 → `--sections: command not found` → `|| fail` 报了误导性的"仍有残留可读串"）。
+- **aarch64 崩**：`[!] arm64 end-to-end: MISMATCH (native rc=0, protected rc=139)`、`qemu: uncaught target signal 11`，
+  且日志里**没有** `VMPELF ...` 失败打印 ⇒ 不是我们那几条失败路径，而更像"mprotect 之后往只读页里写"那一步。
+
+本机交叉编译 aarch64 目标后的布局（`GOOS=linux GOARCH=arm64`，无需交叉工具链）：
+```
+PH[2] LOAD R+X off=0x0     va=0x10000  filesz=0x91064 memsz=0x91064 end=0xA1064
+PH[3] LOAD R   off=0xA0000 va=0xB0000  filesz=0xBE668 memsz=0xBE668 end=0x16E668
+.text      end=0xA1064  inPH=2   .rodata end=0xFBC07  inPH=3   .gopclntab end=0x16E668 inPH=3
+```
+⇒ **"节超出实际映射"与"与已加密段重叠"两个假设都被数据否掉**（两节都完整落在只读段内）。
+
+处置：解密时的临时权限从"一律 R|W|X"改成"执行节 R|W|X、数据节 R|W"（三条分支：Linux x86-64、Linux aarch64、
+Windows 的 VirtualProtect 同理）。这是**待验证**的假设 —— 下一轮在 `linux-arm64` 上只为那一步打开
+`-enc-image-elf-data` 复现，并抓 `build/ci_step.log` 里的打包/运行输出。

@@ -1472,7 +1472,10 @@ int vm_unpack_image(const void *tblp) {
         u64 page = 0x1000;
         u64 pstart = (u64)dst & ~(page - 1);
         u64 pend = ((u64)dst + size + page - 1) & ~(page - 1);
-        long mr = vm_syscall3_a64(226 /* SYS_mprotect */, (long)pstart, (long)(pend - pstart), 1 | 2 | 4);
+        /* 临时放开写权限即可：**只读数据节不需要 X**。一律要 RWX 是多余的，
+         * 且在 aarch64（qemu）上实测会让打包后的目标 SIGSEGV。 */
+        u32 tmpProt = 1u | 2u | ((flags & 1u) ? 4u : 0u);
+        long mr = vm_syscall3_a64(226 /* SYS_mprotect */, (long)pstart, (long)(pend - pstart), (long)tmpProt);
         if (mr != 0) {
             vm_img_diag[0] = 5;
             vm_dbg_trace("VMPELF mprotectfail rva=", (long)rva);
@@ -1556,7 +1559,9 @@ int vm_unpack_image(const void *tblp) {
         u64 page = 0x1000;
         u64 pstart = (u64)dst & ~(page - 1);
         u64 pend = ((u64)dst + size + page - 1) & ~(page - 1);
-        long mr = vm_syscall3(10 /* SYS_mprotect */, (long)pstart, (long)(pend - pstart), 1 | 2 | 4);
+        /* 同 aarch64：只读数据节临时只要 R|W，不要 X。 */
+        u32 tmpProt = 1u | 2u | ((flags & 1u) ? 4u : 0u);
+        long mr = vm_syscall3(10 /* SYS_mprotect */, (long)pstart, (long)(pend - pstart), (long)tmpProt);
         if (mr != 0) {
             vm_img_diag[0] = 5;
             vm_dbg_trace("VMPELF mprotectfail rva=", (long)rva);
@@ -1704,7 +1709,7 @@ int vm_unpack_image(const void *tblp) {
         *(u32 *)(aad + 4) = size;
         if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_img_fail(4); return -4; }
         u32 old = 0;
-        if (!vp(dst, size, 0x40u /* PAGE_EXECUTE_READWRITE */, &old)) { vm_img_diag[0] = 5; vm_img_fail(5); return -5; }
+        if (!vp(dst, size, (flags & 1u) ? 0x40u : 0x04u /* 执行节 RWX，数据节 RW */, &old)) { vm_img_diag[0] = 5; vm_img_fail(5); return -5; }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
         /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）
          * PAGE_READONLY=0x02 / PAGE_READWRITE=0x04 / PAGE_EXECUTE_READ=0x20 / PAGE_EXECUTE_READWRITE=0x40 */
