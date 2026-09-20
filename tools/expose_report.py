@@ -84,6 +84,8 @@ def main():
     ap.add_argument("--sections", default="", help="only these sections (comma separated)")
     ap.add_argument("--minlen", type=int, default=6)
     ap.add_argument("--max-ratio", type=float, default=1.0,
+    ap.add_argument("--max-abs", type=int, default=256,
+                    help="absolute allowance for >=12-char readable bytes in the packed image; a tiny original makes the ratio meaningless (random data yields short printable runs)")
                     help="with --compare: fail (exit 2) if the packed image keeps more than this fraction of the original >=12-byte readable strings")
     a = ap.parse_args()
     only = [s.strip() for s in a.sections.split(",") if s.strip()]
@@ -120,11 +122,16 @@ def main():
         print("    %-14s H=%.2f -> H=%.2f   readable>=%d: %d -> %d  (hidden %.0f%%)"
               % ("TOTAL", entropy(d), entropy(d2), a.minlen, tot6, o6,
                  100.0 * (tot6 - o6) / max(tot6, 1)))
-        if tot12 > 0 and o12 > int(tot12 * a.max_ratio):
-            print("[!] packed image still exposes %d bytes of >=12-char readable strings (%.1f%% of original %d, limit %.1f%%)"
-                  % (o12, 100.0 * o12 / tot12, tot12, 100.0 * a.max_ratio))
+        # 通过条件：比例达标 **或** 绝对量本来就很小。
+        # 只查 .text 时原始基线可能只有几百字节，此时"比例"没有意义 ——
+        # 随机密文本身就会产生零星的 12 字节可打印串（aarch64 实测 69 字节/590KB，比例 29%）。
+        if tot12 > 0 and o12 > int(tot12 * a.max_ratio) and o12 > a.max_abs:
+            print("[!] packed image still exposes %d bytes of >=12-char readable strings "
+                  "(%.1f%% of original %d, limits: %.1f%% and %d bytes)"
+                  % (o12, 100.0 * o12 / tot12, tot12, 100.0 * a.max_ratio, a.max_abs))
             sys.exit(2)
-        print("[+] readable-string exposure is within the limit (packed %d bytes vs original %d)" % (o12, tot12))
+        print("[+] readable-string exposure is within the limit (packed %d bytes vs original %d; ratio limit %.1f%%, absolute %d)"
+              % (o12, tot12, 100.0 * a.max_ratio, a.max_abs))
 
 
 if __name__ == "__main__":
