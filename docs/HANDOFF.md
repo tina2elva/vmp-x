@@ -89,3 +89,22 @@
 2. 本机产品级回归：demo64 三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 输出除 base 两行外一致；
 3. CI **五个作业全绿**（run 号写进 STATUS）；
 4. `docs/STATUS.md` 追加一条：做了什么、证据（含 run 号与命令）、**未做项**。
+
+
+---
+
+## 附录 A：T1 精确改动点（动手前先按这里 `grep` 出原文）
+- 打包端 `cmd/vmpack/main.go`：单个 `aead` 的三处使用（字节码 Seal ≈142 行、PE 整体加密 Seal ≈893 行、ELF 整体加密 ≈937 行）；`patchKey` 赋值 ≈147 行；`inject.Options` 传递处 ≈491/661 行。
+- 运行期 `stub/win/x64/vm_interp.c`：七处 `u8 key[32] = VM_KEY_BYTES;`（≈558/659/679/1344/1454/1544/1695）。
+- 派生函数已就位：`internal/inject/kdf.go` 的 `KDFEntry`/`KDFSaltForPlacement`；C 侧 `stub/win/x64/vm_kdf.c` 的 `vm_kdf_entry`/`vm_kdf_salt`（KAT 已对齐，5 组向量见 `docs/STATUS.md #378`）。
+- 注意：另一会话已在 `vm_interp.c` 里用 `d->reserved1` 作条目 salt 调用 `vm_kdf_entry` —— **先确认它与打包端写入的字段含义一致**，不一致就是全量 trap。
+
+## 附录 B：验收证据清单（缺一不可）
+1. `tools/preflight.ps1` → `[+] preflight: OK`；
+2. `tools/gates.ps1` → `total 11 gates, 0 failed`（e2e 147/0、dll 3/3、arm64 客户机 OK）；
+3. demo64：三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 仅 base/地址两行不同、退出码 0=0；
+4. CI 五个作业全绿，run 号写进 STATUS。
+
+## 附录 C：并发协作约定
+- 工作区可能有两个会话同时改：**提交只用明确路径**（如 `git add cmd/vmpack/main.go`），**不要 `git add -A`**；动手前 `git status`/`git log` 看清现状。
+- 若发现别人未提交的改动：**不要覆盖**，先确认边界或停下来问。
