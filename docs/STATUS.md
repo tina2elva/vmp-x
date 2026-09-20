@@ -3982,3 +3982,36 @@ ELF/arm64 侧的实现、DLL 的默认加密（当前必须显式开 enc-image-d
 工具侧沉淀：tools/image_residue.py（PE 多节）、tools/image_residue_elf.py（ELF 执行段）、
 tools/residue_probe.py（运行期原生码/明文字节码）、tools/live_code_{residue,map}.py、tools/rip_probe.py、
 tools/e2e_elf_image.sh（Linux 侧真机检查）。
+
+### 365. 第十轮（CI 循环）：arm64（Linux/aarch64 + qemu）整体加密**真机验证通过**
+CI run 35481263128（提交 2c5daaa）**五个作业全绿**，其中 linux-arm64 新增那步跑出：
+```
+[*] ELF 整体加密：PT_LOAD(X) va=0x10000 跳过头部 4096 字节，加密 589924 字节（入口自解密）
+[*] ELF PT_LOAD(X) va=0x11000 size=589924 | chunks=9217 all-zero(excluded)=0 NON-ZERO FOUND=0
+[+] no ELF code readable in the packed file
+[*] 运行期：原生 vs 加密后逐字节比对
+[OK  ] ELF 整体加密：输出一致
+[+] e2e_elf_image: OK
+```
+即：**aarch64 的可执行段在文件里被整体加密（0 残留），入口自解密（mprotect=226 那条 svc 路径）在
+qemu-aarch64 上真跑，输出与原生逐字节一致**。目标项 (2) 的 ELF/x86-64 与 Linux/aarch64 两半都有真机证据。
+
+### 366. 这一路 CI 抓到 / 修掉的问题（都不在本机能复现）
+1. **ELF 头被加密**（run #288）：ET_EXEC 第一个 PT_LOAD 的 p_offset=0，ELF 头/程序头表都在里面 →
+   e_entry 读出来是垃圾。修：跳过 [0, align_up(phoff+phnum*phentsize, 4096))。
+2. **入口给了校验蹦床而不是自解密蹦床**（run #292）：ApplyELF 漏了 PE 侧那条 ImgHookRVA 优先级 →
+   .text 仍是密文、起手即死且连失败 trace 都没有。修：与 PE 侧同义分流。
+3. **VM_BLOB_TARGET_LINUX 位置错**（run #289）：写在 if compilerIsWindows 里，Linux 原生编译时从未定义
+   → 编进去的是 #else 桩（-9）→ 蹦床 fail-fast 命中 ud2。修：提到条件之外。
+4. **汇编步骤不看 -cc**（run #35480635489）：给 aarch64 建 blob 必须带 `-merge go`（内置合并器），
+   否则宿主 ld 链 aarch64 目标文件报 "file in wrong format"；CC/OBJDUMP 也要以环境变量给。
+5. **lifter 缺 `ORR Xd, XZR, #imm`**（run #35481040253）：Go 给 main.sumTo 编出的第一条就是这个 →
+   打包被拒。**这是既有覆盖缺口**，本轮先用 VMP_FUNCS 只保护 checkKey 绕过；正修待做（本机可测）。
+6. **默认开的代价**（run #294）：把 ELF 整体加密切默认开，会让 tools/verify_linux_payload 的探针
+   读到密文（它要从打包文件里读函数入口补丁字节）→ 已回退为 opt-in，前置条件记录在案。
+
+### 367. 仍未做（下一轮起）
+- **PE/arm64**（Windows/arm64）：需要给 vm_unpack_image 加 Windows/arm64 分支（从 TEB/PEB 取模块基址 +
+  解析导出表拿 VirtualProtect）；CI 的 windows-arm64-run 是原生 arm64 Windows，可作验证环境。
+- **lifter 的 `ORR Xd, XZR, #imm`**（第 5 条）：修好后 main.sumTo 也能被保护，VMP_FUNCS 的临时收紧可撤。
+- **ELF 整体加密转默认**：前置是让载荷探针不再依赖"打包文件里的明文补丁字节"。
