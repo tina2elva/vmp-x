@@ -45,6 +45,8 @@ def main():
     ap.add_argument("--section", default=".text,.rdata,.data",
                     help="comma separated section names to check")
     ap.add_argument("--chunk", type=int, default=64)
+    ap.add_argument("--allow-missing", action="store_true",
+                    help="原始镜像里没有该节就跳过（freestanding 目标没有 .data 属正常）；有节但仍有残留照旧报错")
     a = ap.parse_args()
 
     orig = open(a.src, "rb").read()
@@ -53,6 +55,9 @@ def main():
     for name in [s.strip() for s in a.section.split(",") if s.strip()]:
         body, rva, size = section_bytes(orig, name)
         if body is None:
+            if a.allow_missing:
+                print("[*] %-8s 原始镜像里没有这个节 -> 跳过（--allow-missing）" % name)
+                continue
             print("[!] %s: no section %s" % (a.src, name))
             sys.exit(2)
         pbody, _, _ = section_bytes(pack, name)
