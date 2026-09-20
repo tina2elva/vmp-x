@@ -190,6 +190,12 @@ jobs:
           exit $rc
 
       - name: ELF image encryption e2e (aarch64, entry self-decrypt, qemu)
+        # 与既有的 arm64 e2e 用同一套环境变量：vmpbuild 的**汇编**那一步走的是环境里的 CC，
+        # 只给 -cc 的话 .S 会被宿主的 gcc/as 编成 x86-64，链接时报
+        # "linux_arm64_vm_entry_asm.S.o: error adding symbols: file in wrong format"（CI 现场）。
+        env:
+          CC: aarch64-linux-gnu-gcc
+          OBJDUMP: aarch64-linux-gnu-objdump
         run: |
           set -o pipefail
           BLOB_SRC=stub/linux/arm64 BLOB_CC=aarch64-linux-gnu-gcc BLOB_GUEST=arm64 GOARCH_TARGET=arm64 QEMU=qemu-aarch64 TAG=a64 \
