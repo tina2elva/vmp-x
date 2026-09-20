@@ -4542,4 +4542,23 @@ kernelbase，所以只有 CI 会崩；现有镜像自解密只用 VirtualProtect
 - 本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e **155 passed / 0 failed**）。
 - CI：（待填）
 
+
+
+**踩坑记录：这一条也在 CI 上死了两次（都是"本机看不见"的类型）**
+1. run **35502909253**：linux-amd64 与 linux-arm64 同时红，报 `[!] VA 0xFFFFFFFF8F91E8E0 不在任何 PT_LOAD 中`。
+   根因**不是产物**，而是**诊断工具** `cmd/extractpayload` 按明文读描述符的 `reserved2`（补丁相对偏移）——
+   加了掩码之后它算出的是一个负 VA。这反过来正好证明掩码生效了。
+   修法：工具新增 `-manifest`（用主密钥 + 掩码种子把描述符 8..32 解回来再打印；不传就明确打
+   "下面的标量仍是掩码态"）；三个 ELF 门禁脚本（`verify_linux_payload.sh/.ps1`、`e2e_arm64.sh`）补上 `-manifest`。
+2. run **35503163052**：linux-amd64 转绿，**linux-arm64 仍红**，而且症状换了：packed 产物能跑、但结果错
+   （protected 返回入参、`vm_diag` 里 `code=0 len=0`）。根因是"魔数默认随机"暴露的一个**潜伏 bug**：
+   `stub/{linux,win}/arm64/vm_entry_asm.S` 把魔数**写死**成 `"VMPK"`(=0x4B504D56) 并据此判断
+   "这个 thunk 前面到底有没有描述符"。魔数一随机化，这个判断永远失败 → `vm->desc = 0` →
+   `vm_run` 直接跳过整段解密分支。x86-64 那侧用的是 `$VM_DESC_MAGIC` 宏，所以一直没事。
+   修法：`desc_magic.h` 增发 `VM_DESC_MAGIC_LO/HI`（aarch64 只能用 movz/movk 拼常数；LO/HI **不带 `u` 后缀**，
+   那是给汇编器吃的），两个 arm64 `vm_abi.h` 在 `#ifndef VM_DESC_MAGIC` 里补同样的默认值，两个 asm 改用宏。
+
+**证据**：CI run **35503599178（664eccc）五个作业全绿**（含 linux-arm64 与 windows-arm64-run）；
+反证：35498251605（(2) 完成时）全绿 → 35502909253 / 35503163052 两次红 → 修完转绿，红绿分界就落在 (3)。
+
 **未做**：(4) 反调试多路径、(6) 重定位/ASLR；以及 #385 里登记的 1b 边界项。
