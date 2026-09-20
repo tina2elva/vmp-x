@@ -479,6 +479,7 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	// 于是同名全局符号在两个目标文件里各定义一次，合并时报"全局符号重复"
 	// （CI 的 linux-arm64 作业就死在 arm64_mask_w 上）。所以按名字去重。
 	sources = appendUnique(sources, "win/x64/vm_crypto.c")
+	sources = appendUnique(sources, "win/x64/vm_kdf.c")
 	if guest == "arm64" {
 		// ARM64 客户机：标志位/条件码语义来自 stub/arm64 的独立模块
 		sources = appendUnique(sources, "arm64/guest_semantics_arm64.c")
