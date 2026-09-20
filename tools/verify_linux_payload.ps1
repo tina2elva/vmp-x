@@ -25,8 +25,11 @@ Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
 
 # On Windows the Linux blob is built by mingw (Win64 internal ABI); vmpbuild defines
 # VM_BLOB_USES_WIN64 automatically so the entry calls vm_run with RCX + shadow space.
+Remove-Item build\vm_interp_linux.bin -ErrorAction SilentlyContinue   # 先删：blob 构建失败立刻暴露，而不是拿旧 blob 假过
 & .\build\vmpbuild.exe -src stub/linux/amd64 -out build/vm_interp_linux.bin -manifest build/vm_interp_linux.json -entry vm_entry | Out-Null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path build/vm_interp_linux.bin)) { Write-Host "[FAIL] linux blob build failed"; exit 1 }
 & .\build\vmpack.exe -exe build/linux_target -func main.checkKey -func main.sumTo -blob build/vm_interp_linux.bin -manifest build/vm_interp_linux.json -out build/linux_target.vmp -report build/linux_vmp.json | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] packing failed"; exit 1 }
 
 $m = Get-Content build/linux_vmp.json | ConvertFrom-Json
 $p = $m.placements | Where-Object { $_.name -eq "main.checkKey" }

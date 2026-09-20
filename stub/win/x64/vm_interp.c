@@ -884,12 +884,15 @@ u32 vm_dbg_defer; /* .bss；非 Windows 也定义（vm_run 里统一判断） */
 /* 这两个符号定义在本文件靠后的 Windows 段里。**必须在 VM_KEY_EXTERNAL 之外也声明**：
  * 兼容模式（baked）下反调试同样要用它们（上一版把声明放在外置分支里 -> baked 编不过 ->
  * blob 构建失败，而我只 grep 'blob:' 没看出来，于是打包用的还是旧 blob）。 */
-#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
+/* 注意条件是"**Windows 目标**"而不是只看内部 ABI：mingw 编 Linux 目标时 VM_BLOB_USES_WIN64
+ * 同样成立（那是宿主 ABI），但 Windows 目标那段代码不参与编译，符号是未定义的 ——
+ * 上一版就是这么把 linux blob 编成"非自包含"的（CI 报：引用了未定义符号 "vm_find_module"）。 */
+#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__) && !defined(VM_BLOB_TARGET_LINUX)
 static u64 vm_find_module(const char *name);
 static void *vm_get_proc(u64 mod, const char *fn);
 #endif
 
-#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)
+#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__) && !defined(VM_BLOB_TARGET_LINUX)
 /* 信号按**路径**记位，而不是计数：同一个路径被两个调用点各查一次（入口蹦床的 vm_verify_table
  * 与 vm_run）不该算两个信号 —— 那会把"≥2 条不同路径"退化成"同一条路径查了两次"。 */
 static u32 vm_dbg_mask;       /* bit0=①BeingDebugged bit1=②调试端口/对象 bit2=③DR bit3=④时间差 */
