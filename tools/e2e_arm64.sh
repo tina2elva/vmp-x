@@ -50,7 +50,7 @@ echo "[*] building the linux/arm64 blob (built-in merger)..."
 ./build/vmpbuild -src stub/linux/arm64 \
     -out build/vm_interp_arm64.bin -manifest build/vm_interp_arm64.json \
     -entry vm_entry -guest arm64 -merge go -random-opcodes=false \
-    -cc "$CC" -objdump "$OBJDUMP"
+    -cc "$CC" -objdump "$OBJDUMP" -enc-image-elf-data
 
 echo "[*] packing check_key / sum_to..."
 ./build/vmpack -exe build/arm64_target -func check_key -func sum_to \
