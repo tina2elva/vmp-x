@@ -57,6 +57,38 @@ powershell -NoProfile -File tools/gates.ps1
 | `go test ./...` | 11 个包：解码、lifter、参考 VM、注入、扫描、覆盖率 | 全绿 |
 | `powershell -NoProfile -File tools/difftest.ps1` | 与独立参考实现（x86asm/arm64asm/Go 参考 VM）的差分测试 | 全绿 |
 
+## 加固分层与四平台证据
+
+这一版把"保护"拆成三层，每层都有**可复跑的门禁**或**真机 CI 证据**（不靠叙述）：
+
+| 层 | 做什么 | 证据 |
+|---|---|---|
+| ① 原生机器码抹除（`-wipe`，默认开） | 入口跳板之外的原生函数体在打包时被抹成**伪随机**字节（不是 `E9..CC` 那种一眼可辨的填充） | 门禁第 9 条 `residue probe`：文件与**运行期内存**里 `native:check_key/sum_to` 双 absent |
+| ② 字节码执行期不常驻明文（流式取指） | AEAD 只用于**验签**（Poly1305 认的是密文），取指时按 64 字节块取 ChaCha20 密钥流、逐字节异或还原；没有整份明文缓冲 | 门禁第 10 条 `bytecode plaintext scan`：打包进程里 `bytecode:check_key` **absent**；blob 544,768 → **32,768 字节** |
+| ③ 原镜像整体加密（默认对 x86-64 EXE/DLL 与 ET_EXEC x86-64 ELF 开） | `.text`/`.rdata`/`.data`（PE）与可执行段（ELF）**原地**加密；入口自解密：PE 自己从 PEB 找 kernel32 取 `VirtualProtect`（arm64 走 `x18`→TEB→PEB），ELF 走 `mprotect` 系统调用（aarch64 为 `svc #226`）；TLS 目录搬进 payload 并重指；拆重定位表 | 门禁第 11 条 `image residue`：三节非零 64B 块 **0 命中**（`.text` 熵 5.99→7.99、`.rdata` 4.88→7.96、`.data` 0.75→7.59） |
+
+四平台的真机证据（都是本仓库 GitHub Actions 跑出来的，`.github/workflows/ci.yml`）：
+
+| 平台 | 验证内容 | 结果 |
+|---|---|---|
+| windows-amd64 | gofmt/vet/test + E2E 147 例 + DLL 3 例 + arm64 客户机差分 | 绿（每次 push 都跑） |
+| linux-amd64 | **ELF 整体加密默认开**：打包 → 结构断言 → 文件级 0 残留 → 真跑与原生逐字节一致（`tools/e2e_elf_image.sh --strict`） | run **35482334570** 绿：`[OK  ] ELF 整体加密：输出一致` |
+| linux-arm64（qemu-user） | aarch64 的 ELF 整体加密 + 入口自解密（含补上的 `ORR Xd, XZR, #imm` 形式，两个被保护函数） | run **35481622554** 绿：`chunks=9217 NON-ZERO FOUND=0` + 运行期一致 |
+| windows-arm64（原生 arm64 Windows） | PE/arm64 三段：结构（补丁 `F0 03 1E AA …`）+ 文件级（`.text` 2.87→7.55、`.rdata` 0.20→7.62，0 命中）+ 运行期退出码一致 | run **35483191384** 绿：`native=… protected=…` |
+
+> 注意：`windows-arm64-run` 在 `ci.yml` 里标了 `continue-on-error: true`（runner 标签可用性所限），
+> 所以它**红不会让整个 run 变红**——看结论时要单独看这个作业。
+
+### 仍未做（如实）
+
+1. **镜像必须落在首选基址**：整体加密是在文件字节上做的，所以打包端会拆掉重定位表（`IMAGE_FILE_RELOCS_STRIPPED`）；基址被占则**明确失败**，不静默跑飞。代价是该模块失去 ASLR。
+2. **ELF 只支持 ET_EXEC**：PIE/ET_DYN 会被 `ld.so` 的重定位写进密文，当前明确跳过（要做得先解决重定位与加密的交互）。
+3. **ELF 侧只加密可执行段**：`.rodata`/`.data` 等其它段仍是明文（PE 侧已覆盖 `.rdata`/`.data`）。
+4. **arm64 的两个宿主 blob 只能由 CI 构建**：本机没有 `aarch64-w64-mingw32` / `aarch64-linux-gnu` 工具链，Windows/arm64 与 Linux/arm64 的 blob 由 CI 的 clang / 交叉 gcc 作业产出并验证。
+5. **解释器仍是 `-O1`**：`-O2` 下只要浮点函数里含整数↔浮点转换，整个解释器会被 gcc 编译错（见 `docs/STATUS.md` 第 71/72 轮）。
+6. **指令子集未覆盖** x87、AVX/VEX、AES-NI、REP 字符串、`SYSCALL`。
+7. **没有反调试/反 dump 纵深**（除入口补丁校验与自校验外），也没有 JIT。
+
 ## 覆盖到的指令子集
 
 在**真实编译产物**上的实测（`build/coverage.exe <目标>`，函数级 = 整段可翻译的比例）：
