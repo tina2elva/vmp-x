@@ -5023,9 +5023,10 @@ powershell -NoProfile -File tools/acceptance_demo.ps1 -DemoExe X.exe -DemoMap X.
 **过程中抓出的三处「静默算错」（正是本目标要消灭的东西）**
 1. `__int128` 除法把 `__divti3` 拉进 freestanding blob → 门禁直接报「引用了未定义符号」；
    改为 8/16/32 位用 u64/i64（2w 位被除数在 w≤32 时放得进 64 位）、64 位交给硬件 `divq/idivq`。
-2. inline asm 约束写错：独立的 `=a`/`=d` 输出 + `a`/`d` 输入 → GCC 分配错，64 位算出垃圾值；
-   改成 `+a`/`+d`（读写同一寄存器）。**这一支原本没有真实程序覆盖** —— 补了个 64 位除法小程序才暴露出来。
-3. 操作数编号越界（`divq %3` 而只有 3 个操作数）→ 又一类静默算错；改回 `%2` 后与原生完全一致。
+2. 64 位那一支最初用 inline asm：先写错了约束（独立的 `=a`/`=d` + 输入）→ 算出垃圾值；改成 `+a`/`+d` 后本地通过，
+   但 **CI 的 arm64 作业把同一个 `vm_interp.c` 用 clang 交叉编译**（clang 报 `invalid output constraint '+a'`，而且 `divq` 本就是 x86 指令）→
+   **最终改为可移植的手写 128/64 长除法**：不用 `__int128` 除法（freestanding 会拉进 `__divti3`）、也不用 inline asm。
+   这一支原本没有真实程序覆盖 —— 补了个 64 位除法小程序（`d64u`/`d64s`/`m64u`）才暴露出来，现与原生逐字一致。
 另：参考执行器的 `OpAluU` 走的是 `aluUnary` 而不是 `aluApply`，我的 div 分支**一开始被绕过去、静默返回错值** ——
 已在 `OpAluU` 里拦截，并在 `aluApply` 的 div 分支留了 fail-loud panic 守卫。
 

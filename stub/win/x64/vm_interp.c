@@ -1551,17 +1551,48 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
                         write_reg(vm, VRDX, 32, r & 0xFFFFFFFFu);
                     }
                 } else {
-                    /* 64 位：交给硬件（#DE 由硬件按 x86 语义处理，最忠实）。
-                     * 关键：被除数/商/余都在同一对寄存器（RAX/RDX）里，必须用 "+a"/"+d"（读写）约束；
-                     * 写成独立的 "=a"/"=d" + "a"/"d" 输入会让 GCC 分配错，实测算出垃圾值。 */
-                    u64 lo = vm->regs[VRAX], hi = vm->regs[VRDX], dv = a;
-                    if (kind == K_DIVU) {
-                        __asm__ volatile("divq %2" : "+a"(lo), "+d"(hi) : "r"(dv) : "cc");
-                    } else {
-                        __asm__ volatile("idivq %2" : "+a"(lo), "+d"(hi) : "r"(dv) : "cc");
+                    /* 64 位：手写 128/64 长除法。
+                     * 为什么不用 inline asm：同一个 vm_interp.c 也会被 clang 交叉编译成 arm64 blob，
+                     * 那里既没有 divq、clang 也不接受 "+a"/"+d" 约束（CI 实测报 invalid output constraint）。
+                     * 也不用 __int128 的除法：freestanding blob 里会拉进 __divti3（门禁直接报未定义符号）。 */
+                    u64 dxv = vm->regs[VRDX], axv = vm->regs[VRAX], dv = a;
+                    u32 negn = 0, negd = 0;
+                    u64 qq = 0, rem = 0;
+                    int bi;
+                    if (kind == K_DIVS) {
+                        if (dxv >> 63) { /* 取 |被除数|（128 位取反加一） */
+                            axv = ~axv + 1ull;
+                            dxv = ~dxv + (axv == 0 ? 1ull : 0ull);
+                            negn = 1;
+                        }
+                        if (dv >> 63) {
+                            dv = ~dv + 1ull;
+                            negd = 1;
+                        }
                     }
-                    write_reg(vm, VRAX, 64, lo);
-                    write_reg(vm, VRDX, 64, hi);
+                    if (dv == 0) __builtin_trap();
+                    if (dxv >= dv) __builtin_trap(); /* 商放不下 64 位 ⇒ #DE */
+                    rem = dxv;
+                    for (bi = 63; bi >= 0; bi--) {
+                        u64 carry = rem >> 63;
+                        rem = (rem << 1) | ((axv >> (u32)bi) & 1ull);
+                        if (carry || rem >= dv) {
+                            rem -= dv;
+                            qq |= (1ull << (u32)bi);
+                        }
+                    }
+                    if (kind == K_DIVS) {
+                        /* 向零截断：商为负 ⟺ 两操作数异号；余数随被除数的符号。 */
+                        if (negn != negd) {
+                            if (qq > 0x8000000000000000ull) __builtin_trap();
+                            qq = ~qq + 1ull;
+                        } else if (qq > 0x7FFFFFFFFFFFFFFFull) {
+                            __builtin_trap();
+                        }
+                        if (negn) rem = ~rem + 1ull;
+                    }
+                    write_reg(vm, VRAX, 64, qq);
+                    write_reg(vm, VRDX, 64, rem);
                 }
                 vm->pc = pc + 5;
                 break;
