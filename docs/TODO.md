@@ -3,6 +3,20 @@
 > 纪律：每条都要有「为什么 / 验收标准 / 证据落点」三件套。做完就把这条从这里删掉，
 > 过程与证据写进 `docs/STATUS.md`（编号追加，不覆盖历史）。
 > 本文件是**待办清单**；任务书（授权范围、验收口径）仍以 `docs/HANDOFF.md` 为准。
+>
+> **状态汇总（截至 STATUS #400）**：未完成 **15 项**（其中 12 项是勾选框、4 项是 §1–§4 的散文任务，§5 里"Sentinel 接口层"与勾选框那条重复计一次）、已完成 **4 项**。
+>
+> | 优先级 | 未完成项 | 为什么 |
+> |---|---|---|
+> | **P0 技术缺口**（直接决定"哪些函数保护得了"） | ① `CDQ/CQO/IDIV/DIV` lift　② `/Od` 栈传参/varargs　③ `CVTDQ2PD`/double | 客户 demo 里 `Gcd`/`IsPrime`/`Mean` 就因为缺这几条指令**被拒绝保护**；varargs 影响面最广 |
+> | **P1 授权/产品化** | ④ Sentinel 接口层（路线 A）　⑤ `features`（并发/功能点/机器绑定）语义　⑥ 吊销/黑名单　⑦ 母狗私钥在构建机的保护（DPAPI/TPM）+ `--key-from-dongle` | 商业化要靠"可管理、可撤销"；上了狗还能白拿"密钥不出硬件" |
+> | **P2 平台/形态补全** | ⑧ ELF `.rela` 先减后加　⑨ Linux 侧反调试（`TracerPid`）　⑩ 外置密钥+DLL、Linux/arm64 取钥　⑪ 1b 其余取钥形态（授权回调/TPM/TEE） | 跨平台与更硬的密钥托管 |
+> | **P3 工具增强（可选）** | ⑫ `vmpepoch which` 支持 ELF　⑬ `export` 发版包　⑭ CI 集成（`epochs.json` 核对） | 交付运维便利 |
+> | **P4** | ⑮ 把客户自带的 `verify.py`/`ground_truth_exe.txt` 接进验收，并产出"逐函数可保护性清单" | 复跑口径与客户一致 |
+>
+> **已完成**：工具授权（构建凭据）✅、委派签发（canIssue）✅、运行期强制 ✅、商业化闭环可复跑脚本 `tools/acceptance_demo.ps1`（23/23）✅
+>
+> 下面第 0–5 节保留**设计基线与历史记录**（很多文字描述的东西已经实现，看上面的汇总表即可知道哪些还没做）。
 
 ## 0. 密钥纪元管理工具（客户反馈；工具已交付，剩下可选增强）
 
@@ -62,9 +76,13 @@
 - [ ] Linux 侧反调试：`/proc/self/status` 的 `TracerPid`（现在四条路径都是 Windows 目标）。(`STATUS #389`)
 - [ ] 外置密钥 + DLL 组合；Linux/arm64 的取钥路径。(`STATUS #385`)
 - [ ] 1b 的其余取钥形态：授权回调、TPM/TEE 封印（接缝已是 `vm_key_from_file()` 一个函数）；本次对话拟定的过渡方案是 **DPAPI 包装的密钥文件**。(`STATUS #385/#393`)
-- [ ] `-key-in` 的"密钥纪元"策略落地：每客户（或客户+产品线）一个纪元，交付时按 `<产物>.vmpkey` 命名分发。(`STATUS #395`)
+- [x] `-key-in` 的"密钥纪元"策略：`vmpepoch new` 建纪元、`which` 认领产物、按 `<产物>.vmpkey` 分发 —— 已在 `tools/acceptance_demo.ps1` 里端到端演示（`STATUS #395/#400`）。
 
-## 5. 授权层（License Layer）—— 客户产品模型的核心缺口（优先级：高，但要先确认需求边界）
+## 5. 授权层（License Layer）—— 设计基线与**剩余未做项**
+
+> **现状**：路线 B（纯软件）的授权工具链 + 两级 PKI + 委派签发 + **运行期强制**都**已实现**（STATUS #397–#400）。
+> 本节余下的未做项只有：**Sentinel 接口层（路线 A）**、`features` 语义、**吊销/黑名单**、母狗私钥在构建机的保护。
+> 其余文字是设计基线与事实核对记录（含 Thales 官方文档口径），保留备查。
 
 **客户的实际产品模型**（照抄客户原话整理）：
 - 客户（我们记为**厂商**）卖的是加密工具（vmpbuild/vmpack）；
@@ -359,28 +377,16 @@ vmpepoch lic-show --lic A-A.vmplic --root root.pub --product PROD-A
   下一步：用调试器（或继续压细分支码）定位到具体调用；也可考虑在 blob 里自带 SHA-256、只在 CNG 里做验签。
   **风险控制**：整条路径默认关闭（`kind=0`）；门禁只在外置密钥模式下编入；`vmpack` 拒绝非外置 blob；
   现有产物/门禁/CI 不受影响（本机 gates 11/0 复验）。
-- [ ] **运行期强制**（下一步的主任务，方案已定死）：
-  **① 烘什么、烘在哪**：`vmpbuild` 发一个**占位全局** `vm_license_meta`（默认 kind=0 = 不启用，现有产物不受影响），
-  在 manifest 里暴露它的偏移；`vmpack` 用新参数 `-license-vendor / -license-product / -license-key <pub>`
-  把 vendorID / productID / **签发者公钥** 打进**产物里那份 blob 副本**（blob 在 payload 偏移 0，符号偏移来自 manifest）。
-  **② 为什么只烘「签发者公钥」而不是厂商根**：运行期只做**一次签名验证**（几十行 C），
-  证书链/委派/吊销在**导出授权时**由工具校验（工具侧已有完整链逻辑）；这样 C 侧不用解析证书链。
-  产物由谁构建就烘谁的公钥 —— 与「每个软件厂商是自己那棵树的根」的模型一致。
-  **③ 授权文件**：给运行期用**二进制**格式（`<产物>.vmplic.bin`，C 侧不解析 JSON），
-  内容 = 定长头（版本/vendorID/productID 的 32 字节哈希/到期时间/标志）+ 产品哈希表；
-  `vmpepoch lic-export --lic <json> --key <issuer.priv> --out <exe>.vmplic.bin` 负责导出并**对其字节签名**。
-  **④ 运行期验证**：blob 侧 `vm_license_check()`：
-  - `kind==0` 直接放过（向后兼容）；
-  - 用 PEB 路径逻辑找 `<产物全路径>.vmplic.bin`（复用 `vm_key_path()` 那套，零 API）；
-  - 从 `bcrypt.dll` 取 `BCryptOpenAlgorithmProvider(ECDSA_P256)` / `BCryptImportKeyPair(ECCPUBLIC_BLOB)` /
-    `BCryptVerifySignature`（**公钥 64 字节 X||Y → 加 BCRYPT_ECCKEY_BLOB 头**），验证 64 字节 r||s；
-  - 查 vendorID 哈希一致、productID 在表内、未过期；不通过 → 同一个硬门 `0xC0DE0007`。
-  **⑤ 验收**：带授权跑通（与原生逐行一致）；删授权 → 0xC0DE0007 且无输出；改授权一个字节 → 拒绝；
-  改系统时间到过期之后 → 拒绝；用别的密钥签的授权 → 拒绝。
+**注：以下方案已实现完毕**（见 STATUS #399/#400）—— 保留在这里只作设计记录：
+`vmpbuild` 的占位全局 `vm_license_meta`（默认 kind=0）→ `vmpack -license-vendor/-license-product/-license-pub`
+打进产物里那份 blob → `vmpepoch lic-export` 导出二进制授权 `<产物>.vmplic.bin` → blob 侧 `vm_license_check()`
+用 CNG 验 ECDSA P-256 并查 productID/到期 → 不通过走 `0xC0DE0007`。
+**踩到的两个坑**（都留存档）：① 授权校验**不能**放在 `vm_master()`（那条路径会被 TLS 回调走到，回调里不能加载 DLL/调 CNG）；
+② **自哈希区间是 [0, bssOff) 且包含 .data** —— 打包端改了 `.data` 里的元数据后必须**重算自哈希**，否则 `vm_selfcheck()` 直接 trap。
 
-- [ ] 说明：**Ed25519 已全部换成 ECDSA P-256**（`cmd/vmpepoch/crypto.go`）—— 因为运行期要在产物里验签，
-      而 Windows CNG 只提供 ECDSA/RSA，没有 Ed25519；换掉之后 blob 侧不需要塞上千行第三方密码学实现。
-      私钥文件 = 32 字节标量（hex）；公钥 = 64 字节 X||Y（hex）；签名 = 64 字节 r||s（base64），与 CNG 格式一致。
+**注（工具演进）**：签名原语已从 Ed25519 全部换成 **ECDSA P-256**（`cmd/vmpepoch/crypto.go`、`internal/cred`）——
+因为运行期要在产物里验签，而 Windows CNG 只提供 ECDSA/RSA。私钥 = 32 字节标量（hex）；公钥 = 64 字节 X||Y（hex）；
+签名 = 64 字节 r||s（base64），与 CNG 的 `BCRYPT_ECCKEY_BLOB` 格式一致。
 
 - [ ] **路线 A（Sentinel）**：blob 侧调 Sentinel API（`hasp_login`/`hasp_get_info`/`hasp_decrypt`）——
       **推荐让密钥由狗派生**，这样“同一份产物发所有下游”天然成立，且密钥不出狗。
