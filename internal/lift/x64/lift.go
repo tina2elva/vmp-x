@@ -2379,7 +2379,19 @@ func (l *Lifter) liftImul(f *ir.Func, ins x64dec.Insn, off uint32) error {
 		mw := memWidth(ins)
 		em(ir.Insn{Op: ir.Load, Kind: uint8(ir.ZeroExt), Width: mw, SrcW: mw, Dst: ir.VMSCR,
 			Base: base, Index: index, Scale: scale, Disp: disp})
-		em(ir.Insn{Op: ir.AluRR, Kind: uint8(ir.Mul), Width: mw, Dst: dst, A: dst, B: ir.VMSCR})
+		// 三操作数形式 IMUL r, m, imm 表示 dst = m 乘 imm。
+		// 这里原来漏了两件事：1) 丢掉立即数（退化成 dst = dst 乘 m，拿旧值当被乘数）；
+		// 2) 用了内存宽度而不是目的宽度。/Od 下 MSVC 大量生成这种带内存源与立即数的 imul，
+		// 于是算出静默错值（实测 a + b*2 + c*3 + d*4 得到 27 而不是 30）。
+		if len(args) >= 3 {
+			if imm, isI := immArg(args[2]); isI {
+				em(ir.Insn{Op: ir.AluRI, Kind: uint8(ir.Mul), Width: w, Dst: dst, A: ir.VMSCR,
+					Imm: uint64(uint32(imm))})
+				return nil
+			}
+		}
+		// 两操作数形式 IMUL r, m 表示 dst = dst 乘 m
+		em(ir.Insn{Op: ir.AluRR, Kind: uint8(ir.Mul), Width: w, Dst: dst, A: dst, B: ir.VMSCR})
 		return nil
 	}
 	return fmt.Errorf("不支持的 IMUL 形式")

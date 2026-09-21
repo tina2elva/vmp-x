@@ -99,12 +99,33 @@
   所以问题出在 **VM 对这段「push/sub + 以当前 rsp 为基准的 4/8 字节存读」的建模**上，
   而不是「VM 拿不到调用者的栈参数」。
 
-**下一步（修法候选）**：① 打开 VM 指令轨迹，逐条对照这段的 pc/rsp/内存读写；
-② 重点查 `push`/`sub rsp,imm` 之后 `[rsp+disp]` 的地址计算与**位宽**（4 vs 8 字节），
-以及 `sp_track`（仓库里已有 `internal/lift/x64/sp_track_test.go`）是否在 `push` 之后同步了 rsp；
-③ 修好后用 **/Od + /O2 两种构建**各跑一遍逐行比对，并把它加成 `tools/e2e.ps1` 的用例。
+**真根因（目标第 3 轮，用合成函数隔离后确定；原「栈传参/varargs」假设已被实测否掉）**
 
-**验收**：`DemoFormatReport` 在 `/Od` 与 `/O2` 两种构建下都逐行一致；并补一条 e2e 覆盖"栈参数 + varargs"。
+隔离实验结果（`/Od`，逐个函数单独进 VM）：
+
+| 函数 | 原生 | 受保护 |
+|---|---|---|
+| `five(a,b,c,d,e) = e`（读第 5 个栈参数） | 42 | **42** ✓ |
+| `sum5`（5 个参数全用） | 52 | **52** ✓ |
+| `va_sum` / `va_last`（varargs） | 52 / 42 | **52 / 42** ✓ |
+| `four(a,b,c,d) = a + b*2 + c*3 + d*4` | 30 | **27** ✗ |
+
+**根因 1（已修，STATUS #404）**：`liftImul` 的**内存操作数分支丢立即数 + 被乘数写错**。
+`imul ecx, dword ptr [rsp+18h], 3` 被翻译成 `ecx = ecx × mem`（应为 `mem × 3`）——
+代入 `four` 得 `(1+4)+6 = 11`、`+16 = 27`，与实测完全吻合。已修 + 加 IR 级回归测试
+（`internal/lift/x64/imul_mem_test.go`）。
+
+**根因 2（已定位，未修 —— 下一轮的主任务）**：**VM 调用 native 函数时只传寄存器参数**。
+`stub/win/x64/vm_interp.c` 的 `OP_CALLN` 直接 `fn(rcx,rdx,r8,r9,r10,r11,r12,r13)`，
+于是 native 被调者读自己的**栈参数**时落在宿主 C 栈上（实测 `caller5(x){return five(1,2,3,4,x);}`
+→ native 42、受保护 **1**）。客户 demo 的 `/Od` 症状（`score=8` 应为 42）就剩这一处：
+`DemoFormatReport` 把 `score` 当**第 5 个参数**转发给 native 的 `Math::FormatReport`。
+
+**修法（下一轮）**：给 `OP_CALLN` 加 ABI 蹦床 —— 切到 guest 栈、压一个返回地址、装载寄存器参数后再 call，
+返回后恢复宿主 rsp；并处理 `FrameSkew`（guest 栈相对原生栈的偏移）。
+
+**验收**：`DemoFormatReport` 在 `/Od` 与 `/O2` 两种构建下都逐行一致；
+`caller5`/`caller5b` 合成用例与原生一致；并把它加成 `tools/e2e.ps1` 的用例。
 
 ## 3. `CVTDQ2PD` / double 路径
 

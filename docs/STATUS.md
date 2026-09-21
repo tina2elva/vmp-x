@@ -5022,6 +5022,30 @@ powershell -NoProfile -File tools/acceptance_demo.ps1 -DemoExe X.exe -DemoMap X.
   `push rdi` + `sub rsp,30h` 之后又从 `[rsp+40h..58h]` 读回（同一批绝对地址），再转发给 `Math::FormatReport`。
   即**不依赖调用者真实压栈**，所以 bug 在 VM 对这段栈建模（`push`/`sub rsp,imm` 之后的 `[rsp+disp]` 地址或位宽）上。
 - 反汇编与候选修法已写进 `docs/TODO.md` §2，下一轮照此改，并用 `/Od`+`/O2` 双构建验证。
+### 404. 目标第 3 轮：抓到并修掉「三操作数 IMUL（内存源+立即数）」的静默算错；第二个根因定位到 `OP_CALLN`
+
+**诊断反转（重要）**：原以为 ② 是「栈传参 / varargs」问题。用一组合成函数隔离后**否掉了这个假设** ——
+`five`（读第 5 个栈参数）、`sum5`、`va_sum`、`va_last`（varargs）**全部与原生一致** ✓，
+唯一错的是 `four(a,b,c,d) = a + b*2 + c*3 + d*4` → 受保护得到 **27**，原生 **30**。
+
+**根因 1（已修）**：`internal/lift/x64/lift.go` 的 `liftImul` 内存操作数分支**丢掉了立即数**，
+并把被乘数写成 `dst`（应为刚载入的 `VMSCR`）—— 于是 `imul ecx,[rsp+18h],3` 退化成 `ecx = ecx × mem`。
+代入 `four`：`ecx = b*c = 6`、`eax = (1+4)+6 = 11`、`+d*4 = 27` —— **与实测的 27 完全吻合**。
+修法：三操作数形式发出 `AluRI{Mul, w, dst, A: VMSCR, Imm}`，两操作数形式保持 `AluRR{dst, A: dst, B: VMSCR}`，
+宽度改用**目的宽度**（原来用内存宽度）。
+证据：隔离用例 `four` **27 → 30** ✓（五个函数全部与原生一致）；
+新增 `internal/lift/x64/imul_mem_test.go`（IR 级回归：立即数必须保住、被乘数必须是 VMSCR、两操作数形式不许被改坏）。
+
+**根因 2（已定位，未修）**：VM 调用 **native 函数**时只传寄存器参数 —— `stub/win/x64/vm_interp.c` 的 `OP_CALLN`
+直接用 C 函数指针 `fn(rcx,rdx,r8,r9,r10,r11,r12,r13)` 调用，**native 被调者读自己的栈参数时会落在宿主 C 栈上**。
+证据：合成用例 `caller5(x) { return five(1,2,3,4,x); }`（`five` 保持 native）→
+**native 得到 42，受保护得到 1**；`caller5b` 同样错。这正是客户 demo `/Od` 下 `score=8`（应为 42）的剩余来源：
+`DemoFormatReport` 把 `score` 作为**第 5 个参数**转发给 native 的 `Math::FormatReport`。
+修法（下一轮单独做）：给 `OP_CALLN` 加 ABI 蹦床 —— 切到 guest 栈、压一个返回地址、装载寄存器参数后再 call，
+并在返回后恢复宿主 rsp；同时要处理 `FrameSkew`（guest 栈相对原生栈的偏移）。
+
+注：本轮起把 `docs/TODO.md` §2 的标题与内容按**真实根因**改写（原「栈传参/varargs」的假设已被实测否掉）。
+
 
 ### 402. 目标项 ① 完成：`CDQ`/`CQO` + `DIV`/`IDIV` 全位宽落地；过程中抓出三处「静默算错」
 
