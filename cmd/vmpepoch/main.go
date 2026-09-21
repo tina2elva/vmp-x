@@ -62,6 +62,8 @@ func main() {
 		cmdWhich(os.Args[2:])
 	case "keyid":
 		cmdKeyID(os.Args[2:])
+	case "cert-req":
+		cmdCertReq(os.Args[2:])
 	case "cert-issue":
 		cmdCertIssue(os.Args[2:])
 	case "cert-show":

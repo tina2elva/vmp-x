@@ -201,6 +201,34 @@ vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    
 实测（本机）：整链通过 ✓；**自立门户**（自签一张 FAKE 证书）→ 验链失败 rc=1 ✓；
 **身份与签名者脱钩**（拿别的私钥签）→ 签发时就被拒 ✓；**证书被篡改** → 验签失败 ✓。
 
+**密钥由谁生成（标准流程，回答「custA.priv/pub 谁生成」）**
+
+| 密钥 | 谁生成 | 私钥去哪 | 公钥去哪 |
+|---|---|---|---|
+| **厂商根密钥对** | **厂商自己**（`keygen --out vendor-root`） | 永不外发，只在本机/根签名机 | **公开分发**：客户打包时要烘进产物（运行期验链用） |
+| **一级客户密钥对** | **一级客户自己**（`keygen --out custA`） | 留在客户手里（建议 DPAPI/软狗包住） | **只把公钥交给厂商**（用证书申请文件） |
+| 下游 | 不生成 | —— | 只持有被签名的授权（路线 B）或子狗（路线 A） |
+
+**推荐交付方式：带「持有证明」的证书申请**（防止厂商签错人/被顶替）
+
+```
+客户A: vmpepoch cert-req   --key custA.priv --vendor ACME-0001 --out custA.req.json
+       （请求里含用 custA.priv 签的自签名，证明申请者确实持有与公钥配对的私钥）
+厂商:  vmpepoch cert-issue --root vendor-root.priv --req custA.req.json --vendor ACME-0001 \
+                            --until 2028-12-31 --out custA.cert.json
+       （先验持有证明，再签发；也支持旧写法 --subject custA.pub，跳过证明）
+厂商  ->  把 custA.cert.json 回给客户A
+客户A: vmpepoch lic-new ... --key custA.priv --cert custA.cert.json ...   # 签下游授权
+客户A: vmpbuild ... --license-pubkey vendor-root.pub                      # 烘进产物（待实现）
+```
+
+**为什么不能反过来（厂商替客户生成私钥）**：谁持有私钥，谁就能签该 vendorID 下的**所有**授权 ——
+厂商持有时就等于「厂商能伪造客户给下游的授权」 ✗，商业上讲不清，也违背「密钥不出客户」的信任模型。
+客户若要**轮换密钥**（丢失/泄露），重新 `keygen` 再申请一张新证书即可，vendorID 不变 ✓。
+
+实测（本机）：根生成 → 客户端生成 → `cert-req`（含持有证明）→ `cert-issue` 验证明后签发 →
+`lic-new --cert` → `lic-show --root` **整链通过** ✓；**把请求改成别人的公钥 → 持有证明验不过、拒签** ✓。
+
 **还没做（下一步，按需选择）**
 - [ ] **运行期强制**：blob 侧 `vm_license_check()`（路线 B 需 Ed25519 验签的 C 实现，约 600–900 行 + 两侧 KAT）；
       产物侧加 `-license-vendor/-license-product/-license-pubkey`（像 verify table 那样另立一张表，描述符已满）。
