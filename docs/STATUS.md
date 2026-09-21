@@ -4717,3 +4717,35 @@ Android/Windows-arm64 的 `vm_unpack_image` 本来就是"未实现"分支，不�
 目录不存在时报 `写主密钥文件失败: ... The system cannot find the path specified`。
 
 **证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**；CI **35554780157（84fd8d1）五个作业全绿**。
+
+### 392. 用**你自己的真 demo**（`D:\demo_exe`）验收：能保护、输出与原生一致；并挖出两个真 bug + 一个 lifter 缺口
+
+**对象**：`demo64.exe`（PE32+ x86-64，MSVC，`build.bat` = `/Od /Zi /RTC1 /MDd`；有 `.pdb`、**没有 `.map`**）。
+`demo32.exe` 是 **PE32(i386)** —— vmpack 明确拒绝（`不支持的 PE 机器类型 0x14C`），所以这轮全部用 64 位那份。
+
+**函数名怎么定位**：vmpack 走 **导出表 + MAP**（`-map`），**不读 PDB** —— 直接跑会报
+`找不到符号 "Demo::Math::Add"（该 PE 有 0 个符号；MAP 与导出表里都没有这个名字，可用 -map 指定 MAP）`。
+用 VS2022 重新编译（加 `/MAP`）后，用 **mangled 名**（`?DemoGcd@@YAHHH@Z`）就能定位。
+
+**可保护性（逐个函数试出来的，这才是你要的信息）**
+
+| 构建 | 结果 |
+|---|---|
+| 调试版 `/Od /RTC1`（= 你的 build.bat） | **15/17 可保护**；`Math::Gcd`、`Math::IsPrime` ✗（缺 `CDQ` + `IDIV [mem]`） |
+| 发布版 `/O2` | 除上面两个外，`Mean` 也 ✗（缺 `CVTDQ2PD`，即 SSE2 int→double） |
+
+**验收结果（发布版，保护 11 个函数）**：输出与原生**逐行一致（0 行不同）** ✓；没有密钥 → **什么都不打印**、`0xC0DE0007` ✓；ASLR 重定位生效 ✓；产物里搜不到主密钥 ✓。交付件在 `build/deliver2/`（`demo64.exe` + `demo64.exe.vmpkey`）。
+
+**但调试版挖出两个真 bug（用单函数二分确认，不是互相影响）**
+
+1. `?DemoFormatReport@@YAHPEADHPEBDH@Z`：`score=8`（原生 42）——**错**。它形如
+   `sprintf(buf, n, fmt, score)`，那个 `%d` 参数走的是**栈**（第 5 个及以后的参数 / varargs）。
+   同一个函数在 `/O2` 下是**对的** —— 两种构建把参数物化的方式不同，所以嫌疑集中在
+   **VM 的栈传参 / varargs 路径**。
+2. `?DemoMean@@YANPEBNH@Z`：`0.000`（原生 3.500）——**错**。double 数组求和，涉及 SSE2 与浮点。
+3. 附带的因果链：`DemoFingerprint` **单独**保护时是对的 ✓；它在 15 函数版里错，是因为它 hash 的输入
+   来自上面两个函数 —— 正好说明"错的不是它"。
+
+**结论**：你这套 demo 在**发布版**上已经可以直接保护（输出与原生一致）；**调试版**还需要把这两条 VM 路径修好。
+下一步优先级建议：① `CDQ/CQO + IDIV/DIV` 的 lift（解锁 Gcd/IsPrime，两个构建都受益）；② 调试版的栈传参/varargs 排查；
+③ `CVTDQ2PD`/double 路径；④ 修好 ①② 后再复跑 `D:\demo_exe` 的全量验收。
