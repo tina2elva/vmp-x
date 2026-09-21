@@ -1388,6 +1388,15 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, vm_bcs_t *s, u32 p
                 case KF_DIV: *(double *)pdst = a / b; break;
                 case KF_MIN: *(double *)pdst = a < b ? a : b; break;
                 case KF_MAX: *(double *)pdst = a > b ? a : b; break;
+                case KF_CVTDQ2PD: {
+                    /* CVTDQ2PD dst, src：把 src 低 64 位里的两个 int32 各自转成 double，
+                     * 写满目标的 128 位（两条 lane）。源是 XMM 或内存，lifter 已经把它摆到 pa。 */
+                    const int *si = (const int *)pa;
+                    double *dd = (double *)pdst;
+                    dd[0] = (double)si[0];
+                    dd[1] = (double)si[1];
+                    break;
+                }
 #if defined(__x86_64__) || defined(_M_X64)
                 case KF_SQRT: { double sr; __asm__ __volatile__("sqrtsd %1, %0" : "=x"(sr) : "x"(a)); *(double *)pdst = sr; break; }
 #else

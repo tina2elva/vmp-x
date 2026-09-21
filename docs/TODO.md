@@ -130,6 +130,10 @@
 **修法（下一轮）**：给 `OP_CALLN` 加 ABI 蹦床 —— 切到 guest 栈、压一个返回地址、装载寄存器参数后再 call，
 返回后恢复宿主 rsp；并处理 `FrameSkew`（guest 栈相对原生栈的偏移）。
 
+**已知 flaky（要修）**：`tools/e2e.ps1` 的反调试用例（`antidebug: a single BeingDebugged signal flipped the verdict`）
+本会话已偶发三次（每次重跑就好）。时间差路径已降级为只诊断，但仍有第二条路径在某些运行环境下同时命中，
+使"只注入一个信号"的断言失败。要把它做成确定性用例（或明确哪些路径在该环境下不该参与定性）。
+
 **验收**：`DemoFormatReport` 在 `/Od` 与 `/O2` 两种构建下都逐行一致；
 `caller5`/`caller5b` 合成用例与原生一致；并把它加成 `tools/e2e.ps1` 的用例。
 

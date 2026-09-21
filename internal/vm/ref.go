@@ -298,6 +298,7 @@ const (
 	KFCvtsi2f
 	KFCvttf2si
 	KFUcomi
+	KFCvtDQ2PD // CVTDQ2PD：两个 int32 → 两个 double（与 C 侧 KF_* 顺序一致）
 )
 
 // 原子子操作（与 C 侧 KA_* 一致）

@@ -41,7 +41,8 @@ enum {
     KF_ADD = 0, KF_SUB, KF_MUL, KF_DIV, KF_MIN, KF_MAX, KF_SQRT,
     KF_CVTSI2F, /* 整数（RAX）→ 浮点 */
     KF_CVTTF2SI, /* 浮点 → 整数（RAX，截断） */
-    KF_UCOMI     /* 比较（按 SDM 设置 ZF/PF/CF） */
+    KF_UCOMI,    /* 比较（按 SDM 设置 ZF/PF/CF） */
+    KF_CVTDQ2PD  /* CVTDQ2PD：源的低 64 位（两个 int32）→ 两个 double（写满目标 128 位） */
 };
 
 /* 一元子操作 */

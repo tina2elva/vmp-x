@@ -5084,6 +5084,31 @@ callq *%r10                      ; 返回地址由 call 自己压，落地点就
 | `DemoFormatReport`（`/Od`，原症状） | `score=42` | **`score=42`** ✓ |
 
 **尚未做**：把这条合成用例固化成 `tools/e2e.ps1` 的用例（现在只有本机实测记录）——
+### 406. 目标项 ③：`CVTDQ2PD` 已落地（release 构建 DemoMean 0.000 → 3.500）；`/Od` 变体仍错（另一条路径）
+
+**做了什么**
+- C 侧：`vm_opcodes.h` 新增 `KF_CVTDQ2PD`；`vm_interp.c` 的双精度分支实现语义 ——
+  把源低 64 位里的两个 `int32` 各自转成 `double`，写满目标的 128 位（两条 lane）。
+- lifter：`liftSIMD` 的分发与子分发都加上 `x86asm.CVTDQ2PD` —— 目标是 XMM 槽位；源可以是 XMM（直接用它的槽位）
+  或内存（先 `Load` 到 `VMSCR` 再 `Store` 到暂存槽，和 `CVTSI2SD` 同一套）。发射 `ir.Fp{Kind: 10}`。
+- 参考实现（`internal/vm/ref.go`）补齐缺失的 KF 常量（7/8/9/10），保持与 C 侧顺序一致（此前只到 6）。
+
+**实测证据（本机）**
+
+| 用例 | 原生 | 受保护 |
+|---|---|---|
+| `?Mean@Math@Demo@@QEAANPEBNH@Z`（**/O2 构建**） | 3.500 | **3.500** ✓ |
+| **客户 demo `/O2` 14 个函数（新增 `Mean`）** | 13 行 | **不一致 0 行** ✓ |
+| `?Mean@...`（**/Od 构建**） | 3.500 | ✗ **0.000**（另一条路径，见下） |
+
+`/Od` 下 `Mean` 的反汇编走的是**另一套**：累加器放在栈上（`movsd [rsp+10h],xmm0` / `movsd xmm0,[rsp+10h]`）、
+`addsd xmm0, [rcx+rax*8]`（内存操作数）、`cvtsi2sd xmm0, dword ptr [rsp+40h]`（**32 位**内存源）、`movaps`。
+即与 release 完全不同的指令组合 ⇒ 剩余问题在**这套**（疑似 `movsd` 的 8 字节存/取或 32 位 `CVTSI2SD` 的符号扩展路径），
+与 `CVTDQ2PD` 无关。**这是新的静默算错，下一轮接着查。**
+
+**未留下单测**：想在裸 lifter 环境（`NewLifter(0)` + `SetXMMArea`）里做 IR 级回归，但该环境下这条指令进不到分支
+（真实 demo 能正常 lift），为不留红测试先删掉了；`/O2` 的 demo 差分是当前证据。
+
 目标第 ④ 项「保护前逐函数差分自检」会系统性地覆盖这一类问题。
 
 

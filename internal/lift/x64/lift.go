@@ -1831,7 +1831,8 @@ func (l *Lifter) liftSIMD(f *ir.Func, ins x64dec.Insn, off uint32) (bool, error)
 		return true, nil
 
 	case x86asm.ADDSD, x86asm.SUBSD, x86asm.MULSD, x86asm.DIVSD,
-		x86asm.CVTSI2SD, x86asm.CVTTSD2SI, x86asm.UCOMISD, x86asm.COMISD:
+		x86asm.CVTSI2SD, x86asm.CVTTSD2SI, x86asm.UCOMISD, x86asm.COMISD,
+		x86asm.CVTDQ2PD:
 		// 第 71 轮查明："加了浮点代码就连别的函数都错"是 gcc **-O2 对解释器整体编译错**（疑似既有 UB
 		// 被浮点代码改变了优化决策）。把浮点实现拆成独立函数也无效，改用 -O1 编译解释器后一切正常。
 		// 详见 STATUS 第 71 轮；性能代价 ~1.3-1.7×，已记录在案。
@@ -1926,6 +1927,40 @@ func (l *Lifter) liftSIMD(f *ir.Func, ins x64dec.Insn, off uint32) (bool, error)
 			}
 			em(ir.Insn{Op: ir.Fp, Kind: 7 /* KF_CVTSI2F */, Width: ir.W64, Disp: dd,
 				Imm: uint64(uint32(scratch)), Imm2: 0})
+			return true, nil
+		case x86asm.CVTDQ2PD:
+			// CVTDQ2PD dst, src：把 src 低 64 位（两个 int32）各自转成 double，写满 dst 的 128 位。
+			// 源可以是 XMM（直接用它的槽位）或内存（先搬到暂存槽：vm_tmp+8，和别的内存操作数一致）。
+			cdx, okc := xmmReg(args[0])
+			if !okc {
+				return true, fmt.Errorf("CVTDQ2PD 的目标必须是 XMM")
+			}
+			cdd, okcd := l.xmmDisp(cdx, 0)
+			if !okcd {
+				return true, fmt.Errorf("XMM 槽位不可用")
+			}
+			var csrc int32
+			if sx, oks := xmmReg(args[1]); oks {
+				sd, ok2 := l.xmmDisp(sx, 0)
+				if !ok2 {
+					return true, fmt.Errorf("XMM 槽位不可用")
+				}
+				csrc = sd
+			} else if m, okm := memArg(args[1]); okm {
+				base, index, scale, disp, merr := l.memAddr(ins, m)
+				if merr != nil {
+					return true, merr
+				}
+				em(ir.Insn{Op: ir.Load, Width: ir.W64, SrcW: ir.W64, Dst: ir.VMSCR,
+					Base: base, Index: index, Scale: scale, Disp: disp})
+				em(ir.Insn{Op: ir.Store, Width: ir.W64, Base: ir.VMBASE, Index: ir.NoReg, Scale: 1,
+					Disp: scratch, A: ir.VMSCR})
+				csrc = scratch
+			} else {
+				return true, fmt.Errorf("CVTDQ2PD 的源操作数不支持")
+			}
+			em(ir.Insn{Op: ir.Fp, Kind: 10 /* KF_CVTDQ2PD */, Width: ir.W64, Disp: cdd,
+				Imm: uint64(uint32(csrc)), Imm2: 0})
 			return true, nil
 		case x86asm.CVTTSD2SI:
 			dst, _, okd := regArgInfo(args[0])
