@@ -146,6 +146,11 @@
 
 ## 4. 修完 1、2 后，用 `D:\demo_exe` 复跑全量验收
 
+> **进展（目标第 7 轮）**：已交付 `tools/diffcheck.ps1` —— 逐函数「原生 vs 受保护」自动比对，
+> 输出 `OK / WRONG（点名+首处差异）/ REFUSED（附缺哪条指令）` 与 `report.csv`（即可保护性清单）。
+> 实测客户 demo：`/O2` = 14 可保护 / 0 算错；`/Od` = 13 可保护 / 1 算错（点名 `?Mean@...`）。
+> 待做：接进 `tools/e2e.ps1`；把客户自带的 `verify.py`/`ground_truth_exe.txt` 作为期望值来源（而不只是比自身输出）。
+
 把用户自带的 `verify.py` 流程接进来：`demo32.exe` / `demo64.exe` 两个构建都跑，
 连 `ground_truth_exe.txt`、`run_demo32.exe.txt`、`run_demo64.exe.txt` 一起逐行比；
 产出一份"哪些函数可保护 / 哪些被拒绝（附缺哪条指令）"的清单。
