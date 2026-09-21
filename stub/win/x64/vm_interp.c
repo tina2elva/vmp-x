@@ -1299,6 +1299,11 @@ int vm_run(vm_ctx_t *vm) {
 #endif
     vm_keep_verify_ref(vm);
     u64 rsp_start = vm->regs[VRSP]; /* 诊断用：客户机栈起点，见 vm_run_inner 注释 */
+    /* 【已回退，勿再照抄】曾在这里按 frame = rsp_start + 8 + VM_MARGIN 做 XMM 双向同步，
+     * 实测**毫无效果**（retconst/dblarg/dbladd/noarg 的错值与同步前完全一样），
+     * 说明该地址公式在实际运行时并不成立（或读到的是已被改写的 RSP）。下次先在运行期把
+     * 两个候选地址的内容 dump 出来定位，再动手。诊断结论见 STATUS #408。 */
+    /* 【同步代码已回退；原因见上面的注释】 */
 #ifndef VM_RELEASE /* release 构建不带任何诊断状态：少一份明文、少一族特征 */
     vm_diag[0] = vm->regs[0];          /* 入口 X0（客户机参数） */
     vm_diag[1] = rsp_start;            /* 入口模拟 SP */
@@ -1313,6 +1318,7 @@ int vm_run(vm_ctx_t *vm) {
     }
 #endif /* !VM_RELEASE */
     int rc = vm_run_inner(vm, rsp_start);
+    /* 【出口同步代码已回退；原因见入口处的注释】 */
 #ifndef VM_RELEASE
     vm_diag[4] = vm->regs[0];          /* 出口 X0（返回值） */
     vm_diag[5] = vm->regs[VRSP];
