@@ -5045,6 +5045,47 @@ powershell -NoProfile -File tools/acceptance_demo.ps1 -DemoExe X.exe -DemoMap X.
 并在返回后恢复宿主 rsp；同时要处理 `FrameSkew`（guest 栈相对原生栈的偏移）。
 
 注：本轮起把 `docs/TODO.md` §2 的标题与内容按**真实根因**改写（原「栈传参/varargs」的假设已被实测否掉）。
+### 405. 目标项 ② 完成：VM 调 native 的 Win64 ABI 蹦床（栈参数终于送对了）
+
+**根因 2 的修法**：`OP_CALLN` / `OP_CALLR` 原来直接 `fn(rcx,rdx,r8,r9,...)` —— 只传寄存器参数，
+native 被调者读自己的**栈参数**（第 5 个及以后，位于 `[rsp+0x28..]`）时落在宿主 C 栈上。
+现在改成走一段 **naked asm 蹦床**（`stub/win/x64/vm_interp.c` 的 `vm_calln_x64`）：
+
+```asm
+pushq %rbx / pushq %rbp          ; rbx 由被调者保存，用来存宿主 rsp 锚点
+movq %rsp, %rbx
+movq %rcx, %rbp                  ; 参数块（Win64 第 1 个整型参数在 RCX）
+movq 8(%rbp), %rsp               ; 切到 guest 栈
+movq 16(%rbp), %rax              ; a0 → rax（rcx 还被参数块指针占着）
+movq 24(%rbp), %rdx / 32(%rbp), %r8 / 40(%rbp), %r9
+movq 0(%rbp), %r10               ; fn
+movq %rax, %rcx
+callq *%r10                      ; 返回地址由 call 自己压，落地点就是下一条
+1: movq %rbx, %rsp / popq %rbp / popq %rbx / ret
+```
+
+这样被调者入口 `rsp = guest_rsp - 8`，它读 `[rsp+0x28]` 正好是 guest 写在 `[guest_rsp+0x20]` 的那格 ✓。
+（只对 Windows x64 启用；Linux/SysV 与 arm64 的调用约定不同 —— 前 6/8 个参数都在寄存器里，留作后续。）
+
+**过程中自己踩的三个坑（都已写进代码注释）**
+1. 按 SysV 读了 `%rdi` 当第一个参数 ✗ —— Win64 是 `%rcx`，于是拿到野指针，切栈时 `0xC0000005`；
+2. 先 `sub rsp,8` 再手写一个返回地址 ✗ —— `call` 自己会压返回地址，结果被调者入口 rsp 少 8、栈参数差一格（实测得 0）；
+3. （上一轮）三操作数 IMUL 内存分支丢立即数（见 #404）。
+
+**实测证据（本机）**
+
+| 用例 | 原生 | 受保护 |
+|---|---|---|
+| `caller5(x){ return five(1,2,3,4,x); }`（VM 调 native + 栈参数） | 42 | **42** ✓ |
+| `caller5b` | 14 | **14** ✓ |
+| `caller5`+`caller5b`+`five` 同时进 VM（VM↔VM 与 VM→native 混合） | 42 / 14 | **42 / 14** ✓ |
+| **客户 demo `/Od` 13 个函数** | 13 行 | **不一致 0 行** ✓ |
+| **客户 demo `/O2` 13 个函数（回归）** | 13 行 | **不一致 0 行** ✓ |
+| `DemoFormatReport`（`/Od`，原症状） | `score=42` | **`score=42`** ✓ |
+
+**尚未做**：把这条合成用例固化成 `tools/e2e.ps1` 的用例（现在只有本机实测记录）——
+目标第 ④ 项「保护前逐函数差分自检」会系统性地覆盖这一类问题。
+
 
 
 ### 402. 目标项 ① 完成：`CDQ`/`CQO` + `DIV`/`IDIV` 全位宽落地；过程中抓出三处「静默算错」

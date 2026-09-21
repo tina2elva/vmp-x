@@ -425,6 +425,62 @@ const u64 vm_bc_slot_size = VM_BC_SLOT_SIZE;
  * 不如当场返回一个可辨认的错误码。
  * 用"位移"而不是"直接比较下界"：后者在宿主把 regs[VRSP] 配成 0 的场合（单元测试的 harness）
  * 会因为无符号回绕而误报。 */
+/* ---- 调 native 目标的 ABI 蹦床（Win64）----
+ * 直接 fn(rcx,rdx,r8,r9,...) 只传寄存器参数，native 被调者读自己的**栈参数**时（第 5 个及以后，
+ * 位于 [rsp+0x28..]）会读到宿主 C 栈上 —— 实测 caller5(x){ return five(1,2,3,4,x); } 得到 1 而不是 42，
+ * 客户 demo /Od 下把 score 当第 5 个参数转发给 native 的 Math::FormatReport 也因此在算错。
+ *
+ * 修法：切到 guest 栈、压一个「回到蹦床」的返回地址，再 call —— 这样被调者入口 rsp = guest_rsp-8，
+ * 它读 [rsp+0x28] 正好是 guest 写在 [guest_rsp+0x20] 的那格。返回后用 rbx（被调者必须保存）恢复宿主 rsp。
+ * 只对 Windows x64 启用：Linux/SysV 与 arm64 的调用约定不同（前 6/8 个参数都在寄存器里），留作后续。 */
+#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__) && !defined(VM_BLOB_TARGET_LINUX)
+typedef struct { u64 fn, gsp, a0, a1, a2, a3; } vm_calln_t;
+
+__attribute__((naked, used)) static u64 vm_calln_x64(vm_calln_t *p) {
+    /* 注意：Windows x64 的第一个整型参数在 **RCX**（不是 SysV 的 RDI）。
+     * 一开始照 SysV 读 %rdi，拿到的是野指针 → 切栈时 0xC0000005。
+     * a0 要进 RCX，所以先把参数块指针搬到 rbp，最后一步才写 RCX。
+     * 返回地址由 call 自己压 —— 千万别先 sub rsp,8 再手写一个：那样被调者入口 rsp 会少 8，
+     * 它读第 5 个参数就会差一格（实测得到 0）。 */
+    __asm__ volatile(
+        "pushq %rbx\n\t"
+        "pushq %rbp\n\t"
+        "movq %rsp, %rbx\n\t"
+        "movq %rcx, %rbp\n\t"
+        "movq 8(%rbp), %rsp\n\t"
+
+        "movq 16(%rbp), %rax\n\t"
+        "movq 24(%rbp), %rdx\n\t"
+        "movq 32(%rbp), %r8\n\t"
+        "movq 40(%rbp), %r9\n\t"
+        "movq 0(%rbp), %r10\n\t"
+        "movq %rax, %rcx\n\t"
+        "callq *%r10\n\t"
+        "1:\n\t"
+        "movq %rbx, %rsp\n\t"
+        "popq %rbp\n\t"
+        "popq %rbx\n\t"
+        "ret\n\t");
+}
+
+static u64 vm_call_native(vm_ctx_t *vm, u64 addr) {
+    vm_calln_t c;
+    c.fn = addr;
+    c.gsp = vm->regs[VRSP];
+    c.a0 = vm->regs[VRCX];
+    c.a1 = vm->regs[VRDX];
+    c.a2 = vm->regs[VR8];
+    c.a3 = vm->regs[VR9];
+    return vm_calln_x64(&c);
+}
+#else
+static u64 vm_call_native(vm_ctx_t *vm, u64 addr) {
+    typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
+    fn_t fn = (fn_t)addr;
+    return fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
+              vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+}
+#endif
 static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start);
 static void vm_keep_verify_ref(vm_ctx_t *vm);
 
@@ -1865,16 +1921,13 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_diag[10] = vm_last_call_args[2];
             vm_diag[11] = vm_last_call_args[3];
 #endif
-            typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
-            fn_t fn = (fn_t)addr;
 #ifndef VM_RELEASE
             {   /* 调用前后快照 guest 栈顶 32 个 qword，记录第一处变化 */
                 u64 sp = vm->regs[VRSP] + (u64)VM_MARGIN; /* 调用前后 guest SP 是同一个值；这里只取地址基准 */
                 u32 k;
                 sp = vm->regs[VRSP];
                 for (k = 0; k < 32u; k++) vm_call_snap[k] = ((const u64 *)(void *)sp)[k];
-                vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
-                                    vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+                vm->regs[VRAX] = vm_call_native(vm, addr);
                 for (k = 0; k < 32u; k++) {
                     u64 now = ((const u64 *)(void *)sp)[k];
                     if (now != vm_call_snap[k]) {
@@ -1896,8 +1949,7 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
                 break;
             }
 #endif
-            vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
-                                vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+            vm->regs[VRAX] = vm_call_native(vm, addr);
 #ifndef VM_RELEASE
             vm_call_ring[(vm_call_ring_n & 7u) * 2u] = addr;
             vm_call_ring[(vm_call_ring_n & 7u) * 2u + 1u] = vm->regs[VRAX];
@@ -1924,10 +1976,7 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_diag[11] = vm_last_call_args[3];
 #endif
             if (addr == 0) return 1;
-            typedef u64 (*fnr_t)(u64, u64, u64, u64, u64, u64, u64, u64);
-            fnr_t fn = (fnr_t)addr;
-            vm->regs[VRAX] = fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
-                                vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
+            vm->regs[VRAX] = vm_call_native(vm, addr);
 #ifndef VM_RELEASE
             vm_call_ring[(vm_call_ring_n & 7u) * 2u] = addr | 0x8000000000000000ull;
             vm_call_ring[(vm_call_ring_n & 7u) * 2u + 1u] = vm->regs[VRAX];
