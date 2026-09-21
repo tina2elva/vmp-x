@@ -320,8 +320,29 @@ vmpepoch lic-show --lic A-A.vmplic --root root.pub --product PROD-A
 负例3 授权里塞伪造证书 → `lic-show --root` 报“证书链：不是由上一级签的”✓。
 
 **还没做（下一步，按需选择）**
-- [ ] **运行期强制**：blob 侧 `vm_license_check()`（路线 B 需 Ed25519 验签的 C 实现，约 600–900 行 + 两侧 KAT）；
-      产物侧加 `-license-vendor/-license-product/-license-pubkey`（像 verify table 那样另立一张表，描述符已满）。
+- [ ] **运行期强制**（下一步的主任务，方案已定死）：
+  **① 烘什么、烘在哪**：`vmpbuild` 发一个**占位全局** `vm_license_meta`（默认 kind=0 = 不启用，现有产物不受影响），
+  在 manifest 里暴露它的偏移；`vmpack` 用新参数 `-license-vendor / -license-product / -license-key <pub>`
+  把 vendorID / productID / **签发者公钥** 打进**产物里那份 blob 副本**（blob 在 payload 偏移 0，符号偏移来自 manifest）。
+  **② 为什么只烘「签发者公钥」而不是厂商根**：运行期只做**一次签名验证**（几十行 C），
+  证书链/委派/吊销在**导出授权时**由工具校验（工具侧已有完整链逻辑）；这样 C 侧不用解析证书链。
+  产物由谁构建就烘谁的公钥 —— 与「每个软件厂商是自己那棵树的根」的模型一致。
+  **③ 授权文件**：给运行期用**二进制**格式（`<产物>.vmplic.bin`，C 侧不解析 JSON），
+  内容 = 定长头（版本/vendorID/productID 的 32 字节哈希/到期时间/标志）+ 产品哈希表；
+  `vmpepoch lic-export --lic <json> --key <issuer.priv> --out <exe>.vmplic.bin` 负责导出并**对其字节签名**。
+  **④ 运行期验证**：blob 侧 `vm_license_check()`：
+  - `kind==0` 直接放过（向后兼容）；
+  - 用 PEB 路径逻辑找 `<产物全路径>.vmplic.bin`（复用 `vm_key_path()` 那套，零 API）；
+  - 从 `bcrypt.dll` 取 `BCryptOpenAlgorithmProvider(ECDSA_P256)` / `BCryptImportKeyPair(ECCPUBLIC_BLOB)` /
+    `BCryptVerifySignature`（**公钥 64 字节 X||Y → 加 BCRYPT_ECCKEY_BLOB 头**），验证 64 字节 r||s；
+  - 查 vendorID 哈希一致、productID 在表内、未过期；不通过 → 同一个硬门 `0xC0DE0007`。
+  **⑤ 验收**：带授权跑通（与原生逐行一致）；删授权 → 0xC0DE0007 且无输出；改授权一个字节 → 拒绝；
+  改系统时间到过期之后 → 拒绝；用别的密钥签的授权 → 拒绝。
+
+- [ ] 说明：**Ed25519 已全部换成 ECDSA P-256**（`cmd/vmpepoch/crypto.go`）—— 因为运行期要在产物里验签，
+      而 Windows CNG 只提供 ECDSA/RSA，没有 Ed25519；换掉之后 blob 侧不需要塞上千行第三方密码学实现。
+      私钥文件 = 32 字节标量（hex）；公钥 = 64 字节 X||Y（hex）；签名 = 64 字节 r||s（base64），与 CNG 格式一致。
+
 - [ ] **路线 A（Sentinel）**：blob 侧调 Sentinel API（`hasp_login`/`hasp_get_info`/`hasp_decrypt`）——
       **推荐让密钥由狗派生**，这样“同一份产物发所有下游”天然成立，且密钥不出狗。
 - [ ] `features` 的具体语义（并发/功能点/机器绑定）与判定实现。

@@ -20,8 +20,7 @@ package main
 //   vmpepoch cert-show  --cert <cert> [--root <root.pub>]
 
 import (
-	"crypto/ed25519"
-	"encoding/base64"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -46,16 +45,12 @@ func (r *certReq) msg() []byte {
 }
 
 func (r *certReq) checkSelfSig() error {
-	pub, err := hex.DecodeString(strings.TrimSpace(r.SubjectPub))
-	if err != nil || len(pub) != ed25519.PublicKeySize {
-		return fmt.Errorf("请求里的 subjectPub 不是 %d 字节 hex", ed25519.PublicKeySize)
+	raw, err := hex.DecodeString(strings.TrimSpace(r.SubjectPub))
+	if err != nil || len(raw) != 64 {
+		return fmt.Errorf("请求里的 subjectPub 不是 64 字节 hex（X||Y）")
 	}
-	sig, err := base64.StdEncoding.DecodeString(r.SelfSig)
-	if err != nil {
-		return fmt.Errorf("请求自签名不是 base64: %w", err)
-	}
-	if !ed25519.Verify(ed25519.PublicKey(pub), r.msg(), sig) {
-		return fmt.Errorf("请求自签名验证失败：申请者并没有与 subjectPub 配对的私钥（或请求被改动）")
+	if err := verifyDetached(pubFromBytes(raw), r.msg(), r.SelfSig); err != nil {
+		return fmt.Errorf("请求自签名验证失败：申请者并没有与 subjectPub 配对的私钥（或请求被改动）: %v", err)
 	}
 	return nil
 }
@@ -80,29 +75,22 @@ func (c *vendorCert) canonical() []byte {
 	return b
 }
 
-func (c *vendorCert) signWith(priv ed25519.PrivateKey) {
-	c.Sig = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, c.canonical()))
+func (c *vendorCert) signWith(priv *ecdsa.PrivateKey) {
+	c.Sig = signDetached(priv, c.canonical())
 }
 
-func (c *vendorCert) pub() (ed25519.PublicKey, error) {
+func (c *vendorCert) pub() (*ecdsa.PublicKey, error) {
 	raw, err := hex.DecodeString(strings.TrimSpace(c.SubjectPub))
-	if err != nil || len(raw) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("证书里的 subjectPub 不是 %d 字节 hex", ed25519.PublicKeySize)
+	if err != nil || len(raw) != 64 {
+		return nil, fmt.Errorf("证书里的 subjectPub 不是 64 字节 hex（X||Y）")
 	}
-	return ed25519.PublicKey(raw), nil
+	return pubFromBytes(raw), nil
 }
 
 // verifySelf 用给定公钥验本级签名（不回溯链）。
-func (c *vendorCert) verifySelf(parent ed25519.PublicKey) error {
-	if c.Sig == "" {
-		return fmt.Errorf("证书没有签名")
-	}
-	sig, err := base64.StdEncoding.DecodeString(c.Sig)
-	if err != nil {
-		return fmt.Errorf("证书签名不是 base64: %w", err)
-	}
-	if !ed25519.Verify(parent, c.canonical(), sig) {
-		return fmt.Errorf("证书签名验证失败（vendorID=%s 不是由上一级签的）", c.VendorID)
+func (c *vendorCert) verifySelf(parent *ecdsa.PublicKey) error {
+	if err := verifyDetached(parent, c.canonical(), c.Sig); err != nil {
+		return fmt.Errorf("证书签名验证失败（vendorID=%s 不是由上一级签的）: %v", c.VendorID, err)
 	}
 	if c.ValidUntil != "" {
 		t, perr := time.Parse(time.RFC3339, c.ValidUntil)
@@ -115,7 +103,7 @@ func (c *vendorCert) verifySelf(parent ed25519.PublicKey) error {
 
 // verifyChain 逐级回溯到厂商根：本级由 Issuer 签、Issuer 由它的 Issuer 签…… 顶层由 root 签。
 // 同时校验整条链的 vendorID 一致（防止把别的 vendorID 的证书拼进来）。
-func (c *vendorCert) verifyChain(root ed25519.PublicKey) error {
+func (c *vendorCert) verifyChain(root *ecdsa.PublicKey) error {
 	cur := c
 	for depth := 0; depth < certChainMax; depth++ {
 		if cur.Issuer == nil {
@@ -181,9 +169,8 @@ func cmdCertReq(args []string) {
 		os.Exit(2)
 	}
 	priv := loadPriv(*key)
-	r := &certReq{V: 1, VendorID: *vendor, Note: *note,
-		SubjectPub: hex.EncodeToString(priv.Public().(ed25519.PublicKey))}
-	r.SelfSig = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, r.msg()))
+	r := &certReq{V: 1, VendorID: *vendor, Note: *note, SubjectPub: pubHexOf(&priv.PublicKey)}
+	r.SelfSig = signDetached(priv, r.msg())
 	b, err := json.MarshalIndent(r, "", "  ")
 	must(err)
 	must(os.WriteFile(*out, append(b, 0x0A), 0o644))
@@ -210,20 +197,20 @@ func cmdCertIssue(args []string) {
 		fmt.Println("[!] 需要 --vendor --out 与 (--req 或 --subject)，并且 --root 与 --issuer/--issuer-key 二选一")
 		os.Exit(2)
 	}
-	var pubHex string
+	var pubHexStr string
 	if *reqIn != "" {
 		r := loadReq(*reqIn)
 		if r.VendorID != *vendor {
 			must(fmt.Errorf("请求里的 vendorID（%s）与 --vendor（%s）不一致", r.VendorID, *vendor))
 		}
 		must(r.checkSelfSig())
-		pubHex = strings.ToLower(strings.TrimSpace(r.SubjectPub))
+		pubHexStr = strings.ToLower(strings.TrimSpace(r.SubjectPub))
 		if *note == "" {
 			*note = r.Note
 		}
 		fmt.Println("[*] 请求持有证明校验通过")
 	} else {
-		pubHex = hex.EncodeToString(loadPub(*subject))
+		pubHexStr = pubHexOf(loadPub(*subject))
 	}
 	vu := ""
 	if *until != "" {
@@ -233,7 +220,7 @@ func cmdCertIssue(args []string) {
 			vu = e
 		}
 	}
-	c := &vendorCert{V: 1, VendorID: *vendor, SubjectPub: pubHex,
+	c := &vendorCert{V: 1, VendorID: *vendor, SubjectPub: pubHexStr,
 		Issued: time.Now().UTC().Format(time.RFC3339), ValidUntil: vu, Note: *note, CanIssue: *canIssue}
 	if midMode {
 		if *issuerKey == "" || *rootPub == "" {

@@ -18,10 +18,7 @@ package main
 // 到期写法：2027-12-31（当天 23:59:59 前有效）或 perpetual / 永久。
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/hex"
+	"crypto/ecdsa"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -59,45 +56,18 @@ func (l *license) canonical() []byte {
 	return b
 }
 
-func (l *license) sign(priv ed25519.PrivateKey) {
-	l.Sig = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, l.canonical()))
+func (l *license) sign(priv *ecdsa.PrivateKey) {
+	l.Sig = signDetached(priv, l.canonical())
 }
 
-func (l *license) verify(pub ed25519.PublicKey) error {
-	if l.Sig == "" {
-		return fmt.Errorf("授权没有签名（sig 为空）")
-	}
-	sig, err := base64.StdEncoding.DecodeString(l.Sig)
-	if err != nil {
-		return fmt.Errorf("签名不是 base64: %w", err)
-	}
-	if !ed25519.Verify(pub, l.canonical(), sig) {
-		return fmt.Errorf("签名验证失败（授权被改动，或不是这把母狗签的）")
+func (l *license) verify(pub *ecdsa.PublicKey) error {
+	if err := verifyDetached(pub, l.canonical(), l.Sig); err != nil {
+		return fmt.Errorf("签名验证失败（授权被改动，或不是这把签发密钥签的）: %v", err)
 	}
 	return nil
 }
 
-func loadPriv(path string) ed25519.PrivateKey {
-	b, err := os.ReadFile(path)
-	must(err)
-	raw, err := hex.DecodeString(strings.TrimSpace(string(b)))
-	must(err)
-	if len(raw) != ed25519.PrivateKeySize {
-		must(fmt.Errorf("%s 不是 %d 字节的 Ed25519 私钥（hex）", path, ed25519.PrivateKeySize))
-	}
-	return ed25519.PrivateKey(raw)
-}
-
-func loadPub(path string) ed25519.PublicKey {
-	b, err := os.ReadFile(path)
-	must(err)
-	raw, err := hex.DecodeString(strings.TrimSpace(string(b)))
-	must(err)
-	if len(raw) != ed25519.PublicKeySize {
-		must(fmt.Errorf("%s 不是 %d 字节的 Ed25519 公钥（hex）", path, ed25519.PublicKeySize))
-	}
-	return ed25519.PublicKey(raw)
-}
+// loadPriv / loadPub 见 crypto.go（ECDSA P-256）。
 
 func parseExpiry(s string) (string, error) {
 	s = strings.TrimSpace(s)
@@ -155,10 +125,9 @@ func cmdKeygen(args []string) {
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
 	out := fs.String("out", "vendor-license-key", "输出前缀（生成 <前缀>.priv / <前缀>.pub）")
 	fs.Parse(args)
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	must(err)
-	must(os.WriteFile(*out+".priv", []byte(hex.EncodeToString(priv)+"\n"), 0o600))
-	must(os.WriteFile(*out+".pub", []byte(hex.EncodeToString(pub)+"\n"), 0o644))
+	_, privHex, pubHexStr := genKeypair()
+	must(os.WriteFile(*out+".priv", []byte(privHex+"\n"), 0o600))
+	must(os.WriteFile(*out+".pub", []byte(pubHexStr+"\n"), 0o644))
 	fmt.Printf("[+] 签发密钥对已生成\n")
 	fmt.Printf("    私钥: %s.priv   <- 只应存在于母狗/一级客户手里，绝不进产物\n", *out)
 	fmt.Printf("    公钥: %s.pub    <- 用 vmpbuild 烘进产物，供运行期验签\n", *out)
@@ -190,7 +159,7 @@ func cmdLicNew(args []string) {
 		// 否则“身份”与“签名者”脱钩，验链就失去意义。
 		sub, err := c.pub()
 		must(err)
-		if !sub.Equal(priv.Public().(ed25519.PublicKey)) {
+		if !sub.Equal(&priv.PublicKey) {
 			must(fmt.Errorf("签发私钥与证书里绑定的公钥不匹配（证书 subjectPub=%s）", c.SubjectPub[:16]))
 		}
 		if *rootPub != "" {
