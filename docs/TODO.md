@@ -77,6 +77,33 @@
 
 **为什么优先**：任何用 `sprintf`/varargs/参数超过 4 个的函数都会踩 —— 覆盖面最广。
 
+**已复现并定位到指令序列（目标第 3 轮）**
+- 复现：`build/demo64/demo64_dbg.exe`（`/Od /Zi /RTC1 /MDd`）只把 `?DemoFormatReport@@YAHPEADHPEBDH@Z` 进 VM →
+  输出 `[DEMO_MARKER_ALPHA] score=8`，原生是 `score=42`（**静默算错**）。
+- `dumpbin /disasm` 出来的函数体就是经典的 **varargs「home + 转发」** 序列（`/Od` 特有）：
+  ```asm
+  mov dword ptr [rsp+20h],r9d      ; 把入参 4 存进「调用者给的 shadow space」
+  mov qword ptr [rsp+18h],r8
+  mov dword ptr [rsp+10h],edx
+  mov qword ptr [rsp+8],rcx
+  push rdi
+  sub  rsp,30h
+  mov  eax,dword ptr [rsp+58h]     ; 读回第 5 个参数（= 上面自己 home 的那格）
+  mov  dword ptr [rsp+20h],eax     ; 转发给被调用者
+  mov  r9,[rsp+50h] / mov r8d,[rsp+48h] / mov rdx,[rsp+40h] / lea rcx,[...]
+  call @ILT+70(?FormatReport@Math@Demo@@QEAAHPEADHPEBDH@Z)
+  add  rsp,30h / pop rdi / ret
+  ```
+  关键点：home 写的是 `rsp_entry+8..+0x20`（调用者的 shadow space），`push rdi`+`sub rsp,30h` 之后
+  再用 `[rsp+0x40..0x58]` **原样读回** —— 也就是**同一批绝对地址**，与调用者是否真的压了栈无关（自洽）。
+  所以问题出在 **VM 对这段「push/sub + 以当前 rsp 为基准的 4/8 字节存读」的建模**上，
+  而不是「VM 拿不到调用者的栈参数」。
+
+**下一步（修法候选）**：① 打开 VM 指令轨迹，逐条对照这段的 pc/rsp/内存读写；
+② 重点查 `push`/`sub rsp,imm` 之后 `[rsp+disp]` 的地址计算与**位宽**（4 vs 8 字节），
+以及 `sp_track`（仓库里已有 `internal/lift/x64/sp_track_test.go`）是否在 `push` 之后同步了 rsp；
+③ 修好后用 **/Od + /O2 两种构建**各跑一遍逐行比对，并把它加成 `tools/e2e.ps1` 的用例。
+
 **验收**：`DemoFormatReport` 在 `/Od` 与 `/O2` 两种构建下都逐行一致；并补一条 e2e 覆盖"栈参数 + varargs"。
 
 ## 3. `CVTDQ2PD` / double 路径

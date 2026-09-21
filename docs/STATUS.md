@@ -5011,6 +5011,18 @@ powershell -NoProfile -File tools/acceptance_demo.ps1 -DemoExe X.exe -DemoMap X.
 **验收（本轮）**：`tools/gates.ps1` = **11 gates / 0 failed**（含 `go test ./...` 与 arm64 客户机差分）。
 注：`AGENTS.md`/`docs/HANDOFF.md` 的验收第 1 条要求 `tools/preflight.ps1`，但该脚本已在 `a83a4ad` 移除
 （本文件 #4322 已记录：脚本自检不过被删）——**当前仓库里没有这个文件**，本轮以 `tools/gates.ps1` 为准。
+### 403. 目标第 3 轮：CI 转绿（可移植长除法）+ 目标项 ② 复现并定位到指令序列
+
+**CI**：`35606046838` —— **五作业全绿**（上一轮 `45bbf49` 红的 arm64 三项，随 `89a4ada` 的可移植 128/64 长除法转绿）。
+
+**目标项 ② 的进展（复现 + 定位，未修完）**
+- 用客户源码编出 `/Od /Zi /RTC1 /MDd` 的 `demo64_dbg.exe`（带 `/MAP`），只把 `?DemoFormatReport@@YAHPEADHPEBDH@Z` 进 VM：
+  **受保护输出 `score=8`，原生 `score=42`** —— 与既有记录一致，属「保护成功但算错」。
+- `dumpbin /disasm` 显示该函数在 `/Od` 下是经典的 **varargs home+转发**：先把 4 个入参写进 `[rsp+8..20h]`，
+  `push rdi` + `sub rsp,30h` 之后又从 `[rsp+40h..58h]` 读回（同一批绝对地址），再转发给 `Math::FormatReport`。
+  即**不依赖调用者真实压栈**，所以 bug 在 VM 对这段栈建模（`push`/`sub rsp,imm` 之后的 `[rsp+disp]` 地址或位宽）上。
+- 反汇编与候选修法已写进 `docs/TODO.md` §2，下一轮照此改，并用 `/Od`+`/O2` 双构建验证。
+
 ### 402. 目标项 ① 完成：`CDQ`/`CQO` + `DIV`/`IDIV` 全位宽落地；过程中抓出三处「静默算错」
 
 **做了什么**
