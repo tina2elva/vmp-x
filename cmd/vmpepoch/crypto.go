@@ -16,12 +16,13 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"math/big"
 	"os"
 	"strings"
+
+	"github.com/vmpx/vmp-x/internal/cred"
 )
 
 func sha256Sum(b []byte) []byte {
@@ -82,35 +83,16 @@ func pubFromBytes(raw []byte) *ecdsa.PublicKey {
 		Y: new(big.Int).SetBytes(raw[32:64])}
 }
 
+// pubHexOf 走 internal/cred 的同一实现（签名/验签/公钥编码都只有一份）。
 func pubHexOf(pub *ecdsa.PublicKey) string {
-	return hex.EncodeToString(pubBytes(pub))
+	return cred.PubHex(pub)
 }
 
 // signDetached: base64(r||s)，r/s 各 32 字节大端（CNG 的格式）。
 func signDetached(priv *ecdsa.PrivateKey, msg []byte) string {
-	r, s, err := ecdsa.Sign(rand.Reader, priv, sha256Sum(msg))
-	must(err)
-	raw := make([]byte, 64)
-	r.FillBytes(raw[0:32])
-	s.FillBytes(raw[32:64])
-	return base64.StdEncoding.EncodeToString(raw)
+	return cred.Sign(priv, msg)
 }
 
 func verifyDetached(pub *ecdsa.PublicKey, msg []byte, sigB64 string) error {
-	if sigB64 == "" {
-		return fmt.Errorf("没有签名")
-	}
-	raw, err := base64.StdEncoding.DecodeString(sigB64)
-	if err != nil {
-		return fmt.Errorf("签名不是 base64: %w", err)
-	}
-	if len(raw) != 64 {
-		return fmt.Errorf("签名长度不是 64 字节（%d）", len(raw))
-	}
-	r := new(big.Int).SetBytes(raw[0:32])
-	s := new(big.Int).SetBytes(raw[32:64])
-	if !ecdsa.Verify(pub, sha256Sum(msg), r, s) {
-		return fmt.Errorf("签名验证失败")
-	}
-	return nil
+	return cred.VerifySig(pub, msg, sigB64)
 }

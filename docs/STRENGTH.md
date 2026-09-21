@@ -70,6 +70,33 @@
    白拿硬件密钥隔离 + 狗参与解密 ✓。此时我们的 PKI 只需做**接口层**。
 4. **商务层**：合同 + 更新/支持绑定。很多转卖问题在合同层就解决了，技术只是最后一道。
 5. 可选：用 vmp-x 给工具**加壳**（注意自举顺序：用冻结的旧 blob 保护新工具，链式不循环）。
+**工具授权（构建凭据）已实现 —— 对应 4.4 的第 1 条**
+
+```
+# 客户侧：自己生成「工具安装密钥对」，并把公钥（带持有证明）交给厂商
+vmpepoch keygen   --out vmpx
+vmpepoch cert-req --key vmpx.priv --vendor ACME-0001 --out vmpx.req.json
+# 厂商侧：签发构建凭据（有效期/备注；可绑机器指纹，预留）
+vmpepoch cred-issue --root root.priv --req vmpx.req.json --vendor ACME-0001 --until 2028-12-31 --out vmpx.cred
+vmpepoch cred-show  --cred vmpx.cred --root root.pub
+# 部署：把 vmpx.cred 与私钥（命名为 vmpx.key）放到 vmpbuild/vmpack 同目录；或用 -cred / $VMPX_CRED
+```
+
+**工具侧**：厂商根公钥**烘进工具二进制**（发布构建）：
+`go build -ldflags "-X github.com/vmpx/vmp-x/internal/cred.RootPubHex=<64字节hex>"`。
+留空 = 开发构建 → 校验关闭（只打一行提示），因此现有 CI/gates 不受影响 ✓。
+校验内容：签名 → canBuild → 有效期 → **vendorID 与本次构建声明一致** → 本机私钥与凭据绑定公钥配对。
+不通过一律 exit 8，并打印原因。
+
+**实测（本机，六种情形）**：凭据不在 → 拒；凭据在但私钥不在 → 拒（**只拷 .cred 拷不走权限**）；
+凭据+私钥齐全 → 通过；`-vendor` 与凭据不一致 → 拒；凭据过期 → 拒；凭据被改一个字段 → 拒（签名失败）；
+恢复后重跑 → 通过 ✓。
+
+**边界（如实登记）**：
+- 这只防「顺手转卖/复制工具」✓；铁了心 patch 工具的人仍然能绕过（与所有软件许可同一边界）✗；
+- 机器绑定是**预留**（`--machine` + `machineID()` 现在返回空 = 不校验），接 TPM/机器指纹时在那里实现；
+- 私钥目前是明文文件 `vmpx.key`，下一步应改为 **DPAPI/TPM 不可导出**（否则复制私钥同样绕过）。
+
 
 ### 4.5 一句话给销售
 

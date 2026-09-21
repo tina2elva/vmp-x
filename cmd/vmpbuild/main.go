@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vmpx/vmp-x/internal/cred"
 	"github.com/vmpx/vmp-x/internal/inject"
 )
 
@@ -105,8 +106,16 @@ func main() {
 	keyExternal := flag.Bool("key-external", false, "主密钥外置（1b）：blob 里只放占位密钥 + 密钥校验值，真主密钥运行期从外部取")
 	keyOut := flag.String("key-out", "", "配合 -key-external：把真主密钥以 64 位 hex 文本写到该文件（部署时放到 <产物>.vmpkey 即可）")
 	keyIn := flag.String("key-in", "", "**指定**主密钥而不是随机生成：64 位 hex 字面量，或一个文件（32 字节原始密钥 / 64 位 hex 文本）。用于跨版本、跨构建复用同一把钥匙")
+	credFlag := flag.String("cred", "", "构建凭据路径（默认 $VMPX_CRED 或工具同目录 vmpx.cred）；仅当工具烘焙了厂商根公钥时才校验")
+	vendorFlag := flag.String("vendor", "", "本次构建声明的 vendorID；工具授权开启时会强制与凭据里的一致")
 	verbose := flag.Bool("v", false, "打印符号与重定位详情")
 	flag.Parse()
+	// 工具授权（docs/STRENGTH.md 4.4-1）：只有工具**烘焙了厂商根公钥**时才校验（发布构建），
+	// 开发构建留空 => 关闭校验，现有 CI/gates 不受影响。
+	if err := cred.Require(*credFlag, *vendorFlag); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] 工具授权校验失败: %v\n", err)
+		os.Exit(8)
+	}
 
 	// release 构建：必须在这里就定下来 —— compile() 在下面几步内就会被调用，
 	// 之前放在 measureMaxFrame 旁边导致 -DVM_RELEASE 根本没进编译（.text 反而更大）。

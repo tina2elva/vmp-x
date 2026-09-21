@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/vmpx/vmp-x/internal/cred"
 	arm64dec "github.com/vmpx/vmp-x/internal/decode/arm64"
 	"github.com/vmpx/vmp-x/internal/inject"
 	"github.com/vmpx/vmp-x/internal/ir"
@@ -65,6 +66,8 @@ func main() {
 	stripRelocs := flag.Bool("strip-relocs", false, "退回旧行为：拆掉重定位表 + 清 DYNAMIC_BASE（放弃 ASLR）。默认**保留**，运行期按「先减回去→解密→再加回来」处理")
 	flag.BoolVar(&encImageELFData, "enc-image-elf-data", false, "ELF 侧把 .rodata/.gopclntab 也纳入整体加密（实验：CI 上 aarch64 会 SIGSEGV，默认关）")
 	noEncImageELF := flag.Bool("no-enc-image-elf", false, "对 ET_EXEC 的 ELF 关闭原镜像整体加密（默认开；探针已改为合成补丁字节，不再依赖明文）")
+	credFlag := flag.String("cred", "", "构建凭据路径（默认 $VMPX_CRED 或工具同目录 vmpx.cred）；仅当工具烘焙了厂商根公钥时才校验")
+	vendorFlag := flag.String("vendor", "", "本次构建声明的 vendorID；工具授权开启时会强制与凭据里的一致")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
@@ -74,6 +77,12 @@ func main() {
 	var funcs multiFlag
 	flag.Var(&funcs, "func", "要保护的函数名（可重复）")
 	flag.Parse()
+	// 工具授权（docs/STRENGTH.md 4.4-1）：只有工具**烘焙了厂商根公钥**时才校验（发布构建），
+	// 开发构建留空 => 关闭校验，现有 CI/gates 不受影响。
+	if err := cred.Require(*credFlag, *vendorFlag); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] 工具授权校验失败: %v\n", err)
+		os.Exit(8)
+	}
 	wipeEnabled = *wipe
 	encImageEnabled = !*noEncImage
 	encImageDLLEnabled = !*noEncImageDLL
