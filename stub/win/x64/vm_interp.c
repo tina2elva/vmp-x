@@ -762,6 +762,11 @@ typedef struct __attribute__((aligned(8))) {
 __attribute__((section(".data"), used))
 volatile vm_license_meta_t vm_license_meta = {0, 0, 0, {0}};
 
+/* 门禁失败：对外**统一**是 0xC0DE0007（契约）；"卡在哪一步"记进 vm_license_fail_stage
+ * （.bss，非 static，会出现在 manifest 符号表里，便于现场排查）。 */
+u32 vm_license_fail_stage;
+#define VM_LIC_FAIL(stage) do { vm_license_fail_stage = (stage); vm_key_reject(); } while (0)
+
 /* 把 "<产物全路径><suffix>" 拼成原生 API 要的 "\??\..."（UTF-16）。与 key 不同：不受环境变量覆盖。 */
 static const u16 *vm_exe_path_suffix(const char *suffix, u16 *out, u32 cap) {
     u64 peb = vm_peb_base();
@@ -814,7 +819,7 @@ static int vm_license_verify(const u8 *msg, u32 msgLen, const u8 *sig64, const u
         static const u16 bcName[] = {'b','c','r','y','p','t','.','d','l','l',0};
         bc = vm_load_lib(bcName);
     }
-    if (!bc) { vm_key_reject_code(0x31u); return 0; }
+    if (!bc) { VM_LIC_FAIL(0x31u); return 0; }
     typedef long (*open_t)(void **, const u16 *, const u16 *, u32);
     typedef long (*imp_t)(void *, void *, const u16 *, void **, u8 *, u32, u32);
     typedef long (*hash_t)(void *, void *, u8 *, u32, u8 *, u32, u32);
@@ -827,31 +832,31 @@ static int vm_license_verify(const u8 *msg, u32 msgLen, const u8 *sig64, const u
     hdata_t bData = (hdata_t)vm_get_proc(bc, "BCryptHashData");
     hfin_t bFin = (hfin_t)vm_get_proc(bc, "BCryptFinishHash");
     ver_t bVerify = (ver_t)vm_get_proc(bc, "BCryptVerifySignature");
-    if (!bOpen) { vm_key_reject_code(0x32u); return 0; }
-    if (!bImport) { vm_key_reject_code(0x33u); return 0; }
-    if (!bHash) { vm_key_reject_code(0x34u); return 0; }
-    if (!bData) { vm_key_reject_code(0x35u); return 0; }
-    if (!bFin) { vm_key_reject_code(0x36u); return 0; }
-    if (!bVerify) { vm_key_reject_code(0x37u); return 0; }
+    if (!bOpen) { VM_LIC_FAIL(0x32u); return 0; }
+    if (!bImport) { VM_LIC_FAIL(0x33u); return 0; }
+    if (!bHash) { VM_LIC_FAIL(0x34u); return 0; }
+    if (!bData) { VM_LIC_FAIL(0x35u); return 0; }
+    if (!bFin) { VM_LIC_FAIL(0x36u); return 0; }
+    if (!bVerify) { VM_LIC_FAIL(0x37u); return 0; }
     static const u16 algSha[] = {'S','H','A','2','5','6',0};
     static const u16 algEcc[] = {'E','C','D','S','A','_','P','2','5','6',0};
     static const u16 blobEcc[] = {'E','C','C','P','U','B','L','I','C','B','L','O','B',0};
     void *hSha = 0, *hEcc = 0, *hHash = 0, *hKey = 0;
-    if (bOpen(&hSha, algSha, 0, 0) < 0) { vm_key_reject_code(0x38u); return 0; }
+    if (bOpen(&hSha, algSha, 0, 0) < 0) { VM_LIC_FAIL(0x38u); return 0; }
     u8 digest[32];
     int ok = 0;
-    if (bHash(hSha, &hHash, 0, 0, 0, 0, 0) < 0) { vm_key_reject_code(0x39u); return 0; }
-    if (bData(hHash, (u8 *)msg, msgLen, 0) < 0) { vm_key_reject_code(0x3Au); return 0; }
-    if (bFin(hHash, digest, 32, 0) < 0) { vm_key_reject_code(0x3Bu); return 0; }
-    if (bOpen(&hEcc, algEcc, 0, 0) < 0) { vm_key_reject_code(0x3Cu); return 0; }
+    if (bHash(hSha, &hHash, 0, 0, 0, 0, 0) < 0) { VM_LIC_FAIL(0x39u); return 0; }
+    if (bData(hHash, (u8 *)msg, msgLen, 0) < 0) { VM_LIC_FAIL(0x3Au); return 0; }
+    if (bFin(hHash, digest, 32, 0) < 0) { VM_LIC_FAIL(0x3Bu); return 0; }
+    if (bOpen(&hEcc, algEcc, 0, 0) < 0) { VM_LIC_FAIL(0x3Cu); return 0; }
     {
         /* BCRYPT_ECCKEY_BLOB: { dwMagic, cbKey, X[cbKey], Y[cbKey] } */
         u8 keyBlob[8 + 64];
         *(u32 *)(keyBlob + 0) = 0x31534345u; /* BCRYPT_ECDSA_PUBLIC_P256_MAGIC ('ECS1') */
         *(u32 *)(keyBlob + 4) = 32u;
         for (u32 i = 0; i < 64; i++) keyBlob[8 + i] = pub64[i];
-        if (bImport(hEcc, 0, blobEcc, &hKey, keyBlob, (u32)sizeof(keyBlob), 0) < 0) { vm_key_reject_code(0x3Du); return 0; }
-        if (bVerify(hKey, 0, digest, 32, (u8 *)sig64, 64, 0) < 0) { vm_key_reject_code(0x3Eu); return 0; }
+        if (bImport(hEcc, 0, blobEcc, &hKey, keyBlob, (u32)sizeof(keyBlob), 0) < 0) { VM_LIC_FAIL(0x3Du); return 0; }
+        if (bVerify(hKey, 0, digest, 32, (u8 *)sig64, 64, 0) < 0) { VM_LIC_FAIL(0x3Eu); return 0; }
         ok = 1;
     }
     return ok;
@@ -861,19 +866,19 @@ static int vm_license_verify(const u8 *msg, u32 msgLen, const u8 *sig64, const u
 static int vm_license_check(void) {
     if (vm_license_meta.kind == 0) return 1;
     u16 path[360];
-    if (!vm_exe_path_suffix(".vmplic.bin", path, 360)) { vm_key_reject_code(0x21u); return 0; }
+    if (!vm_exe_path_suffix(".vmplic.bin", path, 360)) { VM_LIC_FAIL(0x21u); return 0; }
     static u8 lic[2048];
     u32 got = 0;
-    if (!vm_key_read_nt(path, lic, (u32)sizeof(lic), &got)) { vm_key_reject_code(0x22u); return 0; }
+    if (!vm_key_read_nt(path, lic, (u32)sizeof(lic), &got)) { VM_LIC_FAIL(0x22u); return 0; }
     /* hdr: magic(4) version(4) vendorHash(4) count(4) reserved(8) = 24；条目 16 字节；末尾 64 字节签名 */
-    if (got < 24 + 64) { vm_key_reject_code(0x23u); return 0; }
-    if (*(const u32 *)(lic + 0) != 0x564C5043u) { vm_key_reject_code(0x24u); return 0; }
-    if (*(const u32 *)(lic + 4) != 1u) { vm_key_reject_code(0x25u); return 0; }
-    if (*(const u32 *)(lic + 8) != vm_license_meta.vendorHash) { vm_key_reject_code(0x26u); return 0; }
+    if (got < 24 + 64) { VM_LIC_FAIL(0x23u); return 0; }
+    if (*(const u32 *)(lic + 0) != 0x564C5043u) { VM_LIC_FAIL(0x24u); return 0; }
+    if (*(const u32 *)(lic + 4) != 1u) { VM_LIC_FAIL(0x25u); return 0; }
+    if (*(const u32 *)(lic + 8) != vm_license_meta.vendorHash) { VM_LIC_FAIL(0x26u); return 0; }
     u32 count = *(const u32 *)(lic + 12);
-    if (got != 24 + count * 16 + 64) { vm_key_reject_code(0x27u); return 0; }
+    if (got != 24 + count * 16 + 64) { VM_LIC_FAIL(0x27u); return 0; }
     u64 signedLen = 24 + (u64)count * 16;
-    if (!vm_license_verify(lic, (u32)signedLen, lic + signedLen, (const u8 *)vm_license_meta.issuerPub)) { vm_key_reject_code(0x28u); return 0; }
+    if (!vm_license_verify(lic, (u32)signedLen, lic + signedLen, (const u8 *)vm_license_meta.issuerPub)) { VM_LIC_FAIL(0x28u); return 0; }
     i64 now = vm_now_unix();
     int found = 0;
     for (u32 i = 0; i < count; i++) {
@@ -884,10 +889,10 @@ static int vm_license_check(void) {
         if (notAfter == 0) { found = 1; break; }          /* 永久 */
         if (now == 0) continue;                            /* 时间取不到 -> 不认"限期授权" */
         if (now <= notAfter) { found = 1; break; }
-        vm_key_reject_code(0x2Au);                         /* 该产品已过期 */
+        VM_LIC_FAIL(0x2Au);                         /* 该产品已过期 */
         return 0;
     }
-    if (!found) { vm_key_reject_code(0x29u); return 0; }
+    if (!found) { VM_LIC_FAIL(0x29u); return 0; }
     return 1;
 }
 

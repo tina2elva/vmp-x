@@ -314,6 +314,55 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
+
+# ---- (2) runtime enforcement: no licence => refuse; valid licence => identical; tamper/expiry => refuse ----
+# The artifact bakes vendorID/productID/issuer-public-key into its blob copy; at run time the entry
+# trampoline reads <exe>.vmplic.bin, verifies the ECDSA P-256 signature via CNG and checks product+expiry.
+& go build -o build/vmpepoch.exe ./cmd/vmpepoch
+$licDir = "build\e2e_lic"
+New-Item -ItemType Directory -Force -Path $licDir | Out-Null
+$issuer = "$licDir\issuer"
+& .\build\vmpepoch.exe keygen --out $issuer 2>&1 | Out-Null
+$licExe = "$licDir\app.exe"
+Remove-Item $licExe, "$licExe.vmpkey", "$licExe.vmplic.bin" -ErrorAction SilentlyContinue
+& .\build\vmpack.exe -exe build\target.exe -func check_key -func sum_to -out $licExe -blob $extBlob -manifest $extMan -license-vendor ACME-0001 -license-product PROD-E2E -license-pub "$issuer.pub" 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    $fail++
+    $failLines += "E2EFAIL runtime-license: packing with -license-* failed"
+} else {
+    Copy-Item $extKey "$licExe.vmpkey" -Force
+    # a) no licence at all -> exactly 0xC0DE0007 and no output
+    $rl = Get-ExitCode $licExe @("check_key", "10")
+    if ((($rl.Code -band 0xFFFFFFFF) -eq 0xC0DE0007) -and ($rl.Out -eq "")) { $pass++ }
+    else { $fail++; $failLines += ("E2EFAIL runtime-license/none: code=0x{0:X8} out=[{1}]" -f ($rl.Code -band 0xFFFFFFFF), $rl.Out.Trim()) }
+    # b) valid licence -> identical to native
+    & .\build\vmpepoch.exe lic-new --vendor ACME-0001 --dongle E2E-1 --key "$issuer.priv" --out "$licDir\lic.json" --product "PROD-E2E@2027-12-31" 2>&1 | Out-Null
+    & .\build\vmpepoch.exe lic-export --lic "$licDir\lic.json" --key "$issuer.priv" --out "$licExe.vmplic.bin" 2>&1 | Out-Null
+    $nOut = Run-File "build/target.exe" @("check_key", "10") 30
+    $vOut = Run-File $licExe @("check_key", "10") 30
+    if (($nOut -ne "") -and ($nOut -eq $vOut)) { $pass++ }
+    else { $fail++; $failLines += ("E2EFAIL runtime-license/ok: native=[{0}] protected=[{1}]" -f $nOut.Trim(), $vOut.Trim()) }
+    # c) tampered licence (one byte) -> refused
+    $lb = [System.IO.File]::ReadAllBytes((Join-Path (Get-Location) "$licExe.vmplic.bin"))
+    $lb[0x20] = $lb[0x20] -bxor 0xFF
+    [System.IO.File]::WriteAllBytes((Join-Path (Get-Location) "$licExe.vmplic.bin"), $lb)
+    $rt = Get-ExitCode $licExe @("check_key", "10")
+    if ((($rt.Code -band 0xFFFFFFFF) -eq 0xC0DE0007) -and ($rt.Out -eq "")) { $pass++ }
+    else { $fail++; $failLines += ("E2EFAIL runtime-license/tamper: code=0x{0:X8} out=[{1}]" -f ($rt.Code -band 0xFFFFFFFF), $rt.Out.Trim()) }
+    # d) expired licence -> refused
+    & .\build\vmpepoch.exe lic-new --vendor ACME-0001 --dongle E2E-2 --key "$issuer.priv" --out "$licDir\exp.json" --product "PROD-E2E@2020-01-01" 2>&1 | Out-Null
+    & .\build\vmpepoch.exe lic-export --lic "$licDir\exp.json" --key "$issuer.priv" --out "$licExe.vmplic.bin" 2>&1 | Out-Null
+    $re = Get-ExitCode $licExe @("check_key", "10")
+    if ((($re.Code -band 0xFFFFFFFF) -eq 0xC0DE0007) -and ($re.Out -eq "")) { $pass++ }
+    else { $fail++; $failLines += ("E2EFAIL runtime-license/expired: code=0x{0:X8} out=[{1}]" -f ($re.Code -band 0xFFFFFFFF), $re.Out.Trim()) }
+    # e) licence signed by another key -> refused
+    & .\build\vmpepoch.exe keygen --out "$licDir\evil" 2>&1 | Out-Null
+    & .\build\vmpepoch.exe lic-new --vendor ACME-0001 --dongle E2E-3 --key "$licDir\evil.priv" --out "$licDir\forge.json" --product "PROD-E2E@2027-12-31" 2>&1 | Out-Null
+    & .\build\vmpepoch.exe lic-export --lic "$licDir\forge.json" --key "$licDir\evil.priv" --out "$licExe.vmplic.bin" 2>&1 | Out-Null
+    $rf2 = Get-ExitCode $licExe @("check_key", "10")
+    if ((($rf2.Code -band 0xFFFFFFFF) -eq 0xC0DE0007) -and ($rf2.Out -eq "")) { $pass++ }
+    else { $fail++; $failLines += ("E2EFAIL runtime-license/forge: code=0x{0:X8} out=[{1}]" -f ($rf2.Code -band 0xFFFFFFFF), $rf2.Out.Trim()) }
+}
 # ---- (2) keyed-MAC integrity: the "refill" bypass must be refused ----
 # Put the native entry bytes back (the bypass the static-analysis report describes). We use an
 # artifact packed with -no-enc-image on purpose: with image encryption on, the entry patch lives

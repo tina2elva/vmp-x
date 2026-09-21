@@ -138,6 +138,16 @@ func main() {
 		copy(stub[off+12:off+76], pub)
 		fmt.Printf("[*] 运行期强制已启用：vendorID=%s productID=%s 签发者公钥前 8 字节=%X\n",
 			*licVendor, *licProduct, pub[0:8])
+		// 自哈希覆盖 [0, bssOff) —— **包含 .data**，而我们刚改了 .data 里的元数据，
+		// 所以必须按同一套 FNV-1a 参数重算，否则 vm_selfcheck() 会直接 trap（实测就是这个坑）。
+		if hoff, ok := man.Symbols["vm_self_hash"]; ok && man.BSSOff > 0 {
+			h := uint32(2166136261)
+			for _, b := range stub[:man.BSSOff] {
+				h = (h ^ uint32(b)) * 16777619
+			}
+			binary.LittleEndian.PutUint32(stub[hoff:], h)
+			fmt.Printf("[*] 已按补丁重算自哈希（覆盖 [0, 0x%X)）\n", man.BSSOff)
+		}
 	}
 	fmt.Printf("[*] 解释器: %s (%d 字节), vm_entry @ +0x%X, FRAME_SKEW=%d, 可写区 [0x%X,+0x%X)",
 		*blobPath, len(stub), entryOff, man.FrameSkew, man.BSSOff, man.BSSSize)
