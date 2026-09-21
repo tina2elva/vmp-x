@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"math/bits"
 
 	arm64sem "github.com/vmpx/vmp-x/internal/guest/arm64"
@@ -280,7 +281,9 @@ const (
 	KBsr
 	KTzcnt
 	KLzcnt
-	KMulHiS // 必须放在最后：值与 IR/C 侧的对应关系靠顺序维持
+	KMulHiS // 值与 IR/C 侧的对应关系靠顺序维持
+	KDivU
+	KDivS // x86 DIV/IDIV：隐含寄存器 + 双输出，与下面 alu(kind,a,b,width)->单值 的形状不符
 )
 
 // 浮点子操作（与 C 侧 KF_* 一致）
@@ -326,6 +329,75 @@ const (
 
 // AluKeepFlags：kind 字节的 bit7。ARM64 不带 S 的运算必须保留标志位。
 const AluKeepFlags uint32 = 0x80
+
+// x86-64 的寄存器槽位（与 ir/vm_types.h 一致）：RAX=0、RDX=2。
+const (
+	refRAX = 0
+	refRDX = 2
+)
+
+// refDiv 是 x86 单操作数 DIV/IDIV 的参考语义（慢但直白，用 math/big 避免微妙的符号问题）：
+//
+//	8 位     ：被除数 AH:AL（= RAX 低 16 位），商→AL、余→AH
+//	16/32/64 ：被除数 DX:AX 族，商→AX 族、余→DX 族
+//
+// 除零 / 商放不下 ⇒ x86 的 #DE：这里用 panic 表示（宁可响亮失败，也不静默给错值）。
+func refDiv(s *RefState, kind uint32, a uint64, width uint32) {
+	m := widthMask(width)
+	var n, dv *big.Int
+	if width == 8 {
+		n = new(big.Int).SetUint64(s.Regs[refRAX] & 0xFFFF)
+		dv = new(big.Int).SetUint64(a & 0xFF)
+	} else {
+		lo := new(big.Int).SetUint64(s.Regs[refRAX] & m)
+		hi := new(big.Int).SetUint64(s.Regs[refRDX] & m)
+		n = lo.Add(lo, hi.Lsh(hi, uint(width)))
+		dv = new(big.Int).SetUint64(a & m)
+	}
+	if kind == KDivS {
+		n = twosToSigned(n, 2*width)
+		dv = twosToSigned(dv, width)
+	}
+	if dv.Sign() == 0 {
+		panic("ref: DIV/IDIV 除零（x86 #DE）")
+	}
+	q, r := new(big.Int), new(big.Int)
+	q.QuoRem(n, dv, r) // 向零截断，与 x86 一致
+	lim := new(big.Int).Lsh(big.NewInt(1), uint(width))
+	if kind == KDivS {
+		half := new(big.Int).Rsh(lim, 1)
+		loLim := new(big.Int).Neg(half)
+		hiLim := new(big.Int).Sub(half, big.NewInt(1))
+		if q.Cmp(loLim) < 0 || q.Cmp(hiLim) > 0 {
+			panic("ref: DIV/IDIV 商溢出（x86 #DE）")
+		}
+	} else if q.Cmp(lim) >= 0 {
+		panic("ref: DIV/IDIV 商溢出（x86 #DE）")
+	}
+	bitMask := new(big.Int).Sub(lim, big.NewInt(1))
+	qm := new(big.Int).And(q, bitMask).Uint64()
+	rm := new(big.Int).And(r, bitMask).Uint64()
+	switch width {
+	case 8:
+		s.Regs[refRAX] = (s.Regs[refRAX] &^ 0xFFFF) | (rm&0xFF)<<8 | (qm & 0xFF)
+	case 16:
+		s.Regs[refRAX] = (s.Regs[refRAX] &^ 0xFFFF) | (qm & 0xFFFF)
+		s.Regs[refRDX] = (s.Regs[refRDX] &^ 0xFFFF) | (rm & 0xFFFF)
+	default:
+		s.Regs[refRAX] = qm
+		s.Regs[refRDX] = rm
+	}
+}
+
+// twosToSigned 把 width 位的补码无符号值解释成有符号（就地修改传入的 big.Int）。
+func twosToSigned(v *big.Int, width uint32) *big.Int {
+	w := new(big.Int).Lsh(big.NewInt(1), uint(width))
+	half := new(big.Int).Rsh(w, 1)
+	if v.Cmp(half) >= 0 {
+		return v.Sub(v, w)
+	}
+	return v
+}
 
 func (s *RefState) aluApply(kind, width uint32, a, b uint64) uint64 {
 	k := kind &^ AluKeepFlags
@@ -395,6 +467,13 @@ func (s *RefState) aluApply(kind, width uint32, a, b uint64) uint64 {
 			s.Flags &^= FlagC
 		}
 		return 0
+	case KDivU, KDivS:
+		// x86 单操作数 DIV/IDIV：被除数是隐含的 DX:AX 族（8 位是 AH:AL），商→AX 族、余→DX 族。
+		// 返回单值的形状装不下两个输出，所以这里直接写 s.Regs；
+		// 除零 / 商溢出按 x86 的 #DE 语义 —— 用 panic 表示（宁可响亮失败，也不要静默给错值）。
+		// 正常情况下 div 由 OpAluU 分支直接处理（见上面）；走到 aluApply 说明路由错了 ——
+		// 这里刻意 panic，绝不让它静默产生错值。
+		panic("ref: KDivU/KDivS 不该走 aluApply（它们由 OpAluU 分支直接处理）")
 	case KMulHiS:
 		// 单操作数 IMUL 的高半（有符号）；CF=OF 表示高半不是低半的符号扩展
 		mm := widthMask(width)
@@ -754,6 +833,13 @@ func (s *RefState) Run(code []byte, maxSteps int) (int, error) {
 			kind, width := uint32(code[pc+1]), uint32(code[pc+2])
 			dst := code[pc+3]
 			a := s.Regs[code[pc+4]]
+			// DIV/IDIV 复用 AluU 的编码，但语义是"隐含寄存器 + 双输出"，走不了 aluUnary。
+			// 之前漏了这一支 ⇒ 参考执行器会静默算出错值（正是我们要消灭的失败模式）。
+			if k := kind &^ AluKeepFlags; k == KDivU || k == KDivS {
+				refDiv(s, k, a, width)
+				pc += 5
+				break
+			}
 			s.writeReg(uint32(dst), width, s.aluUnary(kind, width, a))
 			pc += 5
 		case OpCmpRR:

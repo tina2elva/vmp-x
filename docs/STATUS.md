@@ -5011,6 +5011,36 @@ powershell -NoProfile -File tools/acceptance_demo.ps1 -DemoExe X.exe -DemoMap X.
 **验收（本轮）**：`tools/gates.ps1` = **11 gates / 0 failed**（含 `go test ./...` 与 arm64 客户机差分）。
 注：`AGENTS.md`/`docs/HANDOFF.md` 的验收第 1 条要求 `tools/preflight.ps1`，但该脚本已在 `a83a4ad` 移除
 （本文件 #4322 已记录：脚本自检不过被删）——**当前仓库里没有这个文件**，本轮以 `tools/gates.ps1` 为准。
+### 402. 目标项 ① 完成：`CDQ`/`CQO` + `DIV`/`IDIV` 全位宽落地；过程中抓出三处「静默算错」
+
+**做了什么**
+- `CDQ`/`CQO`：`lift.go` 新增 `case x86asm.CDQ/CQO` → `AluRI{Sar,|KeepFlags}` 写 `RDX`（原来只处理了 `CDQE`）。
+- `DIV`/`IDIV`：新增 ALU kind `ir.DivU/DivS`（0x14/0x15；C 头 `K_DIVU/K_DIVS` 同步、`kind_table_test` 强制三处一致）+ 参考实现 `refDiv`；
+  语义放在 `vm_interp.c` 的 `OP_ALU_U` 分支里**先拦截**（隐含 `DX:AX` 族被除数、商→AX 族、余→DX 族）；
+  8 位走 `AH:AL`（`RAX` 低 16 位，**不是** `DX:AX`）；lifter 新增 `liftDiv`（单操作数形式判据同 `liftImul`）。
+- 新增 `internal/lift/x64/div_test.go`：8/16/32/64 位 × 有符号/无符号各 300 组随机差分（用 `math/big` 独立算）+ `#DE` 边界（除零、商溢出必须 panic）。
+
+**过程中抓出的三处「静默算错」（正是本目标要消灭的东西）**
+1. `__int128` 除法把 `__divti3` 拉进 freestanding blob → 门禁直接报「引用了未定义符号」；
+   改为 8/16/32 位用 u64/i64（2w 位被除数在 w≤32 时放得进 64 位）、64 位交给硬件 `divq/idivq`。
+2. inline asm 约束写错：独立的 `=a`/`=d` 输出 + `a`/`d` 输入 → GCC 分配错，64 位算出垃圾值；
+   改成 `+a`/`+d`（读写同一寄存器）。**这一支原本没有真实程序覆盖** —— 补了个 64 位除法小程序才暴露出来。
+3. 操作数编号越界（`divq %3` 而只有 3 个操作数）→ 又一类静默算错；改回 `%2` 后与原生完全一致。
+另：参考执行器的 `OpAluU` 走的是 `aluUnary` 而不是 `aluApply`，我的 div 分支**一开始被绕过去、静默返回错值** ——
+已在 `OpAluU` 里拦截，并在 `aluApply` 的 div 分支留了 fail-loud panic 守卫。
+
+**实测证据**
+
+| 用例 | 结果 |
+|---|---|
+| 客户 demo 13 个函数（含 `DemoGcd` 8 位除法、`DemoIsPrime` 32 位除法） | **与原生逐行一致（不一致 0 行）**；`DemoGcd(462,1071)=21`、`DemoIsPrime(97)=1` |
+| 64 位专测（`d64u`/`d64s`/`m64u`） | `u=33609235651134 su=-1164736592 m=30300` —— 与原生**逐字相同** |
+| `?DemoGcd@@YAHHH@Z` 拒译指令数 | **2/13 → 0**（`IsPrime` 同样 0/20） |
+| 单测 | `go test ./internal/...` 全绿（含新的 DIV 差分与 #DE 用例） |
+
+**遗留（如实登记）**：16 位的 C 侧分支没有被真实程序覆盖（与 32 位共用同一段代码，仅被 Go 参考实现的单测覆盖）；
+`AGENTS.md`/`HANDOFF.md` 里的 `tools/preflight.ps1` 在仓库中不存在（见 #401）。
+
 
 
 

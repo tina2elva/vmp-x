@@ -23,7 +23,9 @@ enum {
     K_BSR = 0x10,   /* 位扫描（x86 的 BSR）：最高置位位下标，只改 ZF */
     K_TZCNT = 0x11, /* BMI1 TZCNT：源为 0 时结果为位宽，且置 CF/ZF */
     K_LZCNT = 0x12, /* BMI1 LZCNT：同上 */
-    K_MULHIS = 0x13 /* 有符号乘法的高半（单操作数 IMUL）：CF=OF=(高半不是低半的符号扩展) */
+    K_MULHIS = 0x13, /* 有符号乘法的高半（单操作数 IMUL）：CF=OF=(高半不是低半的符号扩展) */
+    K_DIVU = 0x14,   /* x86 DIV （单操作数，无符号）：被除数 DX:AX 族，商→AX 族、余→DX 族 */
+    K_DIVS = 0x15    /* x86 IDIV（单操作数，有符号）：同上；除零/商溢出由解释器直接 trap */
 };
 /* 原子子操作（OP_ATOMIC 的 kind 字节；bit7 仍表示 keep-flags） */
 enum {

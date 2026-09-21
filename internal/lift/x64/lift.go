@@ -698,6 +698,9 @@ func (l *Lifter) liftOne(f *ir.Func, ins x64dec.Insn, off uint32) error {
 			Dst: ir.RDX, A: ir.RAX, Imm: 63})
 		return nil
 
+	case x86asm.DIV, x86asm.IDIV:
+		return l.liftDiv(f, ins, off)
+
 	case x86asm.PUSH:
 		if r, w, ok := regArgInfo(args[0]); ok {
 			if w != ir.W64 {
@@ -2279,6 +2282,45 @@ func (l *Lifter) liftCmp(f *ir.Func, ins x64dec.Insn, off uint32, kind ir.CmpKin
 		return nil
 	}
 	return fmt.Errorf("不支持的 CMP/TEST 形式")
+}
+
+// liftDiv 处理单操作数 DIV/IDIV（F7 /6、F7 /7；8 位是 F6 /6、/7）：
+//
+//	DIV : (DX:AX) / src → 商 AX、余 DX（无符号）
+//	IDIV: 同上（有符号）
+//
+// 被除数与两个输出都是**隐含寄存器**，所以复用 ir.AluU 的编码：A = 除数、Dst 不用。
+// 真正的语义（含除零/商溢出的处理）在解释器 vm_interp.c 的 OP_ALU_U 分支里。
+func (l *Lifter) liftDiv(f *ir.Func, ins x64dec.Insn, off uint32) error {
+	args := ins.Inst.Args
+	em := func(in ir.Insn) { in.SrcOff = off; in.Text = ins.Text(); l.emit(f, in) }
+	w := opWidth(ins)
+
+	// 单操作数形式：x86asm 把隐含的 RAX/RDX 也放进 Args，判据同样是 args[1] == nil。
+	if len(args) < 2 || args[1] != nil {
+		return fmt.Errorf("DIV/IDIV 只支持单操作数形式")
+	}
+	kind := ir.DivU
+	if ins.Inst.Op == x86asm.IDIV {
+		kind = ir.DivS
+	}
+	var src ir.Reg
+	if r, _, ok := regArgInfo(args[0]); ok {
+		src = r
+	} else if m, okm := memArg(args[0]); okm {
+		base, index, scale, disp, merr := l.memAddr(ins, m)
+		if merr != nil {
+			return merr
+		}
+		mw := memWidth(ins)
+		em(ir.Insn{Op: ir.Load, Kind: uint8(ir.ZeroExt), Width: mw, SrcW: mw, Dst: ir.VMSCR,
+			Base: base, Index: index, Scale: scale, Disp: disp})
+		src = ir.VMSCR
+	} else {
+		return fmt.Errorf("DIV/IDIV 的操作数不支持")
+	}
+	em(ir.Insn{Op: ir.AluU, Kind: uint8(kind), Width: w, Dst: ir.RAX, A: src})
+	return nil
 }
 
 func (l *Lifter) liftImul(f *ir.Func, ins x64dec.Insn, off uint32) error {

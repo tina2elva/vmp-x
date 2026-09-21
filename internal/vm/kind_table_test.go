@@ -64,6 +64,8 @@ func TestKindTableMatchesC(t *testing.T) {
 		{"K_TZCNT", ir.Tzcnt, KTzcnt},
 		{"K_LZCNT", ir.Lzcnt, KLzcnt},
 		{"K_MULHIS", ir.MulHiS, KMulHiS},
+		{"K_DIVU", ir.DivU, KDivU},
+		{"K_DIVS", ir.DivS, KDivS},
 	}
 	for _, c := range checks {
 		cv, ok := cvals[c.cname]

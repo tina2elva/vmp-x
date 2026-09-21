@@ -89,6 +89,11 @@ const (
 	Tzcnt // BMI1 的 TZCNT/LZCNT：与 BSF/BSR 相同，但源为 0 时结果是操作数位宽，且同时置 CF
 	Lzcnt
 	MulHiS // **有符号**乘法的高半（x86 单操作数 IMUL）：CF=OF 表示高半不是低半的符号扩展
+	// x86 单操作数 DIV/IDIV：被除数是**隐含的 DX:AX 族**，商→AX 族、余→DX 族，
+	// 所以复用 ir.AluU 编码（A = 除数，Dst 不用）。标志位按 x86 规定是「未定义」，我们不动。
+	// arm64 客户机不产生这两个 kind（arm64 的 SDIV/UDIV 目前也不在 lifter 支持范围内）。
+	DivU
+	DivS
 )
 
 // KeepFlags 是 ALU kind 字节的 bit7：执行运算但**不修改标志位**。

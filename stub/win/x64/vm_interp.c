@@ -1493,6 +1493,79 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             kind &= (u32)~VM_ALU_KEEP_FLAGS;
             u64 a = vm->regs[vmb_byte(&bcs, pc + 4) & VM_REG_MASK];
             u32 saved = vm->flags;
+            if (kind == K_DIVU || kind == K_DIVS) {
+                /* x86 单操作数 DIV/IDIV（复用 OP_ALU_U 编码：a = 除数、dst 不用）。
+                 * 被除数是隐含的：8 位用 AH:AL（= RAX 低 16 位），16/32/64 位用 DX:AX 族；
+                 * 商→AX 族、余→DX 族。标志位按 x86 规定未定义，这里不动。
+                 * 除零 / 商放不下 —— **绝不静默算错**：直接 trap（等同于原生未处理 #DE：进程死掉）。 */
+                u64 q = 0, r = 0;
+                /* 注意：blob 是 freestanding 的，**不能用 __int128 的除法**（会拉进 __divti3，
+                 * 而 stub 不是自包含的 —— 实测门禁直接报"引用了未定义符号 __divti3"）。
+                 * 所以 8/16/32 位用 u64/i64 运算（2w 位被除数在 w<=32 时放得进 64 位），
+                 * 64 位直接交给硬件指令（语义与 #DE 行为都完全一致）。 */
+                if (width == 8) {
+                    u32 dividend = (u32)(vm->regs[VRAX] & 0xFFFFu); /* AH:AL */
+                    if (kind == K_DIVU) {
+                        u32 dv = (u32)(a & 0xFFu);
+                        if (dv == 0) __builtin_trap();
+                        q = dividend / dv;
+                        r = dividend % dv;
+                        if (q > 0xFFu) __builtin_trap();
+                    } else {
+                        int dvd = (int)(short)(unsigned short)dividend;
+                        int dvs = (int)(signed char)(unsigned char)a;
+                        int qq;
+                        if (dvs == 0) __builtin_trap();
+                        qq = dvd / dvs;
+                        if (qq < -128 || qq > 127) __builtin_trap();
+                        q = (u64)(unsigned char)(signed char)qq;
+                        r = (u64)(unsigned char)(signed char)(dvd % dvs);
+                    }
+                    write_reg(vm, VRAX, 16, (u64)(((r & 0xFFu) << 8) | (q & 0xFFu))); /* AH=余、AL=商 */
+                } else if (width == 16 || width == 32) {
+                    u64 mask = width_mask(width);
+                    u64 dxv = vm->regs[VRDX] & mask, axv = vm->regs[VRAX] & mask;
+                    if (kind == K_DIVU) {
+                        u64 dv = a & mask, n = (dxv << width) | axv;
+                        if (dv == 0) __builtin_trap();
+                        q = n / dv;
+                        r = n % dv;
+                        if (q > mask) __builtin_trap();
+                    } else {
+                        i64 dvs = sign_extend_w(a & mask, width);
+                        i64 n, qq, lo, hi;
+                        if (dvs == 0) __builtin_trap();
+                        n = (i64)(((u64)sign_extend_w(dxv, width) << width) | axv);
+                        qq = n / dvs;
+                        lo = -((i64)1 << (width - 1));
+                        hi = ((i64)1 << (width - 1)) - 1;
+                        if (qq < lo || qq > hi) __builtin_trap();
+                        q = (u64)qq & mask;
+                        r = (u64)(n % dvs) & mask;
+                    }
+                    if (width == 16) {
+                        write_reg(vm, VRAX, 16, q & 0xFFFFu);
+                        write_reg(vm, VRDX, 16, r & 0xFFFFu);
+                    } else {
+                        write_reg(vm, VRAX, 32, q & 0xFFFFFFFFu);
+                        write_reg(vm, VRDX, 32, r & 0xFFFFFFFFu);
+                    }
+                } else {
+                    /* 64 位：交给硬件（#DE 由硬件按 x86 语义处理，最忠实）。
+                     * 关键：被除数/商/余都在同一对寄存器（RAX/RDX）里，必须用 "+a"/"+d"（读写）约束；
+                     * 写成独立的 "=a"/"=d" + "a"/"d" 输入会让 GCC 分配错，实测算出垃圾值。 */
+                    u64 lo = vm->regs[VRAX], hi = vm->regs[VRDX], dv = a;
+                    if (kind == K_DIVU) {
+                        __asm__ volatile("divq %2" : "+a"(lo), "+d"(hi) : "r"(dv) : "cc");
+                    } else {
+                        __asm__ volatile("idivq %2" : "+a"(lo), "+d"(hi) : "r"(dv) : "cc");
+                    }
+                    write_reg(vm, VRAX, 64, lo);
+                    write_reg(vm, VRDX, 64, hi);
+                }
+                vm->pc = pc + 5;
+                break;
+            }
             write_reg(vm, dst, width, alu_unary(vm, kind, width, a));
             if (keep) vm->flags = saved;
             vm->pc = pc + 5;
