@@ -229,6 +229,35 @@ vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    
 实测（本机）：根生成 → 客户端生成 → `cert-req`（含持有证明）→ `cert-issue` 验证明后签发 →
 `lic-new --cert` → `lic-show --root` **整链通过** ✓；**把请求改成别人的公钥 → 持有证明验不过、拒签** ✓。
 
+**Sentinel 对应关系（2026-09 核对 Thales 官方文档，链接见文末）**
+
+- **Starter Kit 里有「两把」Vendor key**（这是很多人的误解点）：
+  - **Developer key**：配合 **Envelope** 保护软件/数据文件，通常接在开发机（也可网络共享）；
+  - **Master key**：配合 **EMS / License Generation API** 创建与更新授权、向狗写数据，通常接在 EMS 机器；
+    **Thales 托管的 EMS 甚至不需要这把母狗在本地。**
+- **Vendor Code（.v2c）** 由「引入 Vendor key」（Master Wizard）生成 —— 即**从狗导出**；
+  它**不是公钥** ✗，而是厂商的**机密凭证**（既能保护软件、也能签授权），必须妥善保管。
+- **一个 Batch Code 下可以有多把 Master key**（官方原文：EMS 的 Master 页面在指定 Batch Code 后，
+  若存在多把会在左栏列出）→ 「多母狗对应同一个 vendor 身份」就是这么实现的（多部门 / 灾备）。
+- **隔离**要用**不同的 vendor 身份**（不同 Batch Code / 不同 Vendor Code）：一个 vendor 身份 = 一个信任域，
+  跨域串用会被拒。
+- **销售部门不该拿母狗/VendorCode** ✗ → 用 **EMS 的用户与角色**（只给「生成授权」权限）。
+  对应到我们：**缺一个「受限签发角色」**，见下面「要补的对应物」。
+- **备份**：母狗可有多把/可备份；**若全部丢失**，该 vendor 身份就无法再签发/更新授权
+  （只能重建新 vendor 身份并重新保护产品）→ 必须有**备份母狗 + 保险柜**。
+
+**我们要补的对应物（TODO 子项）**
+- [ ] **委派签发（canIssue）**：根密钥签一张 `canIssue=true` 的证书给「部门/签发服务」，
+      由它去签下游授权（链：厂商根 → 部门/销售 → 下游），并可**吊销**（不续签/加黑名单）。
+      等价于 EMS 角色 —— 目的是**不把根密钥交给销售**，同时让销售能发授权。
+- [ ] 若最终走 Sentinel：以上全部由 Sentinel 体系承担，我们只需做 **`vm_license_fetch/verify` 接口层**
+      （`hasp_login`/`hasp_get_info`/`hasp_decrypt`），**不做自研 PKI**。
+
+官方文档（引用原文口径）：
+- Vendor Keys: https://docs.sentinel.thalesgroup.com/ldk/LDKdocs/SPNL/LDK_SLnP_Guide/GettingStarted/Vendor%20Keys.htm
+- Maintaining Master Keys: https://docs.sentinel.thalesgroup.com/ldk/LDKdocs/WebHelp/MaintainMasterKeys.htm
+- EMS User Types and Roles: https://docs.sentinel.thalesgroup.com/softwareandservices/ldk/LDKdocs/SPNL/LDK_SLnP_Guide/Licensing/Users_and_Roles.htm
+
 **还没做（下一步，按需选择）**
 - [ ] **运行期强制**：blob 侧 `vm_license_check()`（路线 B 需 Ed25519 验签的 C 实现，约 600–900 行 + 两侧 KAT）；
       产物侧加 `-license-vendor/-license-product/-license-pubkey`（像 verify table 那样另立一张表，描述符已满）。
