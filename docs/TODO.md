@@ -258,6 +258,42 @@ vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    
 - Maintaining Master Keys: https://docs.sentinel.thalesgroup.com/ldk/LDKdocs/WebHelp/MaintainMasterKeys.htm
 - EMS User Types and Roles: https://docs.sentinel.thalesgroup.com/softwareandservices/ldk/LDKdocs/SPNL/LDK_SLnP_Guide/Licensing/Users_and_Roles.htm
 
+**文件形态 vs Sentinel：能模拟什么、模拟不了什么**
+
+| Sentinel 概念 | 文件形态对应物 | 我们的状态 |
+|---|---|---|
+| Developer key（Envelope 保护软件） | 构建密钥 `vmpbuild -key-in` | ✅ 已有 |
+| Master key / Vendor Code（签授权） | 厂商根密钥 + 客户身份证书 | ✅ 已有（`cert-req`/`cert-issue`） |
+| Vendor ID / Batch Code（身份=信任域） | `vendorID` + 证书链 | ✅ 已有 |
+| 多把母狗（部门/灾备） | 根密钥多份副本（保险柜/HSM） | ✅ 流程问题 |
+| 子狗（被授权的下游） | `<产物>.vmplic` 签名授权文件 | ✅ 签发/验签已有；**运行期强制未做** |
+| 子狗 ID（哪个下游） | `dongleID` | ✅ |
+| 软件 ID / 功能点 | `productID` + `items[]`（+ 预留 `features`） | ✅ |
+| 到期时间 | `items[].expiry` | ✅（判定已实现） |
+| 增删授权（改狗内容） | `lic-edit` 重签 | ✅ |
+| EMS 角色（销售只发授权、不碰根） | **委派签发 `canIssue`** | ❌ 待做 |
+| 防拷贝（一机一授权） | 机器指纹写进签名授权 | ⚠️ 可做，但文件可复制 |
+| 到期抗回拨（独立时钟/计数器） | 需要可信时间 | ❌ 离线文件形态挡不住 |
+
+**三条硬差异（文件形态做不到的）**
+1. **防拷贝**：授权就是个文件，可以复制到任意机器 ✗。缓解=把**机器指纹**写进签名授权（换机器即失效 ✓），
+   但指纹可虚拟化/可伪造，且硬件变更会误伤，需要多因子 + 容错策略。
+2. **到期抗回拨**：文件形态只能看系统时钟 → 改时间就绕过 ✗（狗里有独立时钟/计数器，这是硬件能力）。
+   离线场景下只能抬高绕过成本（DPAPI + 注册表 + 多副本交叉校验 + 记录最后可信时间），挡不住有心人。
+3. **签发凭证不可复制**：VendorCode / 根私钥在文件形态下就是磁盘上的密钥文件 ✗。
+   缓解（**性价比最高的一步**）：把签名私钥放进 **TPM / Windows CNG 不可导出密钥** ≈ 软件狗，
+   拿到「私钥不出芯片」，成本≈0、不需要买狗、离线可用 ✓✓。
+
+**落地阶段建议**
+- 阶段 1（现在）：文件形态把流程跑通（谁签、给谁、什么产品、何时到期、怎么增删）→ 已完成大半，补 `canIssue` 即等价 EMS 角色；
+- 阶段 2（推荐）：签名私钥进 **TPM/CNG**（软狗）→ 密钥不可导出；
+- 阶段 3（可选）：真上 **Sentinel**（你们已有母狗/子狗）→ 密钥不出狗 + 防拷贝 + 独立时钟。
+  由于已把「取密钥 / 取授权 / 验签」收成接缝（`vm_key_from_file` / `vm_license_fetch/verify`），
+  **阶段 1→2→3 是换实现，不是重写** ✓。
+
+> 别忘了：以上全是「签发侧」。**运行期强制**（产物不认授权就拒绝运行）尚未实现 ——
+> 没有它，这套现在只是管理流程，还不具备 Sentinel 那种「没授权就跑不起来」的体感。
+
 **还没做（下一步，按需选择）**
 - [ ] **运行期强制**：blob 侧 `vm_license_check()`（路线 B 需 Ed25519 验签的 C 实现，约 600–900 行 + 两侧 KAT）；
       产物侧加 `-license-vendor/-license-product/-license-pubkey`（像 verify table 那样另立一张表，描述符已满）。
