@@ -4850,4 +4850,37 @@ blob 是解释器、与 exe 无关，所以同一份 blob 可以长期服务很�
 
 **证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e 158/0）；CI **35562269143（8ddde4d）五个作业全绿**。
 
+### 396. 密钥纪元管理工具 `vmpepoch` ＋ `docs/TODO.md` 登记 5 项待办
+
+**先记下这条硬约束**：**一个 blob 只能配一把主密钥** —— blob 里的 KCV 是构建时用那把密钥算出来的
+（`KDF(master, KEYK, 该 blob 的 salt)`）。所以"换密钥"必然"换 blob"（一次 vmpbuild ≈ 几秒、约 40KB），
+**不能只换钥匙**。反过来，同一套 blob/key 可以打**任意多个 exe、任意多版本** —— 纪元是"授权边界"，不是"程序"。
+
+**工具 `cmd/vmpepoch`**（登记表 `epochs.json` **不存密钥本身**，只存路径与指纹 sha256 前 8 字节）
+- `new --name <纪元> [--key-in <hex|文件>] [--dir ...] [--src stub/win/x64] [--guest arm64] [--note ...]`
+  —— 内部调 `vmpbuild` 建出一套 {blob, manifest, key} 并登记；
+- `list` —— 列纪元（名称/时间/blob 哈希/密钥指纹/guest/备注）；
+- `which --exe <产物>` —— **这个产物是哪个纪元打的**；
+- `keyid --key <.vmpkey>` —— **这把钥匙属于哪个纪元**；未登记则明确报错并非 0 退出（可当 CI 断言）。
+
+**实测（本机）**：建 `custA`（随机密钥）与 `custB`（`-key-in` 指定密钥）两个纪元 →
+`which` 分别正确认出 `custA` / `custB` 的产物；未登记的旧产物明确报"没匹配到"（rc=1）；
+`keyid` 对两个纪元的密钥都正确归属。
+
+**做这个工具时踩到的两个实情（已修正并写进注释）**
+1. **payload 在产物里被拆成多段**：代码段（如 `.bvbjiho`，0x8000）+ `.bss` 段（0x2000）+ 表段（0x400），
+   而 blob 是 40960 字节、**跨了前两段** —— 所以"某一整段装得下整个 blob"永远不成立 ✗，
+   必须按"段的**前缀** vs blob 的**同长前缀**"比对（实测前缀完全一致）；
+2. `which` 对未登记产物必须明确失败（返回非 0），否则 CI 里的"纪元核对"会变成假过。
+
+**`docs/TODO.md`**：登记了客户点名要跟的 5 项 ——
+① `CDQ/CQO/IDIV/DIV` 的 lift（解锁 `Gcd`/`IsPrime`，两个构建都受益）；
+② **调试版栈传参/varargs**（`DemoFormatReport` 在 `/Od` 下 `score=8` vs 原生 42；影响面最大）；
+③ `CVTDQ2PD`/double（`DemoMean` 输出 0.000）；
+④ 修完 ①② 后用 `D:\demo_exe` 复跑全量验收（接用户自带 `verify.py` + `ground_truth_exe.txt`）；
+⑤ `vmpepoch` 的可选增强（ELF 支持、`export` 发版包、CI 集成）。
+另附"其他已登记"：ELF `.rela` 应用器、Linux 侧反调试、DLL+外置密钥、TPM/DPAPI 等。
+
+**证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e 158/0）；CI **35563387578（72fca08）五个作业全绿**。
+
 **证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e 158/0）；CI（待填）。
