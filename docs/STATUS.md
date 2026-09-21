@@ -5168,8 +5168,11 @@ PS 直接报参数校验失败 ⇒ 原生与被保护**都拿到空输出** ⇒ 
 而解释器全程用 blob 里的 `vm_xmm` 当寄存器堆 —— 两者不是同一块内存 ⇒ double 参数读不到、返回值送不出去。
 修法：**让入口蹦床把帧基址写进 ctx**（`vm_ctx_t` 尾巴上原本是 `pad[8]`，大小/偏移不变，改成 `frame` 字段；
 `vm_abi.h` 加 `VM_CTX_FRAME 192`；`vm_entry_asm.S` 在 `subq $VM_FRAME_SIZE` 之后写一条 `movq %rsp, VM_CTX_FRAME(%rsp)`）。
-解释器在 `vm_run` 入口/出口按 `vm->frame` 做双向拷贝，**并要求 `frame != 0`**（测试 harness 直接调 `vm_run`、不经过蹦床，
-该字段为 0 ⇒ 天然跳过；否则会把 XMM 区写坏，实测两个 C 一致性测试都红）。arm64 客户机的帧布局不同，用 `!defined(VM_GUEST_ARM64)` 排除。
+解释器在 `vm_run` 入口/出口按 `vm->frame` 做双向拷贝，启用条件是
+`#if defined(VM_BLOB_USES_WIN64) && !defined(VM_GUEST_ARM64)` **且 `vm->frame != 0`**：
+- 测试 harness 直接调 `vm_run`、不经过蹦床 ⇒ frame 为 0 ⇒ 天然跳过（否则会把 XMM 区写坏，两个 C 一致性测试都红）；
+- arm64 客户机帧布局不同 ⇒ 排除；
+- **Linux blob 的入口 asm 还没写 frame** ⇒ 必须按平台排除（漏了这条，Linux 读到相邻垃圾非 0，ELF e2e 14 例全 fault —— CI 实测）。
 
 （试错留档：第一版按 `帧基址 = 模拟 RSP + 8 + VM_MARGIN` 现算，
 槽位偏移**必须用宏** `VM_SAVE_XMM0`。**上一轮失败的教训**：我当时硬编码成 304（从注释里读的旧值），
