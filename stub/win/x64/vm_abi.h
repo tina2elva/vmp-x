@@ -63,6 +63,7 @@
 #define VM_CTX_CODE     160
 #define VM_CTX_DESC     168 /* 描述符指针（入口写入） */
 #define VM_CTX_SCRATCH  176 /* 解密缓冲指针（入口写入，指向帧内可写区） */
+#define VM_CTX_FRAME    192 /* 帧基址（入口蹦床写入；0 = 非蹦床调用，解释器据此跳过 XMM 边界同步） */
 #define VM_CTX_SCRATCHLEN 184
 
 /* ---- callee-saved 保存区 ---- */

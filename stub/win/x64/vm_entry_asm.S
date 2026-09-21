@@ -10,6 +10,8 @@
     .p2align 4
 vm_entry:
     subq    $VM_FRAME_SIZE, %rsp
+    /* 帧基址交给解释器：XMM 边界同步要用（保存槽就在这个帧里）。见 vm_interp.c。 */
+    movq    %rsp, VM_CTX_FRAME(%rsp)
 
     /* ---- ????????callee-saved ---- */
     movq    %rbx, VM_SAVE_RBX(%rsp)

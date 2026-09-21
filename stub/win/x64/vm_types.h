@@ -65,7 +65,10 @@ typedef struct {
     u8 *scratch;
     u32 scratchLen;
     u32 reserved2;
-    u8 pad[8]; /* 让结构体大小是 16 的倍数，保持后续 ABI 偏移整洁 */
+    /* 原来是 pad[8]：大小/偏移不变，改成**入口蹦床写入**的帧基址。
+     * 解释器用它做 XMM 边界同步；测试 harness 直接调 vm_run、这里为 0 ⇒ 天然跳过同步
+     * （harness 不经过蹦床，帧地址无意义 —— 照着公式同步会把 XMM 区写坏）。 */
+    u64 frame;
 } vm_ctx_t;
 
 #endif /* VM_TYPES_H */

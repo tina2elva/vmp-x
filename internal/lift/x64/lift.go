@@ -1919,8 +1919,16 @@ func (l *Lifter) liftSIMD(f *ir.Func, ins x64dec.Insn, off uint32) (bool, error)
 					return true, merr
 				}
 				mw := memWidth(ins)
-				em(ir.Insn{Op: ir.Load, Kind: uint8(ir.SignExt), Width: ir.W64, SrcW: mw, Dst: ir.VMSCR,
-					Base: base, Index: index, Scale: scale, Disp: disp})
+				// 32 位源走「零扩展载入 + 显式符号扩展」两步 —— 与上面寄存器路径同形。
+				// 原来直接用 Load{SignExt, W64, SrcW=mw}，实测 32 位形式会读成 8 字节（cvt32 得到 ~2^53）。
+				if mw == ir.W32 {
+					em(ir.Insn{Op: ir.Load, Kind: uint8(ir.ZeroExt), Width: ir.W32, SrcW: ir.W32, Dst: ir.VMSCR,
+						Base: base, Index: index, Scale: scale, Disp: disp})
+					em(ir.Insn{Op: ir.Ext, Kind: uint8(ir.SignExt), Width: ir.W64, SrcW: ir.W32, Dst: ir.VMSCR, A: ir.VMSCR})
+				} else {
+					em(ir.Insn{Op: ir.Load, Kind: uint8(ir.SignExt), Width: ir.W64, SrcW: mw, Dst: ir.VMSCR,
+						Base: base, Index: index, Scale: scale, Disp: disp})
+				}
 				em(ir.Insn{Op: ir.Store, Width: ir.W64, Base: ir.VMBASE, Index: ir.NoReg, Scale: 1, Disp: scratch, A: ir.VMSCR})
 			} else {
 				return true, fmt.Errorf("CVTSI2SD 的源操作数不支持")

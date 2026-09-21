@@ -1303,7 +1303,22 @@ int vm_run(vm_ctx_t *vm) {
      * 实测**毫无效果**（retconst/dblarg/dbladd/noarg 的错值与同步前完全一样），
      * 说明该地址公式在实际运行时并不成立（或读到的是已被改写的 RSP）。下次先在运行期把
      * 两个候选地址的内容 dump 出来定位，再动手。诊断结论见 STATUS #408。 */
-    /* 【同步代码已回退；原因见上面的注释】 */
+    /* XMM 边界同步（入口）：蹦床把宿主 xmm0-xmm5 存进了它自己的帧，而解释器全程用 blob 里的
+     * vm_xmm 当寄存器堆 —— 两者不是同一块内存，不同步就会：double 参数读不到、返回值送不出去。
+     * 帧基址 = 模拟 RSP + 8 + VM_MARGIN（vm_abi.h「模拟栈位置」）；槽位偏移必须用宏 ——
+     * 第一版硬编码成 304，而真实值是 VM_SAVE_XMM0(320/336，按平台)，于是同步写进了填充区、毫无效果。 */
+#if !defined(VM_GUEST_ARM64)
+    /* 只在蹦床真的建过帧时同步（vm->frame 由入口 asm 写入；测试 harness 直接调 vm_run，这里是 0）。
+     * arm64 客户机的帧布局不同（XMM 槽位在别处），不套这段。 */
+    if (vm->frame) {
+        u8 *xframe = (u8 *)(u64)vm->frame;
+        int xi;
+        for (xi = 0; xi < 6; xi++) {
+            int b;
+            for (b = 0; b < 16; b++) vm_xmm[xi * 16 + b] = xframe[VM_SAVE_XMM0 + xi * 16 + b];
+        }
+    }
+#endif
 #ifndef VM_RELEASE /* release 构建不带任何诊断状态：少一份明文、少一族特征 */
     vm_diag[0] = vm->regs[0];          /* 入口 X0（客户机参数） */
     vm_diag[1] = rsp_start;            /* 入口模拟 SP */
@@ -1318,7 +1333,18 @@ int vm_run(vm_ctx_t *vm) {
     }
 #endif /* !VM_RELEASE */
     int rc = vm_run_inner(vm, rsp_start);
-    /* 【出口同步代码已回退；原因见入口处的注释】 */
+    /* XMM 边界同步（出口）：把 guest 算出来的 xmm0-xmm5 写回蹦床帧的保存槽，
+     * 这样出口 asm 恢复 xmm0 时交还给调用方的就是**被保护函数的返回值**（xmm0 承载 FP 返回值）。 */
+#if !defined(VM_GUEST_ARM64)
+    if (vm->frame) {
+        u8 *xframe = (u8 *)(u64)vm->frame;
+        int xi;
+        for (xi = 0; xi < 6; xi++) {
+            int b;
+            for (b = 0; b < 16; b++) xframe[VM_SAVE_XMM0 + xi * 16 + b] = vm_xmm[xi * 16 + b];
+        }
+    }
+#endif
 #ifndef VM_RELEASE
     vm_diag[4] = vm->regs[0];          /* 出口 X0（返回值） */
     vm_diag[5] = vm->regs[VRSP];
