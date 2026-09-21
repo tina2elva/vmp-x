@@ -257,6 +257,20 @@ vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    
 - Maintaining Master Keys: https://docs.sentinel.thalesgroup.com/ldk/LDKdocs/WebHelp/MaintainMasterKeys.htm
 - EMS User Types and Roles: https://docs.sentinel.thalesgroup.com/softwareandservices/ldk/LDKdocs/SPNL/LDK_SLnP_Guide/Licensing/Users_and_Roles.htm
 
+**澄清：不存在「自己加密自己」（三个根各管各的）**
+
+| 谁的什么东西 | 用哪个根 | 谁签授权 | 说明 |
+|---|---|---|---|
+| **一级客户的软件**（你们的主业务） | **客户自己的根**（= 他的母狗 / VendorCode 对应物） | 客户自己（给他的下游） | 客户**本来就是他自己那棵树的厂商** —— 这正是 Sentinel 的模型（每家一个 Vendor ID） |
+| **你们的工具 vmpbuild/vmpack**（可选） | **你们的根** | 你们 | 这只是「工具启动时校验一份许可证文件」（读文件 → ECDSA 验签 → 查到期 → 不通过就退出），**与加密功能无关**；不是拿 vmp-x 去加密 vmp-x ✗ |
+| **你们自己的软件产品**（如果有） | **你们的根** | 你们 | 同客户的场景，只是树根换成你们 |
+
+**要不要给工具本身加壳**：那是**另一个可选动作**（用 vmp-x 保护 vmpbuild/vmpack 自己），与授权链无关；
+真要做要注意**自举顺序** —— 用一份**冻结的旧 blob** 去保护新工具（链式，不循环 ✓），而不是「新工具保护新工具」 ✗。
+
+**「工具授权」可做可不做**：不做也能卖（只是客户可以把工具转手 ✗）；做的话就是普通的软件许可校验，
+防得住顺手转手，防不住铁了心 patch 的人（与所有软件许可同一边界）。
+
 **文件形态 vs Sentinel：能模拟什么、模拟不了什么**
 
 | Sentinel 概念 | 文件形态对应物 | 我们的状态 |
