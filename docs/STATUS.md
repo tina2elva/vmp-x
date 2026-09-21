@@ -4777,4 +4777,37 @@ Android/Windows-arm64 的 `vm_unpack_image` 本来就是"未实现"分支，不�
 - 改动（`cmd/vmpbuild`）：主密钥 / KCV salt / 字段掩码 salt / 占位密钥 **全部改走 `crypto/rand`**
   （失败即报错，不静默退化）；操作码映射的每构建随机种子同样改走 `crypto/rand`（可预测种子等于把映射送出去）。
 
+### 394. 密钥生命周期（回答"同一个 exe / 同一项目不同时期的产物，`.vmpkey` 固定吗"）
+
+**结论：默认不固定；但只要复用同一份 blob，就能一直固定。**
+
+| 实验（本机实测） | 结果 |
+|---|---|
+| 同一个 exe、同样的被保护函数，连做两次 `vmpbuild -key-external` | 密钥**不同**（`22f97a80…` vs `37f34825…`） |
+| 复用同一份 blob（+同一把 key）打**两个完全不同的程序**（用户的 `demo64` 与 `testdata/target`） | 同一个 `.vmpkey` 内容**两个都能开** |
+| 拿**另一次构建**的密钥去开旧产物 | 打不开：恰好 `0xC0DE0007`、无输出 |
+
+**为什么**：主密钥是 `crypto/rand` 现取的随机数，**不从 exe 派生**，也与"保护了哪些函数"无关 ——
+它只属于**那一份 blob**（blob 里的 KCV、掩码 salt、sigma、操作码映射、描述符魔数都是同一次构建的产物）。
+被保护函数的密钥是运行期/打包期用 `KDFEntry(master, funcRVA, salt)` 现推的，所以改函数只改派生出来的那一把。
+
+**"一次签发、长期复用"的配方**（密钥不随发版变化）
+
+    # 一次性：生成一个"密钥纪元"，把这三样当发布资产保管
+    vmpbuild -src stub/win/x64 -out release/blob.bin -manifest release/blob.json \
+             -entry vm_entry -key-external -key-out release/project.vmpkey
+    # 每次发版：只打包，不再动 blob/key
+    vmpack -exe new_build.exe -func ... -blob release/blob.bin -manifest release/blob.json -out app.exe
+    copy release\project.vmpkey app.exe.vmpkey
+
+未加密代码如何增删改都无所谓；**改被保护函数的实现也没关系**（同一个主密钥照样能开）。
+blob 是解释器、与 exe 无关，所以同一份 blob 可以长期服务很多版本。
+
+**边界（如实登记）**
+- **blob 与密钥是一对**：换 blob 就得换密钥，旧密钥打不开新 blob 的产物（实验 3）。
+- 一把密钥覆盖的产物越多，泄露后果越大。想要更严的做法是**按客户/按批次分密钥纪元**，
+  或者干脆保持默认（每次构建一把，代价是每次发版都要重新分发密钥）。
+- 目前主密钥只能由 `vmpbuild` 随机**生成**；如果希望**由你们提供**（CI 里从密钥库注入、
+  vmpbuild 不生成密钥），需要加一个 `-key-hex` 之类的入口 —— 这是**未做项**，需要时再加。
+
 **证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e 158/0）；CI（待填）。
