@@ -81,10 +81,11 @@ type manifest struct {
 	RelocsPatch   int            `json:"relocsPatched"`
 	Sections      []sectInfo     `json:"sections"`
 	Symbols       map[string]int `json:"symbols"`
-	OpcodeMap     map[string]int `json:"opcodeMap"` // 逻辑操作码名 -> 本 blob 的实际编码
-	Key           string         `json:"key"`       // AEAD 主密钥（hex）；M2.2 用，定位见 DESIGN §2
-	Guest         string         `json:"guest"`     // 客户机 ISA：x86-64 / arm64
-	RegCount      int            `json:"regCount"`  // ctx 的寄存器槽位数：18（x86-64）/ 35（arm64）
+	OpcodeMap     map[string]int `json:"opcodeMap"`   // 逻辑操作码名 -> 本 blob 的实际编码
+	Key           string         `json:"key"`         // AEAD 主密钥（hex）；M2.2 用，定位见 DESIGN §2
+	KeyExternal   bool           `json:"keyExternal"` // 1b：外置密钥模式（运行期强制只在该模式下编入）
+	Guest         string         `json:"guest"`       // 客户机 ISA：x86-64 / arm64
+	RegCount      int            `json:"regCount"`    // ctx 的寄存器槽位数：18（x86-64）/ 35（arm64）
 	UndefinedSym  []string       `json:"undefinedSymbols,omitempty"`
 }
 
@@ -319,6 +320,7 @@ func main() {
 		BSSOff:        bssOff,
 		BSSSize:       bssSize,
 		Key:           keyHex,
+		KeyExternal:   *keyExternal,
 	}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	must(os.MkdirAll(filepath.Dir(*man), 0o755))

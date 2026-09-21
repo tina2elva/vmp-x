@@ -10,6 +10,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -34,12 +35,13 @@ import (
 )
 
 type stubManifest struct {
-	EntryOff  int    `json:"entryOff"`
-	BSSOff    int    `json:"bssOff"`
-	BSSSize   int    `json:"bssSize"`
-	Key       string `json:"key"`
-	BlobSize  int    `json:"blobSize"`
-	FrameSkew int    `json:"frameSkew"`
+	EntryOff    int    `json:"entryOff"`
+	BSSOff      int    `json:"bssOff"`
+	BSSSize     int    `json:"bssSize"`
+	Key         string `json:"key"`
+	KeyExternal bool   `json:"keyExternal"` // 1b：外置密钥模式（运行期强制只在该模式的 blob 里编入）
+	BlobSize    int    `json:"blobSize"`
+	FrameSkew   int    `json:"frameSkew"`
 	// DescMagic：blob 期望的描述符魔数（现在**每次构建都随机**，见 vmpbuild）。
 	DescMagic uint32 `json:"descMagic"`
 	// FieldMaskSalt：描述符/表的字段混淆掩码种子（见 internal/inject/fields.go）。
@@ -68,6 +70,9 @@ func main() {
 	noEncImageELF := flag.Bool("no-enc-image-elf", false, "对 ET_EXEC 的 ELF 关闭原镜像整体加密（默认开；探针已改为合成补丁字节，不再依赖明文）")
 	credFlag := flag.String("cred", "", "构建凭据路径（默认 $VMPX_CRED 或工具同目录 vmpx.cred）；仅当工具烘焙了厂商根公钥时才校验")
 	vendorFlag := flag.String("vendor", "", "本次构建声明的 vendorID；工具授权开启时会强制与凭据里的一致")
+	licVendor := flag.String("license-vendor", "", "运行期强制：烘进产物的 vendorID（需 -key-external 构建的 blob）")
+	licProduct := flag.String("license-product", "", "运行期强制：该产物代表哪个产品（productID）")
+	licPub := flag.String("license-pub", "", "运行期强制：授权签发者的 ECDSA P-256 公钥（64 字节 X||Y 的 hex，或 .pub 文件）")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
@@ -108,6 +113,31 @@ func main() {
 	entryOff, ok := man.Symbols["vm_entry"]
 	if !ok {
 		fatalf("%s 里没有 vm_entry 符号；请用 -entry vm_entry 构建 blob", *manPath)
+	}
+	if *licVendor != "" || *licProduct != "" || *licPub != "" {
+		off, ok := man.Symbols["vm_license_meta"]
+		if !ok {
+			fatalf("该 blob 里没有 vm_license_meta 符号（运行期强制目前只编入 -key-external 的 blob）")
+		}
+		if !man.KeyExternal {
+			fatalf("-license-* 需要 -key-external 构建出来的 blob（运行期强制只在外置密钥模式下编入）")
+		}
+		if *licVendor == "" || *licProduct == "" || *licPub == "" {
+			fatalf("-license-vendor / -license-product / -license-pub 必须同时给")
+		}
+		pub, err := readLicensePub(*licPub)
+		must(err)
+		vh := sha256.Sum256([]byte(*licVendor))
+		ph := sha256.Sum256([]byte(*licProduct))
+		if off < 0 || off+12+64 > len(stub) {
+			fatalf("vm_license_meta 偏移 0x%X 越界（blob %d 字节）", off, len(stub))
+		}
+		binary.LittleEndian.PutUint32(stub[off+0:], 1) // kind = 1（启用）
+		binary.LittleEndian.PutUint32(stub[off+4:], binary.LittleEndian.Uint32(vh[0:4]))
+		binary.LittleEndian.PutUint32(stub[off+8:], binary.LittleEndian.Uint32(ph[0:4]))
+		copy(stub[off+12:off+76], pub)
+		fmt.Printf("[*] 运行期强制已启用：vendorID=%s productID=%s 签发者公钥前 8 字节=%X\n",
+			*licVendor, *licProduct, pub[0:8])
 	}
 	fmt.Printf("[*] 解释器: %s (%d 字节), vm_entry @ +0x%X, FRAME_SKEW=%d, 可写区 [0x%X,+0x%X)",
 		*blobPath, len(stub), entryOff, man.FrameSkew, man.BSSOff, man.BSSSize)
@@ -962,6 +992,25 @@ func encryptImageSections(f *pe.File, res *inject.Result, master []byte, fieldMa
 		}
 	}
 	return nil
+}
+
+// readLicensePub 读签发者公钥：64 字节 hex 字面量，或一个文件（hex 文本，或 64 字节原始）。
+func readLicensePub(s string) ([]byte, error) {
+	trimmed := strings.TrimSpace(s)
+	if b, err := hex.DecodeString(trimmed); err == nil && len(b) == 64 {
+		return b, nil
+	}
+	raw, err := os.ReadFile(s)
+	if err != nil {
+		return nil, fmt.Errorf("-license-pub 既不是 128 位 hex，也读不到该文件: %w", err)
+	}
+	if len(raw) == 64 {
+		return raw, nil
+	}
+	if b, err := hex.DecodeString(strings.TrimSpace(string(raw))); err == nil && len(b) == 64 {
+		return b, nil
+	}
+	return nil, fmt.Errorf("-license-pub 文件既不是 64 字节原始公钥，也不是 128 位 hex 文本")
 }
 
 // origRelocEntries 读出原镜像的重定位项（type, rva）。stripRelocations 之后就再也读不到了。

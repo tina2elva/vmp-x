@@ -334,6 +334,21 @@ vmpepoch lic-show --lic A-A.vmplic --root root.pub --product PROD-A
 负例3 授权里塞伪造证书 → `lic-show --root` 报“证书链：不是由上一级签的”✓。
 
 **还没做（下一步，按需选择）**
+- [ ] **运行期强制（进行中，勿用于交付）**：门禁链路已就位，但「带**合法**授权运行」这条路径尚未打通。
+  **已做**：
+  - `vmpbuild`：blob 里新增占位全局 `vm_license_meta`（强制 `.data`、默认 `kind=0` = 不启用）+ manifest 暴露符号偏移与 `keyExternal`；
+  - `vmpack`：`-license-vendor / -license-product / -license-pub`；**非外置密钥的 blob 直接拒绝**（避免出现「以为有门禁其实没有」）；
+    把 vendorID/productID 的 `SHA-256[0:4]` 与签发者公钥写进产物里那份 blob；
+  - `vmpepoch lic-export`：JSON 授权 → 运行期二进制授权 `<产物>.vmplic.bin`（hdr+items+签名，与 C 侧逐字节对齐）；
+  - blob 侧 `vm_license_check()`：读授权（复用 1b 的 PEB 路径 + ntdll 读文件）→ 校验 magic/版本/vendorHash/长度 →
+    CNG（bcrypt）验 ECDSA P-256 → 查 productHash 与到期 → 不通过走同一个硬门 `0xC0DE0007`；调用点在**入口蹦床**（入口点、main 之前）；
+  - **实测**：不带授权文件 → **恰好 `0xC0DE0007`、无输出** ✓（「没授权跑不起来」这条已成立）。
+  **未打通**：带合法授权运行时仍 **ud2 崩**（`0xC000001D`，地址在 payload 内、稳定复现）。
+  已用固定分支码（0x21..0x3E）逐段定位并排除：路径拼接、读文件、magic/版本/vendorHash/长度、
+  bcrypt 懒加载（已改用 `ntdll!LdrLoadDll` 自己加载）、TLS/loader-lock 时序（关掉镜像加密、无 TLS 回调现象相同）。
+  下一步：用调试器（或继续压细分支码）定位到具体调用；也可考虑在 blob 里自带 SHA-256、只在 CNG 里做验签。
+  **风险控制**：整条路径默认关闭（`kind=0`）；门禁只在外置密钥模式下编入；`vmpack` 拒绝非外置 blob；
+  现有产物/门禁/CI 不受影响（本机 gates 11/0 复验）。
 - [ ] **运行期强制**（下一步的主任务，方案已定死）：
   **① 烘什么、烘在哪**：`vmpbuild` 发一个**占位全局** `vm_license_meta`（默认 kind=0 = 不启用，现有产物不受影响），
   在 manifest 里暴露它的偏移；`vmpack` 用新参数 `-license-vendor / -license-product / -license-key <pub>`

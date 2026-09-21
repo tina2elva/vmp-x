@@ -4905,3 +4905,32 @@ blob 是解释器、与 exe 无关，所以同一份 blob 可以长期服务很�
   离线授权必须用**公钥签名**：blob 是公开的，对称 HMAC"塞进 blob"会被伪造 ✗。
 
 **证据**：本机 `tools/gates.ps1` = **11 gates / 0 failed**（e2e 158/0）；CI（待填）。
+### 398. 目标项 (2) 运行期强制：门禁链路就位、「无授权即拒绝」已成立；「合法授权」这条路径尚未打通（如实登记）
+
+**已做**（全部默认关闭，不影响现有行为）
+- `vmpbuild`：blob 新增占位全局 `vm_license_meta`（强制 `.data`，默认 `kind=0` = 不启用），manifest 暴露它的符号偏移与 `keyExternal`；
+- `vmpack`：`-license-vendor / -license-product / -license-pub` —— **非外置密钥的 blob 直接拒绝**（宁可不做，也不要出现「以为有门禁其实没有」）；
+  把 vendorID/productID 的 `SHA-256[0:4]` 与签发者公钥写进**产物里那份 blob 副本**（blob 在 payload 偏移 0，符号偏移来自 manifest）；
+- `vmpepoch lic-export`：把 JSON 授权导出成**运行期二进制授权** `<产物>.vmplic.bin`（24 字节头 + 16 字节/项 + 64 字节 ECDSA 签名，与 C 侧逐字段对齐）；
+- blob 侧 `vm_license_check()`：读授权（复用 1b 的 PEB 路径 + ntdll 读文件，零 API）→ 校验 magic/版本/vendorHash/长度 → **CNG（bcrypt）验 ECDSA P-256** →
+  查 productHash 与到期 → 不通过走同一个硬门 `0xC0DE0007`；调用点放在**入口蹦床**（= 入口点、main 之前）。
+
+**实测**
+
+| 场景 | 结果 |
+|---|---|
+| 不带授权文件（外置密钥 + 已烘 vendorID/productID/公钥） | **恰好 `0xC0DE0007`、stdout/stderr 全空** ✓ |
+| 带合法授权 | ✗ **ud2 崩（`0xC000001D`）**，地址在 payload 内、稳定复现 |
+
+**定位过程（分支码 0x21..0x3E 逐段压范围）已排除**
+- 授权路径拼接、读文件、magic/版本/vendorHash/长度校验（这些分支都能给出对应的干净退出码）；
+- **bcrypt.dll 懒加载**：简单进程的模块表里根本没有它 → 已改成用 `ntdll!LdrLoadDll` 自己加载（ntdll 不转发）；
+- **TLS/loader-lock 时序**：门禁最初放在 `vm_master()`（该路径会被 TLS 回调走到，回调里不能加载 DLL/调 CNG）→ 已移到入口蹦床；
+  并用 `-no-enc-image`（无 TLS 回调）对照，崩溃现象**不变** ⇒ 与 TLS 时序无关。
+
+**下一步**（已写进 `docs/TODO.md`）：① 用调试器把崩溃点定位到具体 CNG 调用（或继续压细分支码）；
+② 备选：blob 里自带 SHA-256（约 120 行），只在 CNG 里做 `BCryptVerifySignature`；③ 打通后补五个验收场景。
+
+**风险控制（重要）**：整条路径**默认关闭**（`kind=0`）；门禁只在**外置密钥模式**下编入；`vmpack` **拒绝**给非外置 blob 传 `-license-*`。
+因此现有产物、门禁、CI 全部不受影响 —— 本机 `tools/gates.ps1` = **11 gates / 0 failed**（修复过程中曾因调用点放在共享代码里导致 4 项红，已修）。
+

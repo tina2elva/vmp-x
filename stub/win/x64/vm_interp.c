@@ -747,6 +747,150 @@ static int vm_key_parse(const u8 *buf, u32 got) {
     return 1;
 }
 
+/* ---- 运行期强制（授权门禁）----
+ * 产物里烘的是「签发者公钥 + vendorID/productID 的 4 字节哈希」；运行期读 <产物>.vmplic.bin，
+ * 用 CNG（bcrypt.dll）验 ECDSA P-256 签名，再比对哈希与到期时间；不通过就走同一个硬门 0xC0DE0007。
+ * 这里**没有自带任何密码学实现**：哈希与验签都交给 Windows CNG（Ed25519 换 ECDSA 就是为了这个）。
+ * 注意：门禁只在 **外置密钥模式**（-key-external，推荐的产品形态）下编入。 */
+typedef struct __attribute__((aligned(8))) {
+    u32 kind;          /* 0 = 不校验（默认，向后兼容）；1 = 校验 <产物>.vmplic.bin */
+    u32 vendorHash;    /* SHA-256(vendorID)[0:4]，由 vmpack 烘进来 */
+    u32 productHash;   /* SHA-256(productID)[0:4] */
+    u8 issuerPub[64];  /* ECDSA P-256 签发者公钥 X||Y */
+} vm_license_meta_t;
+
+__attribute__((section(".data"), used))
+volatile vm_license_meta_t vm_license_meta = {0, 0, 0, {0}};
+
+/* 把 "<产物全路径><suffix>" 拼成原生 API 要的 "\??\..."（UTF-16）。与 key 不同：不受环境变量覆盖。 */
+static const u16 *vm_exe_path_suffix(const char *suffix, u16 *out, u32 cap) {
+    u64 peb = vm_peb_base();
+    if (!peb) return 0;
+    const u8 *pp = *(const u8 *const *)(peb + 0x20);
+    if (!pp) return 0;
+    const vm_ustr_t *ip = (const vm_ustr_t *)(pp + 0x60);
+    if (!ip || !ip->Buffer || ip->Length < 2) return 0;
+    u32 n = 0, chars = (u32)(ip->Length / 2);
+    out[n++] = '\\'; out[n++] = '?'; out[n++] = '?'; out[n++] = '\\';
+    for (u32 i = 0; i < chars && n < cap - 24; i++) out[n++] = ip->Buffer[i];
+    for (u32 i = 0; suffix[i] && n < cap - 1; i++) out[n++] = (u16)(u8)suffix[i];
+    out[n] = 0;
+    return out;
+}
+
+/* 当前 UTC Unix 秒（FILETIME 100ns since 1601）。取不到返回 0（0 表示"时间不可用"）。 */
+static i64 vm_now_unix(void) {
+    typedef void (*gstft_t)(void *);
+    gstft_t f = (gstft_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "GetSystemTimeAsFileTime");
+    if (!f) return 0;
+    u64 ft = 0;
+    f(&ft);
+    return (i64)(ft / 10000000ull) - 11644473600LL;
+}
+
+/* bcrypt.dll 是**按需加载**的：在简单进程里 PEB 模块表里根本没有它（实测 0x31）。
+ * 用 ntdll!LdrLoadDll 自己加载 —— ntdll 永远在，且它的导出从不转发。 */
+static u64 vm_load_lib(const u16 *name) {
+    u64 nt = vm_find_module("ntdll.dll");
+    if (!nt) return 0;
+    typedef long (*ldr_t)(u32 *, void *, vm_ustr_t *, void **);
+    ldr_t ldr = (ldr_t)vm_get_proc(nt, "LdrLoadDll");
+    if (!ldr) return 0;
+    vm_ustr_t us;
+    u32 len = 0;
+    while (name[len]) len++;
+    us.Length = (u16)(len * 2);
+    us.MaximumLength = (u16)(len * 2 + 2);
+    us.Buffer = (u16 *)name;
+    void *h = 0;
+    if (ldr(0, 0, &us, &h) < 0) return 0;
+    return (u64)h;
+}
+
+/* CNG：SHA-256 + ECDSA P-256 验签（全部通过 vm_get_proc 取，不引入导入表）。 */
+static int vm_license_verify(const u8 *msg, u32 msgLen, const u8 *sig64, const u8 *pub64) {
+    u64 bc = vm_find_module("bcrypt.dll");
+    if (!bc) {
+        static const u16 bcName[] = {'b','c','r','y','p','t','.','d','l','l',0};
+        bc = vm_load_lib(bcName);
+    }
+    if (!bc) { vm_key_reject_code(0x31u); return 0; }
+    typedef long (*open_t)(void **, const u16 *, const u16 *, u32);
+    typedef long (*imp_t)(void *, void *, const u16 *, void **, u8 *, u32, u32);
+    typedef long (*hash_t)(void *, void *, u8 *, u32, u8 *, u32, u32);
+    typedef long (*hdata_t)(void *, u8 *, u32, u32);
+    typedef long (*hfin_t)(void *, u8 *, u32, u32);
+    typedef long (*ver_t)(void *, void *, u8 *, u32, u8 *, u32, u32);
+    open_t bOpen = (open_t)vm_get_proc(bc, "BCryptOpenAlgorithmProvider");
+    imp_t bImport = (imp_t)vm_get_proc(bc, "BCryptImportKeyPair");
+    hash_t bHash = (hash_t)vm_get_proc(bc, "BCryptCreateHash");
+    hdata_t bData = (hdata_t)vm_get_proc(bc, "BCryptHashData");
+    hfin_t bFin = (hfin_t)vm_get_proc(bc, "BCryptFinishHash");
+    ver_t bVerify = (ver_t)vm_get_proc(bc, "BCryptVerifySignature");
+    if (!bOpen) { vm_key_reject_code(0x32u); return 0; }
+    if (!bImport) { vm_key_reject_code(0x33u); return 0; }
+    if (!bHash) { vm_key_reject_code(0x34u); return 0; }
+    if (!bData) { vm_key_reject_code(0x35u); return 0; }
+    if (!bFin) { vm_key_reject_code(0x36u); return 0; }
+    if (!bVerify) { vm_key_reject_code(0x37u); return 0; }
+    static const u16 algSha[] = {'S','H','A','2','5','6',0};
+    static const u16 algEcc[] = {'E','C','D','S','A','_','P','2','5','6',0};
+    static const u16 blobEcc[] = {'E','C','C','P','U','B','L','I','C','B','L','O','B',0};
+    void *hSha = 0, *hEcc = 0, *hHash = 0, *hKey = 0;
+    if (bOpen(&hSha, algSha, 0, 0) < 0) { vm_key_reject_code(0x38u); return 0; }
+    u8 digest[32];
+    int ok = 0;
+    if (bHash(hSha, &hHash, 0, 0, 0, 0, 0) < 0) { vm_key_reject_code(0x39u); return 0; }
+    if (bData(hHash, (u8 *)msg, msgLen, 0) < 0) { vm_key_reject_code(0x3Au); return 0; }
+    if (bFin(hHash, digest, 32, 0) < 0) { vm_key_reject_code(0x3Bu); return 0; }
+    if (bOpen(&hEcc, algEcc, 0, 0) < 0) { vm_key_reject_code(0x3Cu); return 0; }
+    {
+        /* BCRYPT_ECCKEY_BLOB: { dwMagic, cbKey, X[cbKey], Y[cbKey] } */
+        u8 keyBlob[8 + 64];
+        *(u32 *)(keyBlob + 0) = 0x31534345u; /* BCRYPT_ECDSA_PUBLIC_P256_MAGIC ('ECS1') */
+        *(u32 *)(keyBlob + 4) = 32u;
+        for (u32 i = 0; i < 64; i++) keyBlob[8 + i] = pub64[i];
+        if (bImport(hEcc, 0, blobEcc, &hKey, keyBlob, (u32)sizeof(keyBlob), 0) < 0) { vm_key_reject_code(0x3Du); return 0; }
+        if (bVerify(hKey, 0, digest, 32, (u8 *)sig64, 64, 0) < 0) { vm_key_reject_code(0x3Eu); return 0; }
+        ok = 1;
+    }
+    return ok;
+}
+
+/* 门禁：1 = 放行（未启用也算放行）；0 = 拒绝。 */
+static int vm_license_check(void) {
+    if (vm_license_meta.kind == 0) return 1;
+    u16 path[360];
+    if (!vm_exe_path_suffix(".vmplic.bin", path, 360)) { vm_key_reject_code(0x21u); return 0; }
+    static u8 lic[2048];
+    u32 got = 0;
+    if (!vm_key_read_nt(path, lic, (u32)sizeof(lic), &got)) { vm_key_reject_code(0x22u); return 0; }
+    /* hdr: magic(4) version(4) vendorHash(4) count(4) reserved(8) = 24；条目 16 字节；末尾 64 字节签名 */
+    if (got < 24 + 64) { vm_key_reject_code(0x23u); return 0; }
+    if (*(const u32 *)(lic + 0) != 0x564C5043u) { vm_key_reject_code(0x24u); return 0; }
+    if (*(const u32 *)(lic + 4) != 1u) { vm_key_reject_code(0x25u); return 0; }
+    if (*(const u32 *)(lic + 8) != vm_license_meta.vendorHash) { vm_key_reject_code(0x26u); return 0; }
+    u32 count = *(const u32 *)(lic + 12);
+    if (got != 24 + count * 16 + 64) { vm_key_reject_code(0x27u); return 0; }
+    u64 signedLen = 24 + (u64)count * 16;
+    if (!vm_license_verify(lic, (u32)signedLen, lic + signedLen, (const u8 *)vm_license_meta.issuerPub)) { vm_key_reject_code(0x28u); return 0; }
+    i64 now = vm_now_unix();
+    int found = 0;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *e = lic + 24 + (u64)i * 16;
+        u32 ph = *(const u32 *)(e + 0);
+        i64 notAfter = *(const i64 *)(e + 8);
+        if (ph != vm_license_meta.productHash) continue;
+        if (notAfter == 0) { found = 1; break; }          /* 永久 */
+        if (now == 0) continue;                            /* 时间取不到 -> 不认"限期授权" */
+        if (now <= notAfter) { found = 1; break; }
+        vm_key_reject_code(0x2Au);                         /* 该产品已过期 */
+        return 0;
+    }
+    if (!found) { vm_key_reject_code(0x29u); return 0; }
+    return 1;
+}
+
 static int vm_key_from_file(void) {
     const u16 *path = vm_key_path();
     if (!path || !*path) return 0;
@@ -783,6 +927,10 @@ const u8 *vm_master(void) {
             if (kcv[i] != want[i]) vm_key_reject();
         }
     }
+    /* 注意：授权校验**不能**放在这里 —— vm_master() 也会被 TLS 回调路径调用，
+     * 而在 TLS 回调里调 LdrLoadDll/bcrypt 是非法的（loader lock 被持有，实测 ud2 崩）。
+     * 所以门禁放在入口蹦床 vm_verify_table()：那里是"入口点"，loader lock 已释放，
+     * 而且仍在 main 之前 —— 体感同样是"没授权就跑不起来"。 */
     vm_master_ok = 1;
     return vm_master_buf;
 }
@@ -1740,6 +1888,12 @@ void vm_verify_table(const u32 *t) {
     u32 n, i;
     const u8 *base = (const u8 *)t;
     const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
+#ifdef VM_KEY_EXTERNAL
+    /* (2) 运行期强制：在这里（入口蹦床 = 入口点、main 之前）做授权校验。
+     * 放在 vm_master() 里是错的：那条路径也被 TLS 回调走到，不能在回调里加载 DLL/调 CNG。
+     * 只在外置密钥模式下编入（vmpack 也拒绝给非外置 blob 传 -license-*，所以不存在"静默无门禁"）。 */
+    if (!vm_license_check()) vm_key_reject();
+#endif
     if (!t) return;
     u8 m[32];
     vm_kdf_entry(master, VM_FIELD_MASK_VERIFY, VM_FIELD_MASK_SALT, m);

@@ -78,6 +78,8 @@ func main() {
 		cmdLicNew(os.Args[2:])
 	case "lic-edit":
 		cmdLicEdit(os.Args[2:])
+	case "lic-export":
+		cmdLicExport(os.Args[2:])
 	case "lic-show":
 		cmdLicShow(os.Args[2:])
 	default:
