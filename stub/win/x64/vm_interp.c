@@ -1307,9 +1307,12 @@ int vm_run(vm_ctx_t *vm) {
      * vm_xmm 当寄存器堆 —— 两者不是同一块内存，不同步就会：double 参数读不到、返回值送不出去。
      * 帧基址 = 模拟 RSP + 8 + VM_MARGIN（vm_abi.h「模拟栈位置」）；槽位偏移必须用宏 ——
      * 第一版硬编码成 304，而真实值是 VM_SAVE_XMM0(320/336，按平台)，于是同步写进了填充区、毫无效果。 */
-#if !defined(VM_GUEST_ARM64)
-    /* 只在蹦床真的建过帧时同步（vm->frame 由入口 asm 写入；测试 harness 直接调 vm_run，这里是 0）。
-     * arm64 客户机的帧布局不同（XMM 槽位在别处），不套这段。 */
+#if defined(VM_BLOB_USES_WIN64) && !defined(VM_GUEST_ARM64)
+    /* 只在 Windows blob + x86-64 客户机下同步：
+     * - vm->frame 由 **Windows 入口 asm** 写入（Linux 入口还没写 ⇒ 那里读到的是相邻垃圾，
+     *   实测会让 ELF e2e 全部 fault，所以这里按平台排除）；
+     * - 测试 harness 直接调 vm_run、frame 为 0 ⇒ 天然跳过；
+     * - arm64 客户机的帧布局不同（XMM 槽位在别处），同样排除。 */
     if (vm->frame) {
         u8 *xframe = (u8 *)(u64)vm->frame;
         int xi;
@@ -1335,7 +1338,7 @@ int vm_run(vm_ctx_t *vm) {
     int rc = vm_run_inner(vm, rsp_start);
     /* XMM 边界同步（出口）：把 guest 算出来的 xmm0-xmm5 写回蹦床帧的保存槽，
      * 这样出口 asm 恢复 xmm0 时交还给调用方的就是**被保护函数的返回值**（xmm0 承载 FP 返回值）。 */
-#if !defined(VM_GUEST_ARM64)
+#if defined(VM_BLOB_USES_WIN64) && !defined(VM_GUEST_ARM64)
     if (vm->frame) {
         u8 *xframe = (u8 *)(u64)vm->frame;
         int xi;
