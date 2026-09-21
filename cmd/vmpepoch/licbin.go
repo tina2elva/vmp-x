@@ -34,12 +34,20 @@ func cmdLicExport(args []string) {
 	licPath := fs.String("lic", "", "JSON 授权（.vmplic）")
 	key := fs.String("key", "", "签发者私钥（.priv）—— 必须与产物里烘进的公钥配对")
 	out := fs.String("out", "", "输出二进制授权，命名必须是 <产物全路径>.vmplic.bin")
+	rootPub := fs.String("root-pub", "", "厂商根公钥（.pub）：给了就先验证授权里内嵌的身份证书链（把委派链纳入导出流程）")
 	fs.Parse(args)
 	if *licPath == "" || *key == "" || *out == "" {
 		fmt.Println("[!] 需要 --lic --key --out")
 		os.Exit(2)
 	}
 	l := readLicense(*licPath)
+	if *rootPub != "" {
+		if l.Cert == nil {
+			must(fmt.Errorf("授权里没有身份证书，无法验链（要么去掉 --root-pub，要么用 lic-new --cert 带上证书）"))
+		}
+		must(l.Cert.verifyChain(loadPub(*rootPub)))
+		fmt.Printf("[*] 身份证书链已回溯到厂商根（链深 %d，vendorID=%s）\n", certDepth(l.Cert), l.Cert.VendorID)
+	}
 	n := 24 + len(l.Items)*16
 	buf := make([]byte, n)
 	binary.LittleEndian.PutUint32(buf[0:], licMagic)

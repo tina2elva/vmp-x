@@ -334,7 +334,17 @@ vmpepoch lic-show --lic A-A.vmplic --root root.pub --product PROD-A
 负例3 授权里塞伪造证书 → `lic-show --root` 报“证书链：不是由上一级签的”✓。
 
 **还没做（下一步，按需选择）**
-- [ ] **运行期强制（进行中，勿用于交付）**：门禁链路已就位，但「带**合法**授权运行」这条路径尚未打通。
+- [x] **运行期强制**：已打通（见 STATUS #399）。无授权 → `0xC0DE0007`；合法授权 → 与原生逐行一致；
+  篡改/过期/productID 不符/vendorID 不符/伪造签名 → 全部 `0xC0DE0007`；门禁失败对外统一，内部阶段记在 `vm_license_fail_stage`。
+- [x] **⑦ 全流程可复跑脚本**：`tools/acceptance_demo.ps1`（23 项检查全通过）。
+  用法：`powershell -NoProfile -File tools/acceptance_demo.ps1 -BuildDemo`（现场用 MSVC 重编客户的 demo，带 /MAP），
+  或 `-DemoExe X.exe -DemoMap X.map`（客户自己提供带 MAP 的产物）。
+  覆盖：① 工具授权（无凭据 exit 8 / 有凭据可用）② 密钥纪元 + `which` 归属 ③ 外置密钥保护客户软件
+  ④ 授权链（根→销售 canIssue→客户→下游；无 canIssue 的证书签下级被拒）⑤ 运行期强制（无授权/篡改/过期/伪造 → 0xC0DE0007；
+  合法授权 → 与原生**逐行一致**）⑥ 授权更新（产物哈希不变、输出一致）。
+  注意：**vmpack 靠 MAP 文件按名字定位函数（不读 PDB）** —— 客户自带的 demo64.exe 没有 .map，
+  所以要么 `-BuildDemo` 重编一份带 /MAP 的，要么 `-DemoMap` 指定。
+
   **已做**：
   - `vmpbuild`：blob 里新增占位全局 `vm_license_meta`（强制 `.data`、默认 `kind=0` = 不启用）+ manifest 暴露符号偏移与 `keyExternal`；
   - `vmpack`：`-license-vendor / -license-product / -license-pub`；**非外置密钥的 blob 直接拒绝**（避免出现「以为有门禁其实没有」）；

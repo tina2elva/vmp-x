@@ -4960,6 +4960,34 @@ blob 是解释器、与 exe 无关，所以同一份 blob 可以长期服务很�
 本机 `tools/gates.ps1` = **11 gates / 0 failed**。
 
 **仍默认关闭**：`vm_license_meta.kind = 0` 时不校验；`-license-*` 只在**外置密钥模式**的 blob 上可用（vmpack 强制）。
-**待做**：把「客户 demo 全流程」写成可复跑脚本（目标 ⑦ 的固化）；Sentinel 接口层（若上狗）。
+**待做**：Sentinel 接口层（若上狗）；吊销/黑名单（现在只有有效期这条杠杆）。
+### 400. 目标收口：商业化闭环的**可复跑验收脚本** `tools/acceptance_demo.ps1`（23/23 全通过）
+
+**这是什么**：给定客户自己的 demo（`D:\demo_exe`），一条命令跑完从「厂商签身份」到「下游拿授权跑起来」的全流程，
+并逐行与原生输出比对。它是本目标的 ⑦ 项（把手工验证固化成可复跑验收）。
+
+```
+powershell -NoProfile -File tools/acceptance_demo.ps1 -BuildDemo
+powershell -NoProfile -File tools/acceptance_demo.ps1 -DemoExe X.exe -DemoMap X.map   # 客户自带带 MAP 的产物
+```
+
+**23 项检查（本机实测全通过）**
+
+| 组 | 检查 |
+|---|---|
+| ① 工具授权 | 厂商根密钥对；客户生成工具密钥并提交（**带持有证明**）；厂商签发构建凭据；打一个**烘了厂商根公钥**的发布版 vmpbuild；**没有凭据 → exit 8 拒绝工作**；凭据+私钥齐全 → 可用 |
+| ②③ 密钥纪元 + 保护 | 建立纪元（blob+manifest+密钥）；用**外置密钥 + 运行期强制**保护客户 demo（多函数）；产物可归属到该纪元（`vmpepoch which`） |
+| ④ 授权链 | 根给销售部签 `canIssue` 证书；销售部给客户签发（链深 1）；**无 `canIssue` 的证书签下级被拒**；客户给下游签授权并导出（**导出前验链**） |
+| ⑤ 运行期强制 | 无授权 → 恰好 `0xC0DE0007`、无输出；**合法授权 → 与原生逐行一致（13 行数值全等）**；篡改一字节 / 过期 / 伪造签名 → `0xC0DE0007` |
+| ⑥ 授权更新 | `lic-edit --add PROD-EXTRA` 后重导出：**产物哈希不变**、程序照常、输出与原生一致 |
+
+**过程中修掉的两个真问题**
+1. `vmpepoch which` 用「注入段前缀 vs blob 前缀」认纪元，但 `vmpack` 会把 vendorID/productID/签发者公钥
+   写进 `.data` —— 于是**打过运行期强制补丁的产物永远认不出来** ✗。修法：只比到该纪元 manifest 里 `.data` 起点为止的前缀；
+2. `lic-export` 现在支持 `--root-pub`：**导出前先验证书链**，把 ④ 的委派链正式纳入运行期路径。
+
+**注意（对客户的实操提醒）**：`vmpack` 靠 **MAP 文件**按名字定位函数（**不读 PDB**）。客户自带的 `demo64.exe` 没有 `.map`，
+所以要 `-BuildDemo` 现场重编（带 `/MAP`）或让客户提供 `.map`。这一点已写进脚本帮助与 `docs/TODO.md`。
+
 
 

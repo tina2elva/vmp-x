@@ -279,6 +279,24 @@ func cmdWhich(args []string) {
 		if berr != nil || int64(len(blobBytes)) != e.BlobSize {
 			continue // 纪元登记的 blob 不在本地就没法比前缀（换机器/清过目录时会这样）
 		}
+		// 只比"补丁区之前"的前缀：vmpack 在打包时会把 vendorID/productID/签发者公钥打进
+		// .data（运行期强制），那段之后就不再等于原始 blob 了。上限取该纪元 manifest 里 .data 的起点。
+		capPre := int64(e.BlobSize)
+		if mb, merr := os.ReadFile(e.Manifest); merr == nil {
+			var mref struct {
+				Sections []struct {
+					Name    string `json:"name"`
+					BlobOff int64  `json:"blobOff"`
+				} `json:"sections"`
+			}
+			if json.Unmarshal(mb, &mref) == nil {
+				for _, s := range mref.Sections {
+					if s.Name == ".data" && s.BlobOff > 0 && s.BlobOff < capPre {
+						capPre = s.BlobOff
+					}
+				}
+			}
+		}
 		for _, s := range f.Sections {
 			if s.SizeOfRawData < 64 {
 				continue
@@ -290,8 +308,8 @@ func cmdWhich(args []string) {
 			// payload 在产物里会被拆成多段（代码段 / .bss 段 / 表段），所以比的是"段的前缀"
 			// 与"blob 的同长度前缀"，而不是要求某一整段装得下整个 blob（装不下才是常态）。
 			n := int64(s.SizeOfRawData)
-			if n > e.BlobSize {
-				n = e.BlobSize
+			if n > capPre {
+				n = capPre
 			}
 			avail := int64(len(data) - off)
 			if n > avail {
