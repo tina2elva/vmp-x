@@ -175,6 +175,32 @@ vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    
 **可选的一层管控**：如果你们要防「工具被客户复制给第三方」，就用**你们自己的签发密钥**给一级客户发一份
 「构建授权」（含 vendorID / 到期）。这是路线 B 下**唯一**需要你们签发的东西，要不要做取决于商业模式。
 
+**两级 PKI（解决「客户能无限生成密钥 / 自立门户」）**
+
+`keygen` 只是生成一对 Ed25519 密钥 —— **任何人本来就能自己做**（`openssl genpkey` 一行），
+所以「客户能生成无限对密钥」这件事**堵不住也不该堵** ✗。真正的分界线是两条：
+
+1. **谁的公钥被烘进产物** —— 产物只接受用那把公钥签出的授权；
+2. **谁能签发「身份」** —— 没有这一层，一级客户可以随便编一个 vendorID 自立门户 ✗。
+
+于是加一层（已实现）：
+
+```
+厂商（唯一持有根私钥）:  vmpepoch keygen     --out vendor-root
+                        vmpepoch cert-issue --root vendor-root.priv --subject custA.pub \
+                                             --vendor ACME-0001 --until 2028-12-31 --out custA.cert.json
+一级客户 A（自己保管私钥）: vmpepoch lic-new --vendor ACME-0001 --dongle A-A --key custA.priv \
+                                             --cert custA.cert.json --out A-A.vmplic --product PROD-A@2027-12-31
+下游/运行期验链（只需根公钥）: vmpepoch lic-show --lic A-A.vmplic --root vendor-root.pub --product PROD-A
+```
+
+运行期判定 = 「授权签名 by 证书里的客户公钥」∧「客户公钥 by 厂商根」∧「cert.vendorID == 产物里的 vendorID」。
+效果：客户**仍可自由生成/轮换自己的密钥**（业务不受影响 ✓），但**身份只能由厂商签发** ✓，
+且证书可设**有效期/吊销** ✓ —— 这就是「不乱套」的那道闸。
+
+实测（本机）：整链通过 ✓；**自立门户**（自签一张 FAKE 证书）→ 验链失败 rc=1 ✓；
+**身份与签名者脱钩**（拿别的私钥签）→ 签发时就被拒 ✓；**证书被篡改** → 验签失败 ✓。
+
 **还没做（下一步，按需选择）**
 - [ ] **运行期强制**：blob 侧 `vm_license_check()`（路线 B 需 Ed25519 验签的 C 实现，约 600–900 行 + 两侧 KAT）；
       产物侧加 `-license-vendor/-license-product/-license-pubkey`（像 verify table 那样另立一张表，描述符已满）。
