@@ -62,6 +62,14 @@ func main() {
 		cmdWhich(os.Args[2:])
 	case "keyid":
 		cmdKeyID(os.Args[2:])
+	case "keygen":
+		cmdKeygen(os.Args[2:])
+	case "lic-new":
+		cmdLicNew(os.Args[2:])
+	case "lic-edit":
+		cmdLicEdit(os.Args[2:])
+	case "lic-show":
+		cmdLicShow(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -74,7 +82,12 @@ func usage() {
 		"                [--guest arm64] [--note <text>] [--registry epochs.json] [--vmpbuild <path>]\n" +
 		"  vmpepoch list [--registry epochs.json]\n" +
 		"  vmpepoch which --exe <packed.exe> [--registry epochs.json]\n" +
-		"  vmpepoch keyid --key <keyfile> [--registry epochs.json]\n\n" +
+		"  vmpepoch keyid --key <keyfile> [--registry epochs.json]\n" +
+		"\n  license (Sentinel-style, offline, signed by the first-level customer)\n" +
+		"  vmpepoch keygen   --out <prefix>\n" +
+		"  vmpepoch lic-new  --vendor <id> --dongle <id> --key <priv> --out <lic> [--product ID[@expiry]]...\n" +
+		"  vmpepoch lic-edit --lic <lic> --key <priv> [--add ID[@expiry]]... [--del ID]...\n" +
+		"  vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]\n\n" +
 		"An epoch is one {blob + manifest + master key} triple: one blob matches exactly ONE master key.\n")
 }
 

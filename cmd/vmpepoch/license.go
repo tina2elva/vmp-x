@@ -1,0 +1,316 @@
+package main
+
+// 授权（license）工具链 —— 对应客户的 Sentinel 式模型：
+//   一级客户（母狗持有者）自己**签发**下游授权；下游拿到的是 <产物>.vmplic（离线、可单独更新）。
+//
+// 设计要点（与 docs/TODO.md 第 5 项一致）：
+//   * 授权内容 = {vendorID, dongleID, products[{productID, expiry}], features{...}}；
+//   * 用母狗的签发私钥（Ed25519）签名；受保护产物里只烘**验证公钥**；
+//   * 更新授权 = 增删 productID/到期后**重签**（不碰软件、不碰狗里的密钥）；
+//   * 本工具只做 签发/查看/更新；**运行期强制**由 blob 侧（或 Sentinel SDK）完成，尚未实现。
+//
+// 命令：
+//   vmpepoch keygen   --out <prefix>
+//   vmpepoch lic-new  --vendor <id> --dongle <id> --key <priv> --out <lic> [--product ID[@到期]]...
+//   vmpepoch lic-edit --lic <lic> --key <priv> [--add ID[@到期]]... [--del ID]... [--dongle <id>] [--vendor <id>]
+//   vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]
+//
+// 到期写法：2027-12-31（当天 23:59:59 前有效）或 perpetual / 永久。
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"time"
+)
+
+type licItem struct {
+	ProductID string `json:"productID"`
+	Expiry    string `json:"expiry"`
+}
+
+type license struct {
+	V        int               `json:"v"`
+	VendorID string            `json:"vendorID"`
+	DongleID string            `json:"dongleID"`
+	Issued   string            `json:"issued"`
+	Items    []licItem         `json:"items"`
+	Features map[string]string `json:"features,omitempty"`
+	Sig      string            `json:"sig,omitempty"`
+}
+
+// canonical 返回被签名的字节：去掉 Sig 后按固定字段序列化
+// （结构体字段序固定、map 键有序 => 确定性，两侧无需额外规范化）。
+func (l *license) canonical() []byte {
+	c := *l
+	c.Sig = ""
+	b, err := json.Marshal(c)
+	must(err)
+	return b
+}
+
+func (l *license) sign(priv ed25519.PrivateKey) {
+	l.Sig = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, l.canonical()))
+}
+
+func (l *license) verify(pub ed25519.PublicKey) error {
+	if l.Sig == "" {
+		return fmt.Errorf("授权没有签名（sig 为空）")
+	}
+	sig, err := base64.StdEncoding.DecodeString(l.Sig)
+	if err != nil {
+		return fmt.Errorf("签名不是 base64: %w", err)
+	}
+	if !ed25519.Verify(pub, l.canonical(), sig) {
+		return fmt.Errorf("签名验证失败（授权被改动，或不是这把母狗签的）")
+	}
+	return nil
+}
+
+func loadPriv(path string) ed25519.PrivateKey {
+	b, err := os.ReadFile(path)
+	must(err)
+	raw, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	must(err)
+	if len(raw) != ed25519.PrivateKeySize {
+		must(fmt.Errorf("%s 不是 %d 字节的 Ed25519 私钥（hex）", path, ed25519.PrivateKeySize))
+	}
+	return ed25519.PrivateKey(raw)
+}
+
+func loadPub(path string) ed25519.PublicKey {
+	b, err := os.ReadFile(path)
+	must(err)
+	raw, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	must(err)
+	if len(raw) != ed25519.PublicKeySize {
+		must(fmt.Errorf("%s 不是 %d 字节的 Ed25519 公钥（hex）", path, ed25519.PublicKeySize))
+	}
+	return ed25519.PublicKey(raw)
+}
+
+func parseExpiry(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "perpetual" || s == "永久" || s == "never" {
+		return "perpetual", nil
+	}
+	for _, layout := range []string{"2006-01-02", time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			if layout == "2006-01-02" {
+				t = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, time.UTC)
+			}
+			return t.UTC().Format(time.RFC3339), nil
+		}
+	}
+	return "", fmt.Errorf("到期时间格式无法识别: %q（用 2027-12-31 或 perpetual）", s)
+}
+
+func parseProduct(s string) (licItem, error) {
+	id, exp := s, "perpetual"
+	if i := strings.LastIndex(s, "@"); i > 0 {
+		id, exp = s[:i], s[i+1:]
+	}
+	if strings.TrimSpace(id) == "" {
+		return licItem{}, fmt.Errorf("产品 ID 为空: %q", s)
+	}
+	e, err := parseExpiry(exp)
+	if err != nil {
+		return licItem{}, err
+	}
+	return licItem{ProductID: strings.TrimSpace(id), Expiry: e}, nil
+}
+
+func sortItems(l *license) {
+	sort.Slice(l.Items, func(i, j int) bool { return l.Items[i].ProductID < l.Items[j].ProductID })
+}
+
+func readLicense(path string) *license {
+	b, err := os.ReadFile(path)
+	must(err)
+	l := &license{}
+	must(json.Unmarshal(b, l))
+	if l.V != 1 {
+		must(fmt.Errorf("不认识的授权版本 v=%d", l.V))
+	}
+	return l
+}
+
+func writeLicense(path string, l *license) {
+	b, err := json.MarshalIndent(l, "", "  ")
+	must(err)
+	must(os.WriteFile(path, append(b, 0x0A), 0o644))
+}
+
+func cmdKeygen(args []string) {
+	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
+	out := fs.String("out", "vendor-license-key", "输出前缀（生成 <前缀>.priv / <前缀>.pub）")
+	fs.Parse(args)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	must(err)
+	must(os.WriteFile(*out+".priv", []byte(hex.EncodeToString(priv)+"\n"), 0o600))
+	must(os.WriteFile(*out+".pub", []byte(hex.EncodeToString(pub)+"\n"), 0o644))
+	fmt.Printf("[+] 签发密钥对已生成\n")
+	fmt.Printf("    私钥: %s.priv   <- 只应存在于母狗/一级客户手里，绝不进产物\n", *out)
+	fmt.Printf("    公钥: %s.pub    <- 用 vmpbuild 烘进产物，供运行期验签\n", *out)
+}
+
+func cmdLicNew(args []string) {
+	fs := flag.NewFlagSet("lic-new", flag.ExitOnError)
+	vendor := fs.String("vendor", "", "一级客户 ID（vendorID）")
+	dongle := fs.String("dongle", "", "下游设备 ID（dongleID）")
+	key := fs.String("key", "", "母狗签发私钥（.priv）")
+	out := fs.String("out", "", "输出的授权文件（建议 <产物>.vmplic）")
+	prod := multiString{}
+	fs.Var(&prod, "product", "授权产品，可多次：ID[@到期]")
+	fs.Parse(args)
+	if *vendor == "" || *dongle == "" || *key == "" || *out == "" {
+		fmt.Println("[!] 需要 --vendor --dongle --key --out")
+		os.Exit(2)
+	}
+	l := &license{V: 1, VendorID: *vendor, DongleID: *dongle, Issued: time.Now().UTC().Format(time.RFC3339)}
+	for _, s := range prod {
+		it, err := parseProduct(s)
+		must(err)
+		l.Items = append(l.Items, it)
+	}
+	sortItems(l)
+	l.sign(loadPriv(*key))
+	writeLicense(*out, l)
+	fmt.Printf("[+] 授权已签发: %s（vendor=%s dongle=%s，%d 个产品）\n", *out, l.VendorID, l.DongleID, len(l.Items))
+	for _, it := range l.Items {
+		fmt.Printf("    %-24s %s\n", it.ProductID, it.Expiry)
+	}
+}
+
+func cmdLicEdit(args []string) {
+	fs := flag.NewFlagSet("lic-edit", flag.ExitOnError)
+	licPath := fs.String("lic", "", "要修改的授权文件")
+	key := fs.String("key", "", "母狗签发私钥（.priv）")
+	vendor := fs.String("vendor", "", "改 vendorID（可选）")
+	dongle := fs.String("dongle", "", "改 dongleID（可选）")
+	add := multiString{}
+	del := multiString{}
+	fs.Var(&add, "add", "增加/覆盖产品：ID[@到期]")
+	fs.Var(&del, "del", "删除产品：ID")
+	fs.Parse(args)
+	if *licPath == "" || *key == "" {
+		fmt.Println("[!] 需要 --lic --key")
+		os.Exit(2)
+	}
+	l := readLicense(*licPath)
+	if *vendor != "" {
+		l.VendorID = *vendor
+	}
+	if *dongle != "" {
+		l.DongleID = *dongle
+	}
+	for _, s := range add {
+		it, err := parseProduct(s)
+		must(err)
+		replaced := false
+		for i := range l.Items {
+			if l.Items[i].ProductID == it.ProductID {
+				l.Items[i] = it
+				replaced = true
+			}
+		}
+		if !replaced {
+			l.Items = append(l.Items, it)
+		}
+	}
+	for _, s := range del {
+		kept := l.Items[:0]
+		for _, it := range l.Items {
+			if it.ProductID != strings.TrimSpace(s) {
+				kept = append(kept, it)
+			}
+		}
+		l.Items = kept
+	}
+	sortItems(l)
+	l.Issued = time.Now().UTC().Format(time.RFC3339)
+	l.sign(loadPriv(*key))
+	writeLicense(*licPath, l)
+	fmt.Printf("[+] 授权已更新并重签: %s（vendor=%s dongle=%s，%d 个产品）\n", *licPath, l.VendorID, l.DongleID, len(l.Items))
+	for _, it := range l.Items {
+		fmt.Printf("    %-24s %s\n", it.ProductID, it.Expiry)
+	}
+}
+
+func cmdLicShow(args []string) {
+	fs := flag.NewFlagSet("lic-show", flag.ExitOnError)
+	licPath := fs.String("lic", "", "授权文件")
+	pub := fs.String("pub", "", "验证公钥（.pub）；给了就验签")
+	product := fs.String("product", "", "顺便判定某产品在该授权下是否可用")
+	fs.Parse(args)
+	if *licPath == "" {
+		fmt.Println("[!] 需要 --lic")
+		os.Exit(2)
+	}
+	l := readLicense(*licPath)
+	fmt.Printf("vendorID : %s\ndongleID : %s\nissued   : %s\nproducts :\n", l.VendorID, l.DongleID, l.Issued)
+	now := time.Now().UTC()
+	for _, it := range l.Items {
+		state := "有效"
+		if it.Expiry != "perpetual" {
+			t, err := time.Parse(time.RFC3339, it.Expiry)
+			if err != nil {
+				state = "到期时间无法解析"
+			} else if now.After(t) {
+				state = "已过期"
+			}
+		}
+		fmt.Printf("    %-24s %-24s %s\n", it.ProductID, it.Expiry, state)
+	}
+	if len(l.Features) > 0 {
+		fmt.Printf("features : %v\n", l.Features)
+	}
+	if *pub != "" {
+		if err := l.verify(loadPub(*pub)); err != nil {
+			fmt.Printf("[FAIL] %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("[OK  ] 签名验证通过（确实是这把母狗签的，且内容未被改动）")
+	}
+	if *product != "" {
+		ok, why := l.allows(*product, now)
+		fmt.Printf("[授权判定] %s -> %v（%s）\n", *product, ok, why)
+		if !ok {
+			os.Exit(1)
+		}
+	}
+}
+
+// allows 是运行期判定的 Go 参照实现（blob 侧要写成同一套语义）：
+// vendorID 匹配由调用方保证（产物里烘的 vendorID）；这里判 productID 与到期。
+func (l *license) allows(productID string, now time.Time) (bool, string) {
+	for _, it := range l.Items {
+		if it.ProductID != productID {
+			continue
+		}
+		if it.Expiry == "perpetual" {
+			return true, "永久授权"
+		}
+		t, err := time.Parse(time.RFC3339, it.Expiry)
+		if err != nil {
+			return false, "到期时间无法解析"
+		}
+		if now.After(t) {
+			return false, "已过期（" + it.Expiry + "）"
+		}
+		return true, "有效至 " + it.Expiry
+	}
+	return false, "授权列表里没有这个产品"
+}
+
+type multiString []string
+
+func (m *multiString) String() string     { return strings.Join(*m, ",") }
+func (m *multiString) Set(v string) error { *m = append(*m, v); return nil }

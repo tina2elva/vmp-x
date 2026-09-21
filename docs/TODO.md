@@ -131,11 +131,37 @@ B 用文件 + blob 内 Ed25519；A 换成狗 API。将来换形态不动加密�
 - 安全验收：下游**无法自行伪造/篡改**授权（改签名、加 productID 都要失败）；
   以及**串用**必须被拒（客户B 的狗跑客户A 的软件 → 拒绝）。
 
-**待客户确认的 4 个问题**（决定工作量与选型）
-1. 最终一定上**硬件狗**吗？倾向上哪家（Sentinel LDK / Virbox / 深思…）？—— 决定 A/B 路线；
-2. 授权粒度：只有"产品 + 到期"够吗？还要机器绑定 / 并发数 / 功能点吗？
-3. 母狗形态：**USB 硬狗**还是**软狗（绑构建机）**？构建机是否需要离线？
-4. 子狗授权由**一级客户自己签发**（持有母狗）还是由**我们厂商代签**？（决定密钥托管与商务边界）
+**客户已确认的 4 个问题（2026-09 访谈）**
+1. **最终不一定上硬件狗** —— 取决于 vmp-x 自身够不够硬（见 `docs/STRENGTH.md`：够用就纯软件授权，不够就上狗）；
+   **若上狗优先 Sentinel，而且客户本身就是 Sentinel 的一级客户（已有母狗 + 子狗）** ✓
+   => 路线 A **不需要自研签名**：直接用 Sentinel 的 feature/写狗工具管理授权，blob 侧调 Sentinel API 即可。
+2. **授权粒度要细、并留接口** —— 授权结构里预留了 `features`（并发数/功能点/机器指纹…）；
+   当前先用 `products[{productID, expiry}]`，加字段不破坏签名（结构体字段序固定）。
+3. **母狗形态两者都可能（USB 硬狗 / 软狗绑构建机），且必须支持离线** —— 两条路线都满足离线；
+   软狗形态下私钥在构建机上，必须有导入/托管约束（建议 DPAPI/TPM 包一层，别裸放）。
+4. **子狗授权由一级客户自己签** —— 签发工具必须在**客户自己的机器**上跑、私钥不经过我们；
+   `vmpepoch keygen/lic-new/lic-edit` 已按这个前提实现（我们只提供工具，不持有私钥）。
+
+**本轮已交付（路线 B 的授权工具链，Go 侧）**
+
+```
+vmpepoch keygen   --out <prefix>                                  # 母狗侧生成 Ed25519 签发密钥对
+vmpepoch lic-new  --vendor <id> --dongle <id> --key <priv> --out <lic> [--product ID[@到期]]...
+vmpepoch lic-edit --lic <lic> --key <priv> [--add ID[@到期]]... [--del ID]...   # 增删授权后重签
+vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    # 验签 + 授权判定
+```
+
+实测（本机）：签发 A-A 的 PROD-A（2027-12-31）→ `lic-edit --add PROD-B` **重签**（软件不动、狗不动 ✓）；
+`lic-show --pub` 验签通过；**篡改授权（偷偷加 PROD-C）→ 验签失败 rc=1** ✓；**过期授权 → 判定 false** ✓。
+
+**还没做（下一步，按需选择）**
+- [ ] **运行期强制**：blob 侧 `vm_license_check()`（路线 B 需 Ed25519 验签的 C 实现，约 600–900 行 + 两侧 KAT）；
+      产物侧加 `-license-vendor/-license-product/-license-pubkey`（像 verify table 那样另立一张表，描述符已满）。
+- [ ] **路线 A（Sentinel）**：blob 侧调 Sentinel API（`hasp_login`/`hasp_get_info`/`hasp_decrypt`）——
+      **推荐让密钥由狗派生**，这样“同一份产物发所有下游”天然成立，且密钥不出狗。
+- [ ] `features` 的具体语义（并发/功能点/机器绑定）与判定实现。
+- [ ] 母狗私钥在构建机上的保护（DPAPI/TPM/软狗），以及“从狗直接取密钥”（`vmpbuild --key-from-dongle`）。
+
 
 **验收标准（做之前先和客户确认边界）**：至少覆盖 R2 的"不动锁、单独更新授权"；
 若还要到期/吊销/机器绑定，需明确列出并逐条验收（每条都要有 e2e）。
