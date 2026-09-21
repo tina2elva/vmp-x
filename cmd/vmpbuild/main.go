@@ -17,6 +17,7 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -103,6 +104,7 @@ func main() {
 	merge := flag.String("merge", "ld", "目标文件合并方式：ld（GNU ld -r）或 go（内置直拼，COFF 用它）")
 	keyExternal := flag.Bool("key-external", false, "主密钥外置（1b）：blob 里只放占位密钥 + 密钥校验值，真主密钥运行期从外部取")
 	keyOut := flag.String("key-out", "", "配合 -key-external：把真主密钥以 64 位 hex 文本写到该文件（部署时放到 <产物>.vmpkey 即可）")
+	keyIn := flag.String("key-in", "", "**指定**主密钥而不是随机生成：64 位 hex 字面量，或一个文件（32 字节原始密钥 / 64 位 hex 文本）。用于跨版本、跨构建复用同一把钥匙")
 	verbose := flag.Bool("v", false, "打印符号与重定位详情")
 	flag.Parse()
 
@@ -137,11 +139,14 @@ func main() {
 	if *keyExternal && targetRel != "win/x64" {
 		fatalf("-key-external 目前只有 win/x64 的取钥实现（收到目标 %s）", targetRel)
 	}
-	keyPath, keyHex, fieldMaskSalt, err := generateKeyFile(tmp, *keyExternal)
+	keyPath, keyHex, fieldMaskSalt, err := generateKeyFile(tmp, *keyExternal, *keyIn)
 	must(err)
 	if *keyOut != "" {
 		// 写的是 64 位 hex **文本**：部署时把它设成环境变量 VMPX_KEY（运行期的取钥路径
 		// 见 stub/win/x64/vm_interp.c 的 1b 段：直接读 PEB 的环境块，不调用 kernel32）。
+		if werr := os.MkdirAll(filepath.Dir(*keyOut), 0o755); werr != nil {
+			must(werr)
+		}
 		if werr := os.WriteFile(*keyOut, []byte(keyHex), 0o600); werr != nil {
 			fatalf("写主密钥文件失败: %v", werr)
 		}
@@ -251,6 +256,7 @@ func main() {
 	}
 
 	must(os.MkdirAll(filepath.Dir(*out), 0o755))
+	must(os.MkdirAll(filepath.Dir(*out), 0o755))
 	must(os.WriteFile(*out, blob, 0o644))
 
 	// 可写数据区间：sections 里名为 .bss 的那一段（buildBlob* 已保证它在最后）
@@ -277,6 +283,7 @@ func main() {
 		if o3, ok3 := syms["vm_code_off"]; ok3 {
 			binary.LittleEndian.PutUint64(blob[o3:], uint64(entryOff))
 		}
+		must(os.MkdirAll(filepath.Dir(*out), 0o755))
 		must(os.WriteFile(*out, blob, 0o644))
 	}
 
@@ -305,6 +312,7 @@ func main() {
 		Key:           keyHex,
 	}
 	b, _ := json.MarshalIndent(m, "", "  ")
+	must(os.MkdirAll(filepath.Dir(*man), 0o755))
 	must(os.WriteFile(*man, b, 0o644))
 
 	fmt.Printf("[+] blob: %s (%d bytes), entry %s @ +0x%X\n", *out, len(blob), *entry, entryOff)
@@ -418,7 +426,35 @@ func cryptoRandU64() (uint64, error) {
 // 变形 —— 否则等于把真密钥泄露出去），真主密钥只出现在 manifest 里（vmpack 要用）+ 可选的 -key-out。
 // 无论哪种模式都写一个 16 字节密钥校验值（KCV）= KDFEntry(真主密钥, "KEYK", 每构建随机 salt)[0:16]：
 // 运行期在**任何解密之前**用它判定"手里这把主密钥对不对"，不对就走专用退出码 0xC0DE0007。
-func generateKeyFile(tmp string, external bool) (string, string, uint32, error) {
+// loadKeyIn：-key-in 既接受 64 位 hex 字面量，也接受文件路径（32 字节原始密钥，或 64 位 hex 文本）。
+// 存在的意义：让"同一把主密钥"能跨工具升级、跨构建复用 —— 否则每次 vmpbuild 都会生成新钥匙，
+// 客户升级一次工具就得把所有已发出的 .vmpkey 换一遍。
+func loadKeyIn(s string) ([]byte, error) {
+	if isHex64(s) {
+		return hex.DecodeString(s)
+	}
+	b, err := os.ReadFile(s)
+	if err != nil {
+		return nil, fmt.Errorf("-key-in 既不是 64 位 hex，也读不到该文件: %w", err)
+	}
+	if len(b) == 32 {
+		return b, nil
+	}
+	if k, err := hex.DecodeString(strings.TrimSpace(string(b))); err == nil && len(k) == 32 {
+		return k, nil
+	}
+	return nil, fmt.Errorf("-key-in 文件既不是 32 字节原始密钥，也不是 64 位 hex 文本")
+}
+
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+func generateKeyFile(tmp string, external bool, keyIn string) (string, string, uint32, error) {
 	nl := string(rune(10))
 	outDir := filepath.Join(tmp, "opcodes")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -429,7 +465,15 @@ func generateKeyFile(tmp string, external bool) (string, string, uint32, error) 
 	// 于是"产物不自足"这件事就白做了（密钥文件也不用拿了）。主密钥、KCV salt、掩码 salt、
 	// 占位密钥，一个都不能用可预测的随机。
 	key := make([]byte, 32)
-	if _, err := crand.Read(key); err != nil {
+	if keyIn != "" {
+		k, err := loadKeyIn(keyIn)
+		if err != nil {
+			return "", "", 0, err
+		}
+		copy(key, k)
+		// 只报来源，**绝不打印密钥本身**。
+		fmt.Println("[*] 主密钥来自 -key-in（复用同一把钥匙；跨工具升级也保持一致）")
+	} else if _, err := crand.Read(key); err != nil {
 		return "", "", 0, fmt.Errorf("crypto/rand 不可用: %w", err)
 	}
 	checkSalt, err := cryptoRandU32()
