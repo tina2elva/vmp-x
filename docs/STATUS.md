@@ -4988,6 +4988,30 @@ powershell -NoProfile -File tools/acceptance_demo.ps1 -DemoExe X.exe -DemoMap X.
 
 **注意（对客户的实操提醒）**：`vmpack` 靠 **MAP 文件**按名字定位函数（**不读 PDB**）。客户自带的 `demo64.exe` 没有 `.map`，
 所以要 `-BuildDemo` 现场重编（带 `/MAP`）或让客户提供 `.map`。这一点已写进脚本帮助与 `docs/TODO.md`。
+### 401. TODO 重评 + 新目标「要么正确、要么明确拒绝」；顺修 `CDQ`/`CQO` 的 lift
+
+**TODO 重评（关键结论）**：清单里最要紧的一条原本**不在清单上** —— 我们缺一道**保护前逐函数差分自检**。
+证据：`/Od` 构建下 `DemoFormatReport` 被**成功保护**却算错（`score=8` vs 原生 42）✗，
+即当前工具会**静默产出错误的受保护程序**，比「拒绝保护」危险得多。已提为必做第 ④ 条，并据此立了本目标。
+其余项重评为：必做 4（①②③ + 差分自检）、建议做 3（私钥 DPAPI/TPM、接客户 `verify.py`、export/CI 集成）、
+按需/待决策 6（含 Sentinel 接口层、吊销、ELF/Linux、**PE32 支持**）、可砍 1（授权回调形态并入 DPAPI/TPM 路线）。
+
+**本轮代码改动：`CDQ`/`CQO` 原来根本没被 lifter 处理**
+- 原因：`internal/lift/x64/lift.go` 只有 `case x86asm.CDQE`（CDQE：EAX→RAX）；Go 的 x86asm 里 CDQ/CQO 是**不同助记符**，落到默认分支报「暂不支持该指令」。
+- 修法：新增 `case x86asm.CDQ` → `AluRI{Sar, |KeepFlags, W32, RDX, RAX, 31}`；`case x86asm.CQO` → 同形 W64/63。
+  CDQ/CQO 都**不改标志位**，正好用上 `KeepFlags`（x86 侧恒为 0 的那个 bit7）。
+- 实测：`?DemoGcd@@YAHHH@Z` 的拒译由 **2/13 → 1/13**（只剩 `IDIV R8L`）；`?IsPrime@Math@Demo@@QEAA_NH@Z` 同理。
+
+**`IDIV`/`DIV` 的最小改法已摸清并写进 `docs/TODO.md`**（下一轮照做）：**不需要新增操作码** ——
+复用 `OP_ALU_U`（`[op][kind][width][dst][a]`，`a` = 除数、`dst` 留空），只加两个 ALU kind `ir.DivU/DivS`（值 0x14/0x15），
+同步 `vm_opcodes.h` 的 `K_DIVU/K_DIVS`、`internal/vm/ref.go`（含参考实现，arm64 差分门禁要用）、`kind_table_test.go`；
+语义放在 `OP_ALU_U` 分支里**先拦截**（隐含 `DX:AX` 族被除数，商→AX 族、余→DX 族），**除零/溢出直接 trap**；
+8 位形式（`IDIV R8L`：商 AL、余 AH）最容易写错，客户 demo 两个函数正好一个 8 位、一个 32 位。
+
+**验收（本轮）**：`tools/gates.ps1` = **11 gates / 0 failed**（含 `go test ./...` 与 arm64 客户机差分）。
+注：`AGENTS.md`/`docs/HANDOFF.md` 的验收第 1 条要求 `tools/preflight.ps1`，但该脚本已在 `a83a4ad` 移除
+（本文件 #4322 已记录：脚本自检不过被删）——**当前仓库里没有这个文件**，本轮以 `tools/gates.ps1` 为准。
+
 
 
 

@@ -4,19 +4,24 @@
 > 过程与证据写进 `docs/STATUS.md`（编号追加，不覆盖历史）。
 > 本文件是**待办清单**；任务书（授权范围、验收口径）仍以 `docs/HANDOFF.md` 为准。
 >
-> **状态汇总（截至 STATUS #400）**：未完成 **15 项**（其中 12 项是勾选框、4 项是 §1–§4 的散文任务，§5 里"Sentinel 接口层"与勾选框那条重复计一次）、已完成 **4 项**。
+> **状态汇总（2026-xx 重评后）**：必做 **4** 项、建议做 **3** 项、按需/待决策 **6** 项、可砍 **1** 项；已完成 **4** 项。
 >
-> | 优先级 | 未完成项 | 为什么 |
+> **重评结论（关键）**：清单里最要紧的一条原本**不在清单上** —— 我们缺一道**"保护前逐函数差分自检"**。
+> 证据：`/Od` 构建下 `DemoFormatReport` 被**成功保护**却算错（`score=8` vs 原生 42）✗ ——
+> 也就是说现在的工具会**静默产出错误的受保护程序**。对客户来说这是最危险的一类缺陷（比"拒绝保护"危险得多），
+> 所以它被提到必做第 ④ 条：**保护前先跑一遍"原生 vs VM"对比，不一致就拒绝保护并点名那个函数**。
+>
+> | 分类 | 项 | 判断依据 |
 > |---|---|---|
-> | **P0 技术缺口**（直接决定"哪些函数保护得了"） | ① `CDQ/CQO/IDIV/DIV` lift　② `/Od` 栈传参/varargs　③ `CVTDQ2PD`/double | 客户 demo 里 `Gcd`/`IsPrime`/`Mean` 就因为缺这几条指令**被拒绝保护**；varargs 影响面最广 |
-> | **P1 授权/产品化** | ④ Sentinel 接口层（路线 A）　⑤ `features`（并发/功能点/机器绑定）语义　⑥ 吊销/黑名单　⑦ 母狗私钥在构建机的保护（DPAPI/TPM）+ `--key-from-dongle` | 商业化要靠"可管理、可撤销"；上了狗还能白拿"密钥不出硬件" |
-> | **P2 平台/形态补全** | ⑧ ELF `.rela` 先减后加　⑨ Linux 侧反调试（`TracerPid`）　⑩ 外置密钥+DLL、Linux/arm64 取钥　⑪ 1b 其余取钥形态（授权回调/TPM/TEE） | 跨平台与更硬的密钥托管 |
-> | **P3 工具增强（可选）** | ⑫ `vmpepoch which` 支持 ELF　⑬ `export` 发版包　⑭ CI 集成（`epochs.json` 核对） | 交付运维便利 |
-> | **P4** | ⑮ 把客户自带的 `verify.py`/`ground_truth_exe.txt` 接进验收，并产出"逐函数可保护性清单" | 复跑口径与客户一致 |
+> | **必做（技术正确性）** | ① `CDQ/CQO/IDIV/DIV` lift　② `/Od` 栈传参/varargs　③ `CVTDQ2PD`/double　④ **保护前逐函数差分自检（fail-closed）** | ①②③ 直接卡住客户 demo 里的 `Gcd`/`IsPrime`/`FormatReport`/`Mean`；④ 把"静默算错"变成"明确拒绝" |
+> | **建议做（产品化）** | ⑤ 母狗/工具私钥保护（DPAPI/TPM）+ `--key-from-dongle`　⑥ 接客户自己的 `verify.py`/`ground_truth`，产出**逐函数可保护性清单**　⑦ `export` 发版包 + CI 核对 `epochs.json` | ⑤ 现在私钥是明文文件，复制即绕过工具授权；⑥ 是给客户看的"自证材料"；⑦ 交付与防发错纪元 |
+> | **按需/待决策** | ⑧ Sentinel 接口层（要上狗才做）　⑨ 吊销/黑名单（离线怎么定义要先定）　⑩ `features`（并发/功能点/机器绑定 —— 客户模型里只有"产品+到期"，默认**不做**）　⑪ ELF `.rela` + Linux 反调试　⑫ 外置密钥+DLL / Linux/arm64 取钥　⑬ `vmpepoch which` 支持 ELF　⑭ **PE32（32 位）支持**（客户 `demo32.exe` 被拒：`不支持的 PE 机器类型 0x14C`，这是平台移植不是开关） | 取决于客户实际交付形态；PE32 若客户还有 32 位产品则是**硬门槛** |
+> | **可砍** | ⑮ 1b 的"授权回调"形态（与 ⑤ 的 DPAPI/TPM 路线重复，TPM 那半边并入 ⑤） | 避免两条并行路线 |
 >
 > **已完成**：工具授权（构建凭据）✅、委派签发（canIssue）✅、运行期强制 ✅、商业化闭环可复跑脚本 `tools/acceptance_demo.ps1`（23/23）✅
+> **已经过时/删掉**：授权层设计基线里"路线 B 未实现"的描述、运行期强制 WIP 段、Ed25519 描述（已换 ECDSA P-256）、密钥纪元分发策略（已落地）。
 >
-> 下面第 0–5 节保留**设计基线与历史记录**（很多文字描述的东西已经实现，看上面的汇总表即可知道哪些还没做）。
+> 下面第 0–5 节保留**设计基线与历史记录**（很多文字描述的东西已经实现，看上面的表即可知道哪些还没做）。
 
 ## 0. 密钥纪元管理工具（客户反馈；工具已交付，剩下可选增强）
 
@@ -38,7 +43,24 @@
 - `?DemoGcd@@YAHHH@Z` → `2/13 条指令无法翻译: +0x15 CDQ / +0x16 IDIV R8L`
 - `?IsPrime@Math@Demo@@QEAA_NH@Z` → `+0x44 CDQ / +0x45 IDIV [RSP+Reg(0)]`
 
-**要做**：`CDQ`(0x99) / `CQO`(0x48 0x99)、`IDIV`(F7 /7，r/m8/16/32/64)、`DIV`(F7 /6) 的 lift + 语义 + 单测。
+**进展（本轮）**：`CDQ`/`CQO` **已补**（`internal/lift/x64/lift.go`：`case x86asm.CDQ/CQO` →
+`AluRI{Sar, |KeepFlags}` 写到 `RDX`；注意 Go 的 x86asm 里 CDQ/CQO 与 CDQE 是**不同助记符**，原来只处理了 `CDQE`）。
+实测：`?DemoGcd@@YAHHH@Z` 的拒译从 **2/13 降到 1/13**（只剩 `IDIV R8L`）✓。
+
+**`IDIV`/`DIV` 的最小改法（已摸清，照这个做）** —— 关键是**不需要新增操作码**：
+1. **复用 `OP_ALU_U`**（编码 `[op][kind][width][dst][a]`，5 字节）：`dst` 留空不用（商/余的寄存器由 width 隐含），
+   `a` = 除数。这样**不必动** `internal/vm/opcodes.go` / `vm_opcode_values.h` / `vm_opcodes.h` 的 `OP_*` 表 / `disasm.go` / `codegen.go`；
+2. 新增两个 ALU kind（接在 `MulHiS` 之后 ⇒ 值 **0x14 / 0x15**）：`ir.DivU`/`ir.DivS`（`internal/ir/ir.go`）；
+3. 同步三处（`kind_table_test.go` 会强制三者一致）：
+   `stub/win/x64/vm_opcodes.h` 的 `K_DIVU = 0x14, K_DIVS = 0x15`、`internal/vm/ref.go` 的 `KDivU/KDivS`（放最后）+ 映射表、`kind_table_test.go` 的 checks；
+4. **语义**（`stub/win/x64/vm_interp.c` 的 `OP_ALU_U` 分支里**先拦截**，别走到 `alu_unary`）：
+   被除数 = 隐含的 `DX:AX` 族（按 width 取 `AH:AL` / `DX:AX` / `EDX:EAX` / `RDX:RAX`），商→AX 族、余→DX 族；
+5. **除零/商溢出**：**直接 trap**（绝不静默算错；后果与原生未处理 #DE 一致）；
+6. **lifter**：`case x86asm.DIV/IDIV` —— 单操作数形式的判据与 `liftImul` 相同（`args[1] == nil`），
+   寄存器除数直接进 `A`，内存除数先 `Load` 到 `VMSCR`；**8 位形式（`IDIV R8L`，商 AL/余 AH）最容易写错**，
+   客户 demo 两个函数正是 8 位与 32 位各一；
+7. **参考实现**（`internal/vm/ref.go` 的 switch）也要补：它被 arm64 差分门禁用到，漏了会红；
+8. **验收**：`Gcd`/`IsPrime` 变为"可保护"且进 VM 后与原生逐行一致；`tools/gates.ps1` 11/0。
 
 **验收**：`tools/gates.ps1` 11/0；对 `D:\demo_exe` 的 exe 逐个函数试，`Gcd`/`IsPrime` 变成"可保护"，
 且进 VM 后输出与原生逐行一致。

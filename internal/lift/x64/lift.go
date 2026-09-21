@@ -684,6 +684,20 @@ func (l *Lifter) liftOne(f *ir.Func, ins x64dec.Insn, off uint32) error {
 		em(ir.Insn{Op: ir.Ext, Kind: uint8(ir.SignExt), SrcW: ir.W32, Width: ir.W64, Dst: ir.RAX, A: ir.RAX})
 		return nil
 
+	// CDQ / CQO：把累加器**符号扩展**到 DX（x86 的"给 IDIV 准备被除数"）。
+	//   CDQ: EDX:EAX ← SignExt(EAX)   等价于 EDX = SAR(EAX,31)
+	//   CQO: RDX:RAX ← SignExt(RAX)   等价于 RDX = SAR(RAX,63)
+	// 两者都**不改标志位** —— 所以带 |KeepFlags（x86 侧本来恒为 0，这里正是它的用武之地）。
+	// 注意：CDQE（EAX→RAX）在上面单独一支；Go 的 x86asm 把 CDQ/CQO 与 CDQE 分成不同助记符。
+	case x86asm.CDQ:
+		em(ir.Insn{Op: ir.AluRI, Kind: uint8(ir.Sar) | ir.KeepFlags, Width: ir.W32,
+			Dst: ir.RDX, A: ir.RAX, Imm: 31})
+		return nil
+	case x86asm.CQO:
+		em(ir.Insn{Op: ir.AluRI, Kind: uint8(ir.Sar) | ir.KeepFlags, Width: ir.W64,
+			Dst: ir.RDX, A: ir.RAX, Imm: 63})
+		return nil
+
 	case x86asm.PUSH:
 		if r, w, ok := regArgInfo(args[0]); ok {
 			if w != ir.W64 {
