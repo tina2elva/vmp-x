@@ -1,23 +1,23 @@
 package main
 
-// 两级 PKI：厂商根密钥 -> 一级客户「身份证书」-> 下游授权。
+// 两级/三级 PKI：厂商根 -> （可选）部门/销售（canIssue）-> 一级客户 -> 下游授权。
 //
-// 密钥由谁生成（关键）：
-//   * 厂商根密钥对：**厂商自己生成**，根私钥永不外发，根公钥公开分发（要烘进产物做验链）；
-//   * 一级客户密钥对：**一级客户自己生成**，私钥留在客户手里（建议 DPAPI/软狗包住），
-//     **只把公钥交给厂商**；厂商据此签一张证书（绑定 vendorID + 公钥 + 有效期）；
-//   * 为什么不能反过来（厂商替客户生成私钥）：谁持有私钥谁就能签该 vendorID 下的所有授权，
-//     厂商持有时就等于“厂商能伪造客户给下游的授权” ✗，商业上讲不清。
+// 密钥由谁生成：
+//   * 厂商根密钥对：厂商自己生成，根私钥永不外发，根公钥公开分发（烘进产物做验链）；
+//   * 各级中间/客户密钥对：由该级自己生成，私钥自留，只把公钥（通过带持有证明的请求）交给上级签发。
 //
-// 为避免“厂商签错人/被顶替”，签发支持**持有证明**（self-signed request）：
-//   客户: vmpepoch cert-req  --key custA.priv --vendor ACME-0001 --out custA.req.json
-//   厂商: vmpepoch cert-issue --root vendor-root.priv --req custA.req.json --vendor ACME-0001 --out custA.cert.json
-//   （cert-issue 会先验请求里的自签名，确认对方确实持有与公钥配对的私钥；也接受旧写法 --subject <pub>，跳过证明）
+// 为什么要 canIssue（等价于 Sentinel EMS 的「角色」）：
+//   销售/部门需要**签发授权**，但不该拿到根私钥（拿到根 = 能伪造整棵树）✗。
+//   做法：根签一张 canIssue=true 的证书给该部门；部门用自己的私钥给下游签**子证书**与**授权**；
+//   验链时逐级回溯到根（每级用父级公钥验签），并检查中间证书确实带 canIssue。
+//   可吊销性：证书有有效期，不续签即失效（黑名单/在线吊销未做，如实登记）。
 //
 // 命令：
-//   vmpepoch cert-req   --key <cust.priv> --vendor <id> --out <req.json> [--note ...]
-//   vmpepoch cert-issue --root <root.priv> (--req <req.json> | --subject <cust.pub>) --vendor <id> --out <cert.json> [--until ...] [--note ...]
-//   vmpepoch cert-show  --cert <cert.json> [--root <root.pub>]
+//   vmpepoch cert-req   --key <priv> --vendor <id> --out <req.json> [--note ...]
+//   vmpepoch cert-issue --root <root.priv> --req <req> --vendor <id> --out <cert> [--until ...] [--can-issue]
+//   vmpepoch cert-issue --issuer <cert.json> --issuer-key <issuer.priv> --root-pub <root.pub> \
+//                       --req <req> --vendor <id> --out <cert> [--until ...] [--can-issue]
+//   vmpepoch cert-show  --cert <cert> [--root <root.pub>]
 
 import (
 	"crypto/ed25519"
@@ -31,12 +31,14 @@ import (
 	"time"
 )
 
+const certChainMax = 8
+
 type certReq struct {
 	V          int    `json:"v"`
 	VendorID   string `json:"vendorID"`
 	SubjectPub string `json:"subjectPub"`
 	Note       string `json:"note,omitempty"`
-	SelfSig    string `json:"selfSig"` // 用被申请的那把私钥签，证明“申请者确实持有它”
+	SelfSig    string `json:"selfSig"`
 }
 
 func (r *certReq) msg() []byte {
@@ -59,13 +61,15 @@ func (r *certReq) checkSelfSig() error {
 }
 
 type vendorCert struct {
-	V          int    `json:"v"`
-	VendorID   string `json:"vendorID"`
-	SubjectPub string `json:"subjectPub"`
-	Issued     string `json:"issued"`
-	ValidUntil string `json:"validUntil,omitempty"`
-	Note       string `json:"note,omitempty"`
-	Sig        string `json:"sig,omitempty"` // 厂商根私钥签
+	V          int         `json:"v"`
+	VendorID   string      `json:"vendorID"`
+	SubjectPub string      `json:"subjectPub"`
+	Issued     string      `json:"issued"`
+	ValidUntil string      `json:"validUntil,omitempty"`
+	Note       string      `json:"note,omitempty"`
+	CanIssue   bool        `json:"canIssue,omitempty"` // 允许用它去给下级签子证书与授权（EMS 角色）
+	Issuer     *vendorCert `json:"issuer,omitempty"`   // 上一级证书；为 nil 表示直接由厂商根签发
+	Sig        string      `json:"sig,omitempty"`      // 由 Issuer 的公钥（无 Issuer 时由厂商根）签
 }
 
 func (c *vendorCert) canonical() []byte {
@@ -76,11 +80,20 @@ func (c *vendorCert) canonical() []byte {
 	return b
 }
 
-func (c *vendorCert) sign(root ed25519.PrivateKey) {
-	c.Sig = base64.StdEncoding.EncodeToString(ed25519.Sign(root, c.canonical()))
+func (c *vendorCert) signWith(priv ed25519.PrivateKey) {
+	c.Sig = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, c.canonical()))
 }
 
-func (c *vendorCert) verifyRoot(root ed25519.PublicKey) error {
+func (c *vendorCert) pub() (ed25519.PublicKey, error) {
+	raw, err := hex.DecodeString(strings.TrimSpace(c.SubjectPub))
+	if err != nil || len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("证书里的 subjectPub 不是 %d 字节 hex", ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(raw), nil
+}
+
+// verifySelf 用给定公钥验本级签名（不回溯链）。
+func (c *vendorCert) verifySelf(parent ed25519.PublicKey) error {
 	if c.Sig == "" {
 		return fmt.Errorf("证书没有签名")
 	}
@@ -88,8 +101,8 @@ func (c *vendorCert) verifyRoot(root ed25519.PublicKey) error {
 	if err != nil {
 		return fmt.Errorf("证书签名不是 base64: %w", err)
 	}
-	if !ed25519.Verify(root, c.canonical(), sig) {
-		return fmt.Errorf("证书签名验证失败（不是这把厂商根密钥签的）")
+	if !ed25519.Verify(parent, c.canonical(), sig) {
+		return fmt.Errorf("证书签名验证失败（vendorID=%s 不是由上一级签的）", c.VendorID)
 	}
 	if c.ValidUntil != "" {
 		t, perr := time.Parse(time.RFC3339, c.ValidUntil)
@@ -100,12 +113,38 @@ func (c *vendorCert) verifyRoot(root ed25519.PublicKey) error {
 	return nil
 }
 
-func (c *vendorCert) subjectKey() (ed25519.PublicKey, error) {
-	raw, err := hex.DecodeString(strings.TrimSpace(c.SubjectPub))
-	if err != nil || len(raw) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("证书里的 subjectPub 不是 %d 字节 hex", ed25519.PublicKeySize)
+// verifyChain 逐级回溯到厂商根：本级由 Issuer 签、Issuer 由它的 Issuer 签…… 顶层由 root 签。
+// 同时校验整条链的 vendorID 一致（防止把别的 vendorID 的证书拼进来）。
+func (c *vendorCert) verifyChain(root ed25519.PublicKey) error {
+	cur := c
+	for depth := 0; depth < certChainMax; depth++ {
+		if cur.Issuer == nil {
+			return cur.verifySelf(root)
+		}
+		parentPub, err := cur.Issuer.pub()
+		if err != nil {
+			return err
+		}
+		if err := cur.verifySelf(parentPub); err != nil {
+			return err
+		}
+		if cur.Issuer.VendorID != cur.VendorID {
+			return fmt.Errorf("证书链里 vendorID 不一致（%s vs %s）", cur.Issuer.VendorID, cur.VendorID)
+		}
+		if !cur.Issuer.CanIssue {
+			return fmt.Errorf("中间证书（vendorID=%s）没有 canIssue 权限，无权签发下级", cur.Issuer.VendorID)
+		}
+		cur = cur.Issuer
 	}
-	return ed25519.PublicKey(raw), nil
+	return fmt.Errorf("证书链过深（> %d 级）", certChainMax)
+}
+
+func certDepth(c *vendorCert) int {
+	d := 0
+	for cur := c; cur.Issuer != nil; cur = cur.Issuer {
+		d++
+	}
+	return d
 }
 
 func loadCert(path string) *vendorCert {
@@ -119,11 +158,22 @@ func loadCert(path string) *vendorCert {
 	return c
 }
 
+func loadReq(path string) *certReq {
+	b, err := os.ReadFile(path)
+	must(err)
+	r := &certReq{}
+	must(json.Unmarshal(b, r))
+	if r.V != 1 {
+		must(fmt.Errorf("不认识的请求版本 v=%d", r.V))
+	}
+	return r
+}
+
 func cmdCertReq(args []string) {
 	fs := flag.NewFlagSet("cert-req", flag.ExitOnError)
-	key := fs.String("key", "", "一级客户自己的私钥（.priv，由客户生成并保管）")
+	key := fs.String("key", "", "本级自己的私钥（.priv，自己生成并保管）")
 	vendor := fs.String("vendor", "", "申请的 vendorID")
-	out := fs.String("out", "", "输出的请求文件（.req.json，发给厂商）")
+	out := fs.String("out", "", "输出的请求文件（.req.json）")
 	note := fs.String("note", "", "备注（公司名/合同号）")
 	fs.Parse(args)
 	if *key == "" || *vendor == "" || *out == "" {
@@ -137,32 +187,32 @@ func cmdCertReq(args []string) {
 	b, err := json.MarshalIndent(r, "", "  ")
 	must(err)
 	must(os.WriteFile(*out, append(b, 0x0A), 0o644))
-	fmt.Printf("[+] 证书申请已生成: %s（vendorID=%s，含持有证明自签名）\n    把该文件发给厂商；私钥不要外发。\n", *out, r.VendorID)
+	fmt.Printf("[+] 证书申请已生成: %s（vendorID=%s，含持有证明自签名）\n", *out, r.VendorID)
 }
 
 func cmdCertIssue(args []string) {
 	fs := flag.NewFlagSet("cert-issue", flag.ExitOnError)
-	root := fs.String("root", "", "厂商根私钥（.priv，只有厂商持有）")
-	reqIn := fs.String("req", "", "客户发来的证书申请（.req.json，含持有证明）")
-	subject := fs.String("subject", "", "或直接给客户公钥文件（.pub；跳过持有证明，仅兼容旧流程）")
+	root := fs.String("root", "", "厂商根私钥（顶层签发用）")
+	issuer := fs.String("issuer", "", "本级作为「签发者」的证书（部门/销售；须 canIssue）")
+	issuerKey := fs.String("issuer-key", "", "签发者自己的私钥（.priv）")
+	rootPub := fs.String("root-pub", "", "厂商根公钥（用 --issuer 时必填，用于回溯验链）")
+	reqIn := fs.String("req", "", "下级发来的证书申请（.req.json，含持有证明）")
+	subject := fs.String("subject", "", "或直接给下级公钥文件（.pub；跳过持有证明，兼容旧流程）")
 	vendor := fs.String("vendor", "", "签发的 vendorID")
 	out := fs.String("out", "", "输出证书（.cert.json）")
 	until := fs.String("until", "", "有效期（2028-12-31 或 RFC3339；留空 = 永久）")
-	note := fs.String("note", "", "备注（客户名/合同号…）")
+	note := fs.String("note", "", "备注")
+	canIssue := fs.Bool("can-issue", false, "授予「可继续签发下级证书/授权」的权限（EMS 角色）")
 	fs.Parse(args)
-	if *root == "" || *vendor == "" || *out == "" || (*reqIn == "" && *subject == "") {
-		fmt.Println("[!] 需要 --root --vendor --out，以及 --req 或 --subject 之一")
+	topMode := *root != ""
+	midMode := *issuer != "" || *issuerKey != ""
+	if *vendor == "" || *out == "" || (*reqIn == "" && *subject == "") || (topMode == midMode) {
+		fmt.Println("[!] 需要 --vendor --out 与 (--req 或 --subject)，并且 --root 与 --issuer/--issuer-key 二选一")
 		os.Exit(2)
 	}
 	var pubHex string
 	if *reqIn != "" {
-		rb, err := os.ReadFile(*reqIn)
-		must(err)
-		r := &certReq{}
-		must(json.Unmarshal(rb, r))
-		if r.V != 1 {
-			must(fmt.Errorf("不认识的请求版本 v=%d", r.V))
-		}
+		r := loadReq(*reqIn)
 		if r.VendorID != *vendor {
 			must(fmt.Errorf("请求里的 vendorID（%s）与 --vendor（%s）不一致", r.VendorID, *vendor))
 		}
@@ -171,7 +221,7 @@ func cmdCertIssue(args []string) {
 		if *note == "" {
 			*note = r.Note
 		}
-		fmt.Println("[*] 请求持有证明校验通过（申请者确实持有与公钥配对的私钥）")
+		fmt.Println("[*] 请求持有证明校验通过")
 	} else {
 		pubHex = hex.EncodeToString(loadPub(*subject))
 	}
@@ -184,12 +234,30 @@ func cmdCertIssue(args []string) {
 		}
 	}
 	c := &vendorCert{V: 1, VendorID: *vendor, SubjectPub: pubHex,
-		Issued: time.Now().UTC().Format(time.RFC3339), ValidUntil: vu, Note: *note}
-	c.sign(loadPriv(*root))
+		Issued: time.Now().UTC().Format(time.RFC3339), ValidUntil: vu, Note: *note, CanIssue: *canIssue}
+	if midMode {
+		if *issuerKey == "" || *rootPub == "" {
+			fmt.Println("[!] 用 --issuer 时还需要 --issuer-key 与 --root-pub")
+			os.Exit(2)
+		}
+		ic := loadCert(*issuer)
+		if !ic.CanIssue {
+			must(fmt.Errorf("该签发者证书（vendorID=%s）没有 canIssue 权限，不能签发下级", ic.VendorID))
+		}
+		must(ic.verifyChain(loadPub(*rootPub)))
+		if ic.VendorID != *vendor {
+			must(fmt.Errorf("签发者证书 vendorID（%s）与要签的 vendorID（%s）不一致", ic.VendorID, *vendor))
+		}
+		c.Issuer = ic
+		c.signWith(loadPriv(*issuerKey))
+		fmt.Printf("[*] 由中间签发者签发（链深 %d）\n", certDepth(c))
+	} else {
+		c.signWith(loadPriv(*root))
+	}
 	b, err := json.MarshalIndent(c, "", "  ")
 	must(err)
 	must(os.WriteFile(*out, append(b, 0x0A), 0o644))
-	fmt.Printf("[+] 已签发身份证书: %s（vendorID=%s 有效期=%s）\n    发给该客户；客户签下游授权时用 --cert 带上它。\n", *out, c.VendorID, orDash(vu))
+	fmt.Printf("[+] 已签发证书: %s（vendorID=%s 有效期=%s canIssue=%v 链深=%d）\n", *out, c.VendorID, orDash(vu), c.CanIssue, certDepth(c))
 }
 
 func orDash(s string) string {
@@ -202,20 +270,23 @@ func orDash(s string) string {
 func cmdCertShow(args []string) {
 	fs := flag.NewFlagSet("cert-show", flag.ExitOnError)
 	certPath := fs.String("cert", "", "证书文件")
-	root := fs.String("root", "", "厂商根公钥（.pub）；给了就验签")
+	root := fs.String("root", "", "厂商根公钥（.pub）；给了就验整条链")
 	fs.Parse(args)
 	if *certPath == "" {
 		fmt.Println("[!] 需要 --cert")
 		os.Exit(2)
 	}
 	c := loadCert(*certPath)
-	fmt.Printf("vendorID   : %s\nsubjectPub : %s\nissued     : %s\nvalidUntil : %s\nnote       : %s\n",
-		c.VendorID, c.SubjectPub, c.Issued, orDash(c.ValidUntil), c.Note)
+	fmt.Printf("vendorID   : %s\nsubjectPub : %s\nissued     : %s\nvalidUntil : %s\ncanIssue   : %v\n链深       : %d\nnote       : %s\n",
+		c.VendorID, c.SubjectPub, c.Issued, orDash(c.ValidUntil), c.CanIssue, certDepth(c), c.Note)
+	for cur := c.Issuer; cur != nil; cur = cur.Issuer {
+		fmt.Printf("  └ 上级: vendorID=%s canIssue=%v validUntil=%s\n", cur.VendorID, cur.CanIssue, orDash(cur.ValidUntil))
+	}
 	if *root != "" {
-		if err := c.verifyRoot(loadPub(*root)); err != nil {
+		if err := c.verifyChain(loadPub(*root)); err != nil {
 			fmt.Printf("[FAIL] %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("[OK  ] 证书由该厂商根密钥签发且未过期")
+		fmt.Println("[OK  ] 整条证书链回溯到厂商根，且中间证书均带 canIssue")
 	}
 }

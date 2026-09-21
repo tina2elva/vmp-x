@@ -877,9 +877,15 @@ static void vm_selfcheck(void) {
  * 判据：**累计 >= 2 个信号**才定性 —— 单点误判不动手；真实调试器会同时踩中 ① 与 ②
  * （Windows 调试 API 必然设置这两者），所以并不会漏。
  * 定性后**不 trap**：置延后计数器，接下来 VM_DBG_DEFER_CALLS 次 vm_run 直接返回错误结果，
- * 攻击者看到的是"偶尔算错"，而不是一个可以一眼定位的崩点。 */
+ * 攻击者看到的是"偶尔算错"，而不是一个可以一眼定位的崩点。
+ *
+ * 关于第 ④ 条（时间差）的**降级记录**：它最初参与定性（bit3），但实测**两次误报** ——
+ * 忙机器/虚拟化环境下一次 64 次迭代的空转能被调度顶到远超阈值，只要另一条路径（例如
+ * BeingDebugged）也命中，就会把正常程序判成被调试（e2e 因此偶发红）。现在它只累加
+ * vm_dbg_timing_hits 供诊断，**不再贡献判定位**；真正的调试器由 ①②③ 确定性路径抓。 */
 #define VM_DBG_DEFER_CALLS 3
-u32 vm_dbg_defer; /* .bss；非 Windows 也定义（vm_run 里统一判断） */
+u32 vm_dbg_defer;        /* .bss；非 Windows 也定义（vm_run 里统一判断） */
+u32 vm_dbg_timing_hits;  /* 时间差路径命中次数：**只作参考**，不参与定性（见下） */
 
 /* 这两个符号定义在本文件靠后的 Windows 段里。**必须在 VM_KEY_EXTERNAL 之外也声明**：
  * 兼容模式（baked）下反调试同样要用它们（上一版把声明放在外置分支里 -> baked 编不过 ->
@@ -943,7 +949,7 @@ static u32 vm_antidebug_probe(void) {
         }
     }
 
-    /* ④ 时间差：先热身，取三次测量里的**最小值**，再和一个"天文数字"级阈值比。
+    /* ④ 时间差：**只记录、不定性**。
      * 阈值为什么定这么高（1e9 cycles ≈ 0.3s）：实测在忙的机器上，一次 64 次迭代的空转也能被
      * 调度/页错误顶到 >3ms —— 那样这条路径就成了**误报源**，只要另一条路径（例如 BeingDebugged）
      * 也命中，就会把正常程序判成被调试（本机与 CI 都出现过一次，e2e 因此变成偶发红）。
@@ -956,7 +962,7 @@ static u32 vm_antidebug_probe(void) {
         u64 t1 = vm_rdtsc();
         if (k && (t1 - t0) < best) best = t1 - t0; /* 第 0 次当热身丢弃 */
     }
-    if (best != ~(u64)0 && best > 1000000000ull) hits |= 8u;
+    if (best != ~(u64)0 && best > 1000000000ull) vm_dbg_timing_hits++;
     return hits;
 }
 

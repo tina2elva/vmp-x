@@ -169,7 +169,8 @@ func cmdLicNew(args []string) {
 	vendor := fs.String("vendor", "", "一级客户 ID（vendorID）")
 	dongle := fs.String("dongle", "", "下游设备 ID（dongleID）")
 	key := fs.String("key", "", "母狗签发私钥（.priv）")
-	certPath := fs.String("cert", "", "一级客户的身份证（.cert.json，厂商签发）；带上它运行期才能验链")
+	certPath := fs.String("cert", "", "本级的身份证（.cert.json）；带上它运行期才能验链")
+	rootPub := fs.String("root-pub", "", "厂商根公钥（.pub）：给了就先验一遍证书链再签发")
 	out := fs.String("out", "", "输出的授权文件（建议 <产物>.vmplic）")
 	prod := multiString{}
 	fs.Var(&prod, "product", "授权产品，可多次：ID[@到期]")
@@ -187,10 +188,13 @@ func cmdLicNew(args []string) {
 		}
 		// 关键交叉校验：用来签授权的私钥，必须就是证书里绑定的那把公钥 ——
 		// 否则“身份”与“签名者”脱钩，验链就失去意义。
-		sub, err := c.subjectKey()
+		sub, err := c.pub()
 		must(err)
 		if !sub.Equal(priv.Public().(ed25519.PublicKey)) {
 			must(fmt.Errorf("签发私钥与证书里绑定的公钥不匹配（证书 subjectPub=%s）", c.SubjectPub[:16]))
+		}
+		if *rootPub != "" {
+			must(c.verifyChain(loadPub(*rootPub)))
 		}
 		l.Cert = c
 	}
@@ -305,7 +309,7 @@ func cmdLicShow(args []string) {
 			fmt.Println("[FAIL] 授权里没有身份证书：无法证明这个 vendorID 是厂商承认的（客户可能在自立门户）")
 			os.Exit(1)
 		}
-		sub, err := l.Cert.subjectKey()
+		sub, err := l.Cert.pub()
 		if err != nil {
 			fmt.Printf("[FAIL] %v\n", err)
 			os.Exit(1)
@@ -314,15 +318,15 @@ func cmdLicShow(args []string) {
 			fmt.Printf("[FAIL] 授权签名与证书里绑定的公钥不符: %v\n", err)
 			os.Exit(1)
 		}
-		if err := l.Cert.verifyRoot(loadPub(*root)); err != nil {
-			fmt.Printf("[FAIL] 身份证书: %v\n", err)
+		if err := l.Cert.verifyChain(loadPub(*root)); err != nil {
+			fmt.Printf("[FAIL] 证书链: %v\n", err)
 			os.Exit(1)
 		}
 		if l.Cert.VendorID != l.VendorID {
 			fmt.Printf("[FAIL] 证书 vendorID(%s) 与授权 vendorID(%s) 不一致\n", l.Cert.VendorID, l.VendorID)
 			os.Exit(1)
 		}
-		fmt.Printf("[OK  ] 整链通过：授权 <- %s 的身份证书 <- 厂商根（vendorID=%s，证书有效期=%s）\n", l.Cert.VendorID, l.Cert.VendorID, orDash(l.Cert.ValidUntil))
+		fmt.Printf("[OK  ] 整链通过：授权 <- %s（链深 %d） <- 厂商根\n", l.Cert.VendorID, certDepth(l.Cert))
 	}
 	if *product != "" {
 		ok, why := l.allows(*product, now)

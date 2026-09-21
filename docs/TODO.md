@@ -247,9 +247,8 @@ vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    
   （只能重建新 vendor 身份并重新保护产品）→ 必须有**备份母狗 + 保险柜**。
 
 **我们要补的对应物（TODO 子项）**
-- [ ] **委派签发（canIssue）**：根密钥签一张 `canIssue=true` 的证书给「部门/签发服务」，
-      由它去签下游授权（链：厂商根 → 部门/销售 → 下游），并可**吊销**（不续签/加黑名单）。
-      等价于 EMS 角色 —— 目的是**不把根密钥交给销售**，同时让销售能发授权。
+- [x] **委派签发（canIssue）**：已实现（见下）。等价于 EMS 角色 —— 销售能发授权，但拿不到根密钥。
+- [ ] 吊销/黑名单（现在只有有效期这一条杠杆；在线吊销未做）。
 - [ ] 若最终走 Sentinel：以上全部由 Sentinel 体系承担，我们只需做 **`vm_license_fetch/verify` 接口层**
       （`hasp_login`/`hasp_get_info`/`hasp_decrypt`），**不做自研 PKI**。
 
@@ -271,7 +270,7 @@ vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    
 | 软件 ID / 功能点 | `productID` + `items[]`（+ 预留 `features`） | ✅ |
 | 到期时间 | `items[].expiry` | ✅（判定已实现） |
 | 增删授权（改狗内容） | `lic-edit` 重签 | ✅ |
-| EMS 角色（销售只发授权、不碰根） | **委派签发 `canIssue`** | ❌ 待做 |
+| EMS 角色（销售只发授权、不碰根） | **委派签发 `canIssue`** | ✅ 已实现（本节末） |
 | 防拷贝（一机一授权） | 机器指纹写进签名授权 | ⚠️ 可做，但文件可复制 |
 | 到期抗回拨（独立时钟/计数器） | 需要可信时间 | ❌ 离线文件形态挡不住 |
 
@@ -293,6 +292,32 @@ vmpepoch lic-show --lic <lic> [--pub <pub>] [--product <id>]                    
 
 > 别忘了：以上全是「签发侧」。**运行期强制**（产物不认授权就拒绝运行）尚未实现 ——
 > 没有它，这套现在只是管理流程，还不具备 Sentinel 那种「没授权就跑不起来」的体感。
+
+
+**委派签发（canIssue）已实现 —— 等价于 Sentinel EMS 的「角色」**
+
+```
+# 1) 厂商根（自己生成，私钥不外发）
+vmpepoch keygen     --out root
+# 2) 销售部自己生成密钥，申请；厂商签一张带 canIssue 的证书
+vmpepoch cert-req   --key sales.priv --vendor ACME-0001 --out sales.req.json
+vmpepoch cert-issue --root root.priv --req sales.req.json --vendor ACME-0001 \
+                    --until 2030-01-01 --can-issue --out sales.cert.json
+# 3) 客户A 自己生成密钥，申请；**由销售部**签发（链深 1）
+vmpepoch cert-issue --issuer sales.cert.json --issuer-key sales.priv --root-pub root.pub \
+                    --req custA.req.json --vendor ACME-0001 --until 2028-12-31 --out custA.cert.json
+# 4) 客户A 给下游签授权；5) 下游只需厂商根公钥即可验整链
+vmpepoch lic-new  ... --key custA.priv --cert custA.cert.json --root-pub root.pub --out A-A.vmplic --product PROD-A@2027-12-31
+vmpepoch lic-show --lic A-A.vmplic --root root.pub --product PROD-A
+```
+
+验链规则：本级签名由「Issuer 的公钥」验 → 逐级回溯 → 顶层由厂商根验；
+并且**中间证书必须带 canIssue**，否则它签出来的下级一律不认。
+
+实测（本机）：三层链 `整链通过：授权 <- ACME-0001（链深 1） <- 厂商根` ✓；
+负例1 用**没有 canIssue** 的证书签下级 → 拒（“没有 canIssue 权限，不能签发下级”）✓；
+负例2 伪造一张自我签名的“销售部”证书再去签下级 → 在**签发时**就被拒（链回溯不到厂商根）✓；
+负例3 授权里塞伪造证书 → `lic-show --root` 报“证书链：不是由上一级签的”✓。
 
 **还没做（下一步，按需选择）**
 - [ ] **运行期强制**：blob 侧 `vm_license_check()`（路线 B 需 Ed25519 验签的 C 实现，约 600–900 行 + 两侧 KAT）；
