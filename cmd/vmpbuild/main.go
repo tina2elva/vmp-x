@@ -14,6 +14,7 @@
 package main
 
 import (
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -28,7 +29,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/vmpx/vmp-x/internal/inject"
 )
@@ -366,7 +366,12 @@ func generateOpcodeValues(tmp string, random bool) (string, map[string]int, erro
 		for v := 1; v <= 0xFE; v++ {
 			pool = append(pool, v)
 		}
-		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+		// 操作码映射同样是"每构建随机"的混淆项：也用密码学随机源（用可预测种子等于把映射送出去）。
+		seed, serr := cryptoRandU64()
+		if serr != nil {
+			return "", nil, serr
+		}
+		rnd := rand.New(rand.NewSource(int64(seed)))
 		rnd.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
 		copy(vals, pool)
 	}
@@ -386,6 +391,24 @@ func generateOpcodeValues(tmp string, random bool) (string, map[string]int, erro
 	return outPath, opMap, nil
 }
 
+// cryptoRandU32 / cryptoRandU64：密码学随机源。主密钥、各种 salt、每构建随机的混淆种子都必须走这里
+// —— 以前用 math/rand + 时间种子，输出可预测（等于把密钥送出去）。
+func cryptoRandU32() (uint32, error) {
+	var b [4]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("crypto/rand 不可用: %w", err)
+	}
+	return binary.LittleEndian.Uint32(b[:]), nil
+}
+
+func cryptoRandU64() (uint64, error) {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("crypto/rand 不可用: %w", err)
+	}
+	return binary.LittleEndian.Uint64(b[:]), nil
+}
+
 // generateKeyFile 生成本 blob 的 AEAD 主密钥（vm_crypto_key.h，宏形式：避免外部符号引用
 // 在 mingw 下变成 .rdata$.refptr 绝对指针表，那是位置无关 blob 不能接受的）。
 //
@@ -401,20 +424,29 @@ func generateKeyFile(tmp string, external bool) (string, string, uint32, error) 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return "", "", 0, err
 	}
+	// **必须用密码学随机源**：这里以前是 math/rand + 时间种子（time.Now().UnixNano() ^ 常量）。
+	// 那个 PRNG 的输出完全可预测 —— 攻击者只要知道大致的构建时间，就能把主密钥枚举出来，
+	// 于是"产物不自足"这件事就白做了（密钥文件也不用拿了）。主密钥、KCV salt、掩码 salt、
+	// 占位密钥，一个都不能用可预测的随机。
 	key := make([]byte, 32)
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano() ^ 0x5DEECE66D))
-	for i := range key {
-		key[i] = byte(rnd.Intn(256))
+	if _, err := crand.Read(key); err != nil {
+		return "", "", 0, fmt.Errorf("crypto/rand 不可用: %w", err)
 	}
-	checkSalt := rnd.Uint32()
-	fieldMaskSalt := rnd.Uint32()
+	checkSalt, err := cryptoRandU32()
+	if err != nil {
+		return "", "", 0, err
+	}
+	fieldMaskSalt, err := cryptoRandU32()
+	if err != nil {
+		return "", "", 0, err
+	}
 	kcv := inject.KDFEntry(key, vmKeyCheckRVA, checkSalt)
 
 	baked := key
 	if external {
 		baked = make([]byte, 32)
-		for i := range baked {
-			baked[i] = byte(rnd.Intn(256))
+		if _, err := crand.Read(baked); err != nil {
+			return "", "", 0, err
 		}
 	}
 	var sb strings.Builder
