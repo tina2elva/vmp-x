@@ -181,6 +181,9 @@ func main() {
 	}
 	var merged *mergedBlob
 	var single *objFile
+	/* 基址重定位站点（i386 的 DIR32）与表偏移：自哈希必须与加载期的补丁规则一致。 */
+	var absSites []int
+	relocTabOff := 0
 	objPath := ""
 	switch *merge {
 	case "go":
@@ -243,6 +246,10 @@ func main() {
 		/* 重要：表是 append 上去的，可能**重新分配** m.Data ⇒ 必须在这里重新取切片，
 		 * 否则写文件用的还是旧数组、旧长度（实测：符号有了、文件里却没有表）。 */
 		blob = merged.Data
+		absSites = merged.absSites
+		if v, ok := merged.symOff["vm_reloc_tab"]; ok {
+			relocTabOff = v
+		}
 		for k, v := range merged.symOff {
 			syms[k] = v
 		}
@@ -288,11 +295,27 @@ func main() {
 	// (g) 解释器/桩代码段自哈希：把 [0, bssOff) 的 FNV-1a 与两个偏移写进 blob 里的三个全局
 	// （它们在 .bss，位于被哈希区间之外，所以不会自我指涉）。运行时由 vm_selfcheck() 重算比对。
 	if off, ok := syms["vm_self_hash"]; ok && bssOff > 0 {
+		/* 自哈希必须**跳过基址重定位站点**（这些字节按 0 参与运算）——
+		 * 否则加载期把站点 += base 之后，运行时重算的哈希必然对不上。
+		 * 实测：i686 上正是这样被 vm_selfcheck 的 ud2 拒绝的（896/920 个站点字节落在哈希区间内）。
+		 * 运行期 vm_selfcheck 用同一套规则（经 vm_reloc_tab_off 找到表）。 */
+		siteByte := make([]bool, len(blob))
+		for _, s := range absSites {
+			for k := 0; k < 4 && s+k < len(siteByte); k++ {
+				siteByte[s+k] = true
+			}
+		}
 		h := uint32(2166136261)
-		for _, b := range blob[:bssOff] {
+		for i, b := range blob[:bssOff] {
+			if i < len(siteByte) && siteByte[i] {
+				b = 0
+			}
 			h = (h ^ uint32(b)) * 16777619
 		}
 		binary.LittleEndian.PutUint32(blob[off:], h)
+		if o4, ok4 := syms["vm_reloc_tab_off"]; ok4 {
+			binary.LittleEndian.PutUint32(blob[o4:], uint32(relocTabOff))
+		}
 		if o2, ok2 := syms["vm_self_len"]; ok2 {
 			binary.LittleEndian.PutUint64(blob[o2:], uint64(bssOff))
 		}

@@ -21,7 +21,6 @@ static u8 emu_stack[1 << 20]; /* 1MB 模拟栈：足够 M1 的叶子函数 */
 
 /* 诊断用：未处理异常过滤器 —— 直接把异常码/出错地址/访问违例的目标地址写进日志。
  * 没有它的时候，i686 上跑 blob 只能看到一个 0xC0000005，完全看不出崩在哪。 */
-static void chk(const char *tag); /* 前向声明，定义在下面 */
 static void *g_blob_base;      /* 映射基址：崩溃时把出错地址换算成 blob 内偏移 */
 static long g_entry_off;
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
@@ -41,6 +40,9 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
                     (unsigned long)((unsigned char *)ep->ExceptionRecord->ExceptionAddress -
                                     ((unsigned char *)g_blob_base + g_entry_off)));
         }
+        /* 寄存器转储只在 i386 构建里做：CONTEXT 的成员名 x64 是 Rip/Rsp/Rax...，
+         * 直接写 Eip 会让 x64 探针编译不过（踩过）。 */
+#if defined(__i386__) || defined(_M_IX86)
         if (ep->ContextRecord) {
             CONTEXT *c = ep->ContextRecord;
             fprintf(g, " eip=%p esp=%p eax=%p ebx=%p ecx=%p edx=%p esi=%p edi=%p ebp=%p",
@@ -58,25 +60,16 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
                 }
             }
         }
+#endif
         fprintf(g, "\n");
         fclose(g);
     }
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-/* 诊断用：把检查点直接写文件（崩溃路径下 stdout/stderr 可能丢缓冲，写文件最可靠）。 */
-static void chk(const char *tag) {
-    FILE *g = fopen("build/probe_chk.log", "a");
-    if (g) {
-        fprintf(g, "%s\n", tag);
-        fclose(g);
-    }
-}
 
 static unsigned char *read_file(const char *path, long *size) {
-    chk("read_file: enter");
     FILE *f = fopen(path, "rb");
-    chk(f ? "read_file: fopen ok" : "read_file: fopen FAILED");
     if (!f) {
         fprintf(stderr, "[!] cannot open %s\n", path);
         return NULL;
@@ -93,7 +86,6 @@ static unsigned char *read_file(const char *path, long *size) {
     }
     fclose(f);
     *size = n;
-    chk("read_file: done");
     return buf;
 }
 
@@ -211,13 +203,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[!] VirtualAlloc failed\n");
         return 2;
     }
-    chk("about to memcpy");
     g_blob_base = mem;
     g_entry_off = entryOff;
     memcpy(mem, blob, (size_t)blobSize);
-    chk("memcpy done");
     FlushInstructionCache(GetCurrentProcess(), mem, (SIZE_T)blobSize);
-    chk("icache flushed");
     /* 可选第 5 个参数：vm_reloc_tab 在 blob 里的偏移（0/缺省 = 无表；x64 侧不需要）。
      * i386 的绝对引用（DIR32）在字段里存的是「blob 相对偏移」，必须加上**加载基址**才有效。
      * 表格式：[u32 count][count × u32 站点偏移]。注意要补丁**映射后的副本**（mem），
@@ -264,7 +253,6 @@ int main(int argc, char **argv) {
     ctx.regs[VRSP] = (u64)(emu_stack + sizeof(emu_stack));  /* 模拟栈顶 */
     ctx.regs[VRBASE] = 0;                                  /* M1 叶子函数用不到 */
 
-    chk("about to call vm_run");
     run_fn_t fn = (run_fn_t)((unsigned char *)mem + entryOff);
     int rc = fn(&ctx);
 

@@ -1335,12 +1335,30 @@ static inline void vm_bcs_init(vm_bcs_t *s, const vm_ctx_t *vm) {
  * 2) 必须标 **hidden**：PIE 默认下 gcc 认为它可被外部抢占，于是走 GOT（linux/amd64 上报的
  *    R_X86_64_REX_GOTPCRELX=0x2A 就是这个），hidden 之后才回到 PC 相对引用。 */
 extern void vm_entry(void) __attribute__((visibility("hidden")));
+/* 基址重定位表的 blob 偏移（0 = 没有表），由 vmpbuild 烘焙；非 static 以便出现在符号表里。
+ * 自校验必须与加载期补丁用**同一套规则**：站点内的字节按 0 参与哈希。 */
+u32 vm_reloc_tab_off;
 static void vm_selfcheck(void) {
     const u8 *base = (const u8 *)&vm_entry - (u32)vm_code_off;
     u32 h = 2166136261u;
     u64 i;
     if (!vm_self_len) return; /* 还没被烘焙（比如本地直接编 blob 跑测试） */
-    for (i = 0; i < vm_self_len; i++) { h ^= (u32)base[i]; h *= 16777619u; }
+    for (i = 0; i < vm_self_len; i++) {
+        u32 b = (u32)base[i];
+        if (vm_reloc_tab_off) {
+            const u32 *tab = (const u32 *)(base + vm_reloc_tab_off);
+            u32 n = tab[0], k;
+            for (k = 0; k < n; k++) {
+                u32 site = tab[1 + k];
+                if (i >= site && i < site + 4u) {
+                    b = 0; /* 基址相关站点：加载期会被加 base，所以哈希按 0 算 */
+                    break;
+                }
+            }
+        }
+        h ^= b;
+        h *= 16777619u;
+    }
     if (h != vm_self_hash) __builtin_trap();
 }
 
