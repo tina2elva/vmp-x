@@ -80,6 +80,15 @@ func NewLifterMode(imageBase uint64, mode int) *Lifter {
 	return &Lifter{ImageBase: imageBase, Mode: mode}
 }
 
+// ptrWidth 返回本模式下"地址/指针寄存器"的宽度：
+// 32 位客户机的基址/索引/间接跳转寄存器是 EAX..EDI（W32），64 位是 RAX..RDI（W64）。
+func (l *Lifter) ptrWidth() ir.Width {
+	if l.mode() == x64dec.Mode32 {
+		return ir.W32
+	}
+	return ir.W64
+}
+
 // mode 取解码模式；零值视为 64 位（结构体字面量构造时不会漏）。
 func (l *Lifter) mode() int {
 	if l.Mode == 0 {
@@ -376,14 +385,14 @@ func (l *Lifter) memAddr(ins x64dec.Insn, m x86asm.Mem) (base, index ir.Reg, sca
 		disp = int32(target - l.ImageBase)
 	default:
 		r, w, ok := regInfo(m.Base)
-		if !ok || w != ir.W64 {
+		if !ok || w != l.ptrWidth() {
 			return 0, 0, 0, 0, fmt.Errorf("不支持的基址寄存器 %v", m.Base)
 		}
 		base = r
 	}
 	if m.Index != 0 {
 		r, w, ok := regInfo(m.Index)
-		if !ok || w != ir.W64 {
+		if !ok || w != l.ptrWidth() {
 			return 0, 0, 0, 0, fmt.Errorf("不支持的索引寄存器 %v", m.Index)
 		}
 		if m.Scale != 1 && m.Scale != 2 && m.Scale != 4 && m.Scale != 8 {
@@ -730,8 +739,8 @@ func (l *Lifter) liftOne(f *ir.Func, ins x64dec.Insn, off uint32) error {
 
 	case x86asm.PUSH:
 		if r, w, ok := regArgInfo(args[0]); ok {
-			if w != ir.W64 {
-				return fmt.Errorf("只支持 64 位 PUSH 寄存器")
+			if w != l.ptrWidth() {
+				return fmt.Errorf("只支持指针宽度的 PUSH 寄存器（当前模式 %d 位）", l.mode())
 			}
 			em(ir.Insn{Op: ir.PushR, Dst: r})
 			return nil
@@ -744,7 +753,7 @@ func (l *Lifter) liftOne(f *ir.Func, ins x64dec.Insn, off uint32) error {
 
 	case x86asm.POP:
 		r, w, ok := regArgInfo(args[0])
-		if !ok || w != ir.W64 {
+		if !ok || w != l.ptrWidth() {
 			return fmt.Errorf("只支持 64 位 POP 寄存器")
 		}
 		em(ir.Insn{Op: ir.PopR, Dst: r})
