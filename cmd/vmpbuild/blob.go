@@ -306,7 +306,7 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 					o.Sections[r.SecIdx].Name, r.Off, r.RawType, o.Format, r.SymName, r.TargetSec, r.Addend)
 			}
 			if verbose {
-				fmt.Printf("    [reloc] %s+0x%X type=0x%X kind=%d sym=%s -> target=0x%X\n", o.Sections[r.SecIdx].Name, r.Off, r.RawType, r.SymName, target)
+				fmt.Printf("    [reloc] %s+0x%X type=0x%X sym=%s -> target=0x%X\n", o.Sections[r.SecIdx].Name, r.Off, r.RawType, r.SymName, target)
 			}
 		}
 	}
