@@ -834,6 +834,28 @@ func (l *Lifter) liftOne(f *ir.Func, ins x64dec.Insn, off uint32) error {
 		}
 		return fmt.Errorf("只支持相对 CALL 或间接 CALL r/m")
 
+	case x86asm.LEAVE:
+		/* leave = mov esp/rsp, ebp/rbp ; pop ebp/rbp —— 32 位代码的函数出口几乎必用。
+		 * 我们是在**第一个真实 32 位函数**上撞到它的（"LEAVE — 暂不支持该指令"），
+		 * 而它的语义恰好就是那两条指令，所以这里用**同样的记账 + 同样的 IR**，不引入新机制。 */
+		if !l.spKnown {
+			return fmt.Errorf("LEAVE 但 RSP 已被不可跟踪的方式修改（%s）", l.spLostBy)
+		}
+		if !l.rbpKnown {
+			l.loseSP(ins)
+			return fmt.Errorf("LEAVE 但 RBP 的来源不可跟踪，无法安全翻译栈访问")
+		}
+		w := ir.W64
+		if l.mode() == x64dec.Mode32 {
+			w = ir.W32
+		}
+		l.spDelta = l.rbpEff /* esp = ebp */
+		em(ir.Insn{Op: ir.MovRR, Width: w, Dst: ir.RSP, A: ir.RBP})
+		l.spDelta += l.stackSlot() /* pop ebp：栈槽宽度按模式走 */
+		em(ir.Insn{Op: ir.PopR, Dst: ir.RBP})
+		l.rbpKnown = false /* RBP 现在来自栈，不再等于进入时的偏移 */
+		return nil
+
 	case x86asm.RET:
 		em(ir.Insn{Op: ir.Ret})
 		return nil
