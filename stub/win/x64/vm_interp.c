@@ -169,6 +169,12 @@ static u32 flags_mul_w(u64 x, u64 y, u64 r, u32 w) {
     i64 a = sign_extend_w(x, w), b = sign_extend_w(y, w);
     u64 phi = 0, plo = 0;
     vm_mul64_full((u64)a, (u64)b, &phi, &plo);
+    /* 为什么这里还要修正：helper 算的是**无符号** 64x64->128，而我们要的是**有符号**乘积。
+     * 两者的关系是（与下面 K_MULHIS 同一套式子）：
+     *   有符号乘积 = 无符号乘积 − (a<0 ? b : 0) − (b<0 ? a : 0)
+     * 只做"无符号重解释"是不够的：a=-1,b=1 时无符号乘积是 2^64−1，而有符号乘积是 −1。（
+     * 这个坑真踩过：不加修正会让 IMUL 的 CF/OF **多置**，被 C/Go 对拍抓住。） */
+    phi -= (a < 0 ? (u64)b : 0ull) + (b < 0 ? (u64)a : 0ull);
     i64 lo = sign_extend_w(r, w);
     u32 f = 0;
     if ((r & width_mask(w)) == 0) f |= VM_FL_Z;
