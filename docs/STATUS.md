@@ -6146,3 +6146,22 @@ DIR32 届时从「拒绝」升级为「可修复」。
 
 **目标 ⑥ 的准确状态**：blob 可构建（44100 字节、含 230 项基址表）✓；真实 32 位函数可 lift ✓；
 加载侧修复逻辑已写 ✓；**运行仍未跑通** ✗ ⇒ ⑥ **未达成**，目标保持 active。
+
+### 450. 一条必须记住的命名纪律：`build/runbc_x8632.exe` 是**仓库约定的 x64 探针**
+
+**我踩的坑**：为了跑 i686 blob，我用 `i686-w64-mingw32-gcc` 直接覆盖了 `build/runbc_x8632.exe` ✗。
+而仓库约定（`tools/e2e_arm64guest.ps1:37`）是：
+
+    gcc -O1 -Wall -DVM_GUEST_X86_32=1 -I stub/win/x64 -o build/runbc_x8632.exe stub/win/x64/blob_probe.c
+
+即它是 **x64 二进制 + x86-32 客户机模式**（用于「x64 blob 跑 x86-32 客户机」的差分），**不是** i686 宿主探针。
+覆盖它之后 `go test ./...` 立刻红（`TestConformanceAgainstCInterpreter` 失败），我一度误判成"陈旧探针"或"改动弄坏了 C 解释器"。
+按约定重建后立刻 `ok` ✓。
+
+**纪律**：i686 宿主探针必须用**专属名字** `build/runbc_i686.exe`：
+
+    i686-w64-mingw32-gcc -O2 -Wall -I stub/win/x86 -I stub/win/x64 -o build/runbc_i686.exe stub/win/x64/blob_probe.c
+
+（注意 `-I stub/win/x86` **在前**，这样它拿到的是 32 位 ctx 布局的 `vm_abi.h`。）
+
+**当前状态**：`go test ./...` **全绿** ✓；那条真实函数的运行仍崩（0xC0000005），崩溃窗口见 #449。
