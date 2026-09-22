@@ -149,14 +149,32 @@ static u32 flags_logic_w(u64 r, u32 w) {
     return f | parity_flag(r); /* 逻辑运算清 CF/OF */
 }
 
+/* 64x64 -> 128 的**可移植**实现：i686 没有 __int128（会直接编译不过）。
+ *
+ * 关键性质：二进制补码下，把操作数**按无符号重解释**后算出的 128 位乘积，
+ * 与"有符号乘积"的**位模式完全一致** ⇒ 一个无符号版本就够两边用（有符号那边按需做符号修正）。
+ * 算法：把两个 64 位操作数各拆成 32 位两半做小学生乘法；
+ *   mid = (p00>>32) + 低32(p01) + 低32(p10) < 3*2^32 ⇒ 不会溢出。
+ * 这也是本文件"除法早就不用 __int128"那条纪律的延续（见下面 K_DIVU/K_DIVS 的注释）。 */
+static void vm_mul64_full(u64 a, u64 b, u64 *hi, u64 *lo) {
+    u64 a0 = a & 0xFFFFFFFFu, a1 = a >> 32;
+    u64 b0 = b & 0xFFFFFFFFu, b1 = b >> 32;
+    u64 p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    u64 mid = (p00 >> 32) + (p01 & 0xFFFFFFFFu) + (p10 & 0xFFFFFFFFu);
+    *lo = (mid << 32) | (p00 & 0xFFFFFFFFu);
+    *hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+
 static u32 flags_mul_w(u64 x, u64 y, u64 r, u32 w) {
     i64 a = sign_extend_w(x, w), b = sign_extend_w(y, w);
-    __int128 p = (__int128)a * (__int128)b;
+    u64 phi = 0, plo = 0;
+    vm_mul64_full((u64)a, (u64)b, &phi, &plo);
     i64 lo = sign_extend_w(r, w);
     u32 f = 0;
     if ((r & width_mask(w)) == 0) f |= VM_FL_Z;
     if (r & (1ull << (w - 1))) f |= VM_FL_N;
-    if ((__int128)lo != p) f |= (VM_FL_C | VM_FL_V);
+    /* 与原来等价的判据：乘积是否等于 lo 的**128 位符号扩展** */
+    if (plo != (u64)lo || phi != (lo < 0 ? ~0ull : 0ull)) f |= (VM_FL_C | VM_FL_V);
     return f | parity_flag(r);
 }
 
@@ -259,11 +277,10 @@ static u64 alu_apply(vm_ctx_t *vm, u32 kind, u32 width, u64 a, u64 b) {
         u64 lo, hi;
         if (width >= 64) {
             i64 a = (i64)x, b = (i64)y;
-            unsigned __int128 p = (unsigned __int128)(u64)a * (unsigned __int128)(u64)(b);
             /* 有符号高半 = 无符号高半 − (a<0 ? b : 0) − (b<0 ? a : 0) */
-            u64 uh = (u64)(p >> 64);
+            u64 uh = 0;
+            vm_mul64_full((u64)a, (u64)b, &uh, &lo);
             u64 uh2 = uh - (a < 0 ? (u64)b : 0ull) - (b < 0 ? (u64)a : 0ull);
-            lo = (u64)p;
             hi = uh2;
         } else {
             i64 p = (i64)sign_extend_w(x, width) * (i64)sign_extend_w(y, width);
@@ -282,7 +299,7 @@ static u64 alu_apply(vm_ctx_t *vm, u32 kind, u32 width, u64 a, u64 b) {
         u64 m = width_mask(width);
         u64 hi;
         if (width >= 64) {
-            hi = (u64)(((unsigned __int128)x * (unsigned __int128)y) >> 64);
+            { u64 dummy = 0; vm_mul64_full(x, y, &hi, &dummy); }
         } else {
             hi = ((x & m) * (y & m)) >> width;
         }
