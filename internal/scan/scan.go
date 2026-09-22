@@ -37,8 +37,12 @@ func findFunctionRaw(path string, f *pe.File, name string) (*Found, error) {
 	defer df.Close()
 
 	var target *dbgpe.Symbol
+	/* i386 的 COFF 符号带**前导下划线**（`int vm32_sum10()` → 符号 `_vm32_sum10`），
+	 * 而调用方给的是源码里的名字 ⇒ 两种写法都要试。
+	 * （同一个坑先前在 cmd/vmpbuild 读 COFF 时踩过，见 STATUS #441/#453。） */
+	alt := "_" + name
 	for _, s := range df.Symbols {
-		if s.Name == name && s.SectionNumber > 0 {
+		if (s.Name == name || s.Name == alt) && s.SectionNumber > 0 {
 			target = s
 			break
 		}

@@ -166,13 +166,16 @@ type Arch string
 const (
 	ArchX64   Arch = "x86-64"
 	ArchARM64 Arch = "arm64"
+	// ArchX86：32 位 PE（i386）。thunk 与入口补丁和 x86-64 **同编码**（E8/E9 rel32，都是 5 字节），
+	// 所以编码参数与 x64 共用一支；真正的差异在 PE 重定位类型（HIGHLOW=3，而不是 DIR64=10）。
+	ArchX86 Arch = "x86"
 )
 
 // archInfo 每个架构的编码参数（thunk 长度与入口补丁长度）
 func (a Arch) info() (thunkLen, patchLen int, err error) {
 	switch a {
-	case "", ArchX64:
-		return 5, 5, nil // E8 rel32 / E9 rel32
+	case "", ArchX64, ArchX86:
+		return 5, 5, nil // E8 rel32 / E9 rel32（i386 与 x86-64 同编码）
 	case ArchARM64:
 		// 入口补丁 8 字节：mov x16, x30（先把调用方的返回地址挪到 IP0）+ b thunk
 		// 为什么不只用 4 字节的 b：thunk 里的 BL vm_entry 会覆盖 X30（LR），

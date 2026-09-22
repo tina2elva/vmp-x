@@ -29,6 +29,7 @@ import (
 
 	"github.com/vmpx/vmp-x/internal/cred"
 	arm64dec "github.com/vmpx/vmp-x/internal/decode/arm64"
+	x64dec "github.com/vmpx/vmp-x/internal/decode/x64"
 	"github.com/vmpx/vmp-x/internal/inject"
 	"github.com/vmpx/vmp-x/internal/ir"
 	arm64lift "github.com/vmpx/vmp-x/internal/lift/arm64"
@@ -330,13 +331,10 @@ func main() {
 		case 0x8664:
 			arch = inject.ArchX64
 		case pe.MachineI386:
-			// 32 位（PE32）：**解析**已经支持（internal/load/pe 的 PE32/PE32+ 双分支，见 STATUS #423），
-			// 但注入还不行 —— VM blob 只有 64 位平台（stub/win/x64、stub/win/arm64）。
-			// 要真正支持得先有 32 位 blob：需要 i686 工具链（本机 gcc 无 -m32、无 clang）。
-			// 这里保持**明确拒绝**，不产出坏产物。
-			fatalf("目标是 32 位 PE（机器类型 0x14C）：vmp-x 的 VM blob 目前只有 64 位平台，无法注入。\n" +
-				"    可行路径：在 CI（有 clang）上用 --target=i686-pc-windows-msvc -c 编 32 位 blob，再走 -merge go 合并；\n" +
-				"    或在本机装 i686-w64-mingw32 工具链（例如 msys2 的 mingw-w64-i686-gcc）。详见 docs/TODO.md 的 PE32 一节。")
+			// 32 位（PE32）：blob 用 stub/win/x86（i686 工具链编，见 docs/PE32.md）。
+			// 编码层面与 x86-64 同构（E8/E9 rel32），差异是 PE 重定位类型（HIGHLOW=3）与
+			// 32 位指针宽度；blob 里的绝对引用已在 blob 内被登记成基址站点表。
+			arch = inject.ArchX86
 		default:
 			fatalf("不支持的 PE 机器类型 0x%X", binary.LittleEndian.Uint16(head[peOff+4:]))
 		}
@@ -377,7 +375,7 @@ func main() {
 		}
 		*section = sectionNamesFor(*section)
 		bytecodeLimitFlag = bytecodeLimit(man.Symbols, stub)
-		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, man.FieldMaskSalt, *stripRelocs, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
+		res = packPE(*exe, outPath, stub, entryOff, man.FrameSkew, man.DescMagic, patchKey, imgMaster, man.FieldMaskSalt, *stripRelocs, verifyFn, man.Symbols["vm_unpack_image"], scratchOff, scratchLen, man.Symbols["vm_reloc_tab"], man.BSSOff, man.BSSSize, man.Symbols["vm_xmm"], man.Symbols["vm_tmp"], funcs, opcodeMap, enc, arch, *verbose, *section, *reportPath)
 	}
 
 	for _, p := range res.Placements {
@@ -502,11 +500,11 @@ func liftAll(lifter liftIface, names []string, find func(string) (*scan.Found, e
 	return specs, nil
 }
 
-func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, fieldMaskSalt uint32, stripRelocs bool, verifyFn, unpackFn, scratchOff, scratchLen, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
+func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic uint32, patchKey [8]byte, master []byte, fieldMaskSalt uint32, stripRelocs bool, verifyFn, unpackFn, scratchOff, scratchLen, relocTabOff, bssOff, bssSize, xmmOff, tmpOff int, funcs []string, opcodeMap *vm.OpcodeMap, enc inject.EncryptFunc, arch inject.Arch, verbose bool, section, report string) *inject.Result {
 	f, err := pe.Open(exe)
 	must(err)
-	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 {
-		fatalf("只支持 x86-64 / arm64 的 PE，该文件 Machine=0x%X", f.Machine)
+	if f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64 && f.Machine != pe.MachineI386 {
+		fatalf("只支持 x86-64 / arm64 / i386 的 PE，该文件 Machine=0x%X", f.Machine)
 	}
 	fmt.Printf("[*] 目标: %s", f.Summary())
 
@@ -526,7 +524,11 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 		a64 := &arm64lift.Lifter{ImageBase: f.ImageBase, FrameSkew: uint64(frameSkew)}
 		lifter = a64Adapter{a64}
 	} else {
-		lx := x64.NewLifter(f.ImageBase)
+		// i386 目标必须用 Mode32 的 lifter（绝对 [disp32] 寻址、字节序/宽度都不同）。
+		lx := x64.NewLifterMode(f.ImageBase, x64dec.Mode64)
+		if f.Is32Bit() {
+			lx = x64.NewLifterMode(f.ImageBase, x64dec.Mode32)
+		}
 		lx.SetFrameSkew(int64(frameSkew))
 		// SIMD：XMM 寄存器堆在 blob 的 .bss 里，符号表给出它在 blob 内的偏移；
 		// 目标镜像里的 RVA = 预测的 payload RVA + 该偏移（Apply 用同一个 NextRVA 计算，是确定的）。
@@ -567,7 +569,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	case imgMaster == nil:
 		imgSkip = "-no-encrypt（没有主密钥，无法验签/解密）"
 	case f.Machine != pe.MachineAMD64 && f.Machine != pe.MachineARM64:
-		imgSkip = "只支持 x86-64 / arm64 的 PE"
+		imgSkip = "原镜像整体加密目前只支持 x86-64 / arm64（i386 先跳过这一项）"
 	case f.Characteristics&0x2000 != 0 && !encImageDLLEnabled:
 		imgSkip = "目标是 DLL（已用 -no-enc-image-dll 关闭）"
 	}
@@ -674,51 +676,90 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 			// (6) payload 里那些**绝对 VA** 也必须让加载器重定位，否则它们仍指向首选基址。
 			// 实测漏掉它们：加载器按 TLS 回调数组跳到"首选基址 + rva"的旧地址 -> 0xC0000005。
 			// payload 节不参与整体加密，所以运行期不需要对它们做"先减后加"。
-			var items [][2]uint32
-			if origTLSRVA != 0 && res.TlsDirRVA != 0 {
-				for _, e := range origRelocEntries(f) {
-					if e[1] >= origTLSRVA && e[1] < origTLSRVA+40 {
-						items = append(items, [2]uint32{e[0], res.TlsDirRVA + (e[1] - origTLSRVA)})
-					}
+		}
+
+	}
+	/* payload 的基址重定位与镜像加密**无关**：原来嵌在 if len(imgSecs)>0 里，
+	 * 于是 i386（跳过镜像加密）与 -no-enc-image 的情形下这段根本不执行 —— 实测因此
+	 * 打包产物能跑但结果错。现在移到外面，并保留"拆表时不追加"的语义。 */
+	if !stripRelocs {
+		var items [][2]uint32
+		if origTLSRVA != 0 && res.TlsDirRVA != 0 {
+			for _, e := range origRelocEntries(f) {
+				if e[1] >= origTLSRVA && e[1] < origTLSRVA+40 {
+					items = append(items, [2]uint32{e[0], res.TlsDirRVA + (e[1] - origTLSRVA)})
 				}
-			}
-			if res.ImgTlsArrayRVA != 0 {
-				for i := 0; i < 1+len(imgTLS); i++ { // 终止项是 0，不需要（也不该）重定位
-					items = append(items, [2]uint32{10, res.ImgTlsArrayRVA + uint32(i*8)})
-				}
-			}
-			if len(items) > 0 {
-				if err := appendRelocs(f, items); err != nil {
-					fatalf("补 payload 重定位项失败: %v", err)
-				}
-				fmt.Printf("[*] payload 里的绝对 VA 补了 %d 个重定位项（ASLR 下必须）", len(items))
-				fmt.Println()
 			}
 		}
-		tlsDir := tlsDirectoryRVA(f)
-		if len(loadCfgCopy) > 0 && res.LoadCfgRVA != 0 {
-			if err := setLoadConfigDirectoryRVA(f, res.LoadCfgRVA); err != nil {
-				fatalf("重指 LOAD_CONFIG 数据目录失败: %v", err)
-			}
-			fmt.Printf("[*] LOAD_CONFIG 数据目录已重指到 payload RVA=0x%X", res.LoadCfgRVA)
-			fmt.Println()
-		}
-		if len(tlsDirCopy) > 0 && res.TlsDirRVA != 0 {
-			if err := setTLSDirectoryRVA(f, res.TlsDirRVA); err != nil {
-				fatalf("重指 TLS 数据目录失败: %v", err)
-			}
-			tlsDir = res.TlsDirRVA
+		/* 重定位类型与指针宽度都按镜像位宽选：
+		 *   PE32+ : IMAGE_REL_BASED_DIR64 = 10，8 字节
+		 *   PE32  : IMAGE_REL_BASED_HIGHLOW = 3，4 字节 */
+		relType := uint32(10)
+		ptrSize := uint32(8)
+		if f.Is32Bit() {
+			relType = 3
+			ptrSize = 4
 		}
 		if res.ImgTlsArrayRVA != 0 {
-			if err := setTLSCallbacks(f, tlsDir, f.ImageBase+uint64(res.ImgTlsArrayRVA)); err != nil {
-				fatalf("改写 TLS 回调数组失败: %v", err)
+			for i := 0; i < 1+len(imgTLS); i++ { // 终止项是 0，不需要（也不该）重定位
+				items = append(items, [2]uint32{relType, res.ImgTlsArrayRVA + uint32(i)*ptrSize})
 			}
 		}
-		if stripRelocs {
-			fmt.Println("[*] 原镜像已原地加密，并清除 DYNAMIC_BASE（加载器因此不做重定位）")
-		} else {
-			fmt.Println("[*] 原镜像已原地加密（重定位保留：运行期先减回去、解密、再加回来）")
+		/* blob 里的**基址相关站点**（i386 的 DIR32 ⇒ vmpbuild 记进了 blob 末尾的表）：
+		 * 字段存的是"blob 相对偏移"，必须由加载器加上镜像基址。这是"入口自修复"的
+		 * **标准替代**：交给加载器一次性完成，既不会重复施加，也天然支持 ASLR。 */
+		if relocTabOff > 0 && relocTabOff+4 <= len(stub) && res.SectionRVA != 0 {
+			n := int(binary.LittleEndian.Uint32(stub[relocTabOff:]))
+			for i := 0; i < n; i++ {
+				p := relocTabOff + 4 + i*4
+				if p+4 > len(stub) {
+					break
+				}
+				site := binary.LittleEndian.Uint32(stub[p:])
+				rva := res.SectionRVA + site
+				/* 关键：HIGHLOW 的语义是"字段 += 实际基址 − 首选基址"，
+				 * 所以字段里必须先放**首选基址下的绝对 VA**；blob 里存的是"blob 相对偏移"，
+				 * 这里再补上"首选基址 + payload RVA"。少了这一步就是"加载器加完仍不是有效地址"。 */
+				if off, e := f.RVAtoOffset(rva); e == nil && off >= 0 && off+4 <= len(f.Data) {
+					cur := binary.LittleEndian.Uint32(f.Data[off:])
+					binary.LittleEndian.PutUint32(f.Data[off:], uint32(f.ImageBase)+res.SectionRVA+cur)
+				}
+				items = append(items, [2]uint32{relType, rva})
+			}
+			fmt.Printf("[*] blob 基址站点补了 %d 个重定位项（type=%d）", n, relType)
+			fmt.Println()
 		}
+		if len(items) > 0 {
+			if err := appendRelocs(f, items); err != nil {
+				fatalf("补 payload 重定位项失败: %v", err)
+			}
+			fmt.Printf("[*] payload 里的绝对 VA 补了 %d 个重定位项（ASLR 下必须）", len(items))
+			fmt.Println()
+		}
+	}
+	tlsDir := tlsDirectoryRVA(f)
+	if len(loadCfgCopy) > 0 && res.LoadCfgRVA != 0 {
+		if err := setLoadConfigDirectoryRVA(f, res.LoadCfgRVA); err != nil {
+			fatalf("重指 LOAD_CONFIG 数据目录失败: %v", err)
+		}
+		fmt.Printf("[*] LOAD_CONFIG 数据目录已重指到 payload RVA=0x%X", res.LoadCfgRVA)
+		fmt.Println()
+	}
+	if len(tlsDirCopy) > 0 && res.TlsDirRVA != 0 {
+		if err := setTLSDirectoryRVA(f, res.TlsDirRVA); err != nil {
+			fatalf("重指 TLS 数据目录失败: %v", err)
+		}
+		tlsDir = res.TlsDirRVA
+	}
+	if res.ImgTlsArrayRVA != 0 {
+		if err := setTLSCallbacks(f, tlsDir, f.ImageBase+uint64(res.ImgTlsArrayRVA)); err != nil {
+			fatalf("改写 TLS 回调数组失败: %v", err)
+		}
+	}
+	if stripRelocs {
+		fmt.Println("[*] 原镜像已原地加密，并清除 DYNAMIC_BASE（加载器因此不做重定位）")
+	} else {
+		fmt.Println("[*] 原镜像已原地加密（重定位保留：运行期先减回去、解密、再加回来）")
 	}
 	must(f.Save(outPath))
 	fmt.Printf("[*] 新节 %s: RVA=0x%X size=0x%X | vm_entry RVA=0x%X",
@@ -1190,10 +1231,24 @@ func verifyArtifact(orig, packed, args, filter string, timeoutSec int) error {
 	return fmt.Errorf("输出不同（原始 %d 行 / 受保护 %d 行）", len(wl), len(gl))
 }
 
+// dirBase 返回**数据目录**数组在文件里的起始偏移。
+// 两者不同只因为 NumberOfRvaAndSizes 的位置不同（它前面是 PE32 独有的 BaseOfData + 4 字节 ImageBase）：
+//
+//	PE32  : NumberOfRvaAndSizes @ 92, 数据目录 @ 96
+//	PE32+ : NumberOfRvaAndSizes @ 108, 数据目录 @ 112
+//
+// 其余字段（含 DllCharacteristics@70）在 ImageBase 之后会自动对齐，所以只有这一处需要分位宽。
+func dirBase(f *pe.File) int {
+	if f.Is32Bit() {
+		return f.OptHeaderOffset + 96
+	}
+	return f.OptHeaderOffset + 112
+}
+
 // origRelocEntries 读出原镜像的重定位项（type, rva）。stripRelocations 之后就再也读不到了。
 func origRelocEntries(f *pe.File) [][2]uint32 {
 	const relocDir = 5
-	o := f.OptHeaderOffset + 112 + relocDir*8
+	o := dirBase(f) + relocDir*8
 	if o+8 > len(f.Data) {
 		return nil
 	}
@@ -1234,7 +1289,7 @@ func appendRelocs(f *pe.File, items [][2]uint32) error {
 		return nil
 	}
 	const relocDir = 5
-	do := f.OptHeaderOffset + 112 + relocDir*8
+	do := dirBase(f) + relocDir*8
 	rva := binary.LittleEndian.Uint32(f.Data[do:])
 	size := binary.LittleEndian.Uint32(f.Data[do+4:])
 	if rva == 0 {
@@ -1301,7 +1356,7 @@ func appendRelocs(f *pe.File, items [][2]uint32) error {
 // 拆掉重定位表之后，加载器**只能**落在首选基址；落不下就明确失败，而不是悄悄跑飞。
 func stripRelocations(f *pe.File) {
 	const relocDir = 5
-	o := f.OptHeaderOffset + 112 + relocDir*8
+	o := dirBase(f) + relocDir*8
 	if o+8 <= len(f.Data) {
 		rva := binary.LittleEndian.Uint32(f.Data[o:])
 		binary.LittleEndian.PutUint32(f.Data[o:], 0)
@@ -1399,7 +1454,7 @@ func clearDynamicBase(f *pe.File) {
 // 注意：仅仅存在 TLS 目录是无害的（mingw 的 exe 几乎都有），关键是**回调**——它们在
 // 入口点之前运行，那时 .text 还是密文，所以我们必须把自己的回调插到数组最前面。
 func tlsCallbacks(f *pe.File) []uint64 {
-	o := f.OptHeaderOffset + 112 + 9*8
+	o := dirBase(f) + 9*8
 	if o+8 > len(f.Data) {
 		return nil
 	}
@@ -1537,7 +1592,7 @@ func loaderDirConflict(f *pe.File, s pe.Section) string {
 	}
 	end := s.VirtualAddress + s.SizeOfRawData
 	for _, d := range dirs {
-		o := f.OptHeaderOffset + 112 + d.idx*8
+		o := dirBase(f) + d.idx*8
 		if o+8 > len(f.Data) {
 			continue
 		}
@@ -1577,7 +1632,7 @@ func resolveLoaderConflict(loadCfgCopy *[]byte, f *pe.File, s pe.Section) string
 
 // loadConfigDirRVASize 返回 LOAD_CONFIG 数据目录（索引 10）的 (RVA, size)。
 func loadConfigDirRVASize(f *pe.File) (uint32, uint32) {
-	o := f.OptHeaderOffset + 112 + 10*8
+	o := dirBase(f) + 10*8
 	if o+8 > len(f.Data) {
 		return 0, 0
 	}
@@ -1586,7 +1641,7 @@ func loadConfigDirRVASize(f *pe.File) (uint32, uint32) {
 
 // setLoadConfigDirectoryRVA 把 LOAD_CONFIG 数据目录重新指向 payload 里的那份副本。
 func setLoadConfigDirectoryRVA(f *pe.File, rva uint32) error {
-	o := f.OptHeaderOffset + 112 + 10*8
+	o := dirBase(f) + 10*8
 	if o+8 > len(f.Data) {
 		return fmt.Errorf("没有 LOAD_CONFIG 目录项")
 	}
@@ -1596,7 +1651,7 @@ func setLoadConfigDirectoryRVA(f *pe.File, rva uint32) error {
 
 // tlsDirectoryRVA 返回 TLS 数据目录指向的 RVA（0 = 没有）。
 func tlsDirectoryRVA(f *pe.File) uint32 {
-	o := f.OptHeaderOffset + 112 + 9*8
+	o := dirBase(f) + 9*8
 	if o+8 > len(f.Data) {
 		return 0
 	}
@@ -1605,7 +1660,7 @@ func tlsDirectoryRVA(f *pe.File) uint32 {
 
 // setTLSDirectoryRVA 把 TLS 数据目录重新指向 payload 里的那份副本。
 func setTLSDirectoryRVA(f *pe.File, rva uint32) error {
-	o := f.OptHeaderOffset + 112 + 9*8
+	o := dirBase(f) + 9*8
 	if o+8 > len(f.Data) {
 		return fmt.Errorf("没有 TLS 目录项")
 	}
