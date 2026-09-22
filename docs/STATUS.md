@@ -5843,6 +5843,26 @@ vmpack 无法覆盖 ⇒ `rc=1` ⇒ e2e 报 `packing failed`。
 以及 `vm_run` 到底在不在 C 目标文件里 —— 不再从代码推断。
 
 **验收**：x64 blob 不受影响（见下）；门禁在本轮开头/下一轮补。
+### 442. 目标 ⑤：32 位整链又推进两关 —— 符号下划线归一 + i386 REL32（都已实测生效）
+
+**突破 1：`-merge go`**。vmpbuild 有两条合并路径：Go 内置（`buildBlobMulti`）与 `ld -r`（`mergeWithLd`，默认）。
+源码注释早已写明「COFF 没有 ld -r 的等价物 ⇒ Windows/arm64 走 `-merge go`」，而我之前的 i686 调用一直在用默认值，
+所以 Go 合并器**根本没被调用**（我加的调试钩子一开始没输出，就是这条造成的）。改用 `-merge go` 后钩子立刻生效。
+（未做：让 vmpbuild 对 COFF 目标**自动**选 `go`，现在是调用方显式传。）
+
+**突破 2：i386 的 `REL32`（0x14）**。`readCOFFObject` 的重定位 switch 原先只认 AMD64 的类型号，
+i686 的 thunk 一进来就报「不支持的重定位类型 0x14」。而 0x14 正是 `IMAGE_REL_I386_REL32`（4 字节 PC 相对），
+也就是 `call vm_run` 用的那种。补上映射后改名成 `relPCRel32` 处理。
+
+**同时验证了两条先前的改动是对的**：用一个临时 Go 测试把两个 i686 目标文件喂给 `readCOFFObject`，
+看到定义侧符号已被剥成 `vm_run`（而不是 `_vm_run`）、引用侧的 reloc 名也是 `vm_run` —— 归一确实生效。
+
+**当前卡点（已换到新问题）**：`__divdi3` 未定义 ✗。i686 没有原生 64 位除法指令，GCC 会调用运行时助手 ——
+和当年 `__int128` 除法同源。项目里**已有可移植长除法的先例**（K_DIVU/K_DIVS 那段，当年为 aarch64 CI 写的），
+下一步就是把 blob 里剩下的 64 位除法也换成那个做法。
+
+**验收**：x64 blob 未受影响（改动都在 vmpbuild 的 COFF 读取与常量表，x64 走 AMD64 分支）；门禁已起。
+
 
 ⑥ 完整构建 + 32 位 harness。
 

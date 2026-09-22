@@ -169,6 +169,10 @@ func readCOFFObject(path string) (*objFile, error) {
 				continue
 			}
 			switch {
+			case r.Type == relI386Rel32:
+				/* i386 COFF 的 REL32 = 4 字节 PC 相对，正是 `call vm_run` 这种跨目标文件调用用的类型。
+				 * 之前只认 AMD64 的类型号，于是 i686 的 thunk 一进来就报「不支持的重定位类型 0x14」。 */
+				rel.Kind = relPCRel32
 			case r.Type == relAMD64Rel32:
 				rel.Kind = relPCRel32
 			case r.Type >= relAMD64Rel32+1 && r.Type <= relAMD64Rel32N:
@@ -197,10 +201,11 @@ const (
 	/* COFF（Windows 对象文件）*/
 	coffMachineARM64          = 0xAA64
 	coffMachineI386           = 0x014C
-	coffRelARM64Branch26      = 3 /* IMAGE_REL_ARM64_BRANCH26  : bl/b */
-	coffRelARM64PageBaseRel21 = 4 /* IMAGE_REL_ARM64_PAGEBASE_REL21 : adrp */
-	coffRelARM64PageOffset12A = 6 /* IMAGE_REL_ARM64_PAGEOFFSET_12A : add x, x, #:lo12:sym */
-	coffRelARM64PageOffset12L = 7 /* IMAGE_REL_ARM64_PAGEOFFSET_12L : ldr/str x, [x, #:lo12:sym]（按宽度缩放） */
+	relI386Rel32              = 0x0014 /* IMAGE_REL_I386_REL32：4 字节 PC 相对 */
+	coffRelARM64Branch26      = 3      /* IMAGE_REL_ARM64_BRANCH26  : bl/b */
+	coffRelARM64PageBaseRel21 = 4      /* IMAGE_REL_ARM64_PAGEBASE_REL21 : adrp */
+	coffRelARM64PageOffset12A = 6      /* IMAGE_REL_ARM64_PAGEOFFSET_12A : add x, x, #:lo12:sym */
+	coffRelARM64PageOffset12L = 7      /* IMAGE_REL_ARM64_PAGEOFFSET_12L : ldr/str x, [x, #:lo12:sym]（按宽度缩放） */
 
 	/* AArch64（ELF for the ARM 64-bit Architecture）*/
 	R_AARCH64_CALL26             = 283

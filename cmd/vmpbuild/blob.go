@@ -232,6 +232,7 @@ func buildBlobMulti(objs []*objFile) (*mergedBlob, error) {
 			m.symOff[s.Name] = off
 		}
 	}
+
 	return m, nil
 }
 
