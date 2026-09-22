@@ -5440,6 +5440,27 @@ CNG/TPM 里**私钥根本导不出来**，我们只能**让它签一段挑战**�
 - blob 真能编出来（调 `vmpbuild` 编一次再删掉临时产物）。
 
 **实测**：正常 ⇒ `[+] preflight: OK`、exit=0；故意藏掉 `build/vmpack.exe` ⇒
+### 423. 目标项 ③ 第一步：PE32 **解析**落地 + PE32 现状的实测评估
+
+**已落地（可测、不碰 blob）**：`internal/load/pe` 现在同时支持 PE32 与 PE32+ 的可选头 ——
+两者只有 `ImageBase` 不同（PE32: u32 @+28；PE32+: u64 @+24），其余字段偏移一致；
+新增 `OptMagicPE32`、`MachineI386`、`File.OptMagic`、`File.Is32Bit()`。
+
+**测试**：`internal/load/pe/pe32_test.go` —— 合成 PE32（machine/入口/对齐/节 全断言）+ **真实 32 位 exe**
+`C:\Windows\SysWOW64\notepad.exe`：实测 `base=0x400000 entry=0x25FF0 sections=6` ✓（没有该文件就 skip）。
+
+**拒绝路径保持"明确拒绝"，但提示改成可操作**：`vmpack` 新增 `case pe.MachineI386`，
+对 `D:\demo_exe\demo32.exe` 实测：`exit=1`、**不产出产物**，提示两条可行路径（CI 用 clang 编 32 位 blob；
+或本机装 i686-w64-mingw32 工具链）。
+
+**评估的硬事实（决定了为什么这轮只能做"解析"）**：
+- 本机 `gcc -m32` **失败**（ucrt64 只有 64 位）、本机**没有 clang**（CI 里有）；
+- 现有 blob 平台没有 32 位（`stub/win/{x64,arm64}`、`stub/linux/{amd64,arm64}`）；
+- 要支持 PE32 还缺四块：32 位 blob 平台、32 位工具链（**当前硬阻塞**）、客户机 x86-32 语义、PE32 注入/重定位/harness。
+
+**未做（如实登记）**：32 位 blob、x86-32 客户机语义、PE32 注入、32 位 harness —— 见 `docs/TODO.md` 的 PE32 评估一节
+（含两条路 A/B 与各自的代价）。
+
 `[!] tool binaries and scripts exist` + `[!] preflight: 1 problem(s)`、**exit=1**；恢复后再次 `OK`。
 
 

@@ -22,9 +22,11 @@ const (
 	// PE 签名 "PE\0\0"
 	PeMagic = 0x00004550
 
+	MachineI386  = 0x14C
 	MachineAMD64 = 0x8664
 	MachineARM64 = 0xAA64
 
+	OptMagicPE32     = 0x10B
 	OptMagicPE32Plus = 0x20B
 
 	SectionHeaderSize = 40
@@ -60,6 +62,7 @@ type File struct {
 	Characteristics      uint16
 
 	OptHeaderOffset  int
+	OptMagic         uint16
 	SectionTableOff  int
 	SectionAlignment uint32
 	FileAlignment    uint32
@@ -71,6 +74,11 @@ type File struct {
 
 	Sections []Section
 }
+
+// Is32Bit 报告这是不是 32 位（PE32）镜像。
+// 注意：vmp-x 的 VM blob 目前只有 64 位平台（stub/win/x64、stub/win/arm64），
+// 所以 PE32 到这里能正确解析，但还**不能**被注入 —— 打包端会明确拒绝（见 cmd/vmpack）。
+func (f *File) Is32Bit() bool { return f.OptMagic == OptMagicPE32 }
 
 func u16(b []byte, off int) uint16 { return binary.LittleEndian.Uint16(b[off:]) }
 func u32(b []byte, off int) uint32 { return binary.LittleEndian.Uint32(b[off:]) }
@@ -109,15 +117,25 @@ func Parse(data []byte) (*File, error) {
 	if f.OptHeaderOffset+2 > len(data) {
 		return nil, fmt.Errorf("optional header out of range")
 	}
-	if magic := u16(data, f.OptHeaderOffset); magic != OptMagicPE32Plus {
-		return nil, fmt.Errorf("only PE32+ supported, got optional magic 0x%X", magic)
+	// PE32（0x10B，32 位）与 PE32+（0x20B，64 位）在下面这些字段上**偏移相同**，
+	// 只有 ImageBase 的宽度/偏移不同（PE32: u32 @+28；PE32+: u64 @+24）。
+	f.OptMagic = u16(data, f.OptHeaderOffset)
+	switch f.OptMagic {
+	case OptMagicPE32:
+		if f.OptHeaderOffset+96 > len(data) {
+			return nil, fmt.Errorf("optional header truncated")
+		}
+		f.AddressOfEntry = u32(data, f.OptHeaderOffset+16)
+		f.ImageBase = uint64(u32(data, f.OptHeaderOffset+28))
+	case OptMagicPE32Plus:
+		if f.OptHeaderOffset+112 > len(data) {
+			return nil, fmt.Errorf("optional header truncated")
+		}
+		f.AddressOfEntry = u32(data, f.OptHeaderOffset+16)
+		f.ImageBase = binary.LittleEndian.Uint64(data[f.OptHeaderOffset+24:])
+	default:
+		return nil, fmt.Errorf("unknown optional magic 0x%X", f.OptMagic)
 	}
-	if f.OptHeaderOffset+112 > len(data) {
-		return nil, fmt.Errorf("optional header truncated")
-	}
-
-	f.AddressOfEntry = u32(data, f.OptHeaderOffset+16)
-	f.ImageBase = binary.LittleEndian.Uint64(data[f.OptHeaderOffset+24:])
 	f.SectionAlignment = u32(data, f.OptHeaderOffset+32)
 	f.FileAlignment = u32(data, f.OptHeaderOffset+36)
 	f.SizeOfImage = u32(data, f.OptHeaderOffset+56)

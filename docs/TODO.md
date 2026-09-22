@@ -21,6 +21,40 @@
 > **已完成**：工具授权（构建凭据）✅、委派签发（canIssue）✅、运行期强制 ✅、商业化闭环可复跑脚本 `tools/acceptance_demo.ps1`（23/23）✅
 > **已经过时/删掉**：授权层设计基线里"路线 B 未实现"的描述、运行期强制 WIP 段、Ed25519 描述（已换 ECDSA P-256）、密钥纪元分发策略（已落地）。
 >
+## PE32（32 位 x86 客户机）评估 —— 硬事实与两条路（本轮实测）
+
+**今天的行为（保持"明确拒绝"）**：`vmpack` 对 PE32 直接拒绝，且提示已改成可操作的两条路径。
+拒绝点：`cmd/vmpack/main.go` 的机器类型 switch（新增 `case pe.MachineI386`）。
+
+**本轮已落地（不碰 blob，可测）**：`internal/load/pe` 支持 **PE32 解析** ——
+可选头走 0x10B/0x20B 双分支（两格式只有 `ImageBase` 不同：PE32 是 u32 @+28，PE32+ 是 u64 @+24），
+新增 `OptMagicPE32`、`MachineI386`、`File.OptMagic`、`File.Is32Bit()`；
+回归测试 `internal/load/pe/pe32_test.go`：合成 PE32 用例 + **真实 `C:\Windows\SysWOW64\notepad.exe`**
+（实测 `base=0x400000 entry=0x25FF0 sections=6`）。
+
+**硬事实（本轮实测，决定了"最小里程碑"的边界）**
+
+| 事实 | 证据 |
+|---|---|
+| 本机 **gcc 没有 32 位能力** | `gcc -m32` 失败（`ld` 跳过不兼容的 `libmingw32.a`，ucrt64 只有 64 位） |
+| 本机 **没有 clang** | `clang --version` → 命令不存在（CI 里有，arm64 那条路在用） |
+| PE32 样本齐备 | `C:\Windows\SysWOW64\notepad.exe`、`D:\demo_exe\demo32.exe`（43 KB） |
+| blob 有两条合并路径 | `vmpbuild -merge ld`（x86-64 默认）/ `-merge go`（内置直拼，COFF 用） |
+| 现有 blob 平台 | `stub/win/x64`、`stub/win/arm64`、`stub/linux/{amd64,arm64}` —— **没有 32 位** |
+
+**要真正支持 PE32，缺的是四块（按依赖顺序）**
+1. **32 位 blob 平台** `stub/win/x86`：VM 解释器 + 入口蹦床（AT&T 内联汇编 ⇒ 需要 GCC/Clang **不能**用 MSVC）；
+2. **32 位工具链**：这是当前的**硬阻塞** —— 本机没有 ⇒ 只能在 CI 用 clang
+   （`--target=i686-pc-windows-msvc -c`，freestanding 不需要 32 位 libc/头文件）+ `-merge go` 合并；
+3. **客户机 x86-32 语义**：解码要切 32 位模式（`golang.org/x/arch/x86/x86asm` 的 `Decode(..., 32)` 支持），
+   lift 与栈/ABI 语义（`__cdecl`/`__stdcall`、4 字节指针）要新增一条客户机 ISA —— 参考现有 `-guest arm64` 的结构；
+4. **PE32 注入 + 重定位 + 32 位宿主 harness**（`internal/inject` 现在只按 AMD64/ARM64 布局写）。
+
+**两条路（需要你定）**
+- **A（推荐，若 PE32 是真实需求）**：在 CI 里把 32 位 blob 编出来（clang + `-merge go`），本地只做 1/3/4；
+  代价：本地无法端到端验证 32 位产物 ⇒ 验证只能在 CI 上做（本目标的验收本来就含"CI 五作业全绿"）。
+- **B（若 32 位只是"客户顺手提到"）**：保持"明确拒绝 + 可操作提示"，把预算投在 PE64 的深度上。
+
 > 下面第 0–5 节保留**设计基线与历史记录**（很多文字描述的东西已经实现，看上面的表即可知道哪些还没做）。
 
 ## 0. 密钥纪元管理工具（客户反馈；工具已交付，剩下可选增强）

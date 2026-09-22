@@ -329,6 +329,14 @@ func main() {
 			arch = inject.ArchARM64
 		case 0x8664:
 			arch = inject.ArchX64
+		case pe.MachineI386:
+			// 32 位（PE32）：**解析**已经支持（internal/load/pe 的 PE32/PE32+ 双分支，见 STATUS #423），
+			// 但注入还不行 —— VM blob 只有 64 位平台（stub/win/x64、stub/win/arm64）。
+			// 要真正支持得先有 32 位 blob：需要 i686 工具链（本机 gcc 无 -m32、无 clang）。
+			// 这里保持**明确拒绝**，不产出坏产物。
+			fatalf("目标是 32 位 PE（机器类型 0x14C）：vmp-x 的 VM blob 目前只有 64 位平台，无法注入。\n" +
+				"    可行路径：在 CI（有 clang）上用 --target=i686-pc-windows-msvc -c 编 32 位 blob，再走 -merge go 合并；\n" +
+				"    或在本机装 i686-w64-mingw32 工具链（例如 msys2 的 mingw-w64-i686-gcc）。详见 docs/TODO.md 的 PE32 一节。")
 		default:
 			fatalf("不支持的 PE 机器类型 0x%X", binary.LittleEndian.Uint16(head[peOff+4:]))
 		}
