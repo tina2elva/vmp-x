@@ -973,6 +973,67 @@ static int vm_license_check(void) {
     return 1;
 }
 
+/* ---- Sentinel 后端（可选）---- 删掉这一段 + 不烘 kind 就回到"文件/环境变量取钥"。
+ * 设计要点：① 动态加载 hasp*.dll（**无导入表**，没狗也能启动）；② 路由由烘进产物的 kind 决定；
+ *           ③ kind>=2 时**严格模式**：只用狗，失败即硬门 —— 不回退文件/环境变量（堵降级攻击）。
+ * kind: 2 = Sentinel 真狗（hasp_login/hasp_read）  3 = 假狗文件（测试用，路径需 \??\... 形式）
+ * vm_key_src 放在 .data：它在自哈希区间 [0,bssOff) 内，静态改 kind 会让 vm_selfcheck() 直接拒绝。 */
+typedef struct __attribute__((aligned(8))) {
+    u32 kind, feature, fileID, offset, length, reserved;
+    char vendorCode[64];
+    char dllName[64];
+    char fakePath[128];
+} vm_key_src_t;
+
+__attribute__((section(".data"), used))
+volatile vm_key_src_t vm_key_src = {0, 0, 0, 0, 0, 0, {0}, {0}, {0}};
+
+u32 vm_sentinel_fail_stage; /* 卡在哪一步（1=假狗文件 2=加载 DLL 3=缺导出 4=登录 5=读取 15=未启用） */
+
+static int vm_key_from_sentinel(void) {
+    if (vm_key_src.kind == 3) {
+        u16 wpath[300];
+        u32 n = 0;
+        const char *p = (const char *)vm_key_src.fakePath;
+        while (p[n] && n < 280) { wpath[n] = (u16)(u8)p[n]; n++; }
+        wpath[n] = 0;
+        u8 buf[32];
+        u32 got = 0;
+        if (!vm_key_read_nt(wpath, buf, 32u, &got) || got < 32) { vm_sentinel_fail_stage = 1; return 0; }
+        { u32 i; for (i = 0; i < 32; i++) vm_master_buf[i] = buf[i]; }
+        return 1;
+    }
+    if (vm_key_src.kind == 2) {
+        const char *dll = vm_key_src.dllName[0] ? (const char *)vm_key_src.dllName : "hasp_windows.dll";
+        u64 h = vm_find_module(dll);
+        if (!h) {
+            static u16 wname[64];
+            u32 n = 0;
+            while (dll[n] && n < 63) { wname[n] = (u16)(u8)dll[n]; n++; }
+            wname[n] = 0;
+            h = vm_load_lib(wname);
+        }
+        if (!h) { vm_sentinel_fail_stage = 2; return 0; }
+        typedef i32 (*login_t)(u32, const char *, u32 *);
+        typedef i32 (*logout_t)(u32);
+        typedef i32 (*hread_t)(u32, u32, u32, u32, void *);
+        login_t pLogin = (login_t)vm_get_proc(h, "hasp_login");
+        logout_t pLogout = (logout_t)vm_get_proc(h, "hasp_logout");
+        hread_t pRead = (hread_t)vm_get_proc(h, "hasp_read");
+        if (!pLogin || !pLogout || !pRead) { vm_sentinel_fail_stage = 3; return 0; }
+        u32 handle = 0;
+        if (pLogin(vm_key_src.feature, (const char *)vm_key_src.vendorCode, &handle) != 0) { vm_sentinel_fail_stage = 4; return 0; }
+        u8 buf[32];
+        i32 st = pRead(handle, vm_key_src.fileID, vm_key_src.offset, 32u, buf);
+        pLogout(handle);
+        if (st != 0) { vm_sentinel_fail_stage = 5; return 0; }
+        { u32 i; for (i = 0; i < 32; i++) vm_master_buf[i] = buf[i]; }
+        return 1;
+    }
+    vm_sentinel_fail_stage = 15;
+    return 0;
+}
+
 static int vm_key_from_file(void) {
     const u16 *path = vm_key_path();
     if (!path || !*path) return 0;
@@ -1000,7 +1061,14 @@ const u8 *vm_master(void) {
      *           ② 环境变量 VMPX_KEY（64 位 hex，方便临时/CI 用）
      * 两者都拿不到、或与 KCV 不符 -> 硬门 0xC0DE0007。将来上硬件狗时，
      * 换掉的只是 ①（同一个函数接缝：把 vm_key_from_file 换成向狗询问即可）。 */
-    if (!vm_key_from_file() && !vm_key_from_env()) vm_key_reject();
+    /* 取钥路由由烘进产物的 kind 决定（vmpack 写 vm_key_src）：kind>=2 = **严格模式，只用狗**，
+     * 失败即硬门、不回退文件/环境变量；kind=0 时是今天的默认行为（文件 -> 环境变量），逐字节不变。 */
+    if (vm_key_src.kind >= 2) {
+        /* 对外统一 0xC0DE0007（契约）；卡在哪一步记在 vm_sentinel_fail_stage 里备查 */
+        if (!vm_key_from_sentinel()) vm_key_reject();
+    } else if (!vm_key_from_file() && !vm_key_from_env()) {
+        vm_key_reject();
+    }
     {   /* KCV 自检：在任何解密之前判定"手里这把主密钥对不对" */
         static const u8 want[VM_KEY_CHECK_LEN] = VM_KEY_CHECK_BYTES;
         u8 kcv[32];

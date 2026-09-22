@@ -5369,6 +5369,22 @@ CNG/TPM 里**私钥根本导不出来**，我们只能**让它签一段挑战**�
 **尚未做（如实登记）**：真后端的 `Products()`（`hasp_get_info`/`hasp_get_size`）还没实现 —— 现在返回明确错误；
 运行期（blob 侧）问狗的那条路也还没接（当前运行期仍用 `<产物>.vmplic.bin` + ECDSA 验签），
 那需要把 Sentinel API 也接进 blob（或改成"狗内解密"路线）。
+### 418. blob 侧 Sentinel 后端落地：主密钥可直接从狗取，**严格模式不回退**
+
+按上一轮定的清单做完（并采纳"编译进去 + 无回退"这个更强版本）：
+
+- `vm_key_src_t vm_key_src`（`kind/feature/fileID/offset/length` + `vendorCode[64]/dllName[64]/fakePath[128]`），
+  `.data` + `used`，**默认全零 = 不启用**；它在自哈希区间 `[0,bssOff)` 内 ⇒ 静态改 `kind` 会被 `vm_selfcheck()` 拒绝；
+- `kind=2` 真狗：`vm_find_module` 找不到就用已有的 `vm_load_lib` 动态加载 `hasp*.dll`，再 `hasp_login` → `hasp_read` → `hasp_logout`；
+- `kind=3` 假狗文件：复用 `vm_key_read_nt`（路径 `\??\…`）；
+- **严格模式**：`kind>=2` 只用狗，失败走硬门 —— **不回退文件/环境变量**；
+- 阶段记 `vm_sentinel_fail_stage`（1=假狗文件 2=加载 DLL 3=缺导出 4=登录 5=读取 15=未启用），对外统一 `0xC0DE0007`；
+- **可拆性**：删掉那段带标记的代码、或不烘 `kind` ⇒ 行为与今天**逐字节一致**；
+- `vmpack` 新增 `-dongle-key/-dongle-vendor-code/-dongle-feature/-dongle-dll/-dongle-fake-file`，补丁后**重算自哈希**。
+
+**实测**：`kind=3`（假狗文件）→ `check_key(10)=143`（=原生）；`kind=2` 但本机无狗 → **`rc=0xC0DE0007`、无输出**，
+且**旁边放着 `.vmpkey` 也不回退**；不写 dongle 参数（`kind=0`）→ `143`，行为与今天一致。
+
 
 
 要"私钥永不出芯片"得用 **TPM/CNG 不可导出密钥**（`NCryptCreatePersistedKey` + 用签名挑战代替比对公钥）—— 那是本条的下一步。

@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +83,11 @@ func main() {
 	licVendor := flag.String("license-vendor", "", "运行期强制：烘进产物的 vendorID（需 -key-external 构建的 blob）")
 	licProduct := flag.String("license-product", "", "运行期强制：该产物代表哪个产品（productID）")
 	licPub := flag.String("license-pub", "", "运行期强制：授权签发者的 ECDSA P-256 公钥（64 字节 X||Y 的 hex，或 .pub 文件）")
+	dongleKey := flag.String("dongle-key", "", "主密钥来自 Sentinel 加密狗：<fileID>:<offset>（严格模式：不回退文件/环境变量）")
+	dongleVC := flag.String("dongle-vendor-code", "", "Sentinel vendor code（hasp_login 用）")
+	dongleFeat := flag.Uint("dongle-feature", 0, "Sentinel feature id（hasp_login 用）")
+	dongleDLL := flag.String("dongle-dll", "", "Sentinel 运行时 DLL 名（默认 hasp_windows.dll）")
+	dongleFake := flag.String("dongle-fake-file", "", "测试用：假狗文件（kind=3；路径需为 \\??\\D:\\... 形式）")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
@@ -122,6 +128,59 @@ func main() {
 	entryOff, ok := man.Symbols["vm_entry"]
 	if !ok {
 		fatalf("%s 里没有 vm_entry 符号；请用 -entry vm_entry 构建 blob", *manPath)
+	}
+	if *dongleKey != "" || *dongleFake != "" {
+		off, ok := man.Symbols["vm_key_src"]
+		if !ok {
+			fatalf("该 blob 里没有 vm_key_src 符号（只有 -key-external 构建的 blob 才有 Sentinel 后端）")
+		}
+		if !man.KeyExternal {
+			fatalf("-dongle-* 需要 -key-external 构建出来的 blob")
+		}
+		if off < 0 || off+280 > len(stub) {
+			fatalf("vm_key_src 偏移 0x%X 越界", off)
+		}
+		putStr := func(at int, s string, cap int) {
+			if len(s) >= cap {
+				fatalf("字段太长（%d >= %d）: %s", len(s), cap, s)
+			}
+			for i := 0; i < cap; i++ {
+				stub[off+at+i] = 0
+			}
+			copy(stub[off+at:off+at+cap], s)
+		}
+		binary.LittleEndian.PutUint32(stub[off+16:], 32) // length：主密钥固定 32 字节
+		if *dongleFake != "" {
+			binary.LittleEndian.PutUint32(stub[off+0:], 3)
+			putStr(152, *dongleFake, 128)
+			fmt.Printf("[*] 主密钥来源：假狗文件（kind=3）%s\n", *dongleFake)
+		} else {
+			parts := strings.Split(*dongleKey, ":")
+			if len(parts) != 2 {
+				fatalf("-dongle-key 形式应为 <fileID>:<offset>")
+			}
+			fid, e1 := strconv.ParseUint(parts[0], 10, 32)
+			ofs, e2 := strconv.ParseUint(parts[1], 10, 32)
+			if e1 != nil || e2 != nil {
+				fatalf("-dongle-key 的两个数字解析失败")
+			}
+			binary.LittleEndian.PutUint32(stub[off+0:], 2) // kind=2 真狗
+			binary.LittleEndian.PutUint32(stub[off+4:], uint32(*dongleFeat))
+			binary.LittleEndian.PutUint32(stub[off+8:], uint32(fid))
+			binary.LittleEndian.PutUint32(stub[off+12:], uint32(ofs))
+			putStr(24, *dongleVC, 64)
+			putStr(88, *dongleDLL, 64)
+			fmt.Printf("[*] 主密钥来源：Sentinel 加密狗（kind=2，fileID=%d offset=%d feature=%d，严格模式不回退）\n", fid, ofs, *dongleFeat)
+		}
+		// 打完补丁必须重算自哈希（vm_key_src 在 [0,bssOff) 内，见 STATUS #399 那次教训）
+		if hoff, ok2 := man.Symbols["vm_self_hash"]; ok2 && man.BSSOff > 0 {
+			h := uint32(2166136261)
+			for _, b := range stub[:man.BSSOff] {
+				h = (h ^ uint32(b)) * 16777619
+			}
+			binary.LittleEndian.PutUint32(stub[hoff:], h)
+			fmt.Printf("[*] 已按补丁重算自哈希（覆盖 [0, 0x%X)）\n", man.BSSOff)
+		}
 	}
 	if *licVendor != "" || *licProduct != "" || *licPub != "" {
 		off, ok := man.Symbols["vm_license_meta"]
