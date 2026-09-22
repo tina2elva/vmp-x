@@ -462,8 +462,15 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		}
 		// (3) 校验表每条 24 字节整体加掩码（delta/len/check/selfRVA/funcRVA/codeLen）：
 		// 只蒙 funcRVA 而留着 delta 是自欺欺人 —— delta 就等于 funcRVA - tableRVA。
-		if len(opt.Master) == 32 {
-			mv := FieldMask(opt.Master, FieldMaskDomainVerify, opt.FieldMaskSalt)
+		/* 与描述符字段同理：**必须无条件加掩码**。运行期 vm_verify_table 总是按掩码解（否则
+		 * delta 会成垃圾 ⇒ p = base + delta 成野指针 ⇒ vm_patch_mac 里的 memcpy 直接 0xC0000005，
+		 * 实测 -no-encrypt 产物就崩在 blob 0xA740）。没有主密钥时用全零 master（与 vm_master() 一致）。 */
+		{
+			m := opt.Master
+			if len(m) != 32 {
+				m = make([]byte, 32)
+			}
+			mv := FieldMask(m, FieldMaskDomainVerify, opt.FieldMaskSalt)
 			for i := range opt.Funcs {
 				XorMask(data, vmEntriesAt+4+i*24, 24, mv[:24])
 			}
