@@ -72,6 +72,10 @@ func main() {
 		cmdCertIssue(os.Args[2:])
 	case "cert-show":
 		cmdCertShow(os.Args[2:])
+	case "cng-gen":
+		cmdCngGen(os.Args[2:])
+	case "cng-probe":
+		cmdCngProbe(os.Args[2:])
 	case "keygen":
 		cmdKeygen(os.Args[2:])
 	case "lic-new":

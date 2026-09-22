@@ -39,6 +39,25 @@ const KeyFileName = "vmpx.key"
 // KeyFileNameDPAPI：**受保护**的私钥文件名（DPAPI，绑本机+本用户）。存在时优先用它。
 const KeyFileNameDPAPI = "vmpx.key.dpapi"
 
+// KeyFileNameCNG：**CNG/TPM 不可导出密钥**的形式 —— 文件里只写密钥名，私钥在安全边界里。
+const KeyFileNameCNG = "vmpx.cng"
+
+// cngChallenge 是让 CNG 密钥签的那段挑战：绑住 vendorID 与凭据公钥，
+// 所以这段签名拿去另一个凭据上也验不过（不能跨凭据重放）。
+func cngChallenge(c *Cred) []byte {
+	return []byte("vmpx-cng:v1:" + c.VendorID + ":" + strings.ToLower(strings.TrimSpace(c.SubjectPub)))
+}
+
+// cngKeyName 读 <dir>/vmpx.cng（一行密钥名）。
+func cngKeyName(dir string) (string, bool) {
+	b, err := os.ReadFile(filepath.Join(dir, KeyFileNameCNG))
+	if err != nil {
+		return "", false
+	}
+	n := strings.TrimSpace(string(b))
+	return n, n != ""
+}
+
 // LoadToolKey 取本机的工具私钥：优先受保护形式，其次明文（并把风险喊出来）。
 func LoadToolKey(dir string) (raw []byte, note string, err error) {
 	dp := filepath.Join(dir, KeyFileNameDPAPI)
@@ -108,6 +127,20 @@ func PubHex(pub *ecdsa.PublicKey) string {
 	pub.X.FillBytes(out[0:32])
 	pub.Y.FillBytes(out[32:64])
 	return hex.EncodeToString(out)
+}
+
+// VerifySigDigest：用**预计算的摘要**验签（CNG 的 NCryptSignHash 收的就是摘要）。
+// sig 是原始 64 字节 r||s（不是 base64）。
+func VerifySigDigest(pub *ecdsa.PublicKey, digest, sig []byte) error {
+	if len(sig) != 64 {
+		return fmt.Errorf("签名长度不是 64 字节（%d）", len(sig))
+	}
+	r := new(big.Int).SetBytes(sig[0:32])
+	s := new(big.Int).SetBytes(sig[32:64])
+	if !ecdsa.Verify(pub, digest, r, s) {
+		return fmt.Errorf("签名验证失败")
+	}
+	return nil
 }
 
 func VerifySig(pub *ecdsa.PublicKey, msg []byte, sigB64 string) error {
@@ -204,8 +237,25 @@ func Require(explicitCredPath, vendorID string) error {
 		return fmt.Errorf("凭据里的 vendorID（%s）与本次构建声明的（%s）不一致", c.VendorID, vendorID)
 	}
 	// 关键：凭据必须与本机那把私钥配对 —— 只拷 .cred 拷不走权限。
-	// 私钥优先用 DPAPI 保护形式（vmpx.key.dpapi）：那样连"拷走文件"都不成立。
-	raw, _, kerr := LoadToolKey(filepath.Dir(path))
+	dir := filepath.Dir(path)
+	// (1) 最优：CNG/TPM 不可导出密钥。私钥不在任何文件里，只能"签挑战"证明它在本机。
+	if name, ok := cngKeyName(dir); ok {
+		sub, perr := PubFromHex(c.SubjectPub)
+		if perr != nil {
+			return perr
+		}
+		ch := cngChallenge(c)
+		sig, serr := CNGSignChallenge(name, ch)
+		if serr != nil {
+			return fmt.Errorf("CNG/TPM 密钥不可用（%s）：%w", name, serr)
+		}
+		if verr := VerifySigDigest(sub, sha256Sum(ch), sig); verr != nil {
+			return fmt.Errorf("CNG/TPM 密钥的挑战签名验不过（凭据绑的不是这把密钥，或密钥被换过）: %w", verr)
+		}
+		return nil
+	}
+	// (2) 次优：DPAPI 保护的私钥文件；再退明文。
+	raw, _, kerr := LoadToolKey(dir)
 	if kerr != nil {
 		return kerr
 	}

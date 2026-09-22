@@ -5312,6 +5312,36 @@ FP 隔离套件（`cvt32/cvt64/localrt/acc/divd`）五个函数**全部**与原�
 | 只放明文 `vmpx.key` | 仍可用，但 stderr 警告"拷走它即可绕过工具授权" |
 
 **边界（如实写进文档）**：DPAPI 用户作用域**不防同一用户下的本机攻击**，也不防内存抓取；
+### 415. 工具授权私钥进 **TPM（CNG 不可导出密钥）**：私钥不再以任何文件形式存在
+
+**与 DPAPI 的本质区别**：DPAPI 保护的是"磁盘上的密钥文件"——同一用户在本机仍可解密（内存抓取/本机攻击挡不住）；
+CNG/TPM 里**私钥根本导不出来**，我们只能**让它签一段挑战**，用公钥验签来证明"它在这台机器上"。
+于是：拷走全部文件、dump 内存，都拿不到可用私钥。
+
+**改动**
+- `internal/cred/ncrypt_windows.go`：`NCryptOpenStorageProvider` → `NCryptCreatePersistedKey`/`NCryptFinalizeKey`/`NCryptOpenKey`/`NCryptExportKey`/`NCryptSignHash`（`ncrypt.dll`，stdlib `syscall`）；
+  提供程序**优先 `Microsoft Platform Crypto Provider`（TPM）**，不可用才退 `Microsoft Software Key Storage Provider`；
+- `internal/cred/ncrypt_other.go`：非 Windows 明确报错；
+- `cred.Require` 增加**第三种形式** `vmpx.cng`（文件里只有**密钥名**）：签 `vmpx-cng:v1:<vendorID>:<subjectPub>` 挑战 → 用凭据公钥验签；
+  挑战绑住 vendorID + 公钥，所以签名**不能跨凭据重放**；
+- `vmpepoch cng-gen --name <n> --out <前缀>`（生成密钥 + 写 `<前缀>.pub` / `<前缀>.cng`）、`cng-probe --name <n>`（试着导出私钥，应当被拒）。
+
+**实测（本机，`cng-gen` 显示提供程序 = `Microsoft Platform Crypto Provider` ⇒ 真的用了 TPM）**
+
+| 用例 | 结果 |
+|---|---|
+| `cng-gen --name vmpx-cng-ACME` | 生成 `<前缀>.pub`(129B hex) 与 `<前缀>.cng`(14B，只有密钥名) |
+| **尝试导出私钥**（自证 + `cng-probe`） | **被拒绝**：`导出私钥被拒绝（0x8009000A）` |
+| 发布版工具 + 凭据 + `vmpx.cng` | **exit=0**，正常干活 |
+| 负例：凭据绑的是**别的公钥**，却部署 TPM 的 `.cng` | **exit=8**：`CNG/TPM 密钥的挑战签名验不过（凭据绑的不是这把密钥，或密钥被换过）: 签名验证失败` |
+| 负例：`vmpx.cng` 里写一个**不存在的密钥名** | **exit=8**：`CNG/TPM 密钥不可用（no-such-key）… NCryptOpenKey 失败` |
+
+**部署形态（给客户）**：`vmpepoch cng-gen --name <密钥名> --out vmpx` → 把 `vmpx.pub` 交给厂商换凭据；
+把 **`vmpx.cng` + `vmpx.cred`** 放进工具目录即可（私钥不在任何文件里）。
+
+**遗留**：软件 KSP 兜底时"不可导出"只到 CNG 层面（同机管理员仍可能有办法）；真正的硬件保证要在有 TPM 的机器上走第一档（本机已走）。
+仍需做的：把 `cng-gen`/`cng-probe` 写进 `docs/` 的使用说明，并在 `tools/e2e.ps1` 里加一条不带 TPM 也能过的正例（当前靠本机 TPM 才有完整证据）。
+
 要"私钥永不出芯片"得用 **TPM/CNG 不可导出密钥**（`NCryptCreatePersistedKey` + 用签名挑战代替比对公钥）—— 那是本条的下一步。
 
 客户 demo 会打印基址/函数地址，正好是天然的"必然不同"输入。反例路径因此在本机验证并在文档留档，
