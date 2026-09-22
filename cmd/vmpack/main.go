@@ -652,8 +652,11 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	res, err := inject.Apply(f, inject.Options{SectionName: section, SectionNameB: sectionNames[1], SectionNameC: sectionNames[2], Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
 		DescMagic: descMagic, PatchKey: patchKey, Master: master, FieldMaskSalt: fieldMaskSalt, Verbose: verbose, ScratchOff: scratchOff, ScratchLen: scratchLen, BSSOff: bssOff, BSSSize: bssSize,
 		ImgSections: imgSecs, ImageBase: f.ImageBase, UnpackFn: unpackFn, ImgTlsCallbacks: imgTLS, TlsDirCopy: tlsDirCopy, LoadCfgCopy: loadCfgCopy,
-		Wipe:      wipeEnabled,
-		EntryHook: patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0,
+		Wipe: wipeEnabled,
+		/* 入口 hook 只有 amd64/arm64 的实现；i386 上装了会写进 **x86-64 指令**（实测入口处
+		 * 变成 `51 52 41 50 48 8d 0d …`，在 32 位进程里全是垃圾 ⇒ 立刻 0xC0000005）。
+		 * i386 不装 hook（镜像整体加密本来就跳过），需要校验时用 -verify 另行处理。 */
+		EntryHook: patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0 && f.Machine != pe.MachineI386,
 		VerifyFn:  verifyFn,
 		EntryRVA:  entryRVA})
 	must(err)
@@ -1317,10 +1320,13 @@ func appendRelocs(f *pe.File, items [][2]uint32) error {
 	pos := off + int(size)
 	groups := map[uint32][]uint16{}
 	for _, it := range items {
-		if it[0] != 10 {
+		/* 类型必须**随项保留**：PE32 用 HIGHLOW(3)、PE32+ 用 DIR64(10)。
+		 * 这里原来只认 10 ⇒ i386 的站点被**静默丢弃**（实测：打包产物里一条都没加进去，
+		 * 数据目录 Size 也停留在原值 564）。 */
+		if it[0] != 10 && it[0] != 3 {
 			continue
 		}
-		groups[it[1]&^0xFFF] = append(groups[it[1]&^0xFFF], uint16(it[1]&0xFFF))
+		groups[it[1]&^0xFFF] = append(groups[it[1]&^0xFFF], uint16(it[0]<<12)|uint16(it[1]&0xFFF))
 	}
 	pages := make([]uint32, 0, len(groups))
 	for p := range groups {
@@ -1329,14 +1335,16 @@ func appendRelocs(f *pe.File, items [][2]uint32) error {
 	sort.Slice(pages, func(i, j int) bool { return pages[i] < pages[j] })
 	for _, pg := range pages {
 		offs := groups[pg]
+		/* PE 要求同一页内的项按偏移升序；追加的项目与原有项目混在一起时更需要显式排序。 */
+		sort.Slice(offs, func(a, b2 int) bool { return (offs[a] & 0xFFF) < (offs[b2] & 0xFFF) })
 		blk := 8 + len(offs)*2
 		if pos+blk > so+room || pos+blk > len(f.Data) {
 			return fmt.Errorf(".reloc 空间不足（需要 %d 字节，剩 %d）", blk, so+room-pos)
 		}
 		binary.LittleEndian.PutUint32(f.Data[pos:], pg)
 		binary.LittleEndian.PutUint32(f.Data[pos+4:], uint32(blk))
-		for i, o2 := range offs {
-			binary.LittleEndian.PutUint16(f.Data[pos+8+i*2:], uint16(10<<12)|o2)
+		for i, e := range offs {
+			binary.LittleEndian.PutUint16(f.Data[pos+8+i*2:], e)
 		}
 		pos += blk
 	}

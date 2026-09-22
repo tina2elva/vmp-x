@@ -198,7 +198,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    void *mem = VirtualAlloc(NULL, (SIZE_T)blobSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    /* 多映射 0x4000：thunk 模式要在 blob 之后放描述符与字节码（打包后的真实形态）。 */
+    void *mem = VirtualAlloc(NULL, (SIZE_T)blobSize + 0x4000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) {
         fprintf(stderr, "[!] VirtualAlloc failed\n");
         return 2;
@@ -252,6 +253,42 @@ int main(int argc, char **argv) {
     ctx.regs[VRCX] = arg;                                  /* Win64 第一个整数参数 */
     ctx.regs[VRSP] = (u64)(emu_stack + sizeof(emu_stack));  /* 模拟栈顶 */
     ctx.regs[VRBASE] = 0;                                  /* M1 叶子函数用不到 */
+
+    /* 可选：按**打包后的真实调用形态**跑一遍 —— 在映射区里造一个描述符 + 5 字节 thunk，
+     * 然后 call thunk（thunk 靠返回地址反推描述符）。这样就能把"注入后"的路径
+     * （desc != NULL、code/codeLen 来自描述符、经蹦床进入）在 probe 里复现，
+     * 而 probe 是带异常过滤器的。用法：第 6 个参数写 thunk。 */
+    if (argc >= 7 && strcmp(argv[6], "thunk") == 0) {
+        unsigned long descOff = ((unsigned long)blobSize + 0x3FUL) & ~0x3FUL;
+        unsigned long bcOff = descOff + 0x100UL;
+        unsigned char *d;
+        unsigned char *t;
+        if (bcOff + (unsigned long)bcSize + 64UL > (unsigned long)blobSize + 0x4000UL) {
+            fprintf(stderr, "[!] blob 不够大，放不下描述符/字节码\n");
+            return 2;
+        }
+        d = (unsigned char *)mem + descOff;
+        memset(d, 0, 64);
+        *(unsigned int *)(d + 0) = 0x4B504D56u; /* 魔数（自己造的） */
+        *(unsigned int *)(d + 4) = (unsigned int)(size_t)d; /* selfRVA = 描述符地址 ⇒ base = 0 */
+        *(unsigned int *)(d + 8) = (unsigned int)(bcOff - descOff); /* codeRVA：相对描述符 */
+        *(unsigned int *)(d + 12) = (unsigned int)bcSize;
+        memcpy((unsigned char *)mem + bcOff, bc, (size_t)bcSize);
+        t = (unsigned char *)mem + descOff + 64;
+        t[0] = 0xE8;
+        *(int *)(t + 1) = (int)(((unsigned char *)mem + entryOff) - (t + 5)); /* call vm_entry */
+        fprintf(stderr, "[*] thunk mode: desc=+0x%lX thunk=+0x%lX code=+0x%lX\n",
+                descOff, descOff + 64, bcOff - descOff);
+        {
+            int (*tf)(void) = (int (*)(void))t;
+            int rc2 = tf();
+            printf("thunk: guest_eax=%u rc=%d\n", (unsigned)ctx.regs[VRAX], rc2);
+        }
+        VirtualFree(mem, 0, MEM_RELEASE);
+        free(blob);
+        free(bc);
+        return 0;
+    }
 
     run_fn_t fn = (run_fn_t)((unsigned char *)mem + entryOff);
     int rc = fn(&ctx);
