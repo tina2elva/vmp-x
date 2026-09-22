@@ -92,6 +92,12 @@ func readCOFFObject(path string) (*objFile, error) {
 	out := &objFile{Format: "coff"}
 	// COFF 的 Machine：0x8664 = AMD64，0xAA64 = ARM64
 	out.IsARM64 = uint16(f.FileHeader.Machine) == coffMachineARM64
+	// **i386 的 COFF 会给 C 符号加前导下划线**（`int vm_run()` → 符号 `_vm_run`），
+	// 而 GAS 处理 .S 时**不加**（`call vm_run` 的重定位就叫 `vm_run`）⇒ 两边对不上，
+	// 合并时会报「引用了未定义符号 "vm_run"」（实测：nm 看到定义侧 `_vm_run`、引用侧 `vm_run`）。
+	// 所以按 Machine 判定，在读符号表时**统一剥掉前导下划线** —— 剥在源头，合并/manifest/重定位
+	// 三处就自动一致了。注意不能按"是不是 COFF"判定：arm64 的 PE 符号**不带**下划线。
+	stripUnderscore := uint16(f.FileHeader.Machine) == coffMachineI386
 	for i, s := range f.Sections {
 		data, derr := s.Data()
 		if derr != nil {
@@ -112,6 +118,9 @@ func readCOFFObject(path string) (*objFile, error) {
 		binding := 0
 		if c.StorageClass == 2 {
 			binding = 1
+		}
+		if stripUnderscore && len(name) > 0 && name[0] == '_' {
+			name = name[1:]
 		}
 		out.Symbols = append(out.Symbols, objSymbol{Name: name, Sec: sec, Value: uint64(c.Value), Binding: binding})
 	}
@@ -187,6 +196,7 @@ const (
 
 	/* COFF（Windows 对象文件）*/
 	coffMachineARM64          = 0xAA64
+	coffMachineI386           = 0x014C
 	coffRelARM64Branch26      = 3 /* IMAGE_REL_ARM64_BRANCH26  : bl/b */
 	coffRelARM64PageBaseRel21 = 4 /* IMAGE_REL_ARM64_PAGEBASE_REL21 : adrp */
 	coffRelARM64PageOffset12A = 6 /* IMAGE_REL_ARM64_PAGEOFFSET_12A : add x, x, #:lo12:sym */
