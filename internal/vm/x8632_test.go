@@ -132,6 +132,14 @@ func TestX8632StackSlot(t *testing.T) {
 			om.Encode(logicalOp(t, "OP_POP_R")), rbp,
 			om.Encode(logicalOp(t, "OP_HALT"))}
 	}
+	// 覆盖第二个压栈路径：OP_PUSH_I 在 C 侧是**另一段代码**（32 位槽只写 4 字节），
+	// 只测 PushR 会漏掉它。净效果仍是"一次压栈"，故期望值与上面一致（32 位 4 / 64 位 8）。
+	encImm := func(om *OpcodeMap) []byte {
+		return []byte{om.Encode(logicalOp(t, "OP_PUSH_R")), rbp,
+			om.Encode(logicalOp(t, "OP_PUSH_I")), 0x2A, 0x00, 0x00, 0x00,
+			om.Encode(logicalOp(t, "OP_POP_R")), rbp,
+			om.Encode(logicalOp(t, "OP_HALT"))}
+	}
 	code64 := enc(x64Map)
 	code32 := enc(x32Map)
 	rspC64 := runBatchOne(t, x64Runner, x64Blob, x64Entry, code64, rsp)
@@ -153,6 +161,16 @@ func TestX8632StackSlot(t *testing.T) {
 	}
 	rspGo32 := ref(GuestX8632, x32Map, code32)
 	rspGo64 := ref(GuestX86, x64Map, code64)
+
+	// 同一个判据再来一遍，但把中间的压栈换成 OP_PUSH_I（C 侧另一段代码）。
+	rspC32i := runBatchOne(t, x32Runner, x32Blob, x32Entry, encImm(x32Map), rsp)
+	rspC64i := runBatchOne(t, x64Runner, x64Blob, x64Entry, encImm(x64Map), rsp)
+	slotC32i := int64(rsp) - int64(rspC32i)
+	slotC64i := int64(rsp) - int64(rspC64i)
+	t.Logf("PushI 版本净压栈字节：C(x86-64)=%d C(x86-32)=%d", slotC64i, slotC32i)
+	if slotC64i != 8 || slotC32i != 4 {
+		t.Fatalf("PUSH_I 路径的槽宽不对：C(x86-64)=%d C(x86-32)=%d（期望 8 / 4）", slotC64i, slotC32i)
+	}
 
 	slotC64 := int64(rsp) - int64(rspC64)
 	slotC32 := int64(rsp) - int64(rspC32)
