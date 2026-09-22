@@ -6385,3 +6385,34 @@ DYNAMIC_BASE 未清、字段保持 blob 相对偏移 ⇒ 加载器按 ASLR 重�
 3. 蹦床填入的**初始寄存器**（调用方的值）vs probe 的全 0。
 
 **结论**：目标③**尚未达成**（`vm32_sum10` 已一致 55 ✓，但带本地变量的函数不一致 ✗）；目标保持 active。
+
+### 459. 目标③：在 probe 里**复现**了"打包 ctx"的失败，并二分出**唯一元凶是 VRSP**
+
+**方法**：给 probe 的直呼路径加 `like` 模式 —— 保持字节码/描述符/加密完全不变，只把 ctx 逐项做成打包路径的样子：
+`regs=1` 初值非零 · `sp=1` 打包式 VRSP（`emu_stack_top - 16 - 0x4000`）· `base=1` VRBASE=0x400000。
+于是可以在一份**完全相同**的字节码上做 2x2 矩阵。
+
+**矩阵结果（同一份 `x2.vmb`，期望 35）**：
+
+    全关（= 直呼）        rc=0         rax=35 ✓
+    只开 VRBASE          rc=0         rax=35 ✓
+    只开非零初值          rc=0         rax=35 ✓
+    只开打包式 VRSP       rc=0xC0000005        ✗   <- 唯一能单独复现失败的
+    全开（= 打包）        rc=0xC0000005        ✗
+
+⇒ **元凶是 VRSP**（与 VRBASE、初值寄存器无关）。崩溃点 `blob_offset=0x6B31` = `mov %eax,(%ecx)`，
+其中 `ecx` 来自 `mov 0x20(%esi),%edi`（读 `vm->regs[RSP]`，offset 32）+ `add $-4`；当次 `av_addr=0xFFFFFFFC`，
+即 VM 看到的 `regs[RSP]` 是 **0**。
+
+**解释器对 VRSP 的语义（vm_interp.c 第 1598/1793/1796 行）**：
+
+    u64 rsp_start = vm->regs[VRSP];                       /* 入口值被当作"栈顶" */
+    if (rsp_start - vm->regs[VRSP] > VM_MARGIN) return 99; /* 只允许往下 16KB */
+    if (vm->regs[VRSP] > rsp_start)            return 97; /* 不允许往上 */
+
+⇒ **入口的 `VRSP` 必须是一个"上方无可用、下方正好 16KB 可用"的栈顶**，而不是"栈底附近"。
+我的蹦床给的是 `esp - (16 + VM_MARGIN)`，与这个语义**对不上**（它把一个已经在 16KB 之下的地址当成了栈顶）。
+
+**下一步（很具体）**：在 probe 里把 `sp=1` 的值换成 `emu_stack + 0x80000`（下方留足 16KB 以上）再跑矩阵 ——
+若这样就通过，说明问题只是"栈顶语义"：那么蹦床应当给 `VRSP = esp - 16` 之类（紧贴调用方返回地址上方），
+而 `VM_FRAME_SKEW`/`VM_MARGIN` 的账要按解释器的这个语义重新对齐（三者必须同时对）。

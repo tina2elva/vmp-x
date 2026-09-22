@@ -246,6 +246,52 @@ int main(int argc, char **argv) {
         }
     }
 
+
+    /* 可选："like" 模式 —— 把 ctx 逐项做成**打包路径**的样子（不动描述符/加密）：
+     *   · VRSP 用蹦床的算式：esp - (16 + VM_MARGIN)（VM_MARGIN=0x4000）
+     *   · VRBASE 非零（打包时是 imageBase）
+     *   · 初始 GPR 非零（打包时来自调用方）
+     * 用途：在同一份字节码上分辨"是 ctx 的哪一项让带栈访问的函数算错"。 */
+    if (argc >= 7 && strcmp(argv[6], "like") == 0) {
+        vm_ctx_t c;
+        int r;
+        memset(&c, 0, sizeof(c));
+        c.code = bc;
+        c.codeLen = (u32)bcSize;
+        c.regs[VRSP] = (u64)(size_t)(emu_stack + sizeof(emu_stack)) - 16u - 0x4000u;
+        c.regs[VRBASE] = 0x400000u;
+        /* 二分用：把初始 GPR 置零，只保留 VRSP/VRBASE 两项"打包特征"。
+         * （实测：三特征同时开启时会崩在
+         *  `mov %eax,(%ecx)`，写 0x11110000 —— 说明有寄存器被当成了地址。） */
+        /* 二分用的开关：argv[6]="like"，argv[7] 是逗号分隔的特征集：
+         *   regs=1 初值非零 · sp=1 打包式 VRSP · base=1 VRBASE 非零。默认全 1。 */
+        {
+            int wantRegs = 1, wantSp = 1, wantBase = 1;
+            if (argc >= 8) {
+                const char *f = argv[7];
+                wantRegs = strstr(f, "regs=0") == NULL;
+                wantSp = strstr(f, "sp=0") == NULL;
+                wantBase = strstr(f, "base=0") == NULL;
+            }
+            for (r = 0; r < 8; r++) c.regs[r] = wantRegs ? (0x11110000u + (u64)r) : 0;
+            if (!wantSp) c.regs[VRSP] = (u64)(size_t)(emu_stack + sizeof(emu_stack));
+            if (!wantBase) c.regs[VRBASE] = 0;
+            fprintf(stderr, "[*] like mode: regs=%d sp=%d base=%d rsp=0x%llX vbase=0x%llX\n",
+                    wantRegs, wantSp, wantBase, (unsigned long long)c.regs[VRSP],
+                    (unsigned long long)c.regs[VRBASE]);
+        }
+        fprintf(stderr, "[*] like mode: rsp=0x%llX vbase=0x%llX\n",
+                (unsigned long long)c.regs[VRSP], (unsigned long long)c.regs[VRBASE]);
+        {
+            int (*fn2)(vm_ctx_t *) = (int (*)(vm_ctx_t *))((unsigned char *)mem + entryOff);
+            int rc2 = fn2(&c);
+            printf("like: rax=%llu rc=%d flags=0x%X\n",
+                   (unsigned long long)c.regs[VRAX], rc2, c.flags);
+        }
+        VirtualFree(mem, 0, MEM_RELEASE);
+        free(blob); free(bc);
+        return 0;
+    }
     vm_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.code = bc;
