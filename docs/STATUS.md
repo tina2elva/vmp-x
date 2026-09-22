@@ -5341,6 +5341,35 @@ CNG/TPM 里**私钥根本导不出来**，我们只能**让它签一段挑战**�
 
 **遗留**：软件 KSP 兜底时"不可导出"只到 CNG 层面（同机管理员仍可能有办法）；真正的硬件保证要在有 TPM 的机器上走第一档（本机已走）。
 仍需做的：把 `cng-gen`/`cng-probe` 写进 `docs/` 的使用说明，并在 `tools/e2e.ps1` 里加一条不带 TPM 也能过的正例（当前靠本机 TPM 才有完整证据）。
+### 416. Sentinel 接口层：把"取密钥/查授权"收成接缝，并接进构建流程（-key-in dongle:…）
+
+**为什么先做接口层**：你们已经有母狗/子狗，但**现在不一定上**。把接缝定下来之后，
+今天用假后端（本地文件模拟狗内存）跑通流程与测试；将来换真 DLL 只改一个实现，业务代码不动。
+
+**新增 `internal/sentinel`**
+- `Backend` 接口：`Login/Logout/ReadMemory/Decrypt/Products`（对应 `hasp_login/hasp_logout/hasp_read/`
+  `hasp_decrypt` + 将来的 `hasp_get_info`）；
+- **假后端**：用本地文件模拟狗内存储，`Products` 解析 `1@2030-01-01,2@perpetual` 这类列表；
+- **真后端（Windows）**：`syscall` 动态加载 `hasp*.dll`（显式路径 / `VMPX_SENTINEL_DLL` / 程序目录扫描），
+  四个入口缺一就明确报错；非 Windows 走 `dll_other.go` 明确报错 —— **绝不静默降级**。
+
+**接进流程**
+- `vmpepoch dongle-probe [--fake <文件>] [--vendor-code …] [--feature n] [--dll …]`：探后端 + 读狗 + 列授权；
+- **`vmpbuild -key-in dongle:<fileID>:<offset>:<length>`**：主密钥**直接从狗里读、不落地**（这才是上狗的意义）；
+  真狗需要 `VMPX_SENTINEL_VENDOR_CODE`，没有狗可用 `VMPX_SENTINEL_FAKE` 跑流程。
+
+**实测（本机，假后端）**
+
+| 用例 | 结果 |
+|---|---|
+| `dongle-probe --fake … --fake-products "1001@2030-01-01,1002@perpetual" --vendor-code TESTVC` | `已登录`；`hasp_read` 成功；列出 `1001@2030-01-01`、`1002@perpetual` |
+| `vmpbuild … -key-in dongle:1:0:32` | blob 构建成功；**manifest 里的 key 与"狗"文件逐字节相同**（True） |
+| 用这把"来自狗"的密钥打产物并运行 | `check_key(10) = 143`（= 原生） |
+
+**尚未做（如实登记）**：真后端的 `Products()`（`hasp_get_info`/`hasp_get_size`）还没实现 —— 现在返回明确错误；
+运行期（blob 侧）问狗的那条路也还没接（当前运行期仍用 `<产物>.vmplic.bin` + ECDSA 验签），
+那需要把 Sentinel API 也接进 blob（或改成"狗内解密"路线）。
+
 
 要"私钥永不出芯片"得用 **TPM/CNG 不可导出密钥**（`NCryptCreatePersistedKey` + 用签名挑战代替比对公钥）—— 那是本条的下一步。
 

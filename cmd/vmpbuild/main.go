@@ -33,6 +33,7 @@ import (
 
 	"github.com/vmpx/vmp-x/internal/cred"
 	"github.com/vmpx/vmp-x/internal/inject"
+	"github.com/vmpx/vmp-x/internal/sentinel"
 )
 
 // vmKeyCheckRVA：密钥校验值（KCV）派生时用的"槽位"常量，与 VM_KEY_CHECK_SALT（每次构建随机）
@@ -441,6 +442,36 @@ func cryptoRandU64() (uint64, error) {
 // 存在的意义：让"同一把主密钥"能跨工具升级、跨构建复用 —— 否则每次 vmpbuild 都会生成新钥匙，
 // 客户升级一次工具就得把所有已发出的 .vmpkey 换一遍。
 func loadKeyIn(s string) ([]byte, error) {
+	// 上了狗之后主密钥可以直接从狗里读，**不落地**：-key-in dongle:<fileID>:<offset>:<length>
+	// 需要 VMPX_SENTINEL_VENDOR_CODE（真狗）或 VMPX_SENTINEL_FAKE（假后端，测试/演示）。
+	if strings.HasPrefix(s, "dongle:") {
+		parts := strings.Split(strings.TrimPrefix(s, "dongle:"), ":")
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("dongle: 形式应为 dongle:<fileID>:<offset>:<length>")
+		}
+		fid, e1 := strconv.ParseUint(parts[0], 10, 32)
+		off, e2 := strconv.ParseUint(parts[1], 10, 32)
+		ln, e3 := strconv.ParseUint(parts[2], 10, 32)
+		if e1 != nil || e2 != nil || e3 != nil {
+			return nil, fmt.Errorf("dongle: 的三个数字解析失败: %v/%v/%v", e1, e2, e3)
+		}
+		if ln != 32 {
+			return nil, fmt.Errorf("主密钥是 32 字节，请用 dongle:%d:%d:32", fid, off)
+		}
+		be, oerr := sentinel.Open(sentinel.Options{VendorCode: os.Getenv("VMPX_SENTINEL_VENDOR_CODE"), DLLPath: os.Getenv("VMPX_SENTINEL_DLL")})
+		if oerr != nil {
+			return nil, fmt.Errorf("打开 Sentinel 后端失败: %w", oerr)
+		}
+		if lerr := be.Login(os.Getenv("VMPX_SENTINEL_VENDOR_CODE"), 0); lerr != nil {
+			return nil, fmt.Errorf("狗登录失败: %w", lerr)
+		}
+		defer func() { _ = be.Logout() }()
+		k, rerr := be.ReadMemory(uint32(fid), uint32(off), uint32(ln))
+		if rerr != nil {
+			return nil, fmt.Errorf("从狗里读主密钥失败: %w", rerr)
+		}
+		return k, nil
+	}
 	if isHex64(s) {
 		return hex.DecodeString(s)
 	}
