@@ -22,6 +22,10 @@ const (
 	relPCRel32 relKind = iota
 	relAbsolute32
 	relAbsolute64
+	/* i386 COFF 的 DIR32：**绝对** 32 位引用（字段里放的是"blob 相对偏移"）。
+	 * 它和 REL32 不同 —— 运行期必须再加**加载基址**才是有效地址，所以合并器要把它记进
+	 * 「基址重定位表」，由加载方（probe / 入口 stub）修复。 */
+	relI386Abs32
 	relAArch64Branch26      // 26 位 PC 相对分支（BL/B），字段低 26 位存 imm26（以 4 字节为单位）
 	relAArch64ADRPrelPGHi21 // ADRP：页相对的高 21 位，位域 immlo(30:29) + immhi(23:5)
 	relAArch64AddAbsLo12    // ADD (immediate)：绝对地址的低 12 位，位域 21:10
@@ -178,6 +182,10 @@ func readCOFFObject(path string) (*objFile, error) {
 				/* i386 COFF 的 REL32 = 4 字节 PC 相对，正是 `call vm_run` 这种跨目标文件调用用的类型。
 				 * 之前只认 AMD64 的类型号，于是 i686 的 thunk 一进来就报「不支持的重定位类型 0x14」。 */
 				rel.Kind = relPCRel32
+			case isI386 && r.Type == relI386Dir32:
+				/* i386 的绝对引用：值仍然写成"blob 相对偏移"，但**同时**要求加载方加基址，
+				 * 所以单列一种 Kind，由合并器登记进基址重定位表。 */
+				rel.Kind = relI386Abs32
 			case r.Type == relAMD64Rel32:
 				rel.Kind = relPCRel32
 			case !isI386 && r.Type >= relAMD64Rel32+1 && r.Type <= relAMD64Rel32N:
@@ -207,6 +215,7 @@ const (
 	coffMachineARM64          = 0xAA64
 	coffMachineI386           = 0x014C
 	relI386Rel32              = 0x0014 /* IMAGE_REL_I386_REL32：4 字节 PC 相对 */
+	relI386Dir32              = 0x0006 /* IMAGE_REL_I386_DIR32：4 字节绝对（基址相关） */
 	coffRelARM64Branch26      = 3      /* IMAGE_REL_ARM64_BRANCH26  : bl/b */
 	coffRelARM64PageBaseRel21 = 4      /* IMAGE_REL_ARM64_PAGEBASE_REL21 : adrp */
 	coffRelARM64PageOffset12A = 6      /* IMAGE_REL_ARM64_PAGEOFFSET_12A : add x, x, #:lo12:sym */

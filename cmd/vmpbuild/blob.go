@@ -173,6 +173,9 @@ type mergedBlob struct {
 	Data     []byte
 	secOff   map[[2]int]int // (对象下标, 节下标) -> blob 偏移
 	symOff   map[string]int // 符号名 -> blob 偏移（只含已定义符号）
+	/* 基址相关字段的 blob 偏移（i386 的 DIR32）。合并后写成一张表放在 blob 末尾，
+	 * 加载方（probe / 入口 stub）拿到加载基址后把这些字段 += base。 */
+	absSites []int
 }
 
 func buildBlobMulti(objs []*objFile) (*mergedBlob, error) {
@@ -236,6 +239,30 @@ func buildBlobMulti(objs []*objFile) (*mergedBlob, error) {
 	return m, nil
 }
 
+// emitAbsTable 把基址相关站点写成表放在 blob 末尾，并导出符号 vm_reloc_tab。
+// 必须在 applyAllRelocs **之后**调用（那时站点才被登记）。
+func (m *mergedBlob) emitAbsTable() {
+	/* 基址重定位表：u32 count，随后 count × u32（每个是字段的 blob 偏移）。
+	 * 表内容与基址无关（都是相对偏移），所以可以直接烘进 blob；
+	 * 加载方拿到加载基址后，对每个站点做「字段值 += base」即可把绝对引用修好。
+	 * 导出符号 vm_reloc_tab 让加载方（probe / 入口 stub）找到它。 */
+	if len(m.absSites) > 0 {
+		for len(m.Data)%4 != 0 {
+			m.Data = append(m.Data, 0)
+		}
+		tabOff := len(m.Data)
+		var hdr [4]byte
+		binary.LittleEndian.PutUint32(hdr[:], uint32(len(m.absSites)))
+		m.Data = append(m.Data, hdr[:]...)
+		for _, off := range m.absSites {
+			var b4 [4]byte
+			binary.LittleEndian.PutUint32(b4[:], uint32(off))
+			m.Data = append(m.Data, b4[:]...)
+		}
+		m.symOff["vm_reloc_tab"] = tabOff
+	}
+}
+
 // applyAllRelocs 在多目标视图上应用重定位
 func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) {
 	total := 0
@@ -267,6 +294,11 @@ func (m *mergedBlob) applyAllRelocs(objs []*objFile, verbose bool) (int, error) 
 				target = off + int(r.Addend)
 			}
 			switch r.Kind {
+			case relI386Abs32:
+				/* i386 的绝对引用：字段里写 blob 相对偏移，并登记站点，
+				 * 由加载方拿到基址后统一 += base（见 buildBlobMulti 末尾的表生成）。 */
+				binary.LittleEndian.PutUint32(m.Data[field:], uint32(target))
+				m.absSites = append(m.absSites, field)
 			case relPCRel32:
 				frame := field + r.PlusN
 				if o.Format != "elf" { // 同 applyRelocsObj：ELF 的加数在 RELA 里，不再 +4

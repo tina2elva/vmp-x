@@ -238,6 +238,11 @@ func main() {
 		blob = merged.Data
 		nReloc, err = merged.applyAllRelocs(parsedObjs(objs), *verbose)
 		must(err)
+		merged.emitAbsTable() /* 必须在 reloc 应用之后：那时基址相关站点才被登记 */
+		must(err)
+		/* 重要：表是 append 上去的，可能**重新分配** m.Data ⇒ 必须在这里重新取切片，
+		 * 否则写文件用的还是旧数组、旧长度（实测：符号有了、文件里却没有表）。 */
+		blob = merged.Data
 		for k, v := range merged.symOff {
 			syms[k] = v
 		}
