@@ -1589,6 +1589,12 @@ int vm_run(vm_ctx_t *vm) {
             }
             vm->code = (u8 *)ct;   /* 注意：这里存的是**密文**基址，取指经 vmb_byte 还原 */
             vm->codeLen = f.codeLen;
+        } else {
+            /* 非加密路径也必须用**去掩码后**的字段设 code/codeLen：
+             * 蹦床是用描述符里**未去掩码**的原始值先设过一次的（它没法算掩码），那是垃圾。
+             * 少了这一步，-no-encrypt 产物会在取指时读野地址（实测 0xC0000005）。 */
+            vm->code = (u8 *)d + f.codeRVA;
+            vm->codeLen = f.codeLen;
         }
     }
 #ifndef VM_RELEASE

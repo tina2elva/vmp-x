@@ -407,8 +407,15 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 
 		// (3) 字段混淆：把描述符里"直接可读就有价值"的 6 个 u32（codeRVA/codeLen/encLen/flags/
 		// reserved1/reserved2，偏移 8..32）整体异或上掩码。**必须放在所有字段都写完之后**。
-		if len(opt.Master) == 32 {
-			md := FieldMask(opt.Master, FieldMaskDomainDesc, opt.FieldMaskSalt)
+		// **必须无条件混淆**（包括 -no-encrypt 的情形）：解释器总是按掩码解字段，
+		// 打包端少混淆一次就会让它解出垃圾（实测：-no-encrypt 产物把 codeRVA 解成 0x4AF21230）。
+		// 没有主密钥时用**全零 master** —— 运行期 vm_master() 同样是零，两侧一致。
+		{
+			m := opt.Master
+			if len(m) != 32 {
+				m = make([]byte, 32)
+			}
+			md := FieldMask(m, FieldMaskDomainDesc, opt.FieldMaskSalt)
 			XorMask(data, d+8, 24, md[:24])
 		}
 

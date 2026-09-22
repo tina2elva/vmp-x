@@ -6488,3 +6488,30 @@ DYNAMIC_BASE 未清、字段保持 blob 相对偏移 ⇒ 加载器按 ASLR 重�
 **下一步（已很窄）**：查出明文路径下 `pc` 为何跑飞 —— 具体看 `vm->code` 的**运行期值**是否等于
 「描述符地址 + codeRVA」，以及 `pc` 是**从哪一条 IR 之后**开始不对；blob 自带 trace（`vm_last_pc`/`vm_r1_pcs` 等符号）
 可以在 probe 里按符号偏移读出来，值得优先利用。
+
+### 463. 目标③：修掉两处**真 bug**（`-no-encrypt` 的掩码不一致 + 非加密路径的 code/codeLen）
+
+**修 1（打包端 `internal/inject/payload.go`）**：描述符字段混淆原先只在 `len(opt.Master)==32` 时做，
+而 `-no-encrypt` 时**没有主密钥** ⇒ 跳过混淆；解释器却**总是**按（零密钥派生的）掩码去解 ⇒ 字段全垃圾。
+实测（我写了个临时解码器，用 manifest 的 key+fieldMaskSalt 复算掩码）：
+
+    k1_vmp（有主密钥）: codeRVA=0x50 codeLen=0x36 flags=0x501 funcRVA=0x1500   ← 正确
+    k1_ne （-no-encrypt）: codeRVA=0x4AF21230 codeLen=0x544F5EFB ...            ← 垃圾
+
+改法：**无条件混淆**，没有主密钥时用**全零 master**（运行期 `vm_master()` 同样是零，两侧一致）。
+
+**修 2（blob `vm_interp.c`）**：`vm->code`/`vm->codeLen` 原先只在 **ENC 分支**里用"去掩码后"的字段设置；
+非加密路径就保留**蹦床用未去掩码的原始字段**算出来的值（蹦床算不了掩码）⇒ 取指必读野地址。
+改法：加一个 `else` 分支，同样用去掩码后的 `f.codeRVA/f.codeLen` 设置。
+
+**效果（可观测）**：`-no-encrypt` 产物原先崩在**第一次取指**（blob 偏移 0x2800 = `movzbl (%ebp,%ebx,1)`），
+修后崩溃点**前移到 blob 0xA740**（`vm_patch_mac` 一带，最后一个 .text 节）⇒ 明文路径**明显走得更深**。
+
+**另外两处重要更正（本轮）**：
+· `rc=1` **不是**"提前返回"——能跑通的用例也是 `rax=42 rc=1`，`return 1` 就是**客户机正常返回**；
+  真正决定进程退出码的是蹦床取回的 **ctx->RAX**（= 客户机返回值）。我在 #462 里的相关推断要按这条修正。
+· 我先后否掉了 5 个假设（opcode 长度/字段偏移、VM_REG_MASK、蹦床设 code、keystream 分块、VRSP 系列），
+  都通过**读源码或实测**否掉的，不是猜的。
+
+**下一步**：`-no-encrypt` 现在能走到 `vm_patch_mac` 一带 ⇒ 顺着它的调用条件（`plen = (flags>>8)&0xFF`）
+查为什么在非加密产物里仍被调用/越界；这条路径与加密路径**共用**，修好它对两条路都有意义。
