@@ -103,10 +103,20 @@ if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] gcc build failed"; exit 1 }
 if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] blob build failed (vmpbuild)"; exit 1 }
 
 Write-Output "[*] packing 24 functions..."
-& .\build\vmpack.exe -exe build\target.exe -func check_key -func sum_to -func framed -func mem_ops -func calls_helper -func calls_protected -func via_ptr -func dispatch -func add128 -func sub128 -func mul128 -func disp128 -func vec_bitwise -func vb_xor_only -func bit_scan -func vec_add -func atom_ops -func atom_bump -func smul128 -func fp_mix -func copy16 -func simd_slot -func simd_r -func simd_w -func simd_rw -out build\target_vmp.exe -report build\target_vmp.json | Select-String -Pattern "IR ->|desc=|RVA=0x2"
+# 先把旧产物删掉：否则打包失败时"文件仍在"会让后面的判定看起来像"复用陈旧产物"，
+# 真正的原因（vmpack 的报错）反而被掩盖 —— 2026-09 就因此误判过一次（STATUS #429）。
+Remove-Item build\target_vmp.exe -Force -ErrorAction SilentlyContinue
+# 退出码必须**紧邻**原生命令取：放到别的语句之后再读，读到的可能是更早某个命令留下的值。
+$packLog = (& .\build\vmpack.exe -exe build\target.exe -func check_key -func sum_to -func framed -func mem_ops -func calls_helper -func calls_protected -func via_ptr -func dispatch -func add128 -func sub128 -func mul128 -func disp128 -func vec_bitwise -func vb_xor_only -func bit_scan -func vec_add -func atom_ops -func atom_bump -func smul128 -func fp_mix -func copy16 -func simd_slot -func simd_r -func simd_w -func simd_rw -out build\target_vmp.exe -report build\target_vmp.json 2>&1 | Out-String)
+$packRC = $LASTEXITCODE
+$packLog -split "`n" | Select-String -Pattern "IR ->|desc=|RVA=0x2" | Out-Null
 
-if (-not (Test-Path build\target_vmp.exe)) { Write-Host "[FAIL] packing produced no output"; exit 1 }
-if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] packing failed (unliftable instructions; refusing to reuse a stale artifact)"; exit 1 }
+if (-not (Test-Path build\target_vmp.exe)) { Write-Host "[FAIL] packing produced no output (rc=$packRC)"; ($packLog -split "`n" | Select-Object -Last 12) | ForEach-Object { Write-Host ("    " + $_) }; exit 1 }
+if ($packRC -ne 0) {
+    Write-Host ("[FAIL] packing failed (rc=" + $packRC + "); vmpack 输出末尾如下：") 
+    ($packLog -split "`n" | Select-Object -Last 20) | ForEach-Object { Write-Host ("    " + $_) }
+    exit 1
+}
 $packTime = (Get-Item build\target_vmp.exe).LastWriteTime
 
 $cases = @(
