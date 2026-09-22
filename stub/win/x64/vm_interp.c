@@ -52,6 +52,15 @@ u64 vm_selftest(void *ctxp);
 
 static u32 rd32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
 
+/* 客户机栈槽宽度：x86-32 是 4 字节（push eax 压 4 字节、call 压 4 字节返回地址），
+ * x86-64 / arm64 是 8 字节。这是 x86-32 与 x86-64 在**执行语义**上最主要的一处差别 ——
+ * 其余（标志位、条件码、算术规则）两者一致，运算宽度由每条 IR 自己带。 */
+#ifdef VM_GUEST_X86_32
+#define VM_STACK_SLOT 4u
+#else
+#define VM_STACK_SLOT 8u
+#endif
+
 /* 寄存器字段的掩码：x86-64 客户机 18 个槽位（5 位足够），
  * ARM64 客户机 35 个槽位（必须是 8 位）。
  * 越界寄存器不会来自打包端：字节码经过 AEAD 认证，篡改会在执行前被拒。 */
@@ -2063,15 +2072,18 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         case OP_FP: { vm->pc = vm_fp_step(vm, &bcs, pc); break; }
         case OP_PUSH_R: {
             u32 r = vmb_byte(&bcs, pc + 1) & VM_REG_MASK;
-            u64 sp = vm->regs[VRSP] - 8;
-            *(volatile u64 *)sp = vm->regs[r];
+            u64 sp = vm->regs[VRSP] - VM_STACK_SLOT;
+            /* 按**槽宽**读写：32 位槽只动 4 字节，否则会覆盖槽下方的内存（静默踩内存）。 */
+            if (VM_STACK_SLOT == 4u) *(volatile u32 *)sp = (u32)vm->regs[r];
+            else                    *(volatile u64 *)sp = vm->regs[r];
             vm->regs[VRSP] = sp;
             vm->pc = pc + 2;
             break;
         }
         case OP_PUSH_I: {
-            u64 sp = vm->regs[VRSP] - 8;
-            *(volatile u64 *)sp = (u64)(i64)(i32)vmb_rd32(&bcs, pc + 1);
+            u64 sp = vm->regs[VRSP] - VM_STACK_SLOT;
+            if (VM_STACK_SLOT == 4u) *(volatile u32 *)sp = (u32)(i32)vmb_rd32(&bcs, pc + 1);
+            else                    *(volatile u64 *)sp = (u64)(i64)(i32)vmb_rd32(&bcs, pc + 1);
             vm->regs[VRSP] = sp;
             vm->pc = pc + 5;
             break;
@@ -2079,8 +2091,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
         case OP_POP_R: {
             u32 r = vmb_byte(&bcs, pc + 1) & VM_REG_MASK;
             u64 sp = vm->regs[VRSP];
-            vm->regs[r] = *(volatile u64 *)sp;
-            vm->regs[VRSP] = sp + 8;
+            vm->regs[r] = (VM_STACK_SLOT == 4u) ? (u64)(*(volatile u32 *)sp) : (*(volatile u64 *)sp);
+            vm->regs[VRSP] = sp + VM_STACK_SLOT;
             vm->pc = pc + 2;
             break;
         }

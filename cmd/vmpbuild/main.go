@@ -342,10 +342,17 @@ func main() {
 // 能在运行前就发现"harness 与 blob 布局不一致"——这个坑真踩过一次：
 // 少给 harness 传 -DVM_REG_COUNT=35，症状就是解释器 rc=1，排查了很久。
 func regCountFor(guest string) int {
-	if guest == "arm64" {
+	switch guest {
+	case "arm64":
 		return 35
+	case "x86-64", "x86-32":
+		// 32 位客户机仍用 18 个槽位：IR 里 EAX..EDI 映射到 RAX..RDI，R8-R15 只是不用。
+		// 这样 ctx 布局与 x86-64 完全一致，harness 不用换（-DVM_REG_COUNT 也不用传）。
+		return 18
+	default:
+		fatalf("未知的客户机 ISA %q（支持 x86-64 / x86-32 / arm64）", guest)
+		return 0
 	}
-	return 18
 }
 
 // generateOpcodeValues 生成 vm_opcode_values.h（默认或随机映射），返回文件路径与"名字->编码"表。
@@ -704,6 +711,12 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		// 共享头文件（vm_types.h / vm_opcodes.h）住在 win/x64 下：任何平台目录都要能包含到它，
 		// 否则 linux/arm64 这类平台的 guest_semantics_arm64.h 会找不到 vm_types.h（CI 实测过）。
 		args = append(args, "-I", filepath.Join(tmp, "win", "x64"))
+		if guest == "x86-32" {
+			// 32 位 x86 客户机：与 x86-64 **共用**同一套解释器与语义模块，
+			// 只多一个编译期开关 —— 它把栈槽宽度换成 4 字节（push/pop/call/ret）。
+			// 运算部分不需要特判：每条 IR 自带宽度。
+			args = append(args, "-DVM_GUEST_X86_32=1")
+		}
 		if guest == "arm64" {
 			// ARM64 客户机：语义模块在 arm64/ 下，它自己又 include vm_types.h
 			args = append(args,

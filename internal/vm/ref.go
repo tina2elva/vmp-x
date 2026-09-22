@@ -17,6 +17,14 @@ import (
 //
 // 内存模型：只允许访问 [BufBase, BufBase+BufSize)，用稀疏 map 表示，
 // 这样测试永远不会因为野指针而崩溃。
+// stackSlotBits 返回客户机的栈槽宽度（位）：x86-32 是 32 位，其余是 64 位。
+func (s *RefState) stackSlotBits() uint32 {
+	if s.Guest == GuestX8632 {
+		return 32
+	}
+	return 64
+}
+
 // Guest 选择客户机 ISA：寄存器个数、标志位与条件码语义都随它变化。
 // 与 C 侧一致：x86-64 用 18 个槽位（16 GPR + VBASE + VSCRATCH），
 // ARM64 用 35 个（X0-X30 + SP + VBASE + VSCRATCH + ZR）。
@@ -25,6 +33,10 @@ type Guest uint8
 const (
 	GuestX86 Guest = iota
 	GuestARM64
+	// GuestX8632 是 32 位 x86 客户机：标志位/条件码/算术规则与 GuestX86 **完全一致**
+	// （x86 家族本来就一致），唯一的语义差别是**栈槽 4 字节**（push/pop/call/ret）。
+	// 每条 IR 自带运算宽度，所以运算部分不需要为它特判。
+	GuestX8632
 )
 
 type RefState struct {
@@ -1103,26 +1115,29 @@ func (s *RefState) Run(code []byte, maxSteps int) (int, error) {
 			pc += 12
 		case OpPushR:
 			r := code[pc+1]
-			s.Regs[4] -= 8
+			slot := s.stackSlotBits()
+			s.Regs[4] -= uint64(slot / 8)
 			// 注意：load/store 的 width 单位是**位**（内部按 width/8 取字节数），
 			// 这里曾误传 8 → 只压了 1 个字节（“压栈 8 字节”退化成 1 字节）。
-			if err := s.store(s.Regs[4], 64, s.Regs[r]); err != nil {
+			if err := s.store(s.Regs[4], slot, s.Regs[r]); err != nil {
 				return 1, err
 			}
 			pc += 2
 		case OpPushI:
-			s.Regs[4] -= 8
-			if err := s.store(s.Regs[4], 64, uint64(int64(int32(rd32(pc+1))))); err != nil {
+			slot := s.stackSlotBits()
+			s.Regs[4] -= uint64(slot / 8)
+			if err := s.store(s.Regs[4], slot, uint64(int64(int32(rd32(pc+1))))); err != nil {
 				return 1, err
 			}
 			pc += 5
 		case OpPopR:
 			r := code[pc+1]
-			v, err := s.load(s.Regs[4], 64)
+			slot := s.stackSlotBits()
+			v, err := s.load(s.Regs[4], slot)
 			if err != nil {
 				return 1, err
 			}
-			s.Regs[4] += 8
+			s.Regs[4] += uint64(slot / 8)
 			s.Regs[r] = v
 			pc += 2
 		case OpJbz, OpJbnz:
