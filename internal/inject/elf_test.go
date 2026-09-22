@@ -106,11 +106,14 @@ func TestApplyELFStructural(t *testing.T) {
 		if self != p.DescRVA {
 			t.Errorf("%s selfRVA=0x%X want 0x%X（模块基址 = 描述符地址 - selfRVA）", p.Name, self, p.DescRVA)
 		}
-		codeRel := rd32(descVA + 8)
+		/* 描述符的 6 个标量字段是**无条件混淆**的（没有主密钥时用全零 master —— 见 payload.go），
+		 * 所以这里必须按同样的掩码还原后再比对，否则读到的是掩码后的值（实测 codeRVA=0x68577314）。 */
+		mask := FieldMask(make([]byte, 32), FieldMaskDomainDesc, 0)
+		codeRel := rd32(descVA+8) ^ binary.LittleEndian.Uint32(mask[0:])
 		if codeRel != p.CodeRVA-p.DescRVA {
 			t.Errorf("%s codeRVA=0x%X want 0x%X", p.Name, codeRel, p.CodeRVA-p.DescRVA)
 		}
-		codeLen := rd32(descVA + 12)
+		codeLen := rd32(descVA+12) ^ binary.LittleEndian.Uint32(mask[4:])
 		want := specs[i].Code
 		if int(codeLen) != len(want) {
 			t.Errorf("%s codeLen=%d want %d", p.Name, codeLen, len(want))
