@@ -168,6 +168,39 @@
 - [x] `-key-in` 的"密钥纪元"策略：`vmpepoch new` 建纪元、`which` 认领产物、按 `<产物>.vmpkey` 分发 —— 已在 `tools/acceptance_demo.ps1` 里端到端演示（`STATUS #395/#400`）。
 
 ## 5. 授权层（License Layer）—— 设计基线与**剩余未做项**
+### 417. Sentinel 接进 blob 的设计与执行清单（本轮完成设计，实现留下一轮）
+
+**先回答客户的问题：以后不用 Sentinel，改动麻烦吗？—— 不麻烦，前提是别"编译进产物"，而是做成数据驱动的可选后端。**
+
+| 做法 | 以后不用 Sentinel 的代价 |
+|---|---|
+| 编进产物 + 链接导入库 + 无条件走狗 | 改代码、去链接、重测 —— 麻烦 |
+| **动态加载**（`ntdll!LdrLoadDll` 取 `hasp_*.dll`，无导入表）+ **按烘进产物的 `kind` 路由** + 复用**已有的取密钥接缝** | 不写那个 `kind`（或删掉带标记的那一段）即可；不带 kind 的产物行为与今天完全一致 |
+
+**已就绪（Go 侧，STATUS #416）**：`internal/sentinel`（抽象 + 假后端 + Windows 真后端）+ `vmpepoch dongle-probe` +
+`vmpbuild -key-in dongle:<fileID>:<offset>:<length>`（构建期主密钥直接从狗里读、不落地）。
+
+**blob 侧的执行清单（下一轮照做）**
+1. 在 `stub/win/x64/vm_interp.c` 的 `VM_KEY_EXTERNAL` 分支里、`vm_key_from_file()` **之前**插入一段带标记的代码
+   （`/* ---- Sentinel 后端（可选） ---- */`，约 120 行，删掉这一段即可移除该能力）：
+   - `vm_key_src_t vm_key_src`（`kind/feature/fileID/offset/length/vendorCode[64]/dllName[64]/fakePath[128]`，
+     与 `vm_license_meta` 同款：`.data` + `used` + vmpack 打开开关并填字段）；默认全零 ⇒ 不启用；
+   - `kind=2`（真狗）：`vm_find_module(dllName 或 "hasp_windows.dll")` → 没有就 `vm_load_lib(...)`（文件里已有）→
+     `hasp_login(feature, vendorCode, &h)` / `hasp_read(h, fileID, offset, 32, buf)` / `hasp_logout(h)`；
+   - `kind=3`（假狗文件，**让没有真狗也能测正例**）：路径用 `\??\...` 形式，直接复用已有的 `vm_key_read_nt()`；
+   - 失败按阶段记 `vm_sentinel_fail_stage`（0x5x/0x6x），统一走 `vm_key_reject()`（同一个硬门）。
+2. 把 `vm_key_from_file()` 的开头改成：`if (vm_key_src.kind >= 2) { 取到就 copy 进 vm_master_buf 并 return 1; }`
+   —— 只碰这一个接缝，文件/环境变量那两条路原样保留。
+3. `vmpack` 新增：`-key-dongle <fileID>:<offset>`、`-dongle-vendor-code <vc>`、`-dongle-feature <n>`、
+   `-dongle-dll <name>`、`-dongle-fake-file <path>`（kind=3，测试用）；照 `vm_license_meta` 的做法在补丁后**重算自哈希**
+   （自哈希覆盖 `[0, bssOff)` 含 `.data` —— 这一点在 #399 已踩过）。
+4. 验收：① kind=3 正例（假狗文件里放 32 字节主密钥）→ blob 构出来、产物能跑；
+   ② kind=2 但没有狗/DLL → **明确拒绝**（0xC0DE0007，无输出）而不是静默退回文件；
+   ③ 不写 kind → 行为与今天逐字节一致（现有 gates/e2e 不受影响）。
+
+**仍未做（另一条线）**：真狗的**授权查询**（`hasp_get_info`/`hasp_get_size`）与 blob 侧"问狗要授权"
+（替换/补充现在的 `<产物>.vmplic.bin` + ECDSA 验签）。
+
 
 > **现状**：路线 B（纯软件）的授权工具链 + 两级 PKI + 委派签发 + **运行期强制**都**已实现**（STATUS #397–#400）。
 > 本节余下的未做项只有：**Sentinel 接口层（路线 A）**、`features` 语义、**吊销/黑名单**、母狗私钥在构建机的保护。
