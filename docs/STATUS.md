@@ -5729,6 +5729,35 @@ vmpack 无法覆盖 ⇒ `rc=1` ⇒ e2e 报 `packing failed`。
 **教训（比代码本身重要）**：第一次的"逐位一致性"校验只覆盖了**无符号**语义 ✗，所以它**通过了却没能发现问题** ✗；
 补了一个覆盖**有符号**语义的校验（`build/mulcheck2.c`，2e6 随机 + 49 边界）之后，修复才被证明 ✓。
 **校验必须覆盖"实际使用的那套语义"，否则它只是安慰剂。**
+### 437. 目标 ② 完成：`vm_abi.h` 的 ctx 布局按宿主指针宽度分支（i686 静态断言通过）
+
+**改动**：`vm_abi.h` 用编译器内建 `__SIZEOF_POINTER__` 分支（freestanding 也成立、不需要头文件）。
+32 位上一共有五个常量不同：
+
+- `VM_CTX_SIZE` 200 → **192**
+- `VM_CTX_DESC` 168 → **164**
+- `VM_CTX_SCRATCH` 176 → **168**
+- `VM_CTX_SCRATCHLEN` 184 → **172**
+- `VM_CTX_FRAME` 192 → **184**
+
+（`VM_CTX_CODE`=160 以及寄存器/vbase/flags/pc/codeLen 这些在指针之前的字段**完全相同**。）
+
+**两条实测坑（都记下来，避免重走）**
+
+1. **反直觉**：mingw/MSVC ABI 下 **`u64` 的对齐是 8**（不是 4）⇒ `frame` 在 184、总大小 192。
+   第一版按直觉算成 180/188 ✗，被 `VM_STATIC_ASSERT` 直接挡住（断言就是干这个用的 ✓）；
+   真正定案靠**让 i686 编译器打印真实布局**：`build/layout32.c` 输出
+   `sizeof=192 desc=164 scratch=168 scratchLen=172 reserved2=176 frame=184` ✓。
+2. **PATH 污染陷阱**：在同一 PowerShell 进程里把 `C:\msys64\mingw32\bin` 前置进 PATH 后，
+   后面那条「x64 对照」编译**又用了 i686 的 gcc** ✗ ⇒ 两次输出一模一样，险些误判成「两种宿主布局相同」。
+   判据：如果 `ptr align` 打印成 4 而你以为在编 x64，就是 PATH 被污染了。
+
+**验收**
+
+- x64 blob 构建**完全不变**（36864 字节、manifest 正常）✓；
+- **i686 复探：C 层错误清零** ✓ —— 剩下的全是汇编错误（`subq is only supported in 64-bit mode`、
+  `bad register name %rsp` 等），即下一项 ③（32 位入口蹦床）。
+
 
 
 ### 435. `cmd/lift` 支持 **32 位模式** + 免符号表的 `-rva/-len` —— PE32 的"逐函数可保护性预检"

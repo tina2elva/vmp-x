@@ -30,8 +30,20 @@
 #ifndef VM_ABI_H
 #define VM_ABI_H
 
-/* ---- vm_ctx_t 字段偏移（静态断言保证一致） ---- */
+/* ---- vm_ctx_t 字段偏移（静态断言保证一致） ----
+ *
+ * **32 位宿主**（i686 目标）与 64 位的差别只来自"指针 4 字节 + u64 对齐 4"：
+ *   regs/vbase/vscratch/flags/pc/codeLen/reserved/code 的偏移**完全相同**；
+ *   从 desc 起整体前移：desc 168→164、scratch 176→168、scratchLen 184→172、frame 192→180，
+ *   sizeof 200→188。
+ * 用编译器内建 __SIZEOF_POINTER__ 判断（不需要头文件，freestanding 也成立）。
+ * **写错不用怕**：下面的 VM_STATIC_ASSERT 会逐项比对偏移与尺寸，直接编译失败。
+ */
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
+#define VM_CTX_SIZE     192
+#else
 #define VM_CTX_SIZE     200
+#endif
 #define VM_CTX_RAX      0
 #define VM_CTX_RCX      8
 #define VM_CTX_RDX      16
@@ -60,11 +72,21 @@
 #define VM_CTX_PC       148
 #define VM_CTX_CODELEN  152
 #define VM_CTX_RESERVED 156
-#define VM_CTX_CODE     160
-#define VM_CTX_DESC     168 /* 描述符指针（入口写入） */
-#define VM_CTX_SCRATCH  176 /* 解密缓冲指针（入口写入，指向帧内可写区） */
-#define VM_CTX_FRAME    192 /* 帧基址（入口蹦床写入；0 = 非蹦床调用，解释器据此跳过 XMM 边界同步） */
+#define VM_CTX_CODE     160 /* 两种宿主下都是 160（code 在指针之前） */
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
+#define VM_CTX_DESC       164 /* 描述符指针（入口写入） */
+#define VM_CTX_SCRATCH    168 /* 解密缓冲指针（入口写入，指向帧内可写区） */
+#define VM_CTX_SCRATCHLEN 172
+#define VM_CTX_FRAME      184 /* 帧基址（入口蹦床写入；0 = 非蹦床调用） */
+/* 注意 frame 是 184 而不是 180：**mingw/MSVC ABI 下 u64 的对齐是 8**（不是我以为的 4）——
+ * 176(reserved2 之后) 要补齐到 8 的倍数。这条是实测出来的（build/layout32.c 打印真实偏移），
+ * 也说明"按直觉算布局"不可靠：写错会被静态断言挡住，但那之前先用编译器把真实布局打出来更快。 */
+#else
+#define VM_CTX_DESC       168 /* 描述符指针（入口写入） */
+#define VM_CTX_SCRATCH    176 /* 解密缓冲指针（入口写入，指向帧内可写区） */
 #define VM_CTX_SCRATCHLEN 184
+#define VM_CTX_FRAME      192 /* 帧基址（入口蹦床写入；0 = 非蹦床调用，解释器据此跳过 XMM 边界同步） */
+#endif
 
 /* ---- callee-saved 保存区 ---- */
 #define VM_SAVE_RBX     208
