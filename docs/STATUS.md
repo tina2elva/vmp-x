@@ -5757,6 +5757,31 @@ vmpack 无法覆盖 ⇒ `rc=1` ⇒ e2e 报 `packing failed`。
 - x64 blob 构建**完全不变**（36864 字节、manifest 正常）✓；
 - **i686 复探：C 层错误清零** ✓ —— 剩下的全是汇编错误（`subq is only supported in 64-bit mode`、
   `bad register name %rsp` 等），即下一项 ③（32 位入口蹦床）。
+### 438. 目标 ③ 第一块：新建 `stub/win/x86` 平台目录（ABI 头 + 32 位入口蹦床）
+
+**新增文件**
+
+- `stub/win/x86/vm_abi.h`：32 位平台 ABI 常量。ctx 偏移用**实测值**（192/164/168/172/184）；
+  保存槽按 4 字节布局（EBX/EBP/ESI/EDI=192/196/200/204，EAX/ECX/EDX=208/212/216，XMM0-5=224..304）；
+  `VM_FRAME_SIZE=640`（保持 `%16==0`，因为 `vm_interp.c` 有这条断言）；
+  模拟栈 = `esp - (4 + VM_MARGIN)`（4 是 cdecl 留在 `[esp]` 的返回地址；x64 是 8）；
+  `VM_FRAME_SKEW_EXTRA=8`（thunk 的 call 4 + 客户机返回地址 4）；`VM_DESC_TO_THUNK=64`。
+- `stub/win/x86/vm_entry_asm.S`：32 位入口蹦床，**注释全 ASCII**（现有 x64 的 .S 注释是乱码，不再重复）。
+  与 x64 同构：建帧 → 存 callee-saved/volatile GPR/XMM → 填 ctx → 反推描述符 → `call vm_run` → 还原。
+  cdecl 要点：入口 `esp%16==12`；调用点先 `subl $8`（到 4）再 `pushl`（到 0）满足 ABI 对齐；
+  **EAX 故意不还原** —— `vm_run` 的返回值是 `u64`（EDX:EAX），低半即客户机返回值。
+- `stub/win/x86/BLOB.sources`：`win/x86/vm_entry_asm.S` + 复用 `win/x64/vm_interp.c`（与 arm64 同构）。
+
+**实测**
+
+- 32 位 ABI 头在 i686 下编译通过（`sizeof(vm_desc_t)=64`）✓；
+- **32 位蹦床 `i686-w64-mingw32-gcc -c` 汇编通过**（782 字节目标文件）✓；
+- `vmpbuild -cc i686-… -src stub/win/x86 -guest x86-32` 现在**真的用上了 32 位平台头**（ctx 断言已过）✓，
+  随后撞到 `VM_FRAME_SIZE % 16 == 0` 断言 ⇒ 已把帧大小定回 640、并把 cdecl 对齐移进蹦床 ✓。
+
+**未做**：④ 32 位 native 调用蹦床（cdecl、无 xmm）；⑤ vmpbuild/vmpack 其余 32 位分支；
+⑥ 32 位 blob 完整构建 + 32 位 harness 跑通真实函数；以及**整链仍有一个未分类的编译失败**（下一轮定位）。
+
 
 
 
