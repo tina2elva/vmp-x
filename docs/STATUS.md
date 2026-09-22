@@ -6568,3 +6568,34 @@ counter=1 开始），C 侧取指用 `vm_chacha20_keystream(key, blk + 1u, nonce
 `regs[0]`、`rsp`、`code`、`codeLen`、`pc`、`rc`）以及 `vm_st_pcs/vm_st_addrs/vm_st_vals`（最近 16 次 STORE 的
 pc/地址/值，已在解释器里维护）**写进一个固定文件**（blob 已经会用 PEB 取 kernel32 的 `CreateFileA/WriteFile`，
 照 `vm_img_fail` 的写法即可）。这样两种可能**一次就能分开**，而且完全不必再动 probe。
+
+### 466. 目标③：**证明解密无罪**（离线逐字节比对）；差异锁定在"内存操作语义"
+
+**决定性实验**：写了个临时 Go 工具，用 manifest 的 key + `inject.FieldMask` 还原描述符字段，
+再按打包端同样的算式派生条目密钥（`KDFEntry(master, funcRVA, KDFSaltForPlacement(selfRVA, funcRVA, codeLen))`），
+用 `chacha20.NewUnauthenticatedCipher(key, nonce)` + `SetCounter(1)`（与 `chacha20poly1305` 的数据流约定一致）
+**离线解密产物里的字节码**，再与 `vmp-lift` 的 `.vmb` 逐字节比对：
+
+    fnRVA=0x1500 selfRVA=0x29C50 codeRVA=0x50 codeLen=54
+    离线解密(前20): 50 05 10 20 05 04 21 01 20 04 04 10 00 00 00 11 20 11 02 00
+    vmp-lift .vmb  : 50 05 10 20 05 04 21 01 20 04 04 10 00 00 00 11 20 11 02 00
+    => 完全一致 ✓
+
+⇒ **解密路径（密钥流/counter/nonce/KDF 全部）无罪**，我的密钥流假设到此终结（第 10 次自我纠正）。
+**注意**：第一次跑时用了旧产物（几轮前的 manifest 密钥不同）导致 RVA 越界 panic，重新打包后才对上 ——
+教训：**临时分析工具必须用当前 manifest 重新生成的产物**。
+
+**本轮共排除（都有实测依据）**：
+· 三处 ctx 特征（VRSP / VRBASE / 初始寄存器）——like 矩阵（修掉误清 RSP 的 bug 之后）；
+· XMM 边界同步（`vm->frame`）——临时 `if (0 && vm->frame)` 后仍返回 1；
+· `VM_REG_COUNT`/`VRSCRATCH=17` 与 lifter 的临时寄存器一致（vm_types.h 第 31 行注释明确它是"仅 VM 可见"）；
+· 解密密钥流（上面的离线逐字节比对）；
+· 描述符字段、AEAD 验签、字节码字节、230/230 基址预置。
+
+**剩下的唯一区域**：**内存操作（STORE/LOAD）在打包上下文里的语义**。失败值恰好是 1，而 `k1` 最后一条写 EAX 的
+指令是 `LOAD eax,[ebp-4]` ⇒ "内存里读到 1 而不是 2"最符合观察。
+
+**下一步（唯一还需要的工具）**：给 blob 加一个 **Windows 版**诊断落盘 —— `vm_dbg_trace` 现在走 `vm_syscall3_a64`
+（Linux 系统调用，Windows 用不了），要照 `vm_img_fail` 的写法用 kernel32 的 `CreateFileA/WriteFile`；
+把解释器**已经在维护**的 `vm_st_pcs/vm_st_addrs/vm_st_vals`（最近 16 次 STORE 的 pc/地址/值）与 `vm_diag[]` 写进固定文件，
+一次就能看清"STORE 写到哪、LOAD 从哪读"。
