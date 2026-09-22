@@ -5781,6 +5781,27 @@ vmpack 无法覆盖 ⇒ `rc=1` ⇒ e2e 报 `packing failed`。
 
 **未做**：④ 32 位 native 调用蹦床（cdecl、无 xmm）；⑤ vmpbuild/vmpack 其余 32 位分支；
 ⑥ 32 位 blob 完整构建 + 32 位 harness 跑通真实函数；以及**整链仍有一个未分类的编译失败**（下一轮定位）。
+### 439. 目标 ③/⑤ 推进：定位到"32 位整链编译"的两个真阻塞（都是宿主守卫）
+
+**阻塞 1（已修）**：`vm_run` 在 i686 下**根本没被编译** ✗ —— 核心解释器包在
+`#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__)` 里。改成"Windows 宿主（32 或 64）"：
+新增 `VM_HOST_X86_32`（由 vmpbuild 在目标三元组含 i686/i386 时注入），把 4 处守卫放宽为
+`(defined(__x86_64__) || defined(VM_HOST_X86_32))`；**真·x64 的内联汇编块仍只在 `__x86_64__/_M_X64` 下编译**。
+修完 `undefined symbol "vm_run"` 消失 ✓。
+
+**阻塞 2（部分修，仍卡）**：放宽守卫后暴露出一处 **x64 形式的内联汇编** ✗ ——
+`vm_debugger_present()` 与 `vm_peb_base()` 用 `movq %%gs:0x60` 读 PEB（x64 形式）。已补 i686 分支：
+**`movl %%fs:0x30`**（32 位 Windows 的 PEB 就在 fs:0x30 ✓）。
+再往后是 **`vm_calln_x64` 的 naked 汇编**（Win64 约定：RCX/RDX/R8/R9 + xmm0-3）✗ —— 它就是目标项 ④。
+
+**一次失败的尝试（留档）**：我曾把 468 行那个大块整体放宽 ✗，而它**同时包着** `vm_calln_x64` 与一个
+`#else` 分支 ⇒ 我插入的 `#else` 与文件里原有的 `#else` 撞在一起 ✗（`implicit declaration` 报错）。
+已**回退**该处、保留 PEB 分支 ✓ —— 主干恢复健康：x64 blob 正常构建（36864 字节）✓。
+
+**教训**：`#if/#else` 嵌套块**不能只看单行**就放宽 ✗ —— 先看整块的 `#else` 在哪（这次读了 468/494/518/528 才看清结构 ✗）。
+
+**未做**：④ cdecl native 蹦床（下一步）；⑤ vmpack 的 `Arch` 等其余 32 位分支；⑥ 完整构建 + 32 位 harness。
+
 
 
 
