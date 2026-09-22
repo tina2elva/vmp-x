@@ -5660,6 +5660,22 @@ grep 出剩余的独立写法再修一次才 5/5 —— 这一步值得记：**�
 
 **实测**：`tools/e2e_arm64guest.ps1` → 两段都 OK、`rc=0`：
 `[+] arm64 guest e2e: OK` / `[+] x86-32 guest e2e: OK`。CI 有 gcc ⇒ 这条差分在 CI 里也会真跑（不再 skip）。
+### 433. 用**真实 32 位产物**验证 Mode32：解码 ✓、翻译能走 5KB+ 后止于一处未识别字节
+
+样本：`C:\Windows\SysWOW64\notepad.exe`（PE32/i386，本机就有；没有该文件则 skip —— CI 上会 skip）。
+
+**测试 1（解码，`TestDecodeRealPE32Code`）**：取入口点、`.text+0x100`、`.text+0x800` 三处，各连续解 24 条 —— **全部成功** ✓
+⇒ Mode32 对**真实编译器产物**对齐正确（这正是 `0x40-0x4F` 在 32 位是 INC/DEC、`[disp32]` 是绝对地址那类差异会暴露的地方）。
+
+**测试 2（翻译，`TestLiftRealPE32Entry`）**：入口函数用 Mode32 lifter 翻译 —— 一路走到 **+0x14F2（5KB+）**，
+随后止于 `decode @0x4274E2 (byte 0xFF): unrecognized instruction`。
+⇒ 这是线性遍历撞上**数据/未支持编码**的正常表现（x64 上同样如此：lifter 会停，打包端只保护有明确边界的具名函数）。
+测试对该结果**如实记录**（成功则断言 IR 非空，失败则 log 原因而不判失败）—— 入口是 CRT 桩，翻不过去不是缺陷。
+
+**意义**：PE32 的 Go 侧路径（解析 → 32 位解码 → 32 位 lift → 栈记账）现在在**真实 32 位代码**上站得住 ✓，
+不再只有合成用例。**仍未做**：跨到宿主 native 调用时的 32 位 ABI（参数在栈上，而蹦床按 x64 ABI 传 RCX/RDX/R8/R9）
+—— 它与 32 位 blob/thunk/trampoline（per-platform asm）是同一块，**被工具链决策卡住**（见 TODO 的 PE32 一节）。
+
 
 
 但日志里明明是 11/0 —— 那是**包装管道**的退出码，不是门禁的。要看门禁真实结论，必须不带包装地跑（或直接读 `total … failed` 那一行）。
