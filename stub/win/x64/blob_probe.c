@@ -273,7 +273,12 @@ int main(int argc, char **argv) {
                 wantSp = strstr(f, "sp=0") == NULL;
                 wantBase = strstr(f, "base=0") == NULL;
             }
-            for (r = 0; r < 8; r++) c.regs[r] = wantRegs ? (0x11110000u + (u64)r) : 0;
+            /* **不要动 r==VRSP**：上一版在这里把 RSP 也清零了，导致"只开 sp=1"那组
+             * 实际上是 RSP=0，崩溃在 [-4]，于是矩阵给出了错误结论（STATUS #460 纠正）。 */
+            for (r = 0; r < 8; r++) {
+                if (r == VRSP) continue;
+                c.regs[r] = wantRegs ? (0x11110000u + (u64)r) : 0;
+            }
             if (!wantSp) c.regs[VRSP] = (u64)(size_t)(emu_stack + sizeof(emu_stack));
             if (!wantBase) c.regs[VRBASE] = 0;
             fprintf(stderr, "[*] like mode: regs=%d sp=%d base=%d rsp=0x%llX vbase=0x%llX\n",
@@ -290,6 +295,44 @@ int main(int argc, char **argv) {
         }
         VirtualFree(mem, 0, MEM_RELEASE);
         free(blob); free(bc);
+        return 0;
+    }
+
+    /* 可选："desc" 模式 —— 只加一项差异：**desc != NULL**（打包路径才有的描述符解码路径）。
+     * 描述符字节直接从**打包产物**里取（已按主密钥正确混淆）；把它的 selfRVA 改写成它在本次映射里的
+     * 地址（⇒ base = 0），并把明文字节码放在描述符 + codeRel 处（-no-encrypt 打包时产物里就是明文）。
+     * 用法：argv[6]="desc"、argv[7]=产物路径、argv[8]=描述符文件偏移、argv[9]=描述符 RVA、
+     *       argv[10]=codeRel（产物 code RVA - desc RVA）。 */
+    if (argc >= 11 && strcmp(argv[6], "desc") == 0) {
+        const char *prodPath = argv[7];
+        long prodDescOff = strtol(argv[8], NULL, 0);
+        long codeRel = strtol(argv[10], NULL, 0);
+        long prodSize = 0;
+        unsigned char *prod = read_file(prodPath, &prodSize);
+        if (!prod) return 2;
+        if (prodDescOff + 64 > prodSize) { fprintf(stderr, "[!] desc out of range\n"); return 2; }
+        {
+            unsigned long descOff2 = (((unsigned long)blobSize + 0x3FUL) & ~0x3FUL) + 0x100UL;
+            unsigned char *d2 = (unsigned char *)mem + descOff2;
+            vm_ctx_t c2;
+            memcpy(d2, prod + prodDescOff, 64);
+            *(unsigned int *)(d2 + 4) = (unsigned int)(size_t)d2;   /* selfRVA => base = 0 */
+            memcpy(d2 + codeRel, bc, (size_t)bcSize);
+            memset(&c2, 0, sizeof(c2));
+            c2.code = d2 + codeRel;
+            c2.codeLen = (u32)bcSize;
+            c2.desc = (vm_desc_t *)d2;
+            c2.regs[VRSP] = (u64)(size_t)(emu_stack + sizeof(emu_stack));
+            fprintf(stderr, "[*] desc mode: desc=+0x%lX codeRel=%ld\n", descOff2, codeRel);
+            {
+                int (*fn3)(vm_ctx_t *) = (int (*)(vm_ctx_t *))((unsigned char *)mem + entryOff);
+                int rc3 = fn3(&c2);
+                printf("desc: rax=%llu rc=%d flags=0x%X\n",
+                       (unsigned long long)c2.regs[VRAX], rc3, c2.flags);
+            }
+        }
+        VirtualFree(mem, 0, MEM_RELEASE);
+        free(blob); free(bc); free(prod);
         return 0;
     }
     vm_ctx_t ctx;
