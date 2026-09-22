@@ -85,8 +85,13 @@
 #define VM_MARGIN       0x4000
 
 /* ---- distance between the simulated ESP and the native ESP (used by the lifter) ---- */
-/* 8 = 4 (the thunk's `call vm_entry`) + 4 (the guest return address at [esp+4]). */
-#define VM_FRAME_SKEW_EXTRA 8
+/* 16, not 8, and that matters for a real reason: cdecl callers keep esp 16-byte aligned
+ * at the call site, and a native callee may use aligned SSE stores into its frame. The
+ * simulated stack is `original_esp - VM_FRAME_SKEW`, so for the callee to still see a
+ * 16-byte aligned esp we need VM_FRAME_SKEW % 16 == 0. With EXTRA=8 it was 0x4188 (=8 mod 16)
+ * and every native call would have been misaligned by 8. (4+4=8 is the byte count; the extra
+ * 8 is padding to keep the congruence.) */
+#define VM_FRAME_SKEW_EXTRA 16
 #define VM_FRAME_SKEW   (VM_FRAME_SIZE + VM_FRAME_SKEW_EXTRA + VM_MARGIN)
 
 /* ---- function descriptor (lives in .vmp) ---- */

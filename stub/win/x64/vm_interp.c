@@ -465,11 +465,12 @@ const u64 vm_bc_slot_size = VM_BC_SLOT_SIZE;
  * 修法：切到 guest 栈、压一个「回到蹦床」的返回地址，再 call —— 这样被调者入口 rsp = guest_rsp-8，
  * 它读 [rsp+0x28] 正好是 guest 写在 [guest_rsp+0x20] 的那格。返回后用 rbx（被调者必须保存）恢复宿主 rsp。
  * 只对 Windows x64 启用：Linux/SysV 与 arm64 的调用约定不同（前 6/8 个参数都在寄存器里），留作后续。 */
-#if defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32)) && !defined(VM_BLOB_TARGET_LINUX)
-/* vm_xmm 的定义在后面（.bss），这里先声明：蹦床要用它做 FP 参数装载与返回值回流。 */
+/* vm_xmm 的定义在后面（.bss）；两个平台的蹦床都要用它做 FP 参数装载/返回值回流。 */
 extern u8 vm_xmm[256];
-
+/* 蹦床参数块。字段全是 u64 ⇒ 两种宿主下偏移相同（fn=0 gsp=8 a0=16 a1=24 a2=32 a3=40 xmm=48）。 */
 typedef struct { u64 fn, gsp, a0, a1, a2, a3, xmm; } vm_calln_t;
+
+#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__) && !defined(VM_BLOB_TARGET_LINUX)
 
 /* 注意：这一段是 **x64 专属**（naked 汇编按 Win64 约定搬参数）。32 位宿主的 cdecl 蹦床
  * 属于目标项 ④，尚未实现 —— 见 STATUS #439 的"未做项"。 */
@@ -527,6 +528,48 @@ static u64 vm_call_native(vm_ctx_t *vm, u64 addr) {
     c.a3 = vm->regs[VR9];
     c.xmm = (u64)(void *)vm_xmm; /* guest 的 XMM 堆：call 前装 FP 参数、call 后回流返回值 */
     return vm_calln_x64(&c);
+}
+#elif defined(VM_BLOB_USES_WIN64) && defined(VM_HOST_X86_32) && !defined(VM_BLOB_TARGET_LINUX)
+/* ---- 32 位 Windows 宿主：cdecl 蹦床 ----
+ *
+ * 与 x64 版本最大的不同：**参数不用搬**。cdecl 的参数本来就在客户机栈上（lifted 代码
+ * 自己 push 的），而我们的"客户机栈"就是真实内存里的那段栈 —— 直接切过去 call 即可，
+ * 被调者看到的 [esp+4..] 正好是客户机压的那些参数。这也正是"无 xmm 传参"的原因。
+ *
+ * 仍然要做 XMM0 的回流：cdecl 下 double 返回值在 XMM0 里（SSE2 约定）。
+ *
+ * 进入时（naked + cdecl）：[esp] = 返回地址，[esp+4] = p。 */
+__attribute__((naked, used)) static u64 vm_calln_x86(vm_calln_t *p) {
+    __asm__ volatile(
+        "pushl %ebx\n\t"
+        "pushl %ebp\n\t"
+        "pushl %esi\n\t"
+        "pushl %edi\n\t"
+        "movl 20(%esp), %ebp\n\t" /* p：入口 [esp+4]，四次 push 之后是 [esp+20] */
+        "movl %esp, %ebx\n\t"     /* 宿主 esp 锚点（ebx 是 callee-saved ⇒ call 后仍有效） */
+        "movl 8(%ebp), %esp\n\t"   /* 切到客户机栈 */
+        "call *0(%ebp)\n\t"
+        "movl 48(%ebp), %ecx\n\t" /* 客户机 XMM 堆 */
+        "movups %xmm0, 0(%ecx)\n\t"
+        "movl %ebx, %esp\n\t"
+        "popl %edi\n\t"
+        "popl %esi\n\t"
+        "popl %ebp\n\t"
+        "popl %ebx\n\t"
+        "ret\n\t");
+}
+
+static u64 vm_call_native(vm_ctx_t *vm, u64 addr) {
+    vm_calln_t c;
+    c.fn = addr;
+    c.gsp = vm->regs[VRSP];
+    /* cdecl 下 a0..a3 用不到（参数在客户机栈上）；保留字段只为与 x64 共用布局。 */
+    c.a0 = vm->regs[VRCX];
+    c.a1 = vm->regs[VRDX];
+    c.a2 = vm->regs[VR8];
+    c.a3 = vm->regs[VR9];
+    c.xmm = (u64)(void *)vm_xmm;
+    return vm_calln_x86(&c);
 }
 #else
 static u64 vm_call_native(vm_ctx_t *vm, u64 addr) {
@@ -2557,7 +2600,7 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[0] = 0;
     return 0;
 }
-#elif defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(__aarch64__))
+#elif defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(__aarch64__) || defined(VM_HOST_X86_32))
 /* Windows 上取模块列表的入口：x86-64 走 gs:[0x60]，arm64 走 TEB(x18)+0x60（都是 PEB）。
  * Ldr 链表偏移、导出表解析两边完全一致，所以共用这一整段；只有取 PEB 这一行分架构。 */
 static u64 vm_peb_base(void) {
