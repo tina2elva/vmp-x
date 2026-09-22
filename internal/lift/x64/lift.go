@@ -44,6 +44,8 @@ func (l *Lifter) looksLikeFuncEntry(rva uint32) bool {
 
 type Lifter struct {
 	ImageBase uint64
+	// Mode 是解码模式（x64dec.Mode64 / Mode32）。零值 = 64 位。
+	Mode int
 	// FrameSkew = 模拟栈比原生栈低多少（来自 vm_abi.h / manifest）。
 	// 对“相对进入时 RSP 偏移 >= 0”的访问要补上它，才能读到调用方的栈帧。
 	FrameSkew int64
@@ -71,7 +73,20 @@ type Lifter struct {
 	rbpKnown   bool
 }
 
-func NewLifter(imageBase uint64) *Lifter { return &Lifter{ImageBase: imageBase} }
+func NewLifter(imageBase uint64) *Lifter { return &Lifter{ImageBase: imageBase, Mode: x64dec.Mode64} }
+
+// NewLifterMode 按指定解码模式建 lifter（PE32 用 x64dec.Mode32）。
+func NewLifterMode(imageBase uint64, mode int) *Lifter {
+	return &Lifter{ImageBase: imageBase, Mode: mode}
+}
+
+// mode 取解码模式；零值视为 64 位（结构体字面量构造时不会漏）。
+func (l *Lifter) mode() int {
+	if l.Mode == 0 {
+		return x64dec.Mode64
+	}
+	return l.Mode
+}
 
 // SetScratchArea 告诉 lifter：blob 里那个 8 字节暂存槽（vm_tmp）在目标镜像的哪个 RVA。
 func (l *Lifter) SetScratchArea(rva uint32) { l.ScratchRVA = rva }
@@ -160,7 +175,7 @@ func (l *Lifter) LiftFunc(name string, code []byte, rva uint32) (*ir.Func, error
 		rg := regions[cur]
 		done[rg.rva] = true
 
-		insns, derr := x64dec.DecodeRange(rg.code, l.ImageBase+uint64(rg.rva), 0)
+		insns, derr := x64dec.DecodeRangeMode(rg.code, l.ImageBase+uint64(rg.rva), 0, l.mode())
 		if derr != nil {
 			if rg.rva == rva {
 				return nil, derr
@@ -331,12 +346,24 @@ func regArgInfo(a x86asm.Arg) (ir.Reg, ir.Width, bool) {
 // memAddr 解析内存操作数；RIP-relative 折算为 VMBASE+RVA
 func (l *Lifter) memAddr(ins x64dec.Insn, m x86asm.Mem) (base, index ir.Reg, scale uint8, disp int32, err error) {
 	base, index, scale = ir.NoReg, ir.NoReg, 1
-	if ins.Inst.AddrSize != 0 && ins.Inst.AddrSize != 64 {
-		return 0, 0, 0, 0, fmt.Errorf("不支持 %d 位地址长度", ins.Inst.AddrSize)
+	if ins.Inst.AddrSize != 0 && int(ins.Inst.AddrSize) != l.mode() {
+		return 0, 0, 0, 0, fmt.Errorf("不支持 %d 位地址长度（当前模式 %d）", ins.Inst.AddrSize, l.mode())
 	}
+	absDone := false
 	switch {
 	case m.Base == 0:
-		// 无基址
+		// 无基址。**32 位模式下 "[disp32]"（无下标）是绝对地址** ——
+		// 和 64 位的 RIP-relative 一样必须折算成 VMBASE+RVA，否则会当成裸位移、静默指错地方。
+		// （Base=0 且 Index≠0 是 SIB 无基址形式，位移就是位移，不折算。）
+		if l.mode() == x64dec.Mode32 && m.Index == 0 && m.Disp != 0 {
+			abs := uint64(uint32(m.Disp))
+			if abs < l.ImageBase {
+				return 0, 0, 0, 0, fmt.Errorf("32 位绝对地址 0x%X 低于镜像基址 0x%X", abs, l.ImageBase)
+			}
+			base = ir.VMBASE
+			disp = int32(abs - l.ImageBase)
+			absDone = true
+		}
 	case m.Base == x86asm.RIP:
 		target, ok := ins.PCRelTarget()
 		if !ok {
@@ -365,7 +392,7 @@ func (l *Lifter) memAddr(ins x64dec.Insn, m x86asm.Mem) (base, index ir.Reg, sca
 		index = r
 		scale = uint8(m.Scale)
 	}
-	if m.Base != x86asm.RIP {
+	if !absDone && m.Base != x86asm.RIP {
 		disp = int32(m.Disp)
 	}
 	// 栈相对寻址：模拟栈位于原生栈下方 FrameSkew 处，因此

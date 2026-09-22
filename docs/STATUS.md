@@ -5485,6 +5485,30 @@ CNG/TPM 里**私钥根本导不出来**，我们只能**让它签一段挑战**�
 所以本机就能端到端验证（不像 32 位 blob 那样只能在 CI 上验）。
 
 **未做**：lifter 的模式接线（`internal/lift/x64` 仍只走 64 位解码入口）、客户机 x86-32 的栈/ABI 语义、
+### 425. 目标项 ③ 第三块：lifter 的 **32 位模式接线**（同一段字节，两种模式必须给出不同 IR）
+
+**背景**：`internal/lift/x64` 之前只走 64 位解码入口 ✗，而 32 位代码里最容易**静默算错**的一处就是：
+`mov eax,[disp32]` 在 64 位是 RIP-relative、在 **32 位是绝对地址**。lifter 不知道模式 ⇒ 32 位代码访问全局变量会被折算到完全错误的地址上（不报错、不崩溃，只是算错）。
+
+**改动（对现有调用零影响）**：
+- `Lifter` 增加 `Mode` 字段 + `NewLifterMode(imageBase, mode)`；`NewLifter` 仍等于 64 位；
+  `mode()` 把零值兜底成 64 位（结构体字面量构造也不会漏）；
+- 唯一的解码点 `lift.go:163` 从 `DecodeRange` 换成 `DecodeRangeMode(..., l.mode())`；
+- `memAddr`：`AddrSize` 校验按模式放宽到 32 位；`case m.Base == 0` 里新增 ——
+  **32 位 + 无下标 + disp≠0 ⇒ 绝对地址**，折算成 `VMBASE + (abs - ImageBase)`（低于镜像基址则 fail-loud 报错）；
+  并加 `absDone` 标志，避免被后面那行 `disp = int32(m.Disp)` 覆盖（否则刚算好的折算值会被冲掉 —— 这个坑在写的时候就注意到了）。
+
+**测试（`internal/lift/x64/lift32_test.go`，3/3 过）**：同一段 `8B 05 00 10 40 00 C3`（`mov eax,[0x401000]; ret`）
+
+| 断言 | 结果 |
+|---|---|
+| 32 位 | `Load{Base=VMBASE, Disp=0x1000, Width=W32}`（`0x401000 - 0x400000`） |
+| 64 位 | RIP-relative 折算 ⇒ `Disp=0x402006`（`PC 0x401000 + 6 + 0x401000 - ImageBase`） |
+| 两模式对比 | `Disp` **必须不同** —— 这条本身就是"模式接线生效"的判据 |
+
+**未做**：32 位客户机的**栈槽宽度/ABI**（`push/call/ret` 4 字节、`__cdecl/__stdcall` 参数在栈上）——
+那是"客户机 x86-32 执行模型"这一块，比模式接线大，留下一轮；32 位 blob 仍卡在工具链（需决策）。
+
 32 位 blob（需要 i686 工具链 —— 本机 `gcc -m32` 不可用、无 clang；msys2 有 `pacman` 但装工具链属于改机器，**未做**）。
 
 （含两条路 A/B 与各自的代价）。
