@@ -5646,6 +5646,21 @@ grep 出剩余的独立写法再修一次才 5/5 —— 这一步值得记：**�
 **测试（`internal/lift/x64/lift32_stackarg_test.go`）**：`push 42; mov eax,[esp+4]; ret`，`FrameSkew=64`
 （lifter 只对"有效偏移 ≥ 0"的访问补 FrameSkew，于是两种模式会跨过 0 边界）：
 32 位 `eff=0` ⇒ 补 skew；64 位 `eff=-4` ⇒ 不补 ⇒ 两边 `Disp` **必须不同**，且各自断言到确切值。
+### 432. 把 x86-32 客户机差分**纳入现有 guest 差分门禁**（门禁数仍是 11）
+
+**动机**：#428/#431 的 x86-32 语义此前只有**本地**证据（资产不在门禁的构建范围里 ⇒ 测试会 skip）✗。
+
+**改动**
+- `tools/e2e_arm64guest.ps1` 末尾增加 x86-32 段：构建 `build/vm_interp_x8632.{bin,json}`（`-guest x86-32 -random-opcodes=false`）
+  与 `build/runbc_x8632.exe`（`-DVM_GUEST_X86_32=1`，槽位数保持 18 ⇒ ctx 布局与 x86-64 一致），随后跑 `TestX8632StackSlot`；
+- `tools/gates.ps1` 里该门禁的标签由 `arm64-guest differential` 改为 `guest differential (arm64 + x86-32)`（如实描述；**门禁数不变仍是 11**）。
+
+**为什么放这里而不是新增门禁**：目标验收写的是"gates = 11 gates/0 failed"，新增一道会改口径；
+而"客户机差分"本来就是**同一件事**（64 位宿主跑另一种客户机语义）⇒ 并入同一道门禁最自然。
+
+**实测**：`tools/e2e_arm64guest.ps1` → 两段都 OK、`rc=0`：
+`[+] arm64 guest e2e: OK` / `[+] x86-32 guest e2e: OK`。CI 有 gcc ⇒ 这条差分在 CI 里也会真跑（不再 skip）。
+
 
 但日志里明明是 11/0 —— 那是**包装管道**的退出码，不是门禁的。要看门禁真实结论，必须不带包装地跑（或直接读 `total … failed` 那一行）。
 

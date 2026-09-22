@@ -1,4 +1,4 @@
-# gates.ps1 - run every local (Windows/amd64) gate in one shot.
+﻿# gates.ps1 - run every local (Windows/amd64) gate in one shot.
 #
 #   powershell -NoProfile -File tools/gates.ps1
 #
@@ -75,7 +75,7 @@ Step "image residue (original .text not readable in the packed file)" {
     if ($LASTEXITCODE -ne 0) { Write-Host "[!] original code still readable in the packed image"; $script:stepCode = 1 }
 }
 Step "e2e_dll.ps1"       { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_dll.ps1") }
-Step "arm64-guest differential" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_arm64guest.ps1") }
+Step "guest differential (arm64 + x86-32)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_arm64guest.ps1") }
 Step "linux payload (executed on Windows)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "verify_linux_payload.ps1") }
 
 Write-Host ""

@@ -1,4 +1,4 @@
-# e2e_arm64guest.ps1 - ARM64 GUEST semantics, executed by the x86-64 host interpreter.
+﻿# e2e_arm64guest.ps1 - ARM64 GUEST semantics, executed by the x86-64 host interpreter.
 #
 #   powershell -NoProfile -File tools/e2e_arm64guest.ps1
 #
@@ -25,4 +25,21 @@ Write-Host "[*] ARM64 guest borrow/condition-code semantics"
 if ($LASTEXITCODE -ne 0) { Write-Host "[!] semantics test failed"; exit 1 }
 
 Write-Host "[+] arm64 guest e2e: OK"
+
+# ---- x86-32 guest (32-bit PE32 target support, see STATUS #423-#431) ----
+# 与 arm64 客户机同构：**64 位宿主**跑 C 解释器的 x86-32 客户机模式，无需 32 位工具链。
+# 只差栈槽宽度（4 vs 8），所以差分用例盯的就是它。
+Write-Host "[*] building x86-32 guest blob (identity opcodes, so the Go-side test bytecode matches)"
+& .\build\vmpbuild.exe -src stub/win/x64 -out build/vm_interp_x8632.bin -manifest build/vm_interp_x8632.json -entry vm_entry -guest x86-32 -random-opcodes=false
+if ($LASTEXITCODE -ne 0) { Write-Host "[!] x86-32 blob build failed"; exit 1 }
+
+Write-Host "[*] building x86-32 harness (reg count keeps the x86-64 layout: 18 slots)"
+& gcc -O1 -Wall -DVM_GUEST_X86_32=1 -I stub/win/x64 -o build/runbc_x8632.exe stub/win/x64/blob_probe.c
+if ($LASTEXITCODE -ne 0) { Write-Host "[!] x86-32 harness build failed"; exit 1 }
+
+Write-Host "[*] x86-32 guest stack-slot differential (C interpreter vs Go reference)"
+& go test ./internal/vm/ -run TestX8632StackSlot
+if ($LASTEXITCODE -ne 0) { Write-Host "[!] x86-32 differential failed"; exit 1 }
+
+Write-Host "[+] x86-32 guest e2e: OK"
 exit 0
