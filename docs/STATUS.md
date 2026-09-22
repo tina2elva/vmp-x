@@ -5459,6 +5459,34 @@ CNG/TPM 里**私钥根本导不出来**，我们只能**让它签一段挑战**�
 - 要支持 PE32 还缺四块：32 位 blob 平台、32 位工具链（**当前硬阻塞**）、客户机 x86-32 语义、PE32 注入/重定位/harness。
 
 **未做（如实登记）**：32 位 blob、x86-32 客户机语义、PE32 注入、32 位 harness —— 见 `docs/TODO.md` 的 PE32 评估一节
+### 424. 目标项 ③ 第二块：解码层支持 **32 位模式**（PE32 地基，对主干零风险）
+
+**背景**：`internal/decode/x64` 之前把模式**硬编码**成 64（`x86asm.Decode(code, 64)`）。
+而 x86-32 与 x86-64 的差异不是"少数指令"，而是这几处**会静默错位**的地方：
+- `0x40`-`0x4F`：64 位是 REX 前缀，32 位是 `INC/DEC EAX..EDI`；
+- 默认操作数/栈槽宽度：32 位是 4 字节（`push eax` 推 4 字节）；
+- `ModRM mod=00 rm=101`：32 位是**绝对 disp32**，64 位是 RIP-relative（所以 32 位下 `PCRel` 恒为 0）；
+- 32 位没有 REX、没有 R8-R15。
+
+**改动（零风险）**：新增 `Mode32`/`Mode64` 常量、`DecodeMode(code, pc, mode)`、`DecodeRangeMode(...)`；
+原有 `Decode`/`DecodeRange` 变成 `…Mode(..., Mode64)` 的薄封装 ⇒ **现有调用行为逐字节不变**，
+所有新逻辑都在新入口里。
+
+**测试（`internal/decode/x64/decode32_test.go`，4 条全过）**
+
+| 用例 | 断言 |
+|---|---|
+| `0x40` | 32 位 = `INC EAX`（1 字节）；64 位 = 孤立 REX ⇒ 我们的封装必须 **fail-fast 报错** |
+| `0x50` | 32 位操作数 = `EAX`；64 位 = `RAX` |
+| `8B 05 78 56 34 12` | 32 位 `PCRel==0`（绝对地址）且 `PCRelTarget()` 返回 false；64 位 `PCRel==4` 且目标 = `PC+6+0x12345678` |
+| `40 40 58 50` | `DecodeRangeMode(...,Mode32)` 精确消费 4 条；同一段在 64 位下**必须失败**（REX 错位）|
+
+**为什么这算"最小里程碑"的一块**：它是 PE32 的地基，且**不依赖 32 位工具链/bloB**，
+所以本机就能端到端验证（不像 32 位 blob 那样只能在 CI 上验）。
+
+**未做**：lifter 的模式接线（`internal/lift/x64` 仍只走 64 位解码入口）、客户机 x86-32 的栈/ABI 语义、
+32 位 blob（需要 i686 工具链 —— 本机 `gcc -m32` 不可用、无 clang；msys2 有 `pacman` 但装工具链属于改机器，**未做**）。
+
 （含两条路 A/B 与各自的代价）。
 
 `[!] tool binaries and scripts exist` + `[!] preflight: 1 problem(s)`、**exit=1**；恢复后再次 `OK`。

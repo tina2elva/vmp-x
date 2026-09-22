@@ -80,8 +80,25 @@ func legacyPrefix(b byte) bool {
 	return false
 }
 
-// Decode 解码单条指令
-func Decode(code []byte, pc uint64) (Insn, error) {
+// 解码模式。现有调用一律 Mode64（行为与历史一致）；PE32（32 位 x86 客户机）用 Mode32。
+const (
+	Mode32 = 32
+	Mode64 = 64
+)
+
+// Decode 解码单条指令（mode = 64，保持历史行为）
+func Decode(code []byte, pc uint64) (Insn, error) { return DecodeMode(code, pc, Mode64) }
+
+// DecodeMode 按指定模式解码单条指令。
+//
+// 为什么需要它：x86-32 与 x86-64 的**编码差异**不在少数指令上，而在这些地方 ——
+//   - 0x40-0x4F：64 位是 REX 前缀，32 位是 INC/DEC EAX..EDI；
+//   - 默认操作数/栈槽宽度：32 位是 4 字节（push eax 推 4 字节）；
+//   - ModRM mod=00 rm=101：32 位是**绝对 disp32**，64 位是 RIP-relative（所以 32 位下 PCRel 恒为 0）；
+//   - 32 位没有 REX、没有 R8-R15。
+//
+// 上层（lifter）必须知道自己在哪种模式下翻译，否则会把绝对地址当成 RIP-relative。
+func DecodeMode(code []byte, pc uint64, mode int) (Insn, error) {
 	if len(code) == 0 {
 		return Insn{}, ErrEmpty
 	}
@@ -98,7 +115,7 @@ func Decode(code []byte, pc uint64) (Insn, error) {
 		}, nil
 	}
 
-	inst, err := x86asm.Decode(code, 64)
+	inst, err := x86asm.Decode(code, mode)
 	if err != nil {
 		return Insn{}, fmt.Errorf("decode @0x%X (byte 0x%02X): %w", pc, code[0], err)
 	}
@@ -122,6 +139,11 @@ func Decode(code []byte, pc uint64) (Insn, error) {
 
 // DecodeRange 线性扫描一段代码，返回的指令必须精确覆盖整段（consumed == len(code)）
 func DecodeRange(code []byte, base uint64, maxInsns int) ([]Insn, error) {
+	return DecodeRangeMode(code, base, maxInsns, Mode64)
+}
+
+// DecodeRangeMode 同 DecodeRange，但指定解码模式。
+func DecodeRangeMode(code []byte, base uint64, maxInsns int, mode int) ([]Insn, error) {
 	if maxInsns <= 0 {
 		maxInsns = 1 << 20
 	}
@@ -131,7 +153,7 @@ func DecodeRange(code []byte, base uint64, maxInsns int) ([]Insn, error) {
 		if len(out) >= maxInsns {
 			return nil, fmt.Errorf("too many instructions (>%d) in %d bytes", maxInsns, len(code))
 		}
-		ins, err := Decode(code[off:], base+uint64(off))
+		ins, err := DecodeMode(code[off:], base+uint64(off), mode)
 		if err != nil {
 			return nil, fmt.Errorf("at +0x%X: %w", off, err)
 		}
