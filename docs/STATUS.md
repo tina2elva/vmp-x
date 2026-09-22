@@ -5194,6 +5194,33 @@ FP 隔离套件（`cvt32/cvt64/localrt/acc/divd`）五个函数**全部**与原�
 `retconst/dblarg/dbladd/noarg`（double 参数与返回值跨边界）四个用例**全部**一致。
 
 ⇒ 目标项 ③ 完成 ✓，而且到现在为止**客户 demo 的 14 个函数在两种优化级别下都是"要么正确"**。
+### 410. 目标项 ⑤ 收口：以**客户自己的期望值**为基准的逐函数可保护性清单
+
+**客户资产（`D:\demo_exe`）**：
+- `ground_truth_exe.txt` / `run_demo64.exe.txt` / `run_demo32.exe.txt`：他们跑出来的**期望输出**（含地址行）；
+- `verify.py`：他们的验证脚本（跑两个 exe + 用 dbghelp 枚举 PDB 符号 + PE 结构），说明他们**自己也有符号表能力**。
+
+**`tools/diffcheck.ps1` 增强**
+- `-Expect <file>`：期望值可直接取**客户的 ground truth**（不再只跟"自己跑一遍"比）；
+- `-Map` 变为**可选**（cl 构建的 PE 用 MAP；gcc 目标 vmpack 直接读 COFF 符号表）；
+- `-Markdown <file>`：输出**逐函数可保护性清单**（含 REFUSED 的"缺哪条指令"原文）；
+- 结论三档：`OK` / `WRONG`（点名 + 不一致行数 + 首处差异）/ `REFUSED`。
+
+**实测（判定口径 = 客户 `run_demo64.exe.txt`）**
+
+| 构建 | 汇总 |
+|---|---|
+| `/O2`（14 个函数） | **可保护 14 / 静默算错 0 / 被拒 0** |
+| `/Od`（14 个函数） | **可保护 14 / 静默算错 0 / 被拒 0** |
+
+清单文件：`build/protectable_o2.md`、`build/protectable_od.md`（每行一个函数的结论）。
+
+**固化**：`tools/e2e.ps1` 新增第 (7) 段 —— 用 e2e 自己的目标跑一遍 `diffcheck`（`check_key`/`sum_to`），
+不全绿就让 e2e 失败。这样这道"逐函数差分自检"以后每次门禁都会被真实执行一遍。
+
+**顺带记两条工具坑**：`tools/e2e.ps1`/`diffcheck.ps1` 必须带 **UTF-8 BOM**（PS 5.1 否则按 ANSI 读、中文变乱码）；
+PowerShell 里**多行数组字面量**（逗号接换行接括号表达式）会报 "Expressions are only allowed as the first element of a pipeline"，改成分行 `+=` 即可。
+
 
 所以即使还没修好，客户也不会拿到一个「看起来正常、实际算错」的产物（脚本会报 WRONG 并指出函数名）。
 

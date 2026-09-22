@@ -1,4 +1,4 @@
-# e2e.ps1 - End-to-end test for the Windows/amd64 M1 PoC.
+﻿# e2e.ps1 - End-to-end test for the Windows/amd64 M1 PoC.
 #
 #   1. build tools + blob + target
 #   2. protect check_key and sum_to in build/target.exe
@@ -413,6 +413,12 @@ else { $fail++; $failLines += "E2EFAIL antidebug: a single BeingDebugged signal 
 python tools/field_mask_check.py --packed build/target_vmp.exe --report build/target_vmp.json 2>&1 | Out-Null
 if ($LASTEXITCODE -eq 0) { $pass++ }
 else { $fail++; $failLines += "E2EFAIL field-mask: container scalars (magic/RVA/length/flags) are still plaintext" }
+
+# ---- (7) 逐函数差分自检工具的自检（tools/diffcheck.ps1）----
+# 用现成的 e2e 目标（gcc 构建，vmpack 直接读符号表）：逐函数单独保护 + 与原始输出比对，应当全部 OK。
+& powershell -NoProfile -File tools/diffcheck.ps1 -Exe build\target.exe -FuncList 'check_key,sum_to' -Args 'check_key 10' -Work build\e2e_dc 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { $pass++ }
+else { $fail++; $failLines += ("E2EFAIL diffcheck: 逐函数自检未全绿（exit={0}）" -f $LASTEXITCODE) }
 
 Write-Output ""
 if ($failLines.Count -gt 0) {

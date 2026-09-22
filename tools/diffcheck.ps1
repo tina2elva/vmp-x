@@ -1,60 +1,67 @@
-﻿# diffcheck.ps1 - 保护前逐函数差分自检（目标项 4/5）
+﻿# diffcheck.ps1 - 保护前逐函数差分自检 / 可保护性清单（目标项 4+5）
 #
-# 对候选函数**逐个**单独保护，然后跑原生 vs 受保护，比较输出：
-#   - 打包就被拒（lifter 说缺哪条指令）      -> REFUSED（并打印原因）
-#   - 打包成功但输出不一致（静默算错）        -> WRONG（点名函数）
-#   - 输出一致                                -> OK
+# 对候选函数**逐个**单独保护，然后比对输出，给三档结论：
+#   REFUSED : 打包就被拒（附 lifter 原话，例如缺哪条指令）
+#   WRONG   : 打包成功但输出不一致 —— 点名函数 + 不一致行数 + 首处差异
+#   OK      : 输出一致
 #
-# 为什么这么做：工具以前会**静默产出算错的受保护程序**（比拒绝保护危险得多）。
-# 这个脚本把"静默"变成"点名"，也是给客户看的可保护性清单。
+# 期望值来源（优先级从高到低）：
+#   -Expect <file> : 客户自己的 ground truth / run_*.txt（推荐：验收口径与客户一致）
+#   否则           : 跑一遍原始（未受保护）可执行文件的输出
 #
-# 用法：
-#   powershell -NoProfile -File tools/diffcheck.ps1 -Exe build\a.exe -Map build\a.map \
-#            -FuncList '?A@@YAXXZ,?B@@YAXXZ' [-Args 'x y'] [-Filter '^\[demo'] [-Blob ... -Manifest ...]
 param(
   [Parameter(Mandatory=$true)][string]$Exe,
-  [Parameter(Mandatory=$true)][string]$Map,
+  [string]$Map = '', # 可选：cl 构建的 PE 用 MAP；gcc 目标 vmpack 直接读符号表
   [Parameter(Mandatory=$true)][string]$FuncList,
+  [string]$Expect = '',
   [string]$Args = '',
   [string]$Filter = '',
   [string]$Blob = '',
   [string]$Manifest = '',
   [int]$TimeoutSec = 30,
-  [string]$Work = 'build\diffcheck'
+  [string]$Work = 'build\diffcheck',
+  [string]$Markdown = ''
 )
 $ErrorActionPreference = 'Continue'
 if ($PSScriptRoot) { Set-Location (Join-Path $PSScriptRoot '..') }
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 
+function Filter-Text([string]$t) {
+  if (-not $Filter) { return $t.Trim() }
+  $lines = $t -split "`n" | Where-Object { $_ -notmatch $Filter }
+  return (($lines -join "`n").Trim())
+}
 function RunCapture([string]$exe, [string]$argstr) {
   $tmp = Join-Path $Work 'out.txt'
   Remove-Item $tmp -ErrorAction SilentlyContinue
-  # 注意：**不能**把空数组传给 -ArgumentList —— PS 会直接报参数校验失败，
-  # 于是原生与被保护两边都拿到空输出，比较结果就是假的 OK（实测踩过）。
   $sp = @{ FilePath = $exe; NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $tmp;
           RedirectStandardError = (Join-Path $Work 'err.txt') }
   if ($argstr) { $sp['ArgumentList'] = $argstr.Split(' ') }
   $p = Start-Process @sp
-  if (-not $p.WaitForExit($TimeoutSec * 1000)) { try { $p.Kill() } catch {} ; return @{ Out = '<TIMEOUT>'; Code = -999 } }
+  if (-not $p.WaitForExit($TimeoutSec * 1000)) { try { $p.Kill() } catch {}; return @{ Out = '<TIMEOUT>'; Code = -999 } }
   $out = ''
   if (Test-Path $tmp) { $out = (Get-Content $tmp -Raw) }
   if (-not $out) { $out = '' }
-  if ($Filter) {
-    $lines = $out -split "`n" | Where-Object { $_ -notmatch $Filter }
-    $out = ($lines -join "`n")
-  }
-  return @{ Out = $out.Trim(); Code = $p.ExitCode }
+  return @{ Out = (Filter-Text $out); Code = $p.ExitCode }
 }
 
-$native = RunCapture $Exe $Args
-Write-Host ('原生: exit=' + $native.Code)
+if ($Expect) {
+  if (-not (Test-Path $Expect)) { Write-Host ('[!] 找不到期望值文件 ' + $Expect); exit 3 }
+  $expected = @{ Out = (Filter-Text (Get-Content $Expect -Raw)); Code = 'expect' }
+  Write-Host ('期望值来源: ' + $Expect)
+} else {
+  $expected = RunCapture $Exe $Args
+  Write-Host ('期望值来源: 原始可执行文件（exit=' + $expected.Code + '）')
+}
+
 $funcs = $FuncList.Split(',') | Where-Object { $_ -ne '' }
 $ok = 0; $wrong = 0; $refused = 0
 $report = New-Object System.Collections.ArrayList
 foreach ($f in $funcs) {
   $out = Join-Path $Work 'one.exe'
   Remove-Item $out -ErrorAction SilentlyContinue
-  $pa = @('-exe', $Exe, '-map', $Map, '-func', $f, '-out', $out)
+  $pa = @('-exe', $Exe, '-func', $f, '-out', $out)
+  if ($Map) { $pa += @('-map', $Map) }
   if ($Blob) { $pa += @('-blob', $Blob) }
   if ($Manifest) { $pa += @('-manifest', $Manifest) }
   $packOut = (& .\build\vmpack.exe @pa 2>&1 | Out-String)
@@ -67,13 +74,13 @@ foreach ($f in $funcs) {
     continue
   }
   $prot = RunCapture $out $Args
-  if ($prot.Out -eq $native.Out) {
+  if ($prot.Out -eq $expected.Out) {
     $ok++
     [void]$report.Add([pscustomobject]@{ Func = $f; Verdict = 'OK'; Detail = '' })
     Write-Host ('[OK     ] ' + $f)
   } else {
     $wrong++
-    $nl = @($native.Out -split "`n")
+    $nl = @($expected.Out -split "`n")
     $pl = @($prot.Out -split "`n")
     $nd = 0; $n1 = ''; $p1 = ''
     for ($i = 0; $i -lt [Math]::Max($nl.Count, $pl.Count); $i++) {
@@ -81,7 +88,7 @@ foreach ($f in $funcs) {
       $y = if ($i -lt $pl.Count) { $pl[$i] } else { '<缺>' }
       if ($x -ne $y) { $nd++; if ($n1 -eq '') { $n1 = $x; $p1 = $y } }
     }
-    $detail = ('不一致 ' + $nd + ' 行；首处差异 原生=[' + $n1.Trim() + '] 受保护=[' + $p1.Trim() + ']')
+    $detail = ('不一致 ' + $nd + ' 行；首处差异 期望=[' + $n1.Trim() + '] 受保护=[' + $p1.Trim() + ']')
     [void]$report.Add([pscustomobject]@{ Func = $f; Verdict = 'WRONG'; Detail = $detail })
     Write-Host ('[WRONG  ] ' + $f + '  ' + $detail)
   }
@@ -92,6 +99,21 @@ Write-Host ('==== 汇总：可保护 ' + $ok + ' / 静默算错 ' + $wrong + ' /
 $csv = Join-Path $Work 'report.csv'
 $report | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
 Write-Host ('明细: ' + $csv)
+if ($Markdown) {
+  $src = '原始可执行文件'; if ($Expect) { $src = $Expect }
+  $md = @()
+  $md += '# 逐函数可保护性清单'
+  $md += ''
+  $md += ('- 产物: ' + $Exe)
+  $md += ('- 期望值来源: ' + $src)
+  $md += ('- 汇总: **可保护 ' + $ok + ' / 静默算错 ' + $wrong + ' / 被拒 ' + $refused + '**')
+  $md += ''
+  $md += '| 函数 | 结论 | 说明 |'
+  $md += '|---|---|---|'
+  foreach ($r in $report) { $md += ('| ' + $r.Func + ' | ' + $r.Verdict + ' | ' + ($r.Detail -replace '\|', '/') + ' |') }
+  Set-Content -Path $Markdown -Value ($md -join "`n") -Encoding UTF8
+  Write-Host ('清单(markdown): ' + $Markdown)
+}
 if ($wrong -gt 0) { exit 2 }
 if ($refused -gt 0) { exit 1 }
 exit 0
