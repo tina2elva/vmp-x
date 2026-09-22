@@ -465,12 +465,14 @@ const u64 vm_bc_slot_size = VM_BC_SLOT_SIZE;
  * 修法：切到 guest 栈、压一个「回到蹦床」的返回地址，再 call —— 这样被调者入口 rsp = guest_rsp-8，
  * 它读 [rsp+0x28] 正好是 guest 写在 [guest_rsp+0x20] 的那格。返回后用 rbx（被调者必须保存）恢复宿主 rsp。
  * 只对 Windows x64 启用：Linux/SysV 与 arm64 的调用约定不同（前 6/8 个参数都在寄存器里），留作后续。 */
-#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__) && !defined(VM_BLOB_TARGET_LINUX)
+#if defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32)) && !defined(VM_BLOB_TARGET_LINUX)
 /* vm_xmm 的定义在后面（.bss），这里先声明：蹦床要用它做 FP 参数装载与返回值回流。 */
 extern u8 vm_xmm[256];
 
 typedef struct { u64 fn, gsp, a0, a1, a2, a3, xmm; } vm_calln_t;
 
+/* 注意：这一段是 **x64 专属**（naked 汇编按 Win64 约定搬参数）。32 位宿主的 cdecl 蹦床
+ * 属于目标项 ④，尚未实现 —— 见 STATUS #439 的"未做项"。 */
 __attribute__((naked, used)) static u64 vm_calln_x64(vm_calln_t *p) {
     /* 注意：Windows x64 的第一个整型参数在 **RCX**（不是 SysV 的 RDI）。
      * 一开始照 SysV 读 %rdi，拿到的是野指针 → 切栈时 0xC0000005。
@@ -686,7 +688,7 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
  * 密钥形式：环境变量 VMPX_KEY = 64 个十六进制字符（32 字节原始密钥）。 */
 #ifdef VM_KEY_EXTERNAL
 
-#if !(defined(VM_BLOB_USES_WIN64) && defined(__x86_64__))
+#if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32)))
 #error "VM_KEY_EXTERNAL 目前只有 Windows/x64 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
@@ -1288,12 +1290,12 @@ u32 vm_dbg_timing_hits;  /* 时间差路径命中次数：**只作参考**，不
 /* 注意条件是"**Windows 目标**"而不是只看内部 ABI：mingw 编 Linux 目标时 VM_BLOB_USES_WIN64
  * 同样成立（那是宿主 ABI），但 Windows 目标那段代码不参与编译，符号是未定义的 ——
  * 上一版就是这么把 linux blob 编成"非自包含"的（CI 报：引用了未定义符号 "vm_find_module"）。 */
-#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__) && !defined(VM_BLOB_TARGET_LINUX)
+#if defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32)) && !defined(VM_BLOB_TARGET_LINUX)
 static u64 vm_find_module(const char *name);
 static void *vm_get_proc(u64 mod, const char *fn);
 #endif
 
-#if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__) && !defined(VM_BLOB_TARGET_LINUX)
+#if defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32)) && !defined(VM_BLOB_TARGET_LINUX)
 /* 信号按**路径**记位，而不是计数：同一个路径被两个调用点各查一次（入口蹦床的 vm_verify_table
  * 与 vm_run）不该算两个信号 —— 那会把"≥2 条不同路径"退化成"同一条路径查了两次"。 */
 static u32 vm_dbg_mask;       /* bit0=①BeingDebugged bit1=②调试端口/对象 bit2=③DR bit3=④时间差 */
@@ -1303,7 +1305,16 @@ static u32 vm_dbg_probed;
 
 static int vm_debugger_present(void) {
     const u8 *peb;
+#if defined(VM_HOST_X86_32)
+    /* 32 位 Windows：PEB 指针在 fs:[0x30]（x64 才在 gs:[0x60]）。地址也是 32 位。 */
+    {
+        u32 peb32 = 0;
+        __asm__ volatile("movl %%fs:0x30, %0" : "=r"(peb32));
+        peb = (const u8 *)(u64)peb32;
+    }
+#else
     __asm__ volatile("movq %%gs:0x60, %0" : "=r"(peb));
+#endif
     vm_peb_seen = (u64)peb;
     if (!peb) return 0;
     return *(const u8 *)(peb + 0x02) ? 1 : 0;
@@ -2555,6 +2566,11 @@ static u64 vm_peb_base(void) {
     __asm__ volatile("mov %0, x18" : "=r"(teb));
     if (!teb) return 0;
     return *(const u64 *)(teb + 0x60);
+#elif defined(VM_HOST_X86_32)
+    /* 32 位 Windows：PEB 指针在 fs:[0x30]。 */
+    u32 p32;
+    __asm__ volatile("movl %%fs:0x30, %0" : "=r"(p32));
+    return (u64)p32;
 #else
     u64 p;
     __asm__ volatile("movq %%gs:0x60, %0" : "=r"(p));

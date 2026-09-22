@@ -757,6 +757,11 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		}
 		if compilerIsWindows {
 			args = append(args, "-DVM_BLOB_USES_WIN64=1")
+			// 32 位 Windows 宿主（i686 mingw）：告诉 C 源"这是一条受支持的 Windows 宿主"，
+			// 但它**不等于** x86_64 —— 真·x64 的内联汇编块仍只在 __x86_64__/_M_X64 下编译。
+			if strings.Contains(machine, "i686") || strings.Contains(machine, "i386") {
+				args = append(args, "-DVM_HOST_X86_32=1")
+			}
 		}
 		args = append(args, "-o", objName, srcPath)
 		if verbose {
