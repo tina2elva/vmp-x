@@ -6311,3 +6311,16 @@ x64 宿主 x86-32 客户机模式在真循环上返回 `rc=99` 的既有缺口�
 
 **未做 / 下一步**：① 让 thunk 模式吃 vmpack 产出的 blob（带烘焙密钥）以复现"真·打包"路径；
 ② 给 230 个重定位项新建承载节；③ 端到端（打包后的真 32 位 exe 与原生一致）。
+
+### 456. 一条踩了三次的纪律：**不要手工重建探针/blob 去跑测试**
+
+本轮我为了验证 `thunk` 模式手工重建了 `build/runbc*.exe`，之后 `go test ./...` 一直红（arm64 差分 + x64 conformance），
+我先后怀疑并**回退**了本轮的两处改动（探针的 thunk 模式、vmpack 的 HIGHLOW/入口 hook）——**都回退后仍然红** ✗，
+说明与改动无关。最后把 `build/runbc*.exe` 与 `build/vm_interp.bin` **删掉、交给 `tools/gates.ps1` 按它自己的顺序重建**，
+立刻恢复 `total 11 gates, 0 failed` ✓（改动也原样恢复）。
+
+**结论**：`build/` 下的探针与 blob 必须由**门禁/CI 自己的步骤**产出（它们用的 `-D`/顺序与手工不同）；
+手工重建会制造"看起来是我改坏了"的**假红**。出现红时**第一件事**是：清掉 `build/runbc*.exe`、`build/vm_interp*.bin`，
+让门禁重建，再看结果 —— 而不是先回退代码。
+
+顺带确认：`afc02ab`（含 probe `thunk` 模式 + vmpack 的 HIGHLOW/排序/i386 不装入口 hook）在 CI 上**五绿** ✓、门禁 **11/0** ✓。
