@@ -5243,6 +5243,31 @@ FP 隔离套件（`cvt32/cvt64/localrt/acc/divd`）五个函数**全部**与原�
 返回值靠 **xmm0** 传出。而当前的 XMM 边界同步只在 `vm_run` 的**入口/出口**做；**native 调用返回时**没有把宿主的 xmm0 搬回 guest 的 `vm_xmm[0]`，
 于是壳函数 `ret` 出去的是旧值。
 修法（小改动，下一轮做）：在 `vm_calln_x64` 蹦床 `callq` 之后把 `xmm0`（稳妥起见 `xmm0/xmm1`）写进 guest 的 XMM 堆 —— 把 `&vm_xmm` 作为参数一并传进蹦床即可。
+### 412. 修掉 native 调用的 FP 边界：xmm0-xmm5 回流 + xmm0-xmm3 装载 —— 客户 demo 双构建 26/26
+
+**上一轮抓到的那个静默算错**（`?DemoMean@@YANPEBNH@Z` 转发壳在 `/Od` 下得 0.000）根因确认并修掉：
+该壳函数 `call Math::Mean` 之后**直接 `ret`**，返回值靠 **xmm0** 传出；而 ABI 蹦床此前只搬运**整型**参数/返回值，
+**FP 寄存器完全没接** ⇒ 壳函数交出去的是旧 xmm0。
+
+修法（都在 `vm_calln_x64` 这一段 naked asm 里）：
+- **参数方向**：`callq` 之前把 guest 的 `vm_xmm[0..3]` 装进真实 `xmm0-xmm3`（Win64 前四个浮点参数）；
+- **返回方向**：`callq` 之后把真实 `xmm0-xmm5` 写回 `vm_xmm[0..5]`（返回值在 xmm0）；
+- `vm_calln_t` 增加 `xmm` 字段（`&vm_xmm`），并在蹦床前加 `extern u8 vm_xmm[256];` 前置声明（定义在文件后面）。
+
+**实测**
+
+| 用例 | 原生 | 受保护 |
+|---|---|---|
+| `?DemoMean@@YANPEBNH@Z`（/Od 转发壳） | 3.500 | **3.500** |
+| `retconst/dblarg/dbladd/noarg`（double 参数与返回值） | 3.500 / 2.500 / 3.500 / 3.500 | **全部一致** |
+
+| 构建（26 个函数，口径 = 客户 `run_demo64.exe.txt`） | 汇总 |
+|---|---|
+| `/O2` | **可保护 26 / 静默算错 0 / 被拒 0** |
+| `/Od` | **可保护 26 / 静默算错 0 / 被拒 0** |
+
+（覆盖面从手抄的 14 个提升到 MAP 里匹配的 26 个；清单见 `build/protectable_o2.md` / `protectable_od.md`。）
+
 
 PowerShell 里**多行数组字面量**（逗号接换行接括号表达式）会报 "Expressions are only allowed as the first element of a pipeline"，改成分行 `+=` 即可。
 

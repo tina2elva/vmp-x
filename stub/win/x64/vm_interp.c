@@ -434,7 +434,10 @@ const u64 vm_bc_slot_size = VM_BC_SLOT_SIZE;
  * 它读 [rsp+0x28] 正好是 guest 写在 [guest_rsp+0x20] 的那格。返回后用 rbx（被调者必须保存）恢复宿主 rsp。
  * 只对 Windows x64 启用：Linux/SysV 与 arm64 的调用约定不同（前 6/8 个参数都在寄存器里），留作后续。 */
 #if defined(VM_BLOB_USES_WIN64) && defined(__x86_64__) && !defined(VM_BLOB_TARGET_LINUX)
-typedef struct { u64 fn, gsp, a0, a1, a2, a3; } vm_calln_t;
+/* vm_xmm 的定义在后面（.bss），这里先声明：蹦床要用它做 FP 参数装载与返回值回流。 */
+extern u8 vm_xmm[256];
+
+typedef struct { u64 fn, gsp, a0, a1, a2, a3, xmm; } vm_calln_t;
 
 __attribute__((naked, used)) static u64 vm_calln_x64(vm_calln_t *p) {
     /* 注意：Windows x64 的第一个整型参数在 **RCX**（不是 SysV 的 RDI）。
@@ -447,6 +450,13 @@ __attribute__((naked, used)) static u64 vm_calln_x64(vm_calln_t *p) {
         "pushq %rbp\n\t"
         "movq %rsp, %rbx\n\t"
         "movq %rcx, %rbp\n\t"
+        /* FP 参数方向：把 guest 的 xmm0-xmm3 装进真实寄存器（Win64 前四个浮点参数）。
+         * 不做这一步，被保护函数调用**带 double 参数的 native 函数**时对方拿到的是垃圾。 */
+        "movq 48(%rbp), %r11\n\t"
+        "movups 0(%r11), %xmm0\n\t"
+        "movups 16(%r11), %xmm1\n\t"
+        "movups 32(%r11), %xmm2\n\t"
+        "movups 48(%r11), %xmm3\n\t"
         "movq 8(%rbp), %rsp\n\t"
 
         "movq 16(%rbp), %rax\n\t"
@@ -457,6 +467,16 @@ __attribute__((naked, used)) static u64 vm_calln_x64(vm_calln_t *p) {
         "movq %rax, %rcx\n\t"
         "callq *%r10\n\t"
         "1:\n\t"
+        /* FP 返回方向：把真实 xmm0-xmm5 写回 guest 的 XMM 堆。
+         * 返回值在 xmm0 —— 少了这一步，"转发壳"（call 完直接 ret）交出去的是旧值，
+         * 实测客户 demo 的 ?DemoMean@@YANPEBNH@Z 在 /Od 下因此得到 0.000。 */
+        "movq 48(%rbp), %r11\n\t"
+        "movups %xmm0, 0(%r11)\n\t"
+        "movups %xmm1, 16(%r11)\n\t"
+        "movups %xmm2, 32(%r11)\n\t"
+        "movups %xmm3, 48(%r11)\n\t"
+        "movups %xmm4, 64(%r11)\n\t"
+        "movups %xmm5, 80(%r11)\n\t"
         "movq %rbx, %rsp\n\t"
         "popq %rbp\n\t"
         "popq %rbx\n\t"
@@ -471,6 +491,7 @@ static u64 vm_call_native(vm_ctx_t *vm, u64 addr) {
     c.a1 = vm->regs[VRDX];
     c.a2 = vm->regs[VR8];
     c.a3 = vm->regs[VR9];
+    c.xmm = (u64)(void *)vm_xmm; /* guest 的 XMM 堆：call 前装 FP 参数、call 后回流返回值 */
     return vm_calln_x64(&c);
 }
 #else
