@@ -6324,3 +6324,35 @@ x64 宿主 x86-32 客户机模式在真循环上返回 `rc=99` 的既有缺口�
 让门禁重建，再看结果 —— 而不是先回退代码。
 
 顺带确认：`afc02ab`（含 probe `thunk` 模式 + vmpack 的 HIGHLOW/排序/i386 不装入口 hook）在 CI 上**五绿** ✓、门禁 **11/0** ✓。
+
+### 457. *** 目标③ 首个真实用例达成：32 位 PE 打包后运行结果与原生一致（55）***
+
+**实测**：
+
+    build/real32.exe       i686 gcc 编的真 32 位 PE，原生返回 55
+    vmpack -strip-relocs → build/t4.exe (155648 字节)
+    运行 t4.exe            → 退出码 55  ✓ 与原生一致
+
+**根因（整条 saga 的最后一环）**：i686 蹦床的结尾漏了两件事，而 x64 蹦床都有：
+
+    x64（stub/win/x64/vm_entry_asm.S 结尾）:
+        movq VM_CTX_RAX(%rsp), %rax
+        addq $VM_FRAME_SIZE, %rsp
+        addq $8, %rsp        ← 跳过 thunk 自己那条 E8 压的返回地址
+        ret
+
+我的 i686 版本少了 `addl $4, %esp` 与从 ctx 取回返回值 ⇒ `ret` 落到 thunk 之后的填充字节（`00 00` =
+`add %al,(%eax)`）⇒ 往 `[eax]` 写（eax 此时是返回值 55）⇒ 0xC0000005。已补齐。
+
+**定位手段（本轮新增，值得记）**：对**打包产物**用不了 probe 的 SEH 过滤器，改用 **Windows 应用程序事件日志**：
+`Get-WinEvent -LogName Application` 里 APPCRASH 记录的 **P8 = 错误偏移（模块内 RVA）** 直接就给出了出错指令地址 ——
+本轮据此把崩溃点从 `0x211CF`（`.bss` 写野地址）追到 `0x29C95`（thunk+5），一步到位。
+
+**同时修掉的另外两处"同类遮蔽"**：`-strip-relocs` 的实现（`clearDynamicBase`/`stripRelocations`）与 payload 的
+**字段预置**，原先都嵌在 `if len(imgSecs) > 0`（镜像整体加密）里 ⇒ i386（跳过镜像加密）**从不执行** ⇒
+DYNAMIC_BASE 未清、字段保持 blob 相对偏移 ⇒ 加载器按 ASLR 重定位而预置值按首选基址写。现在两者都独立于镜像加密。
+
+**新发现的两个待办（已开新目标继续）**：
+1. **默认路径（保留 ASLR）被 `.reloc` 空间卡住**：230 个站点需要 146 字节而该节只剩 110 ✗ ⇒
+   需要给这些项一个新的承载节（新建一节装"原有 + 新增"并把数据目录指过去）。
+2. **`vm32_loop` 打包后返回 1（原生 165）** ✗ —— 能跑但结果不对 ⇒ 一个真实的**行为不一致**疑点（下一步查）。

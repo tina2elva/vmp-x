@@ -129,5 +129,11 @@ vm_entry:
     movl    VM_SAVE_ESI(%esp), %esi
     movl    VM_SAVE_EDI(%esp), %edi
 
+    /* 客户机返回值：从 ctx 取回（与 x64 蹦床一致；vm_run 的 u64 返回值低半也在 EAX，但显式取回更稳）。 */
+    movl    VM_CTX_RAX(%esp), %eax
     addl    $VM_FRAME_SIZE, %esp
+    /* **跳过 thunk 自己的返回地址**：进入时栈顶是描述符 thunk 里那条 `E8 vm_entry` 压的返回地址，
+     * 客户机真正的返回地址在它上面。x64 蹦床同样有 `addq $8`（见 vm_entry_asm.S 结尾）；
+     * 少了这一步 ret 会落到 thunk 之后的填充字节（全 0 = `add %al,(%eax)`）⇒ 写 [eax] ⇒ 0xC0000005。 */
+    addl    $4, %esp
     ret

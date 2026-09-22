@@ -660,21 +660,25 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 		VerifyFn:  verifyFn,
 		EntryRVA:  entryRVA})
 	must(err)
-	if len(imgSecs) > 0 {
-		if imgMaster == nil {
-			fatalf("-enc-image 需要主密钥（不能与 -no-encrypt 同时用）")
-		}
-		if err := encryptImageSections(f, res, imgMaster, fieldMaskSalt); err != nil {
-			fatalf("原镜像加密失败: %v", err)
-		}
-		// (6) 默认**保留**重定位与 ASLR：加载器会在入口点之前按 delta 重定位镜像，而那些位置
-		// 此刻还是密文 —— 运行期按 #381 的方案「先减回去 → 解密 → 再加回来」（见 vm_unpack_image）。
-		// -strip-relocs 可以退回旧行为（拆表 + 清 DYNAMIC_BASE，代价是失去 ASLR）。
-		if stripRelocs {
-			clearDynamicBase(f)
-			stripRelocations(f)
-			fmt.Println("[*] -strip-relocs：重定位表已拆、DYNAMIC_BASE 已清（本产物失去 ASLR）")
-		} else {
+	/* -strip-relocs 的实现（拆表 + 清 DYNAMIC_BASE）与"镜像是否整体加密"**无关**：
+	 * 原来它嵌在 if len(imgSecs)>0 里 ⇒ i386（跳过镜像加密）根本不会清 DYNAMIC_BASE，
+	 * 加载器于是仍按 ASLR 重定位，而预置值是按首选基址写的（实测现象诡异）。 */
+	if stripRelocs {
+		clearDynamicBase(f)
+		stripRelocations(f)
+		fmt.Println("[*] -strip-relocs：重定位表已拆、DYNAMIC_BASE 已清（本产物失去 ASLR）")
+	} else {
+
+		if len(imgSecs) > 0 {
+			if imgMaster == nil {
+				fatalf("-enc-image 需要主密钥（不能与 -no-encrypt 同时用）")
+			}
+			if err := encryptImageSections(f, res, imgMaster, fieldMaskSalt); err != nil {
+				fatalf("原镜像加密失败: %v", err)
+			}
+			// (6) 默认**保留**重定位与 ASLR：加载器会在入口点之前按 delta 重定位镜像，而那些位置
+			// 此刻还是密文 —— 运行期按 #381 的方案「先减回去 → 解密 → 再加回来」（见 vm_unpack_image）。
+			// -strip-relocs 可以退回旧行为（拆表 + 清 DYNAMIC_BASE，代价是失去 ASLR）。
 			fmt.Println("[*] 重定位与 DYNAMIC_BASE 保留（ASLR 生效；运行期自解密会把加载器的重定位搬回明文）")
 			// (6) payload 里那些**绝对 VA** 也必须让加载器重定位，否则它们仍指向首选基址。
 			// 实测漏掉它们：加载器按 TLS 回调数组跳到"首选基址 + rva"的旧地址 -> 0xC0000005。
@@ -685,7 +689,10 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 	/* payload 的基址重定位与镜像加密**无关**：原来嵌在 if len(imgSecs)>0 里，
 	 * 于是 i386（跳过镜像加密）与 -no-enc-image 的情形下这段根本不执行 —— 实测因此
 	 * 打包产物能跑但结果错。现在移到外面，并保留"拆表时不追加"的语义。 */
-	if !stripRelocs {
+	/* 注意：**预置**（把字段改成"首选基址下的绝对 VA"）必须无条件做；
+	 * 只有"追加 HIGHLOW 项"才依赖保留镜像重定位。原来整块都在 `if !stripRelocs` 里 ⇒
+	 * strip 模式下字段保持 blob 相对偏移 ⇒ 运行时去写 0x8810 这种未映射地址 ⇒ 0xC0000005（实测）。 */
+	{
 		var items [][2]uint32
 		if origTLSRVA != 0 && res.TlsDirRVA != 0 {
 			for _, e := range origRelocEntries(f) {
@@ -703,7 +710,7 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 			relType = 3
 			ptrSize = 4
 		}
-		if res.ImgTlsArrayRVA != 0 {
+		if !stripRelocs && res.ImgTlsArrayRVA != 0 {
 			for i := 0; i < 1+len(imgTLS); i++ { // 终止项是 0，不需要（也不该）重定位
 				items = append(items, [2]uint32{relType, res.ImgTlsArrayRVA + uint32(i)*ptrSize})
 			}
@@ -727,9 +734,11 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 					cur := binary.LittleEndian.Uint32(f.Data[off:])
 					binary.LittleEndian.PutUint32(f.Data[off:], uint32(f.ImageBase)+res.SectionRVA+cur)
 				}
-				items = append(items, [2]uint32{relType, rva})
+				if !stripRelocs {
+					items = append(items, [2]uint32{relType, rva})
+				}
 			}
-			fmt.Printf("[*] blob 基址站点补了 %d 个重定位项（type=%d）", n, relType)
+			fmt.Printf("[*] blob 基址站点预置了 %d 个（追加重定位项=%v）", n, !stripRelocs)
 			fmt.Println()
 		}
 		if len(items) > 0 {
