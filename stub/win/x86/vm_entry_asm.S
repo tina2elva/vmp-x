@@ -68,8 +68,12 @@ vm_entry:
     movl    $0, VM_CTX_R14(%esp)
     movl    $0, VM_CTX_R15(%esp)
 
-    /* ---- simulated ESP = esp - (4 + VM_MARGIN) ---- */
-    leal    -(4 + VM_MARGIN)(%esp), %eax
+    /* ---- simulated ESP = esp - (16 + VM_MARGIN) ----
+     * 这个 16 必须与 vm_abi.h 的 VM_FRAME_SKEW_EXTRA 一致（lifter 用 FRAME_SIZE+EXTRA+MARGIN 做栈偏移换算）。
+     * 踩坑：原来写 4（只算"thunk 的 E8 + 客户机返回地址"各 4 字节），而 EXTRA 是 16 ⇒
+     * skew 差 12 ⇒ 每条栈访问都偏 12 ⇒ 用栈的函数（如带循环的 vm32_loop）算出错值，
+     * 不用栈的函数（vm32_sum10）看起来正常 —— 极难查。16 还顺带保证了 ≡0 mod 16 的对齐。 */
+    leal    -(16 + VM_MARGIN)(%esp), %eax
     movl    %eax, VM_CTX_RSP(%esp)
 
     /* ---- descriptor = return address - VM_THUNK_SIZE - VM_DESC_TO_THUNK ---- */
