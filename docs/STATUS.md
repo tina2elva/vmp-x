@@ -6165,3 +6165,29 @@ DIR32 届时从「拒绝」升级为「可修复」。
 （注意 `-I stub/win/x86` **在前**，这样它拿到的是 32 位 ctx 布局的 `vm_abi.h`。）
 
 **当前状态**：`go test ./...` **全绿** ✓；那条真实函数的运行仍崩（0xC0000005），崩溃窗口见 #449。
+
+### 451. 验收：门禁 11/0、CI 五绿、preflight OK —— 以及那条 e2e flake 的**真因**
+
+**先说明一次误判**：本轮门禁先红在 `e2e.ps1 (x86-64)`，报 `[FAIL] packing failed (rc=1)`、且"vmpack 输出末尾"是空的 ✗。
+我一度怀疑是自己改坏了 vmpack。**直接复现打包命令**后真相是：
+
+    [!] open build\target_vmp.exe: The process cannot access the file because it is being used by another process.
+
+⇒ 残留的 `target_vmp.exe` 进程锁住了产物 ✗。清掉进程后**单独跑那条打包命令完全成功**：
+
+    [+] 输出: build\target_vmp.exe (196608 字节)
+    [+] 报告: build\target_vmp.json
+
+**注意**：e2e 脚本自己在**更早的步骤**里会运行打包产物，进程可能残留；它在开头杀一次残留不够。
+**下次遇到 e2e packing 失败，先 `Get-Process target_vmp | Stop-Process -Force` 再单独复现那条命令** ——
+别急着怀疑代码。
+
+**最终验收（清干净进程后重跑）**：
+
+    [OK] gofmt / go vet / go test / vmpbuild(blob builds) / e2e.ps1 / residue probe /
+         bytecode plaintext scan / image residue / e2e_dll.ps1 / guest differential(arm64+x86-32) / linux payload
+    total 11 gates, 0 failed
+
+- `tools/preflight.ps1` → `[+] preflight: OK` ✓
+- CI 五作业全绿：run `35712748949` ✓（另有 `35711584220` ✓）
+- `go test ./...` 全绿 ✓、工作区干净 ✓
