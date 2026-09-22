@@ -98,6 +98,11 @@ func readCOFFObject(path string) (*objFile, error) {
 	// 所以按 Machine 判定，在读符号表时**统一剥掉前导下划线** —— 剥在源头，合并/manifest/重定位
 	// 三处就自动一致了。注意不能按"是不是 COFF"判定：arm64 的 PE 符号**不带**下划线。
 	stripUnderscore := uint16(f.FileHeader.Machine) == coffMachineI386
+	/* i386 与 AMD64 的重定位**编号空间不同但数字重叠**：0x06 在 AMD64 是 REL32+4（PC 相对），
+	 * 在 i386 却是 DIR32（**绝对** 32 位）。原来那个"REL32..REL32+9"的范围 case 会把 i386 的
+	 * DIR32 一并吞掉，于是绝对引用被按 PC 相对算 —— 产物**能构建**却在运行期用野指针（实测崩）。
+	 * 所以范围 case 必须限定 AMD64；i386 的绝对重定位落到 default ⇒ 明确拒绝。 */
+	isI386 := stripUnderscore
 	for i, s := range f.Sections {
 		data, derr := s.Data()
 		if derr != nil {
@@ -175,7 +180,7 @@ func readCOFFObject(path string) (*objFile, error) {
 				rel.Kind = relPCRel32
 			case r.Type == relAMD64Rel32:
 				rel.Kind = relPCRel32
-			case r.Type >= relAMD64Rel32+1 && r.Type <= relAMD64Rel32N:
+			case !isI386 && r.Type >= relAMD64Rel32+1 && r.Type <= relAMD64Rel32N:
 				rel.Kind = relPCRel32
 				rel.PlusN = int(r.Type-relAMD64Rel32) + 1
 			case r.Type == relAMD64Addr32 || r.Type == relAMD64Addr32NB:
