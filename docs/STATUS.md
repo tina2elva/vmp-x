@@ -5629,6 +5629,24 @@ grep 出剩余的独立写法再修一次才 5/5 —— 这一步值得记：**�
   `gates 真实退出码 = 0`、`total 11 gates, 0 failed`、`e2e: 165 passed, 0 failed`、`dll e2e: 3 passed, 0 failed`、`[+] arm64 guest e2e: OK` ✓。
 
 **一条排错留档**：本轮我用 `gates.ps1 *>&1 | Tee-Object … | Select-Object -Last 4` 这种包装跑门禁时，后台作业回报的退出码是 1，
+### 431. 目标项 ③ 第七块：**32 位栈传参记账**（push/pop 的模拟栈槽宽按模式走）
+
+**侦察结论（避免了走错方向）**：
+- C 侧 `OP_CALLN` 是 `vm->regs[VRAX] = vm_call_native(vm, addr)` ⇒ 调用走**宿主 ABI 蹦床**，**不往客户机栈压返回地址**；
+- lifter 的 `CALL` 注释也写明是"**净零**语义：不模拟 push 返回地址（被调方 ret 时抵消）"；
+⇒ 所以 `call/ret` **不需要**槽宽改动 ✗；真正的 32 位 ABI 差异在 **`push`/`pop` 的模拟栈记账**上 ✓。
+
+**改动**：新增 `Lifter.stackSlot()`（32 位 ⇒ 4，64 位 ⇒ 8），`PUSH`/`POP` 的 `spDelta` 改用它。
+64 位下与改前完全等价（`stackSlot()` 恒为 8）⇒ 零回归，已由既有测试覆盖。
+
+**为什么这条重要**：模拟栈必须镜像客户机真实栈 —— 32 位下调用方压的参数在 `[esp+4]`/`[esp+8]`，
+而不是 64 位的 `[rsp+8]`/`[rsp+16]`。账记错 4 字节 ⇒ **所有栈传参静默读错位置**（不报错、不崩溃），
+正是本目标要消灭的那类问题。
+
+**测试（`internal/lift/x64/lift32_stackarg_test.go`）**：`push 42; mov eax,[esp+4]; ret`，`FrameSkew=64`
+（lifter 只对"有效偏移 ≥ 0"的访问补 FrameSkew，于是两种模式会跨过 0 边界）：
+32 位 `eff=0` ⇒ 补 skew；64 位 `eff=-4` ⇒ 不补 ⇒ 两边 `Disp` **必须不同**，且各自断言到确切值。
+
 但日志里明明是 11/0 —— 那是**包装管道**的退出码，不是门禁的。要看门禁真实结论，必须不带包装地跑（或直接读 `total … failed` 那一行）。
 
 

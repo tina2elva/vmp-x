@@ -89,6 +89,18 @@ func (l *Lifter) ptrWidth() ir.Width {
 	return ir.W64
 }
 
+// stackSlot 返回本模式下压栈/弹栈的**字节数**：x86-32 是 4，x86-64 是 8。
+//
+// 为什么必须按模式走：模拟栈的布局要镜像客户机的真实栈 —— 32 位下 `push ebp` 只压 4 字节，
+// 调用方压的参数因此落在 `[esp+4]`/`[esp+8]`（而不是 64 位的 `[rsp+8]`/`[rsp+16]`）。
+// 账记错 4 字节 ⇒ 所有栈传参都会**静默读错位置**（不报错、不崩溃）。
+func (l *Lifter) stackSlot() int64 {
+	if l.mode() == x64dec.Mode32 {
+		return 4
+	}
+	return 8
+}
+
 // mode 取解码模式；零值视为 64 位（结构体字面量构造时不会漏）。
 func (l *Lifter) mode() int {
 	if l.Mode == 0 {
@@ -979,7 +991,7 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 	switch ins.Op() {
 	case x86asm.PUSH:
 		if l.spKnown {
-			l.spDelta -= 8
+			l.spDelta -= l.stackSlot()
 		}
 		return nil
 
@@ -989,7 +1001,7 @@ func (l *Lifter) trackRegs(ins x64dec.Insn) error {
 			return nil
 		}
 		if l.spKnown {
-			l.spDelta += 8
+			l.spDelta += l.stackSlot()
 		}
 		return nil
 
