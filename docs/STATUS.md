@@ -5673,6 +5673,28 @@ grep 出剩余的独立写法再修一次才 5/5 —— 这一步值得记：**�
 测试对该结果**如实记录**（成功则断言 IR 非空，失败则 log 原因而不判失败）—— 入口是 CRT 桩，翻不过去不是缺陷。
 
 **意义**：PE32 的 Go 侧路径（解析 → 32 位解码 → 32 位 lift → 栈记账）现在在**真实 32 位代码**上站得住 ✓，
+### 434. #429 那条间歇性门禁失败的**真正根因**：测试进程锁住产物文件（已修）
+
+**真因（由 #430 加的诊断直接打出来）**：
+
+```
+[!] open build\target_vmp.exe: The process cannot access the file because it is being used by another process.
+```
+
+⇒ 上一次运行**残留的 `target_vmp.exe` 进程**还活着（最可能是 `mt_many` 那个 180s 超时用例），锁住产物文件，
+vmpack 无法覆盖 ⇒ `rc=1` ⇒ e2e 报 `packing failed`。
+
+**为什么一直难查**
+1. 症状只在"有残留进程"时出现 ⇒ **只在本地间歇出现**；CI 每次都是干净机器，所以 CI 一直绿；
+2. 旧脚本把 vmpack 的输出**吞掉**、只打印一句自撰文案（"unliftable instructions; refusing to reuse a stale artifact"）
+   ⇒ 被误读成"lifter 无法翻译"，方向从一开始就错了。
+
+**修法**：`tools/e2e.ps1` 开工前清掉残留的 `target_vmp` / `target` 进程（+ 300ms 等待）。
+这样即使某次运行留下了进程，下一次运行也会先清干净。
+
+**教训（值得单独记）**：#430 做的"失败时把 vmpack 输出末尾打出来"看起来只是加日志，
+但**正是它**让这条 flake 一次定位 —— **可诊断性本身就是修复的一部分**。
+
 不再只有合成用例。**仍未做**：跨到宿主 native 调用时的 32 位 ABI（参数在栈上，而蹦床按 x64 ABI 传 RCX/RDX/R8/R9）
 —— 它与 32 位 blob/thunk/trampoline（per-platform asm）是同一块，**被工具链决策卡住**（见 TODO 的 PE32 一节）。
 

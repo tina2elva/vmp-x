@@ -11,7 +11,15 @@
 #
 # Usage: pwsh -File tools/e2e.ps1
 
+# 开工前先清掉可能残留的测试进程：上一次运行如果留下还活着的 target_vmp.exe / target.exe，
+# 会**锁住产物文件**，导致下一次打包直接失败：
+#   [!] open build\target_vmp.exe: The process cannot access the file because it is being used by another process.
+# 这个症状曾经被误判成"lifter 无法翻译"（STATUS #429/#430）。真正的修复就是这里先清干净。
 $ErrorActionPreference = "Continue"
+foreach ($pn in @("target_vmp", "target")) {
+    Get-Process -Name $pn -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch {} }
+}
+Start-Sleep -Milliseconds 300
 if ($PSScriptRoot) { Set-Location (Join-Path $PSScriptRoot "..") }
 New-Item -ItemType Directory -Force -Path build | Out-Null
 
