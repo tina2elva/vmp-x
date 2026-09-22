@@ -1,18 +1,13 @@
-﻿# diffcheck.ps1 - 保护前逐函数差分自检 / 可保护性清单（目标项 4+5）
+﻿# diffcheck.ps1 - 保护前逐函数差分自检 / 可保护性清单
 #
-# 对候选函数**逐个**单独保护，然后比对输出，给三档结论：
-#   REFUSED : 打包就被拒（附 lifter 原话，例如缺哪条指令）
-#   WRONG   : 打包成功但输出不一致 —— 点名函数 + 不一致行数 + 首处差异
-#   OK      : 输出一致
-#
-# 期望值来源（优先级从高到低）：
-#   -Expect <file> : 客户自己的 ground truth / run_*.txt（推荐：验收口径与客户一致）
-#   否则           : 跑一遍原始（未受保护）可执行文件的输出
-#
+# 结论三档：REFUSED（打包被拒，附 lifter 原话）/ WRONG（点名 + 不一致行数 + 首处差异）/ OK
+# 期望值来源：-Expect <file>（客户自己的 ground truth / run_*.txt，推荐）；否则跑原始可执行文件。
+# 函数名来源：-FuncList '?A@@YAXXZ,...'；或只给 -Map，脚本自己从 MAP 里挑带 f 标志的函数。
 param(
   [Parameter(Mandatory=$true)][string]$Exe,
-  [string]$Map = '', # 可选：cl 构建的 PE 用 MAP；gcc 目标 vmpack 直接读符号表
-  [Parameter(Mandatory=$true)][string]$FuncList,
+  [string]$Map = '',
+  [string]$FuncList = '',
+  [string]$FuncFilter = '', # 只跑名字匹配该正则的函数（MAP 自动模式下特别有用，例如 'Demo|Math'）
   [string]$Expect = '',
   [string]$Args = '',
   [string]$Filter = '',
@@ -23,6 +18,8 @@ param(
   [string]$Markdown = ''
 )
 $ErrorActionPreference = 'Continue'
+# 控制台按 UTF-8 输出：否则中文在 GBK(936) 代码页的窗口里显示成乱码
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 if ($PSScriptRoot) { Set-Location (Join-Path $PSScriptRoot '..') }
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 
@@ -34,6 +31,7 @@ function Filter-Text([string]$t) {
 function RunCapture([string]$exe, [string]$argstr) {
   $tmp = Join-Path $Work 'out.txt'
   Remove-Item $tmp -ErrorAction SilentlyContinue
+  # 不能把空数组传给 -ArgumentList（PS 报参数校验失败 ⇒ 两边都空 ⇒ 假 OK）
   $sp = @{ FilePath = $exe; NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $tmp;
           RedirectStandardError = (Join-Path $Work 'err.txt') }
   if ($argstr) { $sp['ArgumentList'] = $argstr.Split(' ') }
@@ -45,6 +43,32 @@ function RunCapture([string]$exe, [string]$argstr) {
   return @{ Out = (Filter-Text $out); Code = $p.ExitCode }
 }
 
+# 从 MAP 取函数名：MSVC 的 MAP 行形如
+#   0001:00000530       ?DemoAdd@@YAHHH@Z          0000000140001530 f   demo_exe.obj
+# 第三个字段是地址、第四个含 f 才表示函数（字符串常量没有 f）。
+function Get-FuncsFromMap([string]$path) {
+  $re = '^\s*[0-9A-Fa-f]{4}:[0-9A-Fa-f]{8}\s+(\S+)\s+[0-9A-Fa-f]{16}\s+(.+?)\s*$'
+  $names = New-Object System.Collections.ArrayList
+  foreach ($line in (Get-Content $path)) {
+    $m = [regex]::Match($line, $re)
+    if (-not $m.Success) { continue }
+    if ($m.Groups[2].Value -notmatch '(^|\s)f(\s|$)') { continue }
+    [void]$names.Add($m.Groups[1].Value)
+  }
+  return $names
+}
+
+if ($FuncList) {
+  $funcs = $FuncList.Split(',') | Where-Object { $_ -ne '' }
+} elseif ($Map -and (Test-Path $Map)) {
+  $funcs = Get-FuncsFromMap $Map
+  if ($FuncFilter) { $funcs = @($funcs) | Where-Object { $_ -match $FuncFilter } }
+  Write-Host ('函数名来源: 从 MAP 自动提取（' + @($funcs).Count + ' 个' + $(if ($FuncFilter) { '，已按 ' + $FuncFilter + ' 过滤' } else { '' }) + '）')
+} else {
+  Write-Host '[!] 需要 -FuncList，或给出 -Map 让脚本自己取函数名'; exit 3
+}
+if (@($funcs).Count -eq 0) { Write-Host '[!] 没有可用的函数名'; exit 3 }
+
 if ($Expect) {
   if (-not (Test-Path $Expect)) { Write-Host ('[!] 找不到期望值文件 ' + $Expect); exit 3 }
   $expected = @{ Out = (Filter-Text (Get-Content $Expect -Raw)); Code = 'expect' }
@@ -54,7 +78,6 @@ if ($Expect) {
   Write-Host ('期望值来源: 原始可执行文件（exit=' + $expected.Code + '）')
 }
 
-$funcs = $FuncList.Split(',') | Where-Object { $_ -ne '' }
 $ok = 0; $wrong = 0; $refused = 0
 $report = New-Object System.Collections.ArrayList
 foreach ($f in $funcs) {
@@ -64,13 +87,28 @@ foreach ($f in $funcs) {
   if ($Map) { $pa += @('-map', $Map) }
   if ($Blob) { $pa += @('-blob', $Blob) }
   if ($Manifest) { $pa += @('-manifest', $Manifest) }
-  $packOut = (& .\build\vmpack.exe @pa 2>&1 | Out-String)
+  # vmpack 是原生程序、输出走 ANSI(GBK)：按 Default 读才不会乱码
+  # 注意：stdout/stderr **不能**重定向到同一个文件（PS 会直接报错 ⇒ 每次都被当成打包失败）
+  $pkOut = Join-Path $Work 'pack_out.txt'
+  $pkErr = Join-Path $Work 'pack_err.txt'
+  Remove-Item $pkOut, $pkErr -ErrorAction SilentlyContinue
+  $sp2 = @{ FilePath = '.\build\vmpack.exe'; ArgumentList = $pa; NoNewWindow = $true; PassThru = $true;
+            RedirectStandardOutput = $pkOut; RedirectStandardError = $pkErr }
+  $pk = Start-Process @sp2
+  $pk.WaitForExit() | Out-Null
+  $packOut = ''
+  # 原生程序的输出是 ANSI(GBK)：按 Default 读才不乱码
+  if (Test-Path $pkOut) { $packOut += (Get-Content $pkOut -Raw -Encoding Default) }
+  if (Test-Path $pkErr) { $packOut += (Get-Content $pkErr -Raw -Encoding Default) }
   if (-not (Test-Path $out)) {
     $refused++
-    $reason = ($packOut -split "`n" | Where-Object { $_ -match '无法翻译|\[!\]' } | Select-Object -First 1)
+    $lines = $packOut -split "`n" | Where-Object { $_.Trim() -ne '' }
+    $reason = ($lines | Where-Object { $_ -match '无法翻译' } | Select-Object -First 1)
+    if (-not $reason) { $reason = ($lines | Where-Object { $_ -notmatch '未烘焙厂商根公钥' } | Select-Object -First 1) }
     if (-not $reason) { $reason = '打包失败' }
-    [void]$report.Add([pscustomobject]@{ Func = $f; Verdict = 'REFUSED'; Detail = $reason.Trim() })
-    Write-Host ('[REFUSED] ' + $f + '  ' + $reason.Trim())
+    $reason = $reason.Trim()
+    [void]$report.Add([pscustomobject]@{ Func = $f; Verdict = 'REFUSED'; Detail = $reason })
+    Write-Host ('[REFUSED] ' + $f + '  ' + $reason)
     continue
   }
   $prot = RunCapture $out $Args
