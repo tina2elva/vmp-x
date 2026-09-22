@@ -19,8 +19,64 @@ typedef int (*run_fn_t)(vm_ctx_t *);
 
 static u8 emu_stack[1 << 20]; /* 1MB 模拟栈：足够 M1 的叶子函数 */
 
+/* 诊断用：未处理异常过滤器 —— 直接把异常码/出错地址/访问违例的目标地址写进日志。
+ * 没有它的时候，i686 上跑 blob 只能看到一个 0xC0000005，完全看不出崩在哪。 */
+static void chk(const char *tag); /* 前向声明，定义在下面 */
+static void *g_blob_base;      /* 映射基址：崩溃时把出错地址换算成 blob 内偏移 */
+static long g_entry_off;
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
+    FILE *g = fopen("build/probe_chk.log", "a");
+    if (g) {
+        fprintf(g, "!! exception code=0x%08lX address=%p",
+                (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                (void *)ep->ExceptionRecord->ExceptionAddress);
+        if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && ep->ExceptionRecord->NumberParameters >= 2) {
+            fprintf(g, " av_kind=%lu av_addr=%p",
+                    (unsigned long)ep->ExceptionRecord->ExceptionInformation[0],
+                    (void *)ep->ExceptionRecord->ExceptionInformation[1]);
+        }
+        if (g_blob_base) {
+            fprintf(g, " blob_offset=0x%lX offset_in_entry=0x%lX",
+                    (unsigned long)((unsigned char *)ep->ExceptionRecord->ExceptionAddress - (unsigned char *)g_blob_base),
+                    (unsigned long)((unsigned char *)ep->ExceptionRecord->ExceptionAddress -
+                                    ((unsigned char *)g_blob_base + g_entry_off)));
+        }
+        if (ep->ContextRecord) {
+            CONTEXT *c = ep->ContextRecord;
+            fprintf(g, " eip=%p esp=%p eax=%p ebx=%p ecx=%p edx=%p esi=%p edi=%p ebp=%p",
+                    (void *)(size_t)c->Eip, (void *)(size_t)c->Esp, (void *)(size_t)c->Eax,
+                    (void *)(size_t)c->Ebx, (void *)(size_t)c->Ecx, (void *)(size_t)c->Edx,
+                    (void *)(size_t)c->Esi, (void *)(size_t)c->Edi, (void *)(size_t)c->Ebp);
+            if (g_blob_base && c->Esp) {
+                const unsigned int *sp = (const unsigned int *)(size_t)c->Esp;
+                unsigned int k;
+                fprintf(g, " stack:");
+                for (k = 0; k < 8; k++) {
+                    unsigned int v = 0;
+                    if (!IsBadReadPtr((const void *)(sp + k), 4)) v = sp[k];
+                    fprintf(g, " [%u]=0x%X", k, v);
+                }
+            }
+        }
+        fprintf(g, "\n");
+        fclose(g);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+/* 诊断用：把检查点直接写文件（崩溃路径下 stdout/stderr 可能丢缓冲，写文件最可靠）。 */
+static void chk(const char *tag) {
+    FILE *g = fopen("build/probe_chk.log", "a");
+    if (g) {
+        fprintf(g, "%s\n", tag);
+        fclose(g);
+    }
+}
+
 static unsigned char *read_file(const char *path, long *size) {
+    chk("read_file: enter");
     FILE *f = fopen(path, "rb");
+    chk(f ? "read_file: fopen ok" : "read_file: fopen FAILED");
     if (!f) {
         fprintf(stderr, "[!] cannot open %s\n", path);
         return NULL;
@@ -37,6 +93,7 @@ static unsigned char *read_file(const char *path, long *size) {
     }
     fclose(f);
     *size = n;
+    chk("read_file: done");
     return buf;
 }
 
@@ -134,6 +191,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: runbc <blob.bin> <entryOff> <bytecode.vmb> <arg>\n");
         return 2;
     }
+    SetUnhandledExceptionFilter(crash_filter);
     const char *blobPath = argv[1];
     long entryOff = strtol(argv[2], NULL, 0);
     const char *bcPath = argv[3];
@@ -153,8 +211,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[!] VirtualAlloc failed\n");
         return 2;
     }
+    chk("about to memcpy");
+    g_blob_base = mem;
+    g_entry_off = entryOff;
     memcpy(mem, blob, (size_t)blobSize);
+    chk("memcpy done");
     FlushInstructionCache(GetCurrentProcess(), mem, (SIZE_T)blobSize);
+    chk("icache flushed");
     /* 可选第 5 个参数：vm_reloc_tab 在 blob 里的偏移（0/缺省 = 无表；x64 侧不需要）。
      * i386 的绝对引用（DIR32）在字段里存的是「blob 相对偏移」，必须加上**加载基址**才有效。
      * 表格式：[u32 count][count × u32 站点偏移]。注意要补丁**映射后的副本**（mem），
@@ -201,6 +264,7 @@ int main(int argc, char **argv) {
     ctx.regs[VRSP] = (u64)(emu_stack + sizeof(emu_stack));  /* 模拟栈顶 */
     ctx.regs[VRBASE] = 0;                                  /* M1 叶子函数用不到 */
 
+    chk("about to call vm_run");
     run_fn_t fn = (run_fn_t)((unsigned char *)mem + entryOff);
     int rc = fn(&ctx);
 

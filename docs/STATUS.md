@@ -6191,3 +6191,28 @@ DIR32 届时从「拒绝」升级为「可修复」。
 - `tools/preflight.ps1` → `[+] preflight: OK` ✓
 - CI 五作业全绿：run `35712748949` ✓（另有 `35711584220` ✓）
 - `go test ./...` 全绿 ✓、工作区干净 ✓
+
+### 452. *** 关键结论：i686 blob 崩在「自校验硬门」—— 它是在**正确地拒绝** ***
+
+**怎么定位到的（这条方法论值得复用）**：
+1. 给 probe 加 `SetUnhandledExceptionFilter`，把**异常码/出错地址/访问违例目标地址**写进日志；
+2. 再用它打印 **blob 映射基址** ⇒ 把出错地址换算成 blob 内偏移；
+3. 用 `objdump -D -b binary -m i386` 反汇编那一处 ⇒ 看到崩溃指令是 **`0f 0b`（ud2）**——
+   也就是项目里的 `__builtin_trap()`：**不是内存踩踏，是 blob 主动拒绝**；
+4. 再打印异常**上下文寄存器**（`esi=0x96` 像哈希循环计数器、`ebx=ecx=blob_base+0x8000`=blob 的 .bss 起点），
+   对照源码锁定了 `vm_selfcheck()`。
+
+**根因**：`vm_selfcheck()` 对 `[base, base+vm_self_len)` 做 FNV-1a，与 vmpack 烘焙的 `vm_self_hash` 比对；
+而我的**基址重定位补丁**（把 230 个 DIR32 站点 `+= base`）改了 `.text` 里的字节 ⇒ 哈希必然对不上 ⇒ 触发 ud2。
+
+**这意味着**：`vm_self_hash` 与"加载期改字节"是**互相冲突**的两个机制，必须协调。标准做法是：
+哈希时把**重定位站点**按规范化值（例如 0）参与运算（即站点字节不进入哈希）；vmpack 烘焙 `vm_self_hash` 时用同一套规则。
+
+**顺带修掉的一个真 bug（本轮的实质进展）**：`vm_find_module` 用的是 **x64 的 PEB 布局**
+（`Ldr@0x18`、8 字节指针、`DllBase@+0x30`…），而 i386 是 `Ldr@0x0C`、4 字节指针、`DllBase@+0x18`、
+`Length@+0x2C`、`Buffer@+0x30`。已按 `VM_HOST_X86_32` 参数化（x64 展开后与原代码逐字节等价，不回退）。
+修之前崩在 `mov 0x20(%esi)` 的访问违例（av_addr=0x11F，blob 偏移 0x72E）；修之后崩溃点推进到自校验（0x27C2）。
+
+**下一步（很明确）**：让自校验跳过重定位站点 ——
+(a) `vm_selfcheck` 通过一个由 vmpack 烘焙的「站点表偏移」全局找到表，遍历时对落在站点内的字节用规范化值；
+(b) `vmpack` 计算 `vm_self_hash` 时用同一套规范化（它已经能读 vmpbuild 的 manifest，站点表信息在那里）。

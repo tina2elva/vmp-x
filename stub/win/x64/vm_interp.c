@@ -2686,20 +2686,44 @@ static int vm_name_eq(const char *a, const char *b) {
     }
 }
 
-/* 只走 PEB -> Ldr -> InMemoryOrderModuleList（x64 偏移：Ldr@0x18，
- * 表头@Ldr+0x20，节点 InMemoryOrderLinks@entry+0x10，DllBase@+0x30，BaseDllName@+0x58）。 */
+/* PEB / PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY 的布局**按宿主位宽不同**：
+ *   x64 : Ldr@0x18、InMemoryOrderModuleList@Ldr+0x20、节点回链@entry+0x10、
+ *         DllBase@+0x30、BaseDllName.Length@+0x58、Buffer@+0x60（指针 8 字节）；
+ *   i386: Ldr@0x0C、InMemoryOrderModuleList@Ldr+0x14、节点回链@entry+0x08、
+ *         DllBase@+0x18、Length@+0x2C、Buffer@+0x30（指针 4 字节）。
+ * 踩坑留档：不区分就会在 i386 上读错字段、顺着垃圾指针走 —— 实测崩在
+ * `mov 0x20(%esi),%eax`（blob 偏移 0x72E），av_addr=0x11F。 */
+#if defined(VM_HOST_X86_32)
+#define VM_PEB_LDR_OFF      0x0Cu
+#define VM_LDR_HEAD_OFF     0x14u
+#define VM_LINK_BACK_OFF    0x08u
+#define VM_DLLBASE_OFF      0x18u
+#define VM_NAMELEN_OFF      0x2Cu
+#define VM_NAMEBUF_OFF      0x30u
+#define vm_pread(p)         (*(const u32 *)(p))
+#else
+#define VM_PEB_LDR_OFF      0x18u
+#define VM_LDR_HEAD_OFF     0x20u
+#define VM_LINK_BACK_OFF    0x10u
+#define VM_DLLBASE_OFF      0x30u
+#define VM_NAMELEN_OFF      0x58u
+#define VM_NAMEBUF_OFF      0x60u
+#define vm_pread(p)         (*(const u64 *)(p))
+#endif
+
+/* 只走 PEB -> Ldr -> InMemoryOrderModuleList（偏移见上面的宏）。 */
 static u64 vm_find_module(const char *name) {
     u64 peb = vm_peb_base();
     if (!peb) return 0;
-    u64 ldr = *(const u64 *)(peb + 0x18);
+    u64 ldr = vm_pread(peb + VM_PEB_LDR_OFF);
     if (!ldr) return 0;
-    u64 head = ldr + 0x20;
-    u64 cur = *(const u64 *)head;
+    u64 head = ldr + VM_LDR_HEAD_OFF;
+    u64 cur = vm_pread(head);
     for (int i = 0; i < 512 && cur && cur != head; i++) {
-        u64 ent = cur - 0x10;
-        u64 base = *(const u64 *)(ent + 0x30);
-        u16 len = *(const u16 *)(ent + 0x58);
-        const u16 *buf = *(const u16 *const *)(ent + 0x60);
+        u64 ent = cur - VM_LINK_BACK_OFF;
+        u64 base = vm_pread(ent + VM_DLLBASE_OFF);
+        u16 len = *(const u16 *)(ent + VM_NAMELEN_OFF);
+        const u16 *buf = (const u16 *)(u64)vm_pread(ent + VM_NAMEBUF_OFF);
         char tmp[64];
         u32 n = len / 2;
         if (n > 63) n = 63;
@@ -2709,7 +2733,7 @@ static u64 vm_find_module(const char *name) {
         }
         tmp[n] = 0;
         if (base && vm_name_eq(tmp, name)) return base;
-        cur = *(const u64 *)cur;
+        cur = vm_pread(cur);
     }
     return 0;
 }
