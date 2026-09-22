@@ -69,11 +69,19 @@ func TestParseRejectsGarbage(t *testing.T) {
 	if _, err := Parse([]byte("not a pe at all, definitely not")); err == nil {
 		t.Error("expected error for non-PE input")
 	}
-	// PE32 (0x10B) 必须被拒绝：本项目只做 PE32+
+	// 可选头 magic 未知时必须报错。
+	// （这里原来断言"PE32 必须被拒绝"，那是旧限制：现在 PE32 是**有意支持**的，
+	//   见 pe32_test.go 的 TestParsePE32/TestParseRealPE32。）
 	d := synthPE(1, 0x200, 0x400)
-	binary.LittleEndian.PutUint16(d[0x40+24:], 0x10B)
+	binary.LittleEndian.PutUint16(d[0x40+24:], 0x999)
 	if _, err := Parse(d); err == nil {
-		t.Error("expected error for PE32 optional header")
+		t.Error("expected error for unknown optional header magic")
+	}
+	// 而 PE32 的 magic 必须**通过**（解析层不再拒绝它）。
+	d2 := synthPE(1, 0x200, 0x400)
+	binary.LittleEndian.PutUint16(d2[0x40+24:], OptMagicPE32)
+	if _, err := Parse(d2); err != nil {
+		t.Errorf("PE32 现在应当能解析，却被拒绝: %v", err)
 	}
 }
 
