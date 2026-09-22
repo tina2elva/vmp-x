@@ -155,6 +155,43 @@ int main(int argc, char **argv) {
     }
     memcpy(mem, blob, (size_t)blobSize);
     FlushInstructionCache(GetCurrentProcess(), mem, (SIZE_T)blobSize);
+    /* 可选第 5 个参数：vm_reloc_tab 在 blob 里的偏移（0/缺省 = 无表；x64 侧不需要）。
+     * i386 的绝对引用（DIR32）在字段里存的是「blob 相对偏移」，必须加上**加载基址**才有效。
+     * 表格式：[u32 count][count × u32 站点偏移]。注意要补丁**映射后的副本**（mem），
+     * 基址就是 mem 本身。 */
+    if (argc >= 6) {
+        long tabOff = strtol(argv[5], NULL, 0);
+        if (tabOff >= 0 && tabOff + 4 <= blobSize) {
+            const unsigned char *tbl = (const unsigned char *)mem + tabOff;
+            unsigned int n = (unsigned int)tbl[0] | ((unsigned int)tbl[1] << 8) |
+                             ((unsigned int)tbl[2] << 16) | ((unsigned int)tbl[3] << 24);
+            unsigned int i;
+            unsigned long base = (unsigned long)(size_t)mem;
+            /* 用 stderr：stdout 重定向到管道时是全缓冲，崩溃会把输出丢掉（踩过）。 */
+            fprintf(stderr, "[*] base relocations: %u site(s), base=0x%lX\n", n, base);
+            for (i = 0; i < n; i++) {
+                long pos = tabOff + 4 + (long)i * 4;
+                unsigned int site, v;
+                unsigned char *f;
+                if (pos + 4 > blobSize) break;
+                site = (unsigned int)tbl[4 + i * 4] | ((unsigned int)tbl[5 + i * 4] << 8) |
+                       ((unsigned int)tbl[6 + i * 4] << 16) | ((unsigned int)tbl[7 + i * 4] << 24);
+                if ((long)site + 4 > blobSize) continue;
+                f = (unsigned char *)mem + site;
+                v = (unsigned int)f[0] | ((unsigned int)f[1] << 8) |
+                    ((unsigned int)f[2] << 16) | ((unsigned int)f[3] << 24);
+                if (i < 2) {
+                    fprintf(stderr, "[*]   site[%u] off=0x%X before=0x%X -> after=0x%X\n",
+                            i, site, v, (unsigned int)(v + (unsigned int)base));
+                }
+                v = (unsigned int)(v + (unsigned int)base);
+                f[0] = (unsigned char)(v & 0xFF);
+                f[1] = (unsigned char)((v >> 8) & 0xFF);
+                f[2] = (unsigned char)((v >> 16) & 0xFF);
+                f[3] = (unsigned char)((v >> 24) & 0xFF);
+            }
+        }
+    }
 
     vm_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
