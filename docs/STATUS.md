@@ -5587,6 +5587,28 @@ grep 出剩余的独立写法再修一次才 5/5 —— 这一步值得记：**�
 
 **未做（如实登记）**：CI 目前**不构建** x86-32 资产 ⇒ 该差分在 CI 上会走 `t.Skipf`（本地可跑，已留构建命令在测试注释里）。
 要让它在 CI 也真跑，需要在门禁脚本里加两行构建 —— 但那会**新增/改动门禁**（目标验收写的是"11 gates"），需你确认口径后再做。
+### 429. 登记一条**新的间歇性门禁失败**：`e2e.ps1` 的 packing 步（与反调试那条 flake 不同）
+
+**现象**：`tools/gates.ps1` 里 `[FAIL] e2e.ps1 (x86-64)`，e2e 自己打印
+`[FAIL] packing failed (unliftable instructions; refusing to reuse a stale artifact)`。
+
+**观察到的分布（本轮 5 次运行）**：
+
+| 运行方式 | 结果 |
+|---|---|
+| 单独跑 `tools/e2e.ps1`（重建产物后） | **165 passed, 0 failed** ✓ |
+| 单独跑 `tools/e2e.ps1`（再跑一次，抓 packing 附近输出） | **exit=0** ✓，且能看到 `check_key: RVA=0x19D0 native=18B -> 5 IR -> 35B bytecode` |
+| 夹在 `tools/gates.ps1` 里 | **2 次红**（同样的 packing 文案）✗ |
+
+**已排除**：与我的 lifter/VM 改动无关 —— 手工用同一个目标打包成功（`[+] 输出: build/manual_vmp.exe`，exit=0），
+且失败文案是 e2e 自己的"拒绝复用陈旧产物"口径（时间戳判定），不是 lifter 的"无法翻译"原文。
+
+**推断（未证实）**：门禁脚本里**先重建 blob**（`vmpbuild (blob builds)` 那道门禁），继而 e2e 在第 149 行附近用
+`LastWriteTime -ne $packTime` 判定"产物是否被重新打包"；如果时间戳精度/顺序在门禁环境下与单独跑不同，就会误判成"没有重新打包"。
+
+**未做（下一轮优先）**：定位并消除这条 flake —— 它与已登记的反调试 flake 不同，会让"门禁 11/0"再次不可靠。
+建议查法：把 e2e 第 149 行附近的判定改成"先删产物再打包，检查是否重新生成 + 内容哈希变了"，而不是比时间戳。
+
 
 
 
