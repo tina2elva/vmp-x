@@ -5693,6 +5693,34 @@ vmpack 无法覆盖 ⇒ `rc=1` ⇒ e2e 报 `packing failed`。
 这样即使某次运行留下了进程，下一次运行也会先清干净。
 
 **教训（值得单独记）**：#430 做的"失败时把 vmpack 输出末尾打出来"看起来只是加日志，
+### 435. `cmd/lift` 支持 **32 位模式** + 免符号表的 `-rva/-len` —— PE32 的"逐函数可保护性预检"
+
+**动机**：PE32 现在**不能打包** ✗（缺 32 位 blob），但可以先把"这个 32 位函数能不能保护、不能的话缺哪条指令"答出来 ✓
+—— 这正是 ④/⑤ 对 x64 做过的事在 PE32 上的对应物，而且**不依赖工具链**。
+
+**改动**
+- `-mode 32|64`（默认 64）：走 `NewLifterMode(ImageBase, mode)`；
+- `-rva 0xXXXX`（+ `-len N`）：**不查符号表**直接在某 RVA 处 lift —— 客户的 `demo32.exe` 没有 MAP，
+  但他们自己的 `verify.py` 已经用 dbghelp 从 PDB 枚举符号/RVA，可以喂进来。
+
+**顺带修掉一个真 bug**：`LiftFunc` 失败时返回的 `irFunc` 是 nil，旧代码却去取 `irFunc.Unsupported` ⇒ **panic** ✗。
+（这个 nil 解引用正是被新增的 `-rva` 路径第一次踩出来的。）它恰好违反本目标的底线：**拒绝不该把工具自己搞崩**。
+现在拒绝只打印原因 + `exit 1`。
+
+**实测**
+
+| 用例 | 结果 |
+|---|---|
+| x64 回归：`-exe build/target.exe -func check_key` | `check_key: RVA=0x19D0 size=18 bytes -> 5 IR -> 35 bytecode bytes`，exit 0 ✓ |
+| PE32 正例：`-exe SysWOW64\notepad.exe -rva 0x25FF0 -len 64 -mode 32` | `[!] at +0x3F: unknown opcode 0x6B @0x42602F`，**exit 1、不崩** ✓ |
+| PE32 反例：`-rva 0x16000`（数据区起步） | `[!] at +0x0: decode @0x416000 (byte 0xFF): unrecognized instruction`，**exit 1、不崩** ✓ |
+
+**使用说明（重要）**：`-rva` 模式只有 `-len`，**走出函数体就会撞数据而误报** ✗。
+客户应从 PDB 同时取 **RVA + size**（他们的 `verify.py` 已经在用 dbghelp），把 size 传给 `-len` ✓。
+
+**未做**：还没做成"一次列出整个 exe 所有函数"的批量报告（需要 PDB 解析或 MAP —— 客户的 `demo32.exe` 两者都没有，
+只能靠他们从 PDB 导出清单）。
+
 但**正是它**让这条 flake 一次定位 —— **可诊断性本身就是修复的一部分**。
 
 不再只有合成用例。**仍未做**：跨到宿主 native 调用时的 32 位 ABI（参数在栈上，而蹦床按 x64 ABI 传 RCX/RDX/R8/R9）
