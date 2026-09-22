@@ -198,8 +198,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* 多映射 0x4000：thunk 模式要在 blob 之后放描述符与字节码（打包后的真实形态）。 */
-    void *mem = VirtualAlloc(NULL, (SIZE_T)blobSize + 0x4000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    void *mem = VirtualAlloc(NULL, (SIZE_T)blobSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) {
         fprintf(stderr, "[!] VirtualAlloc failed\n");
         return 2;
@@ -246,95 +245,6 @@ int main(int argc, char **argv) {
         }
     }
 
-
-    /* 可选："like" 模式 —— 把 ctx 逐项做成**打包路径**的样子（不动描述符/加密）：
-     *   · VRSP 用蹦床的算式：esp - (16 + VM_MARGIN)（VM_MARGIN=0x4000）
-     *   · VRBASE 非零（打包时是 imageBase）
-     *   · 初始 GPR 非零（打包时来自调用方）
-     * 用途：在同一份字节码上分辨"是 ctx 的哪一项让带栈访问的函数算错"。 */
-    if (argc >= 7 && strcmp(argv[6], "like") == 0) {
-        vm_ctx_t c;
-        int r;
-        memset(&c, 0, sizeof(c));
-        c.code = bc;
-        c.codeLen = (u32)bcSize;
-        c.regs[VRSP] = (u64)(size_t)(emu_stack + sizeof(emu_stack)) - 16u - 0x4000u;
-        c.regs[VRBASE] = 0x400000u;
-        /* 二分用：把初始 GPR 置零，只保留 VRSP/VRBASE 两项"打包特征"。
-         * （实测：三特征同时开启时会崩在
-         *  `mov %eax,(%ecx)`，写 0x11110000 —— 说明有寄存器被当成了地址。） */
-        /* 二分用的开关：argv[6]="like"，argv[7] 是逗号分隔的特征集：
-         *   regs=1 初值非零 · sp=1 打包式 VRSP · base=1 VRBASE 非零。默认全 1。 */
-        {
-            int wantRegs = 1, wantSp = 1, wantBase = 1;
-            if (argc >= 8) {
-                const char *f = argv[7];
-                wantRegs = strstr(f, "regs=0") == NULL;
-                wantSp = strstr(f, "sp=0") == NULL;
-                wantBase = strstr(f, "base=0") == NULL;
-            }
-            /* **不要动 r==VRSP**：上一版在这里把 RSP 也清零了，导致"只开 sp=1"那组
-             * 实际上是 RSP=0，崩溃在 [-4]，于是矩阵给出了错误结论（STATUS #460 纠正）。 */
-            for (r = 0; r < 8; r++) {
-                if (r == VRSP) continue;
-                c.regs[r] = wantRegs ? (0x11110000u + (u64)r) : 0;
-            }
-            if (!wantSp) c.regs[VRSP] = (u64)(size_t)(emu_stack + sizeof(emu_stack));
-            if (!wantBase) c.regs[VRBASE] = 0;
-            fprintf(stderr, "[*] like mode: regs=%d sp=%d base=%d rsp=0x%llX vbase=0x%llX\n",
-                    wantRegs, wantSp, wantBase, (unsigned long long)c.regs[VRSP],
-                    (unsigned long long)c.regs[VRBASE]);
-        }
-        fprintf(stderr, "[*] like mode: rsp=0x%llX vbase=0x%llX\n",
-                (unsigned long long)c.regs[VRSP], (unsigned long long)c.regs[VRBASE]);
-        {
-            int (*fn2)(vm_ctx_t *) = (int (*)(vm_ctx_t *))((unsigned char *)mem + entryOff);
-            int rc2 = fn2(&c);
-            printf("like: rax=%llu rc=%d flags=0x%X\n",
-                   (unsigned long long)c.regs[VRAX], rc2, c.flags);
-        }
-        VirtualFree(mem, 0, MEM_RELEASE);
-        free(blob); free(bc);
-        return 0;
-    }
-
-    /* 可选："desc" 模式 —— 只加一项差异：**desc != NULL**（打包路径才有的描述符解码路径）。
-     * 描述符字节直接从**打包产物**里取（已按主密钥正确混淆）；把它的 selfRVA 改写成它在本次映射里的
-     * 地址（⇒ base = 0），并把明文字节码放在描述符 + codeRel 处（-no-encrypt 打包时产物里就是明文）。
-     * 用法：argv[6]="desc"、argv[7]=产物路径、argv[8]=描述符文件偏移、argv[9]=描述符 RVA、
-     *       argv[10]=codeRel（产物 code RVA - desc RVA）。 */
-    if (argc >= 11 && strcmp(argv[6], "desc") == 0) {
-        const char *prodPath = argv[7];
-        long prodDescOff = strtol(argv[8], NULL, 0);
-        long codeRel = strtol(argv[10], NULL, 0);
-        long prodSize = 0;
-        unsigned char *prod = read_file(prodPath, &prodSize);
-        if (!prod) return 2;
-        if (prodDescOff + 64 > prodSize) { fprintf(stderr, "[!] desc out of range\n"); return 2; }
-        {
-            unsigned long descOff2 = (((unsigned long)blobSize + 0x3FUL) & ~0x3FUL) + 0x100UL;
-            unsigned char *d2 = (unsigned char *)mem + descOff2;
-            vm_ctx_t c2;
-            memcpy(d2, prod + prodDescOff, 64);
-            *(unsigned int *)(d2 + 4) = (unsigned int)(size_t)d2;   /* selfRVA => base = 0 */
-            memcpy(d2 + codeRel, bc, (size_t)bcSize);
-            memset(&c2, 0, sizeof(c2));
-            c2.code = d2 + codeRel;
-            c2.codeLen = (u32)bcSize;
-            c2.desc = (vm_desc_t *)d2;
-            c2.regs[VRSP] = (u64)(size_t)(emu_stack + sizeof(emu_stack));
-            fprintf(stderr, "[*] desc mode: desc=+0x%lX codeRel=%ld\n", descOff2, codeRel);
-            {
-                int (*fn3)(vm_ctx_t *) = (int (*)(vm_ctx_t *))((unsigned char *)mem + entryOff);
-                int rc3 = fn3(&c2);
-                printf("desc: rax=%llu rc=%d flags=0x%X\n",
-                       (unsigned long long)c2.regs[VRAX], rc3, c2.flags);
-            }
-        }
-        VirtualFree(mem, 0, MEM_RELEASE);
-        free(blob); free(bc); free(prod);
-        return 0;
-    }
     vm_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.code = bc;
@@ -342,42 +252,6 @@ int main(int argc, char **argv) {
     ctx.regs[VRCX] = arg;                                  /* Win64 第一个整数参数 */
     ctx.regs[VRSP] = (u64)(emu_stack + sizeof(emu_stack));  /* 模拟栈顶 */
     ctx.regs[VRBASE] = 0;                                  /* M1 叶子函数用不到 */
-
-    /* 可选：按**打包后的真实调用形态**跑一遍 —— 在映射区里造一个描述符 + 5 字节 thunk，
-     * 然后 call thunk（thunk 靠返回地址反推描述符）。这样就能把"注入后"的路径
-     * （desc != NULL、code/codeLen 来自描述符、经蹦床进入）在 probe 里复现，
-     * 而 probe 是带异常过滤器的。用法：第 6 个参数写 thunk。 */
-    if (argc >= 7 && strcmp(argv[6], "thunk") == 0) {
-        unsigned long descOff = ((unsigned long)blobSize + 0x3FUL) & ~0x3FUL;
-        unsigned long bcOff = descOff + 0x100UL;
-        unsigned char *d;
-        unsigned char *t;
-        if (bcOff + (unsigned long)bcSize + 64UL > (unsigned long)blobSize + 0x4000UL) {
-            fprintf(stderr, "[!] blob 不够大，放不下描述符/字节码\n");
-            return 2;
-        }
-        d = (unsigned char *)mem + descOff;
-        memset(d, 0, 64);
-        *(unsigned int *)(d + 0) = 0x4B504D56u; /* 魔数（自己造的） */
-        *(unsigned int *)(d + 4) = (unsigned int)(size_t)d; /* selfRVA = 描述符地址 ⇒ base = 0 */
-        *(unsigned int *)(d + 8) = (unsigned int)(bcOff - descOff); /* codeRVA：相对描述符 */
-        *(unsigned int *)(d + 12) = (unsigned int)bcSize;
-        memcpy((unsigned char *)mem + bcOff, bc, (size_t)bcSize);
-        t = (unsigned char *)mem + descOff + 64;
-        t[0] = 0xE8;
-        *(int *)(t + 1) = (int)(((unsigned char *)mem + entryOff) - (t + 5)); /* call vm_entry */
-        fprintf(stderr, "[*] thunk mode: desc=+0x%lX thunk=+0x%lX code=+0x%lX\n",
-                descOff, descOff + 64, bcOff - descOff);
-        {
-            int (*tf)(void) = (int (*)(void))t;
-            int rc2 = tf();
-            printf("thunk: guest_eax=%u rc=%d\n", (unsigned)ctx.regs[VRAX], rc2);
-        }
-        VirtualFree(mem, 0, MEM_RELEASE);
-        free(blob);
-        free(bc);
-        return 0;
-    }
 
     run_fn_t fn = (run_fn_t)((unsigned char *)mem + entryOff);
     int rc = fn(&ctx);
