@@ -939,9 +939,84 @@ static int vm_license_verify(const u8 *msg, u32 msgLen, const u8 *sig64, const u
     return ok;
 }
 
+/* ---- 主密钥来源元数据（由 vmpack 烘进产物；默认全零 = 不启用）----
+ * kind: 0 = 文件/环境变量（默认）  2 = Sentinel 真狗  3 = 假狗文件（测试用）
+ * 放在 .data：它在自哈希区间 [0,bssOff) 内，静态改 kind 会被 vm_selfcheck() 拒绝。
+ * licFeature：vm_license_meta.kind==2 时"问狗要授权"用的 feature id。 */
+typedef struct __attribute__((aligned(8))) {
+    u32 kind, feature, fileID, offset, length, reserved;
+    char vendorCode[64];
+    char dllName[64];
+    char fakePath[128];
+    u32 licFeature;
+} vm_key_src_t;
+
+__attribute__((section(".data"), used))
+volatile vm_key_src_t vm_key_src = {0, 0, 0, 0, 0, 0, {0}, {0}, {0}, 0};
+
+u32 vm_sentinel_fail_stage;
+
+/* ---- 授权判定（blob 侧"问狗"）----
+ * kind==2：用 HASP 的标准做法 —— hasp_login 到**该产品对应的 feature**；
+ * 狗上没有这个 feature、或它已过期，login 就失败 ⇒ 直接拒绝（不需要多一个 API，也不用解析结构体）。
+ * kind==3（假狗文件）：文件布局 [0..31]=主密钥，随后 u32 count，再 count × (u32 feature, i64 notAfter) ——
+ * 让没有真狗也能把这条正例测通；性质与 kind=2 一致：库里没有就拒绝。 */
+static int vm_license_from_fakefile(void) {
+    u16 wpath[300];
+    u32 n = 0;
+    const char *p = (const char *)vm_key_src.fakePath;
+    while (p[n] && n < 280) { wpath[n] = (u16)(u8)p[n]; n++; }
+    wpath[n] = 0;
+    static u8 buf[1024];
+    u32 got = 0;
+    if (!vm_key_read_nt(wpath, buf, (u32)sizeof(buf), &got)) { VM_LIC_FAIL(0x31u); return 0; }
+    if (got < 36) { VM_LIC_FAIL(0x32u); return 0; }
+    u32 count = *(const u32 *)(buf + 32);
+    if (count > 64 || got < 36 + count * 12) { VM_LIC_FAIL(0x33u); return 0; }
+    i64 now = vm_now_unix();
+    for (u32 i = 0; i < count; i++) {
+        const u8 *e = buf + 36 + (u64)i * 12;
+        u32 feat = *(const u32 *)(e + 0);
+        i64 notAfter = *(const i64 *)(e + 4);
+        if (feat != vm_key_src.licFeature) continue;
+        if (notAfter == 0) return 1;
+        if (now == 0) continue;
+        if (now <= notAfter) return 1;
+        VM_LIC_FAIL(0x34u);
+        return 0;
+    }
+    VM_LIC_FAIL(0x35u);
+    return 0;
+}
+
+static int vm_license_from_dongle(void) {
+    if (vm_key_src.kind == 3) return vm_license_from_fakefile();
+    const char *dll = vm_key_src.dllName[0] ? (const char *)vm_key_src.dllName : "hasp_windows.dll";
+    u64 h = vm_find_module(dll);
+    if (!h) {
+        static u16 wname[64];
+        u32 n = 0;
+        while (dll[n] && n < 63) { wname[n] = (u16)(u8)dll[n]; n++; }
+        wname[n] = 0;
+        h = vm_load_lib(wname);
+    }
+    if (!h) { VM_LIC_FAIL(0x36u); return 0; }
+    typedef i32 (*login_t)(u32, const char *, u32 *);
+    typedef i32 (*logout_t)(u32);
+    login_t pLogin = (login_t)vm_get_proc(h, "hasp_login");
+    logout_t pLogout = (logout_t)vm_get_proc(h, "hasp_logout");
+    if (!pLogin || !pLogout) { VM_LIC_FAIL(0x37u); return 0; }
+    u32 handle = 0;
+    if (pLogin(vm_key_src.licFeature, (const char *)vm_key_src.vendorCode, &handle) != 0) { VM_LIC_FAIL(0x38u); return 0; }
+    pLogout(handle);
+    return 1;
+}
+
 /* 门禁：1 = 放行（未启用也算放行）；0 = 拒绝。 */
 static int vm_license_check(void) {
     if (vm_license_meta.kind == 0) return 1;
+    /* (2) 授权来自加密狗：问狗（kind=2 真狗 / kind=3 假狗文件），不走文件授权那条路 */
+    if (vm_license_meta.kind == 2) return vm_license_from_dongle();
     u16 path[360];
     if (!vm_exe_path_suffix(".vmplic.bin", path, 360)) { VM_LIC_FAIL(0x21u); return 0; }
     static u8 lic[2048];
@@ -978,17 +1053,7 @@ static int vm_license_check(void) {
  *           ③ kind>=2 时**严格模式**：只用狗，失败即硬门 —— 不回退文件/环境变量（堵降级攻击）。
  * kind: 2 = Sentinel 真狗（hasp_login/hasp_read）  3 = 假狗文件（测试用，路径需 \??\... 形式）
  * vm_key_src 放在 .data：它在自哈希区间 [0,bssOff) 内，静态改 kind 会让 vm_selfcheck() 直接拒绝。 */
-typedef struct __attribute__((aligned(8))) {
-    u32 kind, feature, fileID, offset, length, reserved;
-    char vendorCode[64];
-    char dllName[64];
-    char fakePath[128];
-} vm_key_src_t;
-
-__attribute__((section(".data"), used))
-volatile vm_key_src_t vm_key_src = {0, 0, 0, 0, 0, 0, {0}, {0}, {0}};
-
-u32 vm_sentinel_fail_stage; /* 卡在哪一步（1=假狗文件 2=加载 DLL 3=缺导出 4=登录 5=读取 15=未启用） */
+/* 主密钥来源元数据与 vm_sentinel_fail_stage 已上移到授权代码之前（那里也要用）。 */
 
 static int vm_key_from_sentinel(void) {
     if (vm_key_src.kind == 3) {

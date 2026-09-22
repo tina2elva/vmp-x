@@ -5384,6 +5384,31 @@ CNG/TPM 里**私钥根本导不出来**，我们只能**让它签一段挑战**�
 
 **实测**：`kind=3`（假狗文件）→ `check_key(10)=143`（=原生）；`kind=2` 但本机无狗 → **`rc=0xC0DE0007`、无输出**，
 且**旁边放着 `.vmpkey` 也不回退**；不写 dongle 参数（`kind=0`）→ `143`，行为与今天一致。
+### 419. blob 侧"问狗要授权"落地：`vm_license_meta.kind==2` ⇒ hasp_login 到该产品的 feature
+
+**做法**（HASP 的标准用法，不需要解析 `hasp_get_info` 的结构体）：
+`hasp_login(feature, vendorCode, &h)` **成功本身就代表**"这把狗上有这个产品、且没到期"（狗的时限由狗自己管），
+失败 ⇒ 直接走硬门 —— 与 key 那条路一样是**严格模式**：`kind==2` 时**完全不看 `.vmplic.bin`**。
+
+- `vm_license_check()` 开头：`if (vm_license_meta.kind == 2) return vm_license_from_dongle();`
+- `vm_license_from_dongle()`：DLL 动态加载（复用 `vm_load_lib`）→ `hasp_login` → `hasp_logout`；
+  `kind==3`（假狗文件）时改走 `vm_license_from_fakefile()`；
+- 假狗文件布局：`[0..31]`=主密钥，随后 `u32 count`，再 `count × (u32 feature, i64 notAfter)`（`notAfter=0` 表示永久）——
+  让**没有真狗也能把这条正例测通**；
+- `vm_key_src` 末尾追加 `u32 licFeature`（原有偏移不变）；`vmpack -license-dongle <featureID>` 写 `kind=2` + 该字段，
+  并在补丁后重算自哈希。
+
+**实测（本机）**
+
+| 用例 | 结果 |
+|---|---|
+| 假狗里有 `feature=1001`，产物**完全没有 `.vmplic.bin`** | `check_key(10)=143`（= 原生）⇒ 授权确实只来自"狗" |
+| 假狗里没有 `feature=9999` | **`rc=0xC0DE0007`、无输出** ⇒ 明确拒绝 |
+
+**过程中的一个假警报（留档）**：第一次正例被拒，原因是我那一步只重建了 `vmpack`、**没重建 blob**，
+于是 vmpack 把 `kind=2` 打进了**旧 blob**（那段还没有问狗代码）⇒ 旧代码不认识 kind=2、回落到文件授权 ⇒ 拒绝。
+重建 blob 后一次通过 —— 与 #399 那次"打包端与运行期必须同一轮改完"是同一类教训。
+
 
 
 

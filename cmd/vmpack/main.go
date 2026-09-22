@@ -88,6 +88,7 @@ func main() {
 	dongleFeat := flag.Uint("dongle-feature", 0, "Sentinel feature id（hasp_login 用）")
 	dongleDLL := flag.String("dongle-dll", "", "Sentinel 运行时 DLL 名（默认 hasp_windows.dll）")
 	dongleFake := flag.String("dongle-fake-file", "", "测试用：假狗文件（kind=3；路径需为 \\??\\D:\\... 形式）")
+	licDongle := flag.Uint("license-dongle", 0, "运行期授权改为**问狗**：给出该产品的 feature id（kind=2；不再读 .vmplic.bin）")
 	dumpBytecode := flag.String("dumpbytecode", "", "把每个函数的**明文**字节码转储到该目录（诊断用）")
 	mapPath := flag.String("map", "", "MSVC MAP 文件：目标没有 COFF 符号表时用它按名字定位函数")
 	reportPath := flag.String("report", "", "注入报告 JSON 路径（可选）")
@@ -181,6 +182,26 @@ func main() {
 			binary.LittleEndian.PutUint32(stub[hoff:], h)
 			fmt.Printf("[*] 已按补丁重算自哈希（覆盖 [0, 0x%X)）\n", man.BSSOff)
 		}
+	}
+	if *licDongle != 0 {
+		loff, ok := man.Symbols["vm_license_meta"]
+		koff, ok2 := man.Symbols["vm_key_src"]
+		if !ok || !ok2 {
+			fatalf("-license-dongle 需要 -key-external 构建的 blob（要同时有 vm_license_meta 与 vm_key_src）")
+		}
+		if loff < 0 || loff+76 > len(stub) || koff < 0 || koff+284 > len(stub) {
+			fatalf("元数据偏移越界")
+		}
+		binary.LittleEndian.PutUint32(stub[loff+0:], 2)                    // kind=2：授权问狗
+		binary.LittleEndian.PutUint32(stub[koff+280:], uint32(*licDongle)) // vm_key_src.licFeature
+		if hoff, ok3 := man.Symbols["vm_self_hash"]; ok3 && man.BSSOff > 0 {
+			h := uint32(2166136261)
+			for _, b := range stub[:man.BSSOff] {
+				h = (h ^ uint32(b)) * 16777619
+			}
+			binary.LittleEndian.PutUint32(stub[hoff:], h)
+		}
+		fmt.Printf("[*] 授权来源：Sentinel 加密狗（feature=%d；kind=2 严格模式，不看 .vmplic.bin）\n", *licDongle)
 	}
 	if *licVendor != "" || *licProduct != "" || *licPub != "" {
 		off, ok := man.Symbols["vm_license_meta"]
