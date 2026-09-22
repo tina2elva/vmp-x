@@ -19,6 +19,7 @@ package main
 
 import (
 	"crypto/ecdsa"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,6 +27,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/vmpx/vmp-x/internal/cred"
 )
 
 type licItem struct {
@@ -124,6 +127,7 @@ func writeLicense(path string, l *license) {
 func cmdKeygen(args []string) {
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
 	out := fs.String("out", "vendor-license-key", "输出前缀（生成 <前缀>.priv / <前缀>.pub）")
+	dpapi := fs.Bool("dpapi", false, "额外生成 DPAPI 保护的私钥 <前缀>.key.dpapi（绑本机+本用户；工具授权推荐用它）")
 	fs.Parse(args)
 	_, privHex, pubHexStr := genKeypair()
 	must(os.WriteFile(*out+".priv", []byte(privHex+"\n"), 0o600))
@@ -131,6 +135,14 @@ func cmdKeygen(args []string) {
 	fmt.Printf("[+] 签发密钥对已生成\n")
 	fmt.Printf("    私钥: %s.priv   <- 只应存在于母狗/一级客户手里，绝不进产物\n", *out)
 	fmt.Printf("    公钥: %s.pub    <- 用 vmpbuild 烘进产物，供运行期验签\n", *out)
+	if *dpapi {
+		raw, derr := hex.DecodeString(privHex)
+		must(derr)
+		blob, perr := cred.Protect(raw)
+		must(perr)
+		must(os.WriteFile(*out+".key.dpapi", blob, 0o600))
+		fmt.Printf("    受保护私钥: %s.key.dpapi（DPAPI，绑本机+本用户；拷到别处解不开）\n", *out)
+	}
 }
 
 func cmdLicNew(args []string) {

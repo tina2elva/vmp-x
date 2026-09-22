@@ -5287,6 +5287,33 @@ FP 隔离套件（`cvt32/cvt64/localrt/acc/divd`）五个函数**全部**与原�
 | e2e 用例（用 e2e 自己的目标） | `自检通过` ✓，已固定进 `tools/e2e.ps1` 第 (8) 段 |
 
 **为什么反例用"不滤地址行"**：e2e 的目标只打印数值、没有易变行，做不出确定性的反例；
+### 414. 工具授权私钥进 DPAPI："拷走密钥文件即可绕过"这条堵上了
+
+**原来**：工具授权靠 `<工具目录>/vmpx.key`（32 字节 hex **明文**）+ `vmpx.cred`；
+把这两个文件拷到别的机器，工具照样能用 —— 工具授权形同虚设。
+
+**现在**：新增**受保护形式** `vmpx.key.dpapi`（DPAPI，`CryptProtectData`，用户作用域 + 固定 entropy `vmpx-toolkey-v1`），
+校验时**优先**用它；解不开就拒绝启动（exit=8）。
+
+**改动**
+- `internal/cred/dpapi_windows.go`：`Protect` / `Unprotect`（走 `crypt32.dll`，stdlib `syscall`，无第三方依赖）；
+  `internal/cred/dpapi_other.go`：非 Windows 明确报错（**不静默退回明文** —— "以为受保护其实没有"比"不受保护"更危险）；
+- `internal/cred/cred.go`：`LoadToolKey`（优先 `.dpapi`，退明文时**在 stderr 喊出风险**）；
+- `vmpepoch keygen --dpapi`：同时生成 `<前缀>.key.dpapi`。
+
+**实测**
+
+| 用例 | 结果 |
+|---|---|
+| `keygen --out vmpx --dpapi` | 生成 `vmpx.priv` / `vmpx.pub` / `vmpx.key.dpapi`(262B) |
+| 密文里是否含明文私钥 | **否**（逐字节比对，`False`） |
+| 发布版工具 + 凭据 + **DPAPI 私钥** | **exit=0**，正常干活 |
+| 把 `.key.dpapi` **改一个字节** | **exit=8**：`受保护的私钥 … 解不开：CryptUnprotectData 失败（换机器/换用户/被篡改都会这样）` |
+| 只放明文 `vmpx.key` | 仍可用，但 stderr 警告"拷走它即可绕过工具授权" |
+
+**边界（如实写进文档）**：DPAPI 用户作用域**不防同一用户下的本机攻击**，也不防内存抓取；
+要"私钥永不出芯片"得用 **TPM/CNG 不可导出密钥**（`NCryptCreatePersistedKey` + 用签名挑战代替比对公钥）—— 那是本条的下一步。
+
 客户 demo 会打印基址/函数地址，正好是天然的"必然不同"输入。反例路径因此在本机验证并在文档留档，
 e2e 里固定的是正例（防止以后 -verify 静默失效）。
 

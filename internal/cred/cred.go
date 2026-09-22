@@ -36,6 +36,35 @@ var RootPubHex string
 // KeyFileName：与凭据配套的工具安装私钥文件名（放在凭据同目录）。
 const KeyFileName = "vmpx.key"
 
+// KeyFileNameDPAPI：**受保护**的私钥文件名（DPAPI，绑本机+本用户）。存在时优先用它。
+const KeyFileNameDPAPI = "vmpx.key.dpapi"
+
+// LoadToolKey 取本机的工具私钥：优先受保护形式，其次明文（并把风险喊出来）。
+func LoadToolKey(dir string) (raw []byte, note string, err error) {
+	dp := filepath.Join(dir, KeyFileNameDPAPI)
+	if b, rerr := os.ReadFile(dp); rerr == nil {
+		plain, uerr := Unprotect(b)
+		if uerr != nil {
+			return nil, "", fmt.Errorf("受保护的私钥 %s 解不开：%w", dp, uerr)
+		}
+		if len(plain) != 32 {
+			return nil, "", fmt.Errorf("%s 解出来不是 32 字节私钥", dp)
+		}
+		return plain, "DPAPI 保护的私钥", nil
+	}
+	kp := filepath.Join(dir, KeyFileName)
+	kb, rerr := os.ReadFile(kp)
+	if rerr != nil {
+		return nil, "", fmt.Errorf("找不到与凭据配套的私钥（%s 或 %s）: %w", kp, dp, rerr)
+	}
+	raw, herr := hex.DecodeString(strings.TrimSpace(string(kb)))
+	if herr != nil || len(raw) != 32 {
+		return nil, "", fmt.Errorf("%s 不是 32 字节的 ECDSA P-256 私钥标量（hex）", kp)
+	}
+	fmt.Fprintln(os.Stderr, "[!] 当前用的是**明文**私钥文件 "+kp+" —— 拷走它即可绕过工具授权。建议改用受保护形式：vmpepoch keygen --out <前缀> --dpapi")
+	return raw, "明文私钥（建议换成 DPAPI 保护的）", nil
+}
+
 type Cred struct {
 	V          int    `json:"v"`
 	VendorID   string `json:"vendorID"`
@@ -175,20 +204,16 @@ func Require(explicitCredPath, vendorID string) error {
 		return fmt.Errorf("凭据里的 vendorID（%s）与本次构建声明的（%s）不一致", c.VendorID, vendorID)
 	}
 	// 关键：凭据必须与本机那把私钥配对 —— 只拷 .cred 拷不走权限。
-	keyPath := filepath.Join(filepath.Dir(path), KeyFileName)
-	kb, err := os.ReadFile(keyPath)
-	if err != nil {
-		return fmt.Errorf("找不到与凭据配套的私钥 %s: %w", keyPath, err)
-	}
-	raw, err := hex.DecodeString(strings.TrimSpace(string(kb)))
-	if err != nil || len(raw) != 32 {
-		return fmt.Errorf("%s 不是 32 字节的 ECDSA P-256 私钥标量（hex）", keyPath)
+	// 私钥优先用 DPAPI 保护形式（vmpx.key.dpapi）：那样连"拷走文件"都不成立。
+	raw, _, kerr := LoadToolKey(filepath.Dir(path))
+	if kerr != nil {
+		return kerr
 	}
 	priv := &ecdsa.PrivateKey{PublicKey: ecdsa.PublicKey{Curve: elliptic.P256()}}
 	priv.D = new(big.Int).SetBytes(raw)
 	priv.PublicKey.X, priv.PublicKey.Y = elliptic.P256().ScalarBaseMult(raw)
 	if PubHex(&priv.PublicKey) != strings.ToLower(strings.TrimSpace(c.SubjectPub)) {
-		return fmt.Errorf("本机的 %s 与凭据里绑定的公钥不匹配（凭据不能挪到别的安装上用）", KeyFileName)
+		return fmt.Errorf("本机的私钥与凭据里绑定的公钥不匹配（凭据不能挪到别的安装上用）")
 	}
 	if c.Machine != "" && c.Machine != machineID() {
 		return fmt.Errorf("凭据绑定的机器（%s）与本机不符", c.Machine)
