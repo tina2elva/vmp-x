@@ -1,0 +1,5 @@
+# Windows/i686 (32-bit) blob source list. Paths are relative to stub/.
+# Same shape as win/arm64: our own entry thunk + the shared interpreter/crypto/kdf
+# (vmpbuild appends win/x64/vm_crypto.c and win/x64/vm_kdf.c itself).
+win/x86/vm_entry_asm.S
+win/x64/vm_interp.c
