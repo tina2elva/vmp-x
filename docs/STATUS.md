@@ -5623,7 +5623,13 @@ grep 出剩余的独立写法再修一次才 5/5 —— 这一步值得记：**�
 - 退出码**紧邻**原生命令读取（`$packRC = $LASTEXITCODE`），判定只看它；
 - 失败时打印 vmpack 输出**末尾 20 行**（含 `packing produced no output (rc=…)` 分支）。
 
-**证据**：修后**连跑 3 次 e2e = 165 passed / 0 failed 三次**；随后连跑门禁见下（两次均为 11/0）。
+**证据（修后）**：
+- **连跑 3 次 e2e** = `165 passed, 0 failed` 三次 ✓；
+- **门禁连续 3 次全部 11/0** ✓；其中最后两次是**不带任何包装**的权威运行（`powershell -File tools/gates.ps1` 输出重定向到文件），
+  `gates 真实退出码 = 0`、`total 11 gates, 0 failed`、`e2e: 165 passed, 0 failed`、`dll e2e: 3 passed, 0 failed`、`[+] arm64 guest e2e: OK` ✓。
+
+**一条排错留档**：本轮我用 `gates.ps1 *>&1 | Tee-Object … | Select-Object -Last 4` 这种包装跑门禁时，后台作业回报的退出码是 1，
+但日志里明明是 11/0 —— 那是**包装管道**的退出码，不是门禁的。要看门禁真实结论，必须不带包装地跑（或直接读 `total … failed` 那一行）。
 
 
 
