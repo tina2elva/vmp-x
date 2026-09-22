@@ -119,6 +119,7 @@ func TestX8632StackSlot(t *testing.T) {
 	if os.Getenv("VMPX_X8632_DIFF") == "" {
 		t.Skip("x86-32 batch 差分尚未跑通（探针 0xC0000005，见 STATUS #427 未做项）；" +
 			"设 VMPX_X8632_DIFF=1 复现")
+	}
 
 	const rbp = byte(5)
 	rsp := uint64(batchBufBase + batchBufLen - 0x100)
