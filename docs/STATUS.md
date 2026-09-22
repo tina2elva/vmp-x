@@ -5267,6 +5267,29 @@ FP 隔离套件（`cvt32/cvt64/localrt/acc/divd`）五个函数**全部**与原�
 | `/Od` | **可保护 26 / 静默算错 0 / 被拒 0** |
 
 （覆盖面从手抄的 14 个提升到 MAP 里匹配的 26 个；清单见 `build/protectable_o2.md` / `protectable_od.md`。）
+### 413. `vmpack -verify`：把"要么正确、要么明确拒绝"从**工具**层推进到**产出端**
+
+**动机**：`tools/diffcheck.ps1` 是外部脚本，默认打包路径**仍然**会给出一个算错的产物。现在加内建开关：
+打包完先跑一遍自检（原始 vs 受保护，同参数、同过滤），**不一致就删除产物并以非零码退出**。
+
+**新增开关**
+- `-verify`：开自检；
+- `-verify-args '<argv>'`：运行时参数（空格分隔）；
+- `-verify-filter '<regex>'`：比对前丢掉匹配的行（例如地址行 `^\[`）；
+- `-verify-timeout <sec>`：单次运行超时（默认 30）。
+
+**实测（本机）**
+
+| 用例 | 结果 |
+|---|---|
+| 正例：客户 demo `/O2`，`-func DemoAdd -func DemoGcd -func Math::Mean -verify -verify-filter '^\['` | `[*] 自检通过`；exit=0；**产物留下**且行为正确（`DemoAdd(2,3)=5`） |
+| 反例：同一个包**不加过滤**（地址行天然不同） | exit=**1**；**产物已被删除**；报出`第 1 行不同：原始=[[demo.exe] base=…` |
+| e2e 用例（用 e2e 自己的目标） | `自检通过` ✓，已固定进 `tools/e2e.ps1` 第 (8) 段 |
+
+**为什么反例用"不滤地址行"**：e2e 的目标只打印数值、没有易变行，做不出确定性的反例；
+客户 demo 会打印基址/函数地址，正好是天然的"必然不同"输入。反例路径因此在本机验证并在文档留档，
+e2e 里固定的是正例（防止以后 -verify 静默失效）。
+
 
 
 PowerShell 里**多行数组字面量**（逗号接换行接括号表达式）会报 "Expressions are only allowed as the first element of a pipeline"，改成分行 `+=` 即可。

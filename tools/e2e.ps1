@@ -420,6 +420,16 @@ else { $fail++; $failLines += "E2EFAIL field-mask: container scalars (magic/RVA/
 if ($LASTEXITCODE -eq 0) { $pass++ }
 else { $fail++; $failLines += ("E2EFAIL diffcheck: 逐函数自检未全绿（exit={0}）" -f $LASTEXITCODE) }
 
+# ---- (8) vmpack -verify：产出端自检（不一致就删产物 + 非零退出）----
+# 正例用 e2e 自己的目标：原始与受保护的输出应当一致 ⇒ 产物应该留下。
+# （拒绝路径在本机用客户 demo 的地址行验证过：不滤地址行时 exit=1 且产物被删除；
+#   e2e 目标只打印数值、没有易变行，做不出确定性的反例，故这里只固定正例。）
+$vvOut = "build\target_verify.exe"
+Remove-Item $vvOut -ErrorAction SilentlyContinue
+& .\build\vmpack.exe -exe build\target.exe -func check_key -func sum_to -out $vvOut -verify -verify-args "check_key 10" 2>&1 | Out-Null
+if (($LASTEXITCODE -eq 0) -and (Test-Path $vvOut)) { $pass++ }
+else { $fail++; $failLines += ("E2EFAIL verify: -verify 正例未通过（exit={0} 产物存在={1}）" -f $LASTEXITCODE, (Test-Path $vvOut)) }
+
 Write-Output ""
 if ($failLines.Count -gt 0) {
     Write-Output "--- failure summary (one line per case, for CI annotations) ---"

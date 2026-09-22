@@ -9,6 +9,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -18,8 +20,11 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/vmpx/vmp-x/internal/cred"
 	arm64dec "github.com/vmpx/vmp-x/internal/decode/arm64"
@@ -70,6 +75,10 @@ func main() {
 	noEncImageELF := flag.Bool("no-enc-image-elf", false, "对 ET_EXEC 的 ELF 关闭原镜像整体加密（默认开；探针已改为合成补丁字节，不再依赖明文）")
 	credFlag := flag.String("cred", "", "构建凭据路径（默认 $VMPX_CRED 或工具同目录 vmpx.cred）；仅当工具烘焙了厂商根公钥时才校验")
 	vendorFlag := flag.String("vendor", "", "本次构建声明的 vendorID；工具授权开启时会强制与凭据里的一致")
+	verify := flag.Bool("verify", false, "自检：跑一遍原始与受保护产物并比对输出，不一致就**删除产物**并失败退出")
+	verifyArgs := flag.String("verify-args", "", "自检运行时传给产物的参数（空格分隔）")
+	verifyFilter := flag.String("verify-filter", "", "自检比对前丢掉匹配该正则的行（例如地址行 '^\\['）")
+	verifyTimeout := flag.Int("verify-timeout", 30, "自检单次运行的超时（秒）")
 	licVendor := flag.String("license-vendor", "", "运行期强制：烘进产物的 vendorID（需 -key-external 构建的 blob）")
 	licProduct := flag.String("license-product", "", "运行期强制：该产物代表哪个产品（productID）")
 	licPub := flag.String("license-pub", "", "运行期强制：授权签发者的 ECDSA P-256 公钥（64 字节 X||Y 的 hex，或 .pub 文件）")
@@ -287,6 +296,13 @@ func main() {
 		fmt.Printf("    %-16s desc=0x%-7X thunk=0x%-7X code=0x%-7X patch=[%s]",
 			p.Name, p.DescRVA, p.ThunkRVA, p.CodeRVA, p.EntryPatchHex)
 		fmt.Println()
+	}
+	if *verify {
+		if err := verifyArtifact(*exe, outPath, *verifyArgs, *verifyFilter, *verifyTimeout); err != nil {
+			_ = os.Remove(outPath)
+			fatalf("自检未通过，产物已删除（不让「看起来正常、实际算错」的东西流出去）: %v\n    定位是哪个函数：powershell -NoProfile -File tools/diffcheck.ps1 -Exe <原产物> -Map <map>", err)
+		}
+		fmt.Println("[*] 自检通过：受保护产物的输出与原始一致")
 	}
 	fmt.Printf("[+] 输出: %s (%d 字节)", outPath, sizeOf(outPath))
 	fmt.Println()
@@ -1021,6 +1037,69 @@ func readLicensePub(s string) ([]byte, error) {
 		return b, nil
 	}
 	return nil, fmt.Errorf("-license-pub 文件既不是 64 字节原始公钥，也不是 128 位 hex 文本")
+}
+
+// verifyArtifact 是 -verify 的实现：同一个程序跑两遍（原始 / 受保护），比对标准输出+错误输出。
+// 为什么把它放进 vmpack 而不是只留一个外部脚本：目标是「要么正确、要么明确拒绝」——
+// 拒绝这件事必须在**产出端**发生，否则默认路径仍然会给出一个算错的产物。
+func verifyArtifact(orig, packed, args, filter string, timeoutSec int) error {
+	filt := func(s string) string {
+		if filter == "" {
+			return strings.TrimSpace(s)
+		}
+		re, err := regexp.Compile(filter)
+		if err != nil {
+			return strings.TrimSpace(s)
+		}
+		var keep []string
+		for _, ln := range strings.Split(s, "\n") {
+			if !re.MatchString(ln) {
+				keep = append(keep, ln)
+			}
+		}
+		return strings.TrimSpace(strings.Join(keep, "\n"))
+	}
+	run := func(exe string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+		defer cancel()
+		var argv []string
+		if args != "" {
+			argv = strings.Fields(args)
+		}
+		cmd := exec.CommandContext(ctx, exe, argv...)
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		err := cmd.Run()
+		return filt(buf.String()), err
+	}
+	want, err1 := run(orig)
+	got, err2 := run(packed)
+	if err1 != nil && want == "" {
+		return fmt.Errorf("原始产物跑不起来（%v）—— 自检无意义，请先用 -verify-args 配对参数", err1)
+	}
+	if want == got {
+		return nil
+	}
+	// 报第一处差异，便于一眼看出问题
+	wl, gl := strings.Split(want, "\n"), strings.Split(got, "\n")
+	for i := 0; i < len(wl) || i < len(gl); i++ {
+		var a, b string
+		if i < len(wl) {
+			a = wl[i]
+		}
+		if i < len(gl) {
+			b = gl[i]
+		}
+		if a != b {
+			hint := ""
+			if err2 != nil {
+				hint = fmt.Sprintf("（受保护产物退出异常: %v）", err2)
+			}
+			return fmt.Errorf("第 %d 行不同%s：原始=[%s] 受保护=[%s]", i+1, hint, a, b)
+		}
+	}
+	return fmt.Errorf("输出不同（原始 %d 行 / 受保护 %d 行）", len(wl), len(gl))
 }
 
 // origRelocEntries 读出原镜像的重定位项（type, rva）。stripRelocations 之后就再也读不到了。
