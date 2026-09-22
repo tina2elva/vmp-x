@@ -90,7 +90,7 @@ func runBatchOne(t *testing.T, runner, blob string, entry int, code []byte, rsp 
 	}
 	out, err := exec.Command(runner, "batch", blob, fmt.Sprint(entry), casesPath, resPath).CombinedOutput()
 	if err != nil {
-		t.Fatalf("runbc batch 失败: %v | %s", err, string(out))
+		t.Fatalf("runbc batch 失败（runner=%s blob=%s rsp=0x%X）: %v | %s", runner, blob, rsp, err, string(out))
 	}
 	raw, err := os.ReadFile(resPath)
 	if err != nil {
@@ -112,17 +112,17 @@ func TestX8632StackSlot(t *testing.T) {
 	)
 	_, x64Entry, x64Map := loadBlob(t, x64Blob, x64Manifest, x64Runner)
 	_, x32Entry, x32Map := loadBlob(t, x32Blob, x32Manifest, x32Runner)
-	// **已知问题（本轮登记，未查完）**：x86-32 资产在 batch 模式下探针崩溃（0xC0000005）。
-	// 已确认：blob 与探针都能构建成功、manifest 是 guest=x86-32 regCount=18；
-	// 未确认：是我的用例构造（batch 内存窗口里的 RSP 取值）还是 x86-32 blob 侧的问题。
-	// 在查清之前**显式跳过**，不让主干变红（AGENTS.md：宁可明确拒绝/登记，不留红灯）。
-	if os.Getenv("VMPX_X8632_DIFF") == "" {
-		t.Skip("x86-32 batch 差分尚未跑通（探针 0xC0000005，见 STATUS #427 未做项）；" +
-			"设 VMPX_X8632_DIFF=1 复现")
-	}
+	// 历史：本轮先踩了两个坑，都已修掉（留档避免重走）——
+	//   1) RSP 取 batchBufBase+batchBufLen-0x100 恰好等于窗口基址（窗口只有 256 字节），
+	//      第一次 push 写到窗口外 ⇒ 探针 0xC0000005；改成 base+len-16 即可。
+	//   2) 参考实现必须用与字节码**匹配**的映射，写死 x32 的映射跑 x64 字节码会报“未知操作码 0x47”。
+	// 资产缺失时跳过（与既有对拍测试一致）：CI 目前不构建 x86-32 资产 ⇒ 在 CI 上会跳过（已登记为未做项）。
 
 	const rbp = byte(5)
-	rsp := uint64(batchBufBase + batchBufLen - 0x100)
+	// RSP 必须落在 batch 内存窗口**内部**：写这段测试时先踩了一次 ——
+	// 用 batchBufBase+batchBufLen-0x100 恰好等于基址（窗口只有 256 字节），
+	// 于是第一次 push 写到 base-4（窗口外）⇒ 探针 0xC0000005。
+	rsp := uint64(batchBufBase + batchBufLen - 16)
 
 	// 用逻辑操作码编好，再按各自 blob 的映射编码（x86-32 资产是 -random-opcodes=false，编码即恒等，
 	// 但这里仍走 Encode，保证将来换成随机映射也成立）。
@@ -138,8 +138,10 @@ func TestX8632StackSlot(t *testing.T) {
 	rspC32 := runBatchOne(t, x32Runner, x32Blob, x32Entry, code32, rsp)
 
 	// Go 参考：同一个客户机设置必须给出与 C 相同的净变化
-	ref := func(g Guest, code []byte) uint64 {
-		st := &RefState{Map: x32Map, Guest: g, BufBase: batchBufBase, BufSize: batchBufLen, Mem: map[uint64]byte{}}
+	// 注意：参考实现必须用**与该字节码匹配**的映射 —— 一开始把 Map 写死成 x32 的，
+	// 拿它去跑 x64 的字节码就报“未知操作码 0x47”（两套映射不同）。
+	ref := func(g Guest, om *OpcodeMap, code []byte) uint64 {
+		st := &RefState{Map: om, Guest: g, BufBase: batchBufBase, BufSize: batchBufLen, Mem: map[uint64]byte{}}
 		for k := 0; k < batchBufLen; k++ {
 			st.Mem[batchBufBase+uint64(k)] = byte((k*7 + 3) & 0xFF)
 		}
@@ -149,8 +151,8 @@ func TestX8632StackSlot(t *testing.T) {
 		}
 		return st.Regs[4]
 	}
-	rspGo32 := ref(GuestX8632, code32)
-	rspGo64 := ref(GuestX86, code64)
+	rspGo32 := ref(GuestX8632, x32Map, code32)
+	rspGo64 := ref(GuestX86, x64Map, code64)
 
 	slotC64 := int64(rsp) - int64(rspC64)
 	slotC32 := int64(rsp) - int64(rspC32)
