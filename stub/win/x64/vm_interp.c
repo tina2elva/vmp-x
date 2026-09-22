@@ -164,6 +164,38 @@ static void vm_mul64_full(u64 a, u64 b, u64 *hi, u64 *lo) {
     *lo = (mid << 32) | (p00 & 0xFFFFFFFFu);
     *hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
 }
+/* Portable 64/64 divide + remainder (only used on 32-bit hosts).
+ * i686 has no native 64-bit division: plain `/` or `%` makes GCC emit calls to the
+ * runtime helpers (__udivdi3 / __umoddi3 / __divdi3 / __moddi3); the blob is
+ * freestanding, so the merge then fails with "undefined symbol __divdi3" - exactly
+ * what blocked the 32-bit blob. Shift-subtract long division works on any host.
+ * Guarded to 32-bit hosts on purpose: x64/arm64 keep the native division so that
+ * their generated code stays byte-identical (which the x64 gates verify). */
+#if defined(VM_HOST_X86_32)
+static u64 vm_udivmod64(u64 n, u64 d, u64 *rem) {
+    u64 q = 0, r = 0;
+    int i;
+    for (i = 63; i >= 0; i--) {
+        r = (r << 1) | ((n >> i) & 1ull);
+        if (r >= d) {
+            r -= d;
+            q |= (1ull << i);
+        }
+    }
+    *rem = r;
+    return q;
+}
+/* Signed version: C truncation semantics (quotient toward zero, remainder sign of n). */
+static i64 vm_idivmod64(i64 n, i64 d, i64 *rem) {
+    int negN = n < 0, negD = d < 0;
+    u64 un = negN ? (u64)(-n) : (u64)n;
+    u64 ud = negD ? (u64)(-d) : (u64)d;
+    u64 ur = 0;
+    u64 uq = vm_udivmod64(un, ud, &ur);
+    *rem = negN ? -(i64)ur : (i64)ur;
+    return negN != negD ? -(i64)uq : (i64)uq;
+}
+#endif
 
 static u32 flags_mul_w(u64 x, u64 y, u64 r, u32 w) {
     i64 a = sign_extend_w(x, w), b = sign_extend_w(y, w);
@@ -944,7 +976,14 @@ static i64 vm_now_unix(void) {
     if (!f) return 0;
     u64 ft = 0;
     f(&ft);
+#if defined(VM_HOST_X86_32)
+    {   /* 32 位宿主没有原生 64 位除法：走可移植助手，避免拉进 __udivdi3 */
+        u64 rem = 0;
+        return (i64)vm_udivmod64(ft, 10000000ull, &rem) - 11644473600LL;
+    }
+#else
     return (i64)(ft / 10000000ull) - 11644473600LL;
+#endif
 }
 
 /* bcrypt.dll 是**按需加载**的：在简单进程里 PEB 模块表里根本没有它（实测 0x31）。
@@ -1868,20 +1907,34 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
                     if (kind == K_DIVU) {
                         u64 dv = a & mask, n = (dxv << width) | axv;
                         if (dv == 0) __builtin_trap();
+#if defined(VM_HOST_X86_32)
+                        q = vm_udivmod64(n, dv, &r);
+#else
                         q = n / dv;
                         r = n % dv;
+#endif
                         if (q > mask) __builtin_trap();
                     } else {
                         i64 dvs = sign_extend_w(a & mask, width);
                         i64 n, qq, lo, hi;
                         if (dvs == 0) __builtin_trap();
                         n = (i64)(((u64)sign_extend_w(dxv, width) << width) | axv);
+#if defined(VM_HOST_X86_32)
+                        {   /* 32 位宿主：有符号 64 位除余也走可移植助手 */
+                            i64 rr = 0;
+                            qq = vm_idivmod64(n, dvs, &rr);
+                            r = (u64)rr & mask;
+                        }
+#else
                         qq = n / dvs;
+#endif
                         lo = -((i64)1 << (width - 1));
                         hi = ((i64)1 << (width - 1)) - 1;
                         if (qq < lo || qq > hi) __builtin_trap();
                         q = (u64)qq & mask;
+#if !defined(VM_HOST_X86_32)
                         r = (u64)(n % dvs) & mask;
+#endif
                     }
                     if (width == 16) {
                         write_reg(vm, VRAX, 16, q & 0xFFFFu);
@@ -1891,7 +1944,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
                         write_reg(vm, VRDX, 32, r & 0xFFFFFFFFu);
                     }
                 } else {
-                    /* 64 位：手写 128/64 长除法。
+                    
+/* 64 位：手写 128/64 长除法。
                      * 为什么不用 inline asm：同一个 vm_interp.c 也会被 clang 交叉编译成 arm64 blob，
                      * 那里既没有 divq、clang 也不接受 "+a"/"+d" 约束（CI 实测报 invalid output constraint）。
                      * 也不用 __int128 的除法：freestanding blob 里会拉进 __divti3（门禁直接报未定义符号）。 */
