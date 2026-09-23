@@ -96,5 +96,26 @@ foreach ($c in $cases) {
     else { $pass++ }
 }
 
-if ($script:bad -eq 0) { Write-Host ("[OK] 32-bit e2e: " + $pass + "/" + $cases.Count + " packed functions match native") }
+# Second pass: the same cases WITHOUT -strip-relocs, i.e. with the relocation table kept.
+# That configuration used to fail outright (".reloc 空间不足"): vmpack can now move the whole
+# relocation table into a new carrier section (.vreloc) when the old .reloc has no raw slack.
+# It exercises the loader-relocation path, so it is worth a pass of its own.
+$pass2 = 0
+foreach ($c in $cases) {
+    $fn = $c[0]; $want = $c[1]
+    $outExe = "build/target32_rel_" + $fn + ".exe"
+    if (Test-Path $outExe) { Remove-Item $outExe -Force }
+    & ".\build\vmpack.exe" -exe "build/target32.exe" -func $fn -out $outExe -blob "build/gates_blob32.bin" -manifest "build/gates_blob32.json" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outExe)) { Fail ("packing " + $fn + " with relocations kept failed"); continue }
+    & ".\build\target32.exe" $fn | Out-Null; $nat = $LASTEXITCODE
+    & $outExe $fn | Out-Null; $pac = $LASTEXITCODE
+    if ($nat -ne $want) { Fail ($fn + " (relocs kept): native=" + $nat + " but the case expects " + $want); continue }
+    if ($pac -ne $nat) { Fail ($fn + " (relocs kept): packed=" + $pac + " native=" + $nat) }
+    else { $pass2++ }
+}
+
+if ($script:bad -eq 0) {
+    Write-Host ("[OK] 32-bit e2e: " + $pass + "/" + $cases.Count + " match native (-strip-relocs)")
+    Write-Host ("[OK] 32-bit e2e: " + $pass2 + "/" + $cases.Count + " match native (relocations kept)")
+}
 exit $script:bad

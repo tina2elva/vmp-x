@@ -7087,3 +7087,34 @@ C 探针）。缺 i686 工具链时打印醒目的 SKIPPED 并退出 0（不静�
 
 **它修的是什么**：32 位 Windows 上 Win32/ntdll/bcrypt API 都是 `__stdcall`（callee 清栈）；
 按默认 cdecl 声明会让**调用方再清一次栈**，每次调用都轻微破坏宿主栈。x64 只有一种调用约定 ⇒ 无此问题。
+
+### 484. 第 3 项完成：**重定位承载节（.vreloc）** —— 保留重定位的 ASLR 配置从"打不了包"变成 24/24 全过
+
+**原先的症状**（复现并量化）：
+
+    .reloc   VA=0xA000  vsize=0x264  raw=0x400  off=0x4600
+    [!] 补 payload 重定位项失败: .reloc 空间不足（需要 154 字节，剩 78）
+
+`appendRelocs` 只能把新块追加进 `.reloc` 节的 **raw 余量**里；而这个节的 raw 后面在**文件里**紧跟着
+`/14`、`/29` 等节的原始数据 ⇒ **不能就地扩展**。于是"保留重定位"这条路在 32 位上是完全不工作的。
+
+**修法**（`cmd/vmpack/main.go` 的 `appendRelocs`）：先只把新块拼进内存；
+· 余量够 ⇒ 维持原行为（x64 走的就是这条，零影响）；
+· 余量不够 ⇒ 把「**原有重定位块 + 新块**」整体搬进一个**新的承载节** `.vreloc`，再把数据目录指向它。
+  加载器只按目录读**一段连续**区间，所以原有块必须一起搬；原有块**按块长逐个拷**（目录 Size 可能带尾部填充，
+  整段照搬会被加载器当成畸形块）。新节用现成的 `pe.File.AddSection`（EOF 对齐追加 + 节头写进表后空闲空间 +
+  修正 `NumberOfSections`/`SizeOfImage`）。
+
+**证据**：
+
+    产物: BASERELOC 目录 RVA=0x2A000 Size=1128，指向节 .vreloc ✓；NumberOfSections=21
+    RELOCS_STRIPPED = clear ✓   DYNAMIC_BASE(0x40) = SET ✓
+    e32_local: native=35  packed=35 ✓
+    门禁两遍都 12/12：-strip-relocs 与 **保留重定位** 各 12 条全部与原生一致 ✓
+
+**门禁已扩展**：`tools/e2e_32bit.ps1` 现在跑**两遍**（一遍 `-strip-relocs`、一遍保留重定位），
+所以这条路径以后有回归保护。
+
+**一个新记录下来的观察（未深究，不影响本项）**：产物虽然 `DYNAMIC_BASE` 为 SET 且重定位表可用，
+实测仍**固定加载在首选基址**（三次运行 `&g_marker32` 都是 `0x00403004`），而 native 的 exe 每次不同。
+可能与本机/系统的 ASLR 策略或该镜像的某些标志有关 ⇒ 留作后续观察点。

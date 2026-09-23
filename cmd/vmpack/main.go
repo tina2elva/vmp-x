@@ -1342,26 +1342,51 @@ func appendRelocs(f *pe.File, items [][2]uint32) error {
 		pages = append(pages, p)
 	}
 	sort.Slice(pages, func(i, j int) bool { return pages[i] < pages[j] })
+	/* 先把新块拼进内存：这样"原地追加"与"新建承载节"两条路可以共用同一份字节。 */
+	var add []byte
 	for _, pg := range pages {
 		offs := groups[pg]
 		/* PE 要求同一页内的项按偏移升序；追加的项目与原有项目混在一起时更需要显式排序。 */
 		sort.Slice(offs, func(a, b2 int) bool { return (offs[a] & 0xFFF) < (offs[b2] & 0xFFF) })
 		blk := 8 + len(offs)*2
-		if pos+blk > so+room || pos+blk > len(f.Data) {
-			return fmt.Errorf(".reloc 空间不足（需要 %d 字节，剩 %d）", blk, so+room-pos)
-		}
-		binary.LittleEndian.PutUint32(f.Data[pos:], pg)
-		binary.LittleEndian.PutUint32(f.Data[pos+4:], uint32(blk))
+		hdr := make([]byte, blk)
+		binary.LittleEndian.PutUint32(hdr[0:], pg)
+		binary.LittleEndian.PutUint32(hdr[4:], uint32(blk))
 		for i, e := range offs {
-			binary.LittleEndian.PutUint16(f.Data[pos+8+i*2:], e)
+			binary.LittleEndian.PutUint16(hdr[8+i*2:], e)
 		}
-		pos += blk
+		add = append(add, hdr...)
 	}
-	newSize := uint32(pos - off)
-	binary.LittleEndian.PutUint32(f.Data[do+4:], newSize)
-	if target.VirtualSize < newSize {
-		target.VirtualSize = newSize
+	if pos+len(add) <= so+room && pos+len(add) <= len(f.Data) {
+		copy(f.Data[pos:], add)
+		newSize := uint32(pos - off + len(add))
+		binary.LittleEndian.PutUint32(f.Data[do+4:], newSize)
+		if target.VirtualSize < newSize {
+			target.VirtualSize = newSize
+		}
+		return nil
 	}
+	/* .reloc 的 raw 余量不够。它后面在**文件里**还压着别的节的原始数据，所以不能就地扩展；
+	 * 而加载器只按数据目录读**一段连续**的重定位块，于是把「原有块 + 新块」整体搬进一个**新的承载节**，
+	 * 再把目录指向它（旧的 .reloc 内容就变成无人引用的死字节）。
+	 * 原有块要按块长逐个拷：目录 Size 可能带尾部填充，整段照搬会被加载器当成一个畸形块。 */
+	var carrier []byte
+	for p := 0; p+8 <= int(size); {
+		blkLen := int(binary.LittleEndian.Uint32(f.Data[off+p+4:]))
+		if blkLen < 8 || p+blkLen > int(size) {
+			break
+		}
+		carrier = append(carrier, f.Data[off+p:off+p+blkLen]...)
+		p += blkLen
+	}
+	carrier = append(carrier, add...)
+	/* 0x40000040 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ */
+	sec, err := f.AddSection(".vreloc", carrier, 0x40000040)
+	if err != nil {
+		return fmt.Errorf(".reloc 空间不足（需要 %d 字节，剩 %d），且新建承载节失败: %w", len(add), so+room-pos, err)
+	}
+	binary.LittleEndian.PutUint32(f.Data[do:], sec.VirtualAddress)
+	binary.LittleEndian.PutUint32(f.Data[do+4:], uint32(len(carrier)))
 	return nil
 }
 
