@@ -6830,3 +6830,34 @@ bcrypt API **全部是 `__stdcall`**（callee 清栈）⇒ 在 i686 构建里，
 
 **下一步**：把 `p1`/`p5` 的 IR 与运行期 `regs[ESP]/regs[EBP]`（经退出码分次读出）对齐，定位那 4 字节；
 修好后本关应当打印 `6/6`，再把它加进 `tools/gates.ps1`（建议放在 `go test` 之前）。
+
+### 475. 32 位 cdecl 参数错位：**已缩小到"参数被读低一个栈槽（4 字节）"**，根因未定
+
+**实验设计**：给四个参数各用一个特征常量，函数分别只返回其中一个 ⇒ 用**完整 32 位退出码**读出"读到了谁的槽"：
+
+    s1(int a,b,c,d){return a;}  native=0x11111111  packed=0x004015C9  <- 这是**返回地址**（代码地址）
+    s2(...){return b;}          native=0x22222222  packed=0x11111111  <- 拿到了 a
+    s3(...){return c;}          native=0x33333333  packed=0x22222222  <- 拿到了 b
+    s4(...){return d;}          native=0x44444444  packed=0x33333333  <- 拿到了 c
+    s6(void){int x=0x77777777;} native=0x77777777  packed=0x77777777  ✓ 本地变量正确
+
+⇒ **参数整体低一个槽（4 字节）**：a 落到返回地址、b 落到 a、c 落到 b、d 落到 c。
+
+**已实测排除**（都不是推理）：
+· **lifter 的位移正确**：`-dumpbytecode` 取到 `s1` 的明文字节码，LOAD 的 disp = `98 42 00 00`
+  = 0x4298 = 17048 = `FrameSkew(0x4290) + 8`，与 `[ebp+8]` 一致 ✓；
+· **blob 里 `VM_STACK_SLOT` = 4**（把常量塞进退出码量出来的）⇒ 客户机 push 宽度按设计；
+· **模拟 ESP 不变式成立**：蹦床把帧基址写进 `VM_CTX_FRAME`，于是 `E = frame + VM_FRAME_SIZE`，
+  实测 `((frame + 640) - VRSP) >> 2 & 0xFF = 164` ⇒ `VRSP = E - 17040` = `E - FrameSkew` ✓；
+· 常量自洽：`VM_FRAME_SIZE 640 + VM_FRAME_SKEW_EXTRA 16 + VM_MARGIN 0x4000 = 17040` = manifest 的 frameSkew ✓；
+· 无参用例 `p4(){return 200;}` 打包后 **200 ✓** ⇒ VM/栈主干没问题。
+
+**因此矛盾点是**：按 `VRSP = E - 17040`、`VM_STACK_SLOT = 4`、disp = `FrameSkew + 8` 三者为真，
+`[ebp+8]` 应当读到 `E + 4`（= a）—— 实测却读到 `E`。也就是说**运行期实际用了 8 字节的槽**（或 `E` 比模型低 4）。
+本轮**没查出**这三者中哪一个是"看起来对、实际不对"。
+
+**下一步（建议按这个顺序，都很快）**：
+1. 让 subject 直接返回 `[esp]`（返回地址）与 `[esp+4]`，用退出码读出来，和 native 的同一位置对比，
+   先把"`E` 到底在哪"钉死（这是唯一还没直接测过的量）；
+2. 若 `E` 与模型差 4，查蹦床入口的 `%esp`（`E9` 补丁是 jmp、不压栈，理论上 `%esp` 就是返回地址槽）；
+3. 若 `E` 正常，则查 `OP_PUSH_R` 运行期是否真的只减 4（可在 IR 层面单测：造一段只含 PUSH_R 的字节码喂 probe）。
