@@ -66,33 +66,43 @@ foreach ($t in @("build/vmpack.exe", "build/vmpbuild.exe")) {
 & $cc -O0 -Wall -msse2 -mfpmath=sse -mno-stackrealign -o build/target32.exe testdata/e2e32.c 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path "build/target32.exe")) { Write-Host "[!] could not build build/target32.exe"; exit 1 }
 
+# A SECOND subject at -O1, used only for the floating-point cases.
+# Why: at -O0 some GCC versions (observed on the CI runner) address the double locals as
+# [ESP+Reg(0)] (indexed stack addressing). The lifter refuses that form by design ("symbol of
+# rsp+idx*scale+disp depends on a runtime index"), so the pack fails there while it passes with
+# the locally installed GCC. At -O1 the doubles stay in XMM registers and the form disappears.
+& $cc -O1 -Wall -msse2 -mfpmath=sse -mno-stackrealign -o build/target32_o1.exe testdata/e2e32.c 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path "build/target32_o1.exe")) { Write-Host "[!] could not build build/target32_o1.exe"; exit 1 }
+
 # ---- the 32-bit blob (VM_HOST_X86_32 + x86-32 guest are injected by vmpbuild from -guest) ----
 & ".\build\vmpbuild.exe" -cc $ccName -src "stub/win/x86" -out "build/gates_blob32.bin" -manifest "build/gates_blob32.json" -entry vm_entry -guest x86-32 -merge go -random-opcodes=false 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Host "[!] i686 blob build failed (stub/win/x86 has compile errors?)"; exit 1 }
 
 # ---- pack each function on its own and compare exit codes ----
 $cases = @(
-    @("e32_const", 100),   # no locals: push/mov/pop/ret
-    @("e32_local",  35),   # two locals via [ebp-N] STORE/LOAD
-    @("e32_loop",   55),   # loop with a stack-resident counter
-    @("e32_args",  123),   # cdecl multi-argument, read from the caller frame
-    @("e32_big",    36),   # many locals: longer bytecode
-    @("e32_call",   42),   # guest calls a native function and uses the result
-    @("e32_shl_imm", 8),   # CONSTANT-local shift: no argument read at all
-    @("e32_shr_imm", 16),  # same, right shift
-    @("e32_shl",     8),   # pure shift left (isolates shift-class ALU_RI)
-    @("e32_shr",    16),   # pure shift right
-    @("e32_dbl",     4),   # floating point, no args
-    @("e32_dblarg",  3)    # floating point, two doubles on the stack (cdecl)
+    @("e32_const", 100, 0),   # no locals: push/mov/pop/ret
+    @("e32_local",  35, 0),   # two locals via [ebp-N] STORE/LOAD
+    @("e32_loop",   55, 0),   # loop with a stack-resident counter
+    @("e32_args",  123, 0),   # cdecl multi-argument, read from the caller frame
+    @("e32_big",    36, 0),   # many locals: longer bytecode
+    @("e32_call",   42, 0),   # guest calls a native function and uses the result
+    @("e32_shl_imm", 8, 0),   # CONSTANT-local shift: no argument read at all
+    @("e32_shr_imm", 16, 0),  # same, right shift
+    @("e32_shl",     8, 0),   # pure shift left (isolates shift-class ALU_RI)
+    @("e32_shr",    16, 0),   # pure shift right
+    @("e32_dbl",     4, 1),   # floating point, no args (needs the -O1 subject)
+    @("e32_dblarg",  3, 1)    # floating point, two doubles on the stack (cdecl)
 )
 $pass = 0
 foreach ($c in $cases) {
     $fn = $c[0]; $want = $c[1]
+    $subj = "build/target32.exe"
+    if ($c[2] -eq 1) { $subj = "build/target32_o1.exe" }
     $outExe = "build/target32_" + $fn + ".exe"
     if (Test-Path $outExe) { Remove-Item $outExe -Force }
-    & ".\build\vmpack.exe" -exe "build/target32.exe" -func $fn -out $outExe -blob "build/gates_blob32.bin" -manifest "build/gates_blob32.json" -strip-relocs 2>&1 | Out-Null
+    & ".\build\vmpack.exe" -exe $subj -func $fn -out $outExe -blob "build/gates_blob32.bin" -manifest "build/gates_blob32.json" -strip-relocs 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outExe)) { Fail ("packing " + $fn + " failed"); continue }
-    & ".\build\target32.exe" $fn | Out-Null; $nat = $LASTEXITCODE
+    & $subj $fn | Out-Null; $nat = $LASTEXITCODE
     & $outExe $fn | Out-Null; $pac = $LASTEXITCODE
     if ($nat -ne $want) { Fail ($fn + ": native=" + $nat + " but the case expects " + $want + " (test subject changed?)"); continue }
     if ($pac -ne $nat) { Fail ($fn + ": packed=" + $pac + " native=" + $nat + " (32-bit guest behaves differently)") }
@@ -107,9 +117,11 @@ foreach ($c in $cases) {
 $pass2 = 0
 foreach ($c in $cases) {
     $fn = $c[0]; $want = $c[1]
+    $subj = "build/target32.exe"
+    if ($c[2] -eq 1) { $subj = "build/target32_o1.exe" }
     $outExe = "build/target32_rel_" + $fn + ".exe"
     if (Test-Path $outExe) { Remove-Item $outExe -Force }
-    $pk = & ".\build\vmpack.exe" -exe "build/target32.exe" -func $fn -out $outExe -blob "build/gates_blob32.bin" -manifest "build/gates_blob32.json" 2>&1 | Out-String
+    $pk = & ".\build\vmpack.exe" -exe $subj -func $fn -out $outExe -blob "build/gates_blob32.bin" -manifest "build/gates_blob32.json" 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outExe)) {
 # Do not swallow the real reason from vmpack: it is the only diagnostic on this path.
         # Print the tail VERBATIM (no filter): an earlier filter dropped the real reason because it
@@ -118,7 +130,7 @@ foreach ($c in $cases) {
         Fail ("packing " + $fn + " with relocations kept failed")
         continue
     }
-    & ".\build\target32.exe" $fn | Out-Null; $nat = $LASTEXITCODE
+    & $subj $fn | Out-Null; $nat = $LASTEXITCODE
     & $outExe $fn | Out-Null; $pac = $LASTEXITCODE
     if ($nat -ne $want) { Fail ($fn + " (relocs kept): native=" + $nat + " but the case expects " + $want); continue }
     if ($pac -ne $nat) { Fail ($fn + " (relocs kept): packed=" + $pac + " native=" + $nat) }
