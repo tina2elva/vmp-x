@@ -109,7 +109,9 @@ foreach ($c in $cases) {
     $pk = & ".\build\vmpack.exe" -exe "build/target32.exe" -func $fn -out $outExe -blob "build/gates_blob32.bin" -manifest "build/gates_blob32.json" 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outExe)) {
 # Do not swallow the real reason from vmpack: it is the only diagnostic on this path.
-        ($pk -split "`r?`n") | Where-Object { $_ -match "\[!\]|error|reloc|failed|space" } | Select-Object -First 3 | ForEach-Object { Write-Host ("      vmpack: " + $_.Trim()) }
+        # Print the tail VERBATIM (no filter): an earlier filter dropped the real reason because it
+# did not contain any of the words I guessed at.
+($pk -split "`r?`n") | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 6 | ForEach-Object { Write-Host ("      vmpack| " + $_.Trim()) }
         Fail ("packing " + $fn + " with relocations kept failed")
         continue
     }
