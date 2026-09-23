@@ -93,3 +93,7 @@
 **G3 进展（本轮）**：`-key-external` 已从只支持 win/x64 扩到**也支持 linux/amd64**（构建级验证通过，见 STATUS #489）；
 其余目标仍被两道守卫 fail-fast 拦住（`cmd/vmpbuild` 白名单 + `vm_interp.c` 的 `#error`）。
 Linux 侧的**运行时**验收尚未加入 CI（本机无法执行 Linux 系统调用）。
+
+**G3 进展（#490）**：linux/amd64 的运行时验收已进 CI（`tools/e2e.sh`：不给密钥必须恰好 rc=7 且无输出、
+给密钥的两条必须与原生一致；run 35838856135 全过）⇒ 该平台的外置密钥已是**常态回归项**。
+linux/arm64 / i386 / win-arm64 仍未做。

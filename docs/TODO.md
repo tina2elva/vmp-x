@@ -699,3 +699,6 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
 - [ ] Linux/amd64 **运行时**验收：必须加进 `tools/e2e.sh`（CI 的 Linux 作业），本机跑不了 Linux syscall。
 - [ ] linux/arm64：同一形态换 syscall 号（read=63 openat=56 close=57 readlinkat=78 exit_group=94）。
 - [ ] Linux 侧授权与狗：目前是 fail-closed 桩。
+
+- [x] **Linux/amd64 运行时验收**：已在 `tools/e2e.sh` 里加三条（无密钥 rc=7 无输出 / VMPX_KEY / .vmpkey 文件），
+      CI run 35838856135 全过（STATUS #490）。**Linux/amd64 至此构建级 + 运行时级双验收完成。**

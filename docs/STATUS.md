@@ -7270,3 +7270,34 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
 2. linux/arm64（同一形态，改 syscall 号；本机无 aarch64 工具链 ⇒ 只能靠 CI 验证）。
 3. 授权与狗在 Linux 上目前是 fail-closed 桩 ⇒ 若客户要在 Linux 上用狗，需单独一轮。
 4. i386 与 win/arm64 各自单独一步（32 位 PEB / ARM64 TEB）。
+
+### 490. W3 第二步：**Linux/amd64 运行时验收通过**（外置取钥在真 Linux 上跑通）
+
+**做法**：在 `tools/e2e.sh`（CI 的 linux-amd64 作业执行）末尾加一节 1b 外置密钥验收，三条用例：
+
+1. **不给密钥**：必须恰好被硬门拒绝（`exit_group(0xC0DE0007)` 在 POSIX 上只暴露低 8 位 ⇒ 断言 `rc=7`，且无输出）；
+2. **给密钥（环境变量 `VMPX_KEY`）**：运行期走 `/proc/self/environ` ⇒ 输出必须与原生一致；
+3. **给密钥（`<产物>.vmpkey` 文件）**：运行期走 `/proc/self/exe` + `.vmpkey` + `open/read/close` ⇒ 必须与原生一致。
+
+（不需要额外开关：`vmpack` 只在传 `-dongle-*`/`-license-*` 时才改 `vm_key_src.kind`；默认 `kind=0` 就是"文件 -> 环境变量"。）
+
+**证据（CI run 35838856135，commit 3790320，linux-amd64 作业）**：
+
+    [*] 1b 外置密钥（-key-external）验收...
+      [OK  ] 无密钥：rc=7（硬门低 8 位）且无输出
+      [OK  ] 有密钥(VMPX_KEY 环境变量)：与原生一致
+      [OK  ] 有密钥(<产物>.vmpkey 文件)：与原生一致
+    e2e(linux): 17 passed, 0 failed
+
+⇒ 加上 #489 的构建级证据（外置 blob 里含 /proc/self/environ 等字符串、非外置 blob 为 0；
+非外置路径 rc=0），**Linux/amd64 这条路径现在构建级 + 运行时级都有验收**，且已进入 CI 常态回归。
+
+**为什么必须靠 CI**：本机是 Windows，**无法执行 Linux 系统调用** —— 取钥实现里 `/proc/self/environ`、
+`open/read`、`exit_group` 这些只有真 Linux（含 qemu-user）能跑到；本机只能做构建级与静态检查。
+
+**未做项（下一步）**：
+1. **linux/arm64**：aarch64 没有 `open` 只有 `openat`、没有 `readlink` 只有 `readlinkat` ⇒ 都需要**第 4 个参数**，
+   而现成的 `vm_syscall3_a64` 只有 3 个 ⇒ 要先加一个 4 参数封装；syscall 号：openat=56 close=57 read=63
+   readlinkat=78 exit_group=94；然后在 `tools/e2e_arm64.sh`（CI 的 linux-arm64 作业，qemu）里加同一节三条验收。
+2. i386（32 位 PEB + __stdcall）与 win/arm64（ARM64 TEB/PEB）各自一步。
+3. Linux 侧授权与狗仍是 fail-closed 桩（需要时单独一轮）。
