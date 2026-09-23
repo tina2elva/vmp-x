@@ -29,8 +29,13 @@
     .p2align 4
 vm_entry:
     subl    $VM_FRAME_SIZE, %esp
-    /* hand the frame base to the interpreter (used by the XMM boundary sync) */
+    /* hand the frame base to the interpreter (used by the XMM boundary sync).
+     * vm_ctx_t.frame is a u64, so clear its HIGH dword too: on i686 the surrounding
+     * writes are 32-bit, and a stale high half would turn vm->frame into a wild pointer
+     * the moment the XMM sync is enabled for this platform (it dereferences
+     * (u8 *)(u64)vm->frame). Measured: the high half WAS non-zero garbage before this. */
     movl    %esp, VM_CTX_FRAME(%esp)
+    movl    $0, (VM_CTX_FRAME + 4)(%esp)
 
     /* ---- callee-saved ---- */
     movl    %ebx, VM_SAVE_EBX(%esp)

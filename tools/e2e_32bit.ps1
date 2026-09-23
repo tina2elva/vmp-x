@@ -54,7 +54,10 @@ foreach ($t in @("build/vmpack.exe", "build/vmpbuild.exe")) {
 }
 
 # ---- the subject: a real 32-bit PE32 exe ----
-& $cc -O0 -Wall -o build/target32.exe testdata/e2e32.c 2>&1 | Out-Null
+# -msse2 -mfpmath=sse: i686 defaults to x87, whose FLD/FSTP the lifter rejects ("unsupported
+# instruction"). Any protected function that touches floating point therefore needs SSE codegen
+# on this target. Keeping the flags here documents that constraint and covers the FP path.
+& $cc -O0 -Wall -msse2 -mfpmath=sse -o build/target32.exe testdata/e2e32.c 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path "build/target32.exe")) { Write-Host "[!] could not build build/target32.exe"; exit 1 }
 
 # ---- the 32-bit blob (VM_HOST_X86_32 + x86-32 guest are injected by vmpbuild from -guest) ----
@@ -68,7 +71,9 @@ $cases = @(
     @("e32_loop",   55),   # loop with a stack-resident counter
     @("e32_args",  123),   # cdecl multi-argument, read from the caller frame
     @("e32_big",    36),   # many locals: longer bytecode
-    @("e32_call",   42)    # guest calls a native function and uses the result
+    @("e32_call",   42),   # guest calls a native function and uses the result
+    @("e32_dbl",     4),   # floating point, no args
+    @("e32_dblarg",  3)    # floating point, two doubles on the stack (cdecl)
 )
 $pass = 0
 foreach ($c in $cases) {

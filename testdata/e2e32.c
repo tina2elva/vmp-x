@@ -32,6 +32,11 @@ int e32_big(void) {
     return v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7;   /* 36 */
 }
 
+/* floating point: exercises the blob FP path. cdecl passes doubles on the stack,
+ * so this also covers 8-byte stack arguments (a shape the integer cases miss). */
+int e32_dbl(void) { double v = 1.5 + 2.5; return (int)v; }          /* 4 */
+int e32_dblarg(double a, double b) { return (int)(a * b); }         /* 1.5 * 2.0 = 3 */
+
 /* nested call: the guest calls another (native) function and uses its result */
 int e32_helper(int x) { return x + 1; }
 int e32_call(void) { return e32_helper(41); }   /* 42 */
@@ -44,5 +49,7 @@ int main(int argc, char **argv) {
     if (!strcmp(w, "e32_args"))  return e32_args(1, 2, 3);
     if (!strcmp(w, "e32_big"))   return e32_big();
     if (!strcmp(w, "e32_call"))  return e32_call();
+    if (!strcmp(w, "e32_dbl"))   return e32_dbl();
+    if (!strcmp(w, "e32_dblarg")) return e32_dblarg(1.5, 2.0);
     return 250;   /* unknown selector: loud, and out of the expected range */
 }
