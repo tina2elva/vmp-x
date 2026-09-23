@@ -67,6 +67,32 @@ vm_entry:
     movl    $0, VM_CTX_R13(%esp)
     movl    $0, VM_CTX_R14(%esp)
     movl    $0, VM_CTX_R15(%esp)
+    /* ---- clear the HIGH half of every u64 register slot ----
+     * vm_ctx_t.regs[] is u64 even for a 32-bit guest, but every store above is a
+     * 32-bit `movl`: without this the upper 4 bytes keep whatever the stack held.
+     * The interpreter reads the full u64 (notably the UNSIGNED stack guard
+     * `rsp_start - regs[VRSP] > VM_MARGIN`), so stale garbage there showed up as a
+     * wild SP (measured: off by exactly 0x10000) and a bogus rc=99.
+     * Offsets are the raw +4 dwords of slots 0..17 (16 GPR + VBASE + VSCRATCH)
+     * so this cannot depend on any name mapping. No register is touched. */
+    movl    $0, 4(%esp)
+    movl    $0, 12(%esp)
+    movl    $0, 20(%esp)
+    movl    $0, 28(%esp)
+    movl    $0, 36(%esp)
+    movl    $0, 44(%esp)
+    movl    $0, 52(%esp)
+    movl    $0, 60(%esp)
+    movl    $0, 68(%esp)
+    movl    $0, 76(%esp)
+    movl    $0, 84(%esp)
+    movl    $0, 92(%esp)
+    movl    $0, 100(%esp)
+    movl    $0, 108(%esp)
+    movl    $0, 116(%esp)
+    movl    $0, 124(%esp)
+    movl    $0, 132(%esp)
+    movl    $0, 140(%esp)
 
     /* ---- simulated ESP = esp - (16 + VM_MARGIN) ----
      * 这个 16 必须与 vm_abi.h 的 VM_FRAME_SKEW_EXTRA 一致（lifter 用 FRAME_SIZE+EXTRA+MARGIN 做栈偏移换算）。
