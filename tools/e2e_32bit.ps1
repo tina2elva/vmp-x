@@ -60,7 +60,10 @@ foreach ($t in @("build/vmpack.exe", "build/vmpbuild.exe")) {
 # -msse2 -mfpmath=sse: i686 defaults to x87, whose FLD/FSTP the lifter rejects ("unsupported
 # instruction"). Any protected function that touches floating point therefore needs SSE codegen
 # on this target. Keeping the flags here documents that constraint and covers the FP path.
-& $cc -O0 -Wall -msse2 -mfpmath=sse -o build/target32.exe testdata/e2e32.c 2>&1 | Out-Null
+# -mno-stackrealign: some GCC versions (observed on the CI runner) emit an SSE stack-realignment
+# prologue (`and esp,-16`) for a function with double locals. The lifter refuses to guess about a
+# modified RSP ("RSP modified in an untrackable way"), so the pack fails. Forbid that prologue.
+& $cc -O0 -Wall -msse2 -mfpmath=sse -mno-stackrealign -o build/target32.exe testdata/e2e32.c 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path "build/target32.exe")) { Write-Host "[!] could not build build/target32.exe"; exit 1 }
 
 # ---- the 32-bit blob (VM_HOST_X86_32 + x86-32 guest are injected by vmpbuild from -guest) ----
