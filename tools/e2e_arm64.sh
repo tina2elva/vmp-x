@@ -155,4 +155,34 @@ else
     tail -n 70 build/qemu_arm64.log 2>/dev/null | sed 's/^/    /'
     exit 1
 fi
+# ---- 1b 外置主密钥（-key-external）验收：与 amd64 侧同一套三条 ----
+# aarch64 没有 open/readlink，走的是 openat/readlinkat（见 vm_interp.c 的 Linux 取钥块）。
+# 硬门是 exit_group(0xC0DE0007)，POSIX 只看得到低 8 位 ⇒ 断言 rc=7 且无输出。
+echo "[*] 1b 外置密钥（-key-external）验收..."
+KEY1B=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+./build/vmpbuild -cc "$CC" -src stub/linux/arm64 -out build/vm_interp_arm64_ext.bin \
+    -manifest build/vm_interp_arm64_ext.json -entry vm_entry \
+    -key-external -key-in "$KEY1B" >/dev/null
+./build/vmpack -exe build/arm64_target -func check_key -func sum_to \
+    -blob build/vm_interp_arm64_ext.bin -manifest build/vm_interp_arm64_ext.json \
+    -out build/arm64_target_ext.vmp -report build/arm64_ext_vmp.json >/dev/null
+
+rc_no=0
+out_no=$($QEMU ./build/arm64_target_ext.vmp 2>&1) || rc_no=$?
+if [ "$rc_no" -eq 7 ] && [ -z "$out_no" ]; then
+    echo "[+] 1b: 无密钥 -> rc=7（硬门低 8 位）且无输出"
+else
+    echo "[!] 1b: 无密钥时 rc=$rc_no（期望 7），输出=[$(printf %s "$out_no" | tr "\n" "|")]"
+    exit 1
+fi
+
+erc=0
+eout=$(VMPX_KEY=$KEY1B $QEMU ./build/arm64_target_ext.vmp 2>&1) || erc=$?
+if [ "$erc" -eq 0 ] && [ "$eout" = "$native" ]; then
+    echo "[+] 1b: 有密钥(VMPX_KEY) -> 与原生一致"
+else
+    echo "[!] 1b: 有密钥(VMPX_KEY) rc=$erc；native=[$(printf %s "$native" | tr "\n" "|")] ext=[$(printf %s "$eout" | tr "\n" "|")]"
+    exit 1
+fi
+
 ok=1

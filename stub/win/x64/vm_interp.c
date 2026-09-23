@@ -773,11 +773,11 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
  * 密钥形式：环境变量 VMPX_KEY = 64 个十六进制字符（32 字节原始密钥）。 */
 #ifdef VM_KEY_EXTERNAL
 
-/* 已实现取钥的平台：Windows/x64（PEB + ntdll）与 Linux/amd64（syscall）。
+/* 已实现取钥的平台：Windows/x64（PEB + ntdll）与 Linux/amd64、Linux/arm64（syscall）。
  * 其它目标在这里就报错，vmpbuild 也会先拦住它们（两道守卫互为呼应）。 */
 #if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32))) && \
-    !(defined(VM_BLOB_TARGET_LINUX) && defined(__x86_64__))
-#error "VM_KEY_EXTERNAL 只有 Windows/x64 与 Linux/amd64 的取钥实现（vmpbuild 会先拦住别的目标）"
+    !(defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(__aarch64__)))
+#error "VM_KEY_EXTERNAL 只有 Windows/x64 与 Linux/amd64、Linux/arm64 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
 static u8 vm_master_buf[32];
@@ -819,14 +819,30 @@ static u32 vm_hexval(u16 c) {
  * 与 Windows 侧的对应关系：PEB -> /proc/self/exe 与 /proc/self/environ；
  * ntdll 文件读 -> open/read/close；NtTerminateProcess -> exit_group。
  * 注意：POSIX 只暴露退出码的低 8 位，所以 Linux 上"硬门"可观测到的值是 0x07。 */
-#if defined(VM_BLOB_TARGET_LINUX) && defined(__x86_64__)
+#if defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(__aarch64__))
+/* 两个架构的系统调用号与封装不同：
+ *   x86_64：read=0 open=2 close=3 readlink=89 exit_group=231（3 参数够用）
+ *   aarch64：read=63 close=57 exit_group=94，但**没有 open/readlink**，
+ *            只有 openat=56 readlinkat=78（都要 AT_FDCWD 这个第 4 参数，用 vm_syscall4_a64） */
+#if defined(__x86_64__)
 static long vm_syscall3(long n, long a, long b, long c);
-
 #define VM_LX_READ 0
-#define VM_LX_OPEN 2
 #define VM_LX_CLOSE 3
-#define VM_LX_READLINK 89
 #define VM_LX_EXIT_GROUP 231
+#define VM_LX_OPEN_RO(path) vm_syscall3(2 /* open */, (long)(path), 0, 0)
+#define VM_LX_READLINK_EXE(buf, cap) vm_syscall3(89 /* readlink */, (long)"/proc/self/exe", (long)(buf), (long)(cap))
+static long vm_lx_sys3(long n, long a, long b, long c) { return vm_syscall3(n, a, b, c); }
+#else
+static long vm_syscall3_a64(long n, long a, long b, long c);
+static long vm_syscall4_a64(long n, long a, long b, long c, long d);
+#define VM_LX_READ 63
+#define VM_LX_CLOSE 57
+#define VM_LX_EXIT_GROUP 94
+#define VM_LX_AT_FDCWD (-100)
+#define VM_LX_OPEN_RO(path) vm_syscall4_a64(56 /* openat */, VM_LX_AT_FDCWD, (long)(path), 0, 0)
+#define VM_LX_READLINK_EXE(buf, cap) vm_syscall4_a64(78 /* readlinkat */, VM_LX_AT_FDCWD, (long)"/proc/self/exe", (long)(buf), (long)(cap))
+static long vm_lx_sys3(long n, long a, long b, long c) { return vm_syscall3_a64(n, a, b, c); }
+#endif
 
 static u8 vm_lx_a[400];       /* ASCII 路径/命令缓冲（.bss，别放帧上） */
 static u16 vm_lx_u16[400];    /* 上层要 u16 路径/值，这里做一次转换 */
@@ -840,17 +856,17 @@ static void *vm_get_proc(u64 mod, const char *fn) { (void)mod; (void)fn; return 
 static u64 vm_peb_base(void) { return 0; }
 
 static void vm_key_reject_code(u32 code) {
-    vm_syscall3(VM_LX_EXIT_GROUP, (long)(0xC0DE0000u | code), 0, 0);
+    vm_lx_sys3(VM_LX_EXIT_GROUP, (long)(0xC0DE0000u | code), 0, 0);
     __builtin_trap();
 }
 static void vm_key_reject(void) { vm_key_reject_code(7u); }
 
 /* 从 /proc/self/environ（NUL 分隔的 NAME=VALUE）里取值，转成 u16 返回。 */
 static const u16 *vm_env_get(const char *name) {
-    long fd = vm_syscall3(VM_LX_OPEN, (long)"/proc/self/environ", 0 /* O_RDONLY */, 0);
+    long fd = VM_LX_OPEN_RO("/proc/self/environ");
     if (fd < 0) return 0;
-    long got = vm_syscall3(VM_LX_READ, fd, (long)vm_lx_a, (long)sizeof(vm_lx_a));
-    vm_syscall3(VM_LX_CLOSE, fd, 0, 0);
+    long got = vm_lx_sys3(VM_LX_READ, fd, (long)vm_lx_a, (long)sizeof(vm_lx_a));
+    vm_lx_sys3(VM_LX_CLOSE, fd, 0, 0);
     if (got <= 0) return 0;
     u32 n = (u32)got, i = 0;
     while (i < n) {
@@ -880,7 +896,7 @@ static const u16 *vm_key_path(void) {
         vm_lx_u16[n] = 0;
         return vm_lx_u16;
     }
-    long got = vm_syscall3(VM_LX_READLINK, (long)"/proc/self/exe", (long)vm_lx_a, (long)(sizeof(vm_lx_a) - 8));
+    long got = VM_LX_READLINK_EXE(vm_lx_a, sizeof(vm_lx_a) - 8);
     if (got <= 0) return 0;
     for (u32 i = 0; i < (u32)got; i++) vm_lx_u16[i] = (u16)vm_lx_a[i];
     n = (u32)got;
@@ -895,10 +911,10 @@ static int vm_key_read_nt(const u16 *path, u8 *out, u32 cap, u32 *got) {
     u32 n = 0;
     while (path[n] && n < 380) { vm_lx_a[n] = (u8)path[n]; n++; }
     vm_lx_a[n] = 0;
-    long fd = vm_syscall3(VM_LX_OPEN, (long)vm_lx_a, 0 /* O_RDONLY */, 0);
+    long fd = VM_LX_OPEN_RO(vm_lx_a);
     if (fd < 0) return 0;
-    long r = vm_syscall3(VM_LX_READ, fd, (long)out, (long)cap);
-    vm_syscall3(VM_LX_CLOSE, fd, 0, 0);
+    long r = vm_lx_sys3(VM_LX_READ, fd, (long)out, (long)cap);
+    vm_lx_sys3(VM_LX_CLOSE, fd, 0, 0);
     if (r < 0) return 0;
     *got = (u32)r;
     return 1;
@@ -1018,7 +1034,7 @@ static int vm_key_read_nt(const u16 *path, u8 *out, u32 cap, u32 *got) {
     *got = (u32)iosb.Information;
     return 1;
 }
-#endif /* VM_BLOB_TARGET_LINUX && __x86_64__ */
+#endif /* VM_BLOB_TARGET_LINUX && (x86_64 || aarch64) */
 
 /* 文件内容 -> 主密钥：32 字节原始，或 64 位 hex 文本（允许尾随空白）。 */
 static int vm_key_parse(const u8 *buf, u32 got) {
@@ -2605,6 +2621,17 @@ static long vm_syscall3_a64(long n, long a, long b, long c) {
     register long x1 __asm__("x1") = b;
     register long x2 __asm__("x2") = c;
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+
+/* 4 参数版：aarch64 没有 open/readlink，只有 openat/readlinkat（都要 dirfd 这个第 4 参数）。 */
+static long vm_syscall4_a64(long n, long a, long b, long c, long d) {
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : "memory");
     return x0;
 }
 

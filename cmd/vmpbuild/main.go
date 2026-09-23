@@ -151,6 +151,7 @@ func main() {
 	keyExternalOK := map[string]bool{
 		"win/x64":     true, // PEB -> KERNEL32 -> ntdll 取钥
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
+		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)
