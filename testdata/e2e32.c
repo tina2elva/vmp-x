@@ -32,6 +32,11 @@ int e32_big(void) {
     return v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7;   /* 36 */
 }
 
+/* pure shift: isolates the shift-class ALU_RI path (suspected after STATUS #478, where
+ * a*100+b*10+c failed while a*b passed - b*10 compiles to shift/add sequences). */
+int e32_shl(int a) { return a << 3; }                                /* 8 */
+int e32_shr(unsigned a) { return (int)(a >> 4); }                    /* 0x10 */
+
 /* floating point: exercises the blob FP path. cdecl passes doubles on the stack,
  * so this also covers 8-byte stack arguments (a shape the integer cases miss). */
 int e32_dbl(void) { double v = 1.5 + 2.5; return (int)v; }          /* 4 */
@@ -49,6 +54,8 @@ int main(int argc, char **argv) {
     if (!strcmp(w, "e32_args"))  return e32_args(1, 2, 3);
     if (!strcmp(w, "e32_big"))   return e32_big();
     if (!strcmp(w, "e32_call"))  return e32_call();
+    if (!strcmp(w, "e32_shl"))   return e32_shl(1);
+    if (!strcmp(w, "e32_shr"))   return e32_shr(0x100);
     if (!strcmp(w, "e32_dbl"))   return e32_dbl();
     if (!strcmp(w, "e32_dblarg")) return e32_dblarg(1.5, 2.0);
     return 250;   /* unknown selector: loud, and out of the expected range */
