@@ -163,6 +163,45 @@ for a in 0 1 2 10 100 1000 9999; do
 done
 
 echo ""
+
+# ---- 1b 外置主密钥（-key-external）验收 ----
+# 这是 Linux 侧取钥路径唯一的**运行时**验收：本机（Windows）无法执行 Linux 系统调用，
+# 只有 CI 的 Linux 作业能真正跑到 /proc/self/environ 与 open/read。
+# 三条：不给密钥必须恰好被硬门拒绝（exit_group(0xC0DE0007) 在 POSIX 上只暴露低 8 位 = 7）、
+# 给密钥（环境变量）必须与原生一致、给密钥（<产物>.vmpkey 文件）必须与原生一致。
+echo "[*] 1b 外置密钥（-key-external）验收..."
+KEY1B=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+./build/vmpbuild -src stub/linux/amd64 -out build/vm_interp_linux_ext.bin \
+    -manifest build/vm_interp_linux_ext.json -entry vm_entry \
+    -key-external -key-in "$KEY1B" >/dev/null
+./build/vmpack -exe build/linux_target -func main.checkKey -func main.sumTo \
+    -blob build/vm_interp_linux_ext.bin -manifest build/vm_interp_linux_ext.json \
+    -out build/linux_target_ext.vmp -report build/linux_ext_vmp.json >/dev/null
+
+rc_no=0
+out_no=$(./build/linux_target_ext.vmp check-key 0 2>&1) || rc_no=$?
+if [ "$rc_no" -eq 7 ] && [ -z "$out_no" ]; then
+    pass=$((pass + 1)); echo "  [OK  ] 无密钥：rc=7（硬门低 8 位）且无输出"
+else
+    fail=$((fail + 1)); echo "  [FAIL] 无密钥：rc=$rc_no（期望 7），输出=[$out_no]"
+fi
+
+nrc=0; nout=$(./build/linux_target check-key 0 2>&1) || nrc=$?
+erc=0; eout=$(VMPX_KEY=$KEY1B ./build/linux_target_ext.vmp check-key 0 2>&1) || erc=$?
+if [ "$nrc" -eq 0 ] && [ "$erc" -eq 0 ] && [ "$(printf %s "$nout" | head -n1)" = "$(printf %s "$eout" | head -n1)" ]; then
+    pass=$((pass + 1)); echo "  [OK  ] 有密钥(VMPX_KEY 环境变量)：与原生一致"
+else
+    fail=$((fail + 1)); echo "  [FAIL] 有密钥(VMPX_KEY)：rc=$erc native=[$nout] ext=[$eout]"
+fi
+
+printf %s "$KEY1B" > build/linux_target_ext.vmp.vmpkey
+frc=0; fout=$(./build/linux_target_ext.vmp check-key 0 2>&1) || frc=$?
+rm -f build/linux_target_ext.vmp.vmpkey
+if [ "$frc" -eq 0 ] && [ "$(printf %s "$nout" | head -n1)" = "$(printf %s "$fout" | head -n1)" ]; then
+    pass=$((pass + 1)); echo "  [OK  ] 有密钥(<产物>.vmpkey 文件)：与原生一致"
+else
+    fail=$((fail + 1)); echo "  [FAIL] 有密钥(.vmpkey 文件)：rc=$frc native=[$nout] ext=[$fout]"
+fi
 echo "e2e(linux): $pass passed, $fail failed"
 ok=1
 [ "$fail" -eq 0 ]
