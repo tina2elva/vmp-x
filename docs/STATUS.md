@@ -6861,3 +6861,32 @@ bcrypt API **全部是 `__stdcall`**（callee 清栈）⇒ 在 i686 构建里，
    先把"`E` 到底在哪"钉死（这是唯一还没直接测过的量）；
 2. 若 `E` 与模型差 4，查蹦床入口的 `%esp`（`E9` 补丁是 jmp、不压栈，理论上 `%esp` 就是返回地址槽）；
 3. 若 `E` 正常，则查 `OP_PUSH_R` 运行期是否真的只减 4（可在 IR 层面单测：造一段只含 PUSH_R 的字节码喂 probe）。
+
+### 476. 32 位参数错位续查：**地址级证据** —— 参数地址被加了整份 FrameSkew，且 guest 帧离原生约 4MB
+
+**实验**：让 subject 返回**地址**（32 位可读），native 与 packed 各跑一次对比：
+
+    t1(int a)        { return (int)&a; }              native=0x00C3F960  packed=0x0062FEDC
+    t2(int a,int b)  { return (int)&b - (int)&a; }     native=4           packed=4        ✓
+    t6(void)         { int x=7; return (int)&x; }      native=0x009FFEB4  packed=0x0062BC40
+    t7(int a)        { int x=7; return (int)&x-(int)&a; }  native=-12     packed=-17040  <- 关键
+
+**两条硬结论**：
+1. **参数地址上被加了整份 FrameSkew**：`&x - &a` 原生是 **-12**，guest 是 **-17040 = -FrameSkew**；
+   而 `&b - &a` 两边都是 **4** ⇒ 参数之间是对的，**参数整体被抬高了一个 skew**；
+2. **guest 的本地帧离原生约 4MB**（`&x` 之差 ≈ 0x3D4254）⇒ 与"模拟栈 = 宿主栈 − skew(17040)"
+   这个模型**对不上**（17040 只有 16KB）。
+
+**为什么这两条重要**：`vm_interp.c` 的注释与 lifter 的设计都建立在"客户机栈就在宿主栈下方 skew 处"这一前提上
+（`adjustStackDisp` 只在 `eff >= 0` 时加 FrameSkew，正是基于此）。本轮证据说明**这个前提在 i686 打包路径上不成立**，
+所以"参数读到低一个槽"只是它的一个症状。
+
+**本轮没有改任何主干代码**（只做了测量，临时文件已删）。
+
+**下一步（把前提本身测掉）**：
+1. 在 `vm_run` 入口把 `regs[VRSP]` 与**蹦床写进 `VM_CTX_FRAME` 的帧基址**一起经退出码分次读出，直接算出
+   「模拟 ESP 与原生 `%esp` 的真实距离」，与 17040 对比（前面测过 `(frame+640)-VRSP = 17040`，但那是**退出时**的值，
+   需要入口/中间的样本）；
+2. 若距离确实是 17040，那么 `&x` 差 4MB 就说明 **packed exe 的 `main` 栈与 native 的 `main` 栈本来就不在同一区域**，
+   此时"参数抬高一个 skew"才是唯一症状，修法应落在 lifter 对 `[ebp+正位移]` 是否该加 skew；
+3. 反之若距离不是 17040，则根因在蹦床的模拟 ESP 公式（`VM_FRAME_SKEW_EXTRA` 与 `VM_FRAME_SIZE` 的账）。
