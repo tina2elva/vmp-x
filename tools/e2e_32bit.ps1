@@ -16,7 +16,10 @@
 #
 # ASCII-only on purpose (see AGENTS.md): Windows PowerShell 5.1 reads .ps1 as ANSI.
 #
-# NOT WIRED INTO gates.ps1 YET. Reason: this gate currently fails on the cdecl
+# WIRED INTO gates.ps1 (right before "go test ./..."). It prints 12/12 as of STATUS #481.
+# The paragraph below is kept only as the history of why this took a while to get there.
+#
+# HISTORICAL NOTE (no longer true): this gate used to fail on the cdecl
 # multi-argument case (e32_args). Five of six cases pass; e32_args reads the wrong
 # stack slot, so the gate is red on purpose until that is fixed. Wiring it in while it
 # is red would make the trunk red, and dropping the case would be lowering the bar -

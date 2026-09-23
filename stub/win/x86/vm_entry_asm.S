@@ -101,10 +101,14 @@ vm_entry:
 
     /* ---- simulated ESP = esp - (16 + VM_MARGIN) ----
      * 这个 16 必须与 vm_abi.h 的 VM_FRAME_SKEW_EXTRA 一致（lifter 用 FRAME_SIZE+EXTRA+MARGIN 做栈偏移换算）。
-     * 踩坑：原来写 4（只算"thunk 的 E8 + 客户机返回地址"各 4 字节），而 EXTRA 是 16 ⇒
-     * skew 差 12 ⇒ 每条栈访问都偏 12 ⇒ 用栈的函数（如带循环的 vm32_loop）算出错值，
-     * 不用栈的函数（vm32_sum10）看起来正常 —— 极难查。16 还顺带保证了 ≡0 mod 16 的对齐。 */
-    leal    -(16 + VM_MARGIN)(%esp), %eax
+     * 踩坑史：先写 4（只算"thunk 的 E8 + 客户机返回地址"各 4 字节）⇒ 带循环的函数算错；
+     * 改成 16（= EXTRA）后简单函数正常，但**读调用方栈帧参数**仍然错（参数被读成返回地址）：
+     * 实测 guest 的 `&a` 比真实调用帧低 **4 字节**（用"同一运行内 &a - 调用方局部变量地址"量出来的，
+     * 注意不能拿两次运行的绝对地址比 —— native 的 exe 有 ASLR，打包产物固定在 0x400000）。
+     * 改成 `EXTRA - 4` = 12 后，tools/e2e_32bit.ps1 从 6/12 变为 **12/12 全部与原生一致**。
+     * 为什么是"减 4"而不是 EXTRA 本身，仍有 4 字节的模型账没对上（见 STATUS #480/#481），
+     * 但这是**实测**结论，且已被门禁逐例覆盖。 */
+    leal    -(VM_FRAME_SKEW_EXTRA - 4 + VM_MARGIN)(%esp), %eax
     movl    %eax, VM_CTX_RSP(%esp)
 
     /* ---- descriptor = return address - VM_THUNK_SIZE - VM_DESC_TO_THUNK ---- */

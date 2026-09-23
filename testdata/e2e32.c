@@ -32,6 +32,20 @@ int e32_big(void) {
     return v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7;   /* 36 */
 }
 
+/* Address probes (not pass/fail cases by themselves; used to locate the guest frame).
+ * e32_arga returns the absolute address the guest computes for its own arg1 ([ebp+8]);
+ * native and packed differ by exactly "how far the simulated frame is from the real one".
+ * e32_argm returns the address of a GLOBAL, which is the same in both runs and therefore
+ * gives an absolute reference point to compare against. */
+int g_marker32 = 0x5A;
+int *g_markerp;   /* main stores &m (a local in main) here, so the callee can compare */
+int e32_arga(int a) { return (int)(unsigned)&a; }
+int e32_argm(void) { return (int)(unsigned)&g_marker32; }
+/* &a (guest-computed arg address) minus a REAL caller-stack local address kept in a global.
+ * Both are stack addresses inside one run, so the value is comparable native vs packed,
+ * unlike absolute addresses (the native exe gets ASLR, the packed one is fixed at 0x400000). */
+int e32_dist(int a) { return (int)((unsigned)&a - (unsigned)g_markerp); }
+
 /* pure shift: isolates the shift-class ALU_RI path (suspected after STATUS #478, where
  * a*100+b*10+c failed while a*b passed - b*10 compiles to shift/add sequences). */
 /* same shift, but on a CONSTANT LOCAL: no argument is read at all, so a wrong result
@@ -51,6 +65,8 @@ int e32_helper(int x) { return x + 1; }
 int e32_call(void) { return e32_helper(41); }   /* 42 */
 
 int main(int argc, char **argv) {
+    int m = 5;
+    g_markerp = &m;
     const char *w = (argc > 1) ? argv[1] : "e32_const";
     if (!strcmp(w, "e32_const")) return e32_const();
     if (!strcmp(w, "e32_local")) return e32_local();
@@ -58,6 +74,9 @@ int main(int argc, char **argv) {
     if (!strcmp(w, "e32_args"))  return e32_args(1, 2, 3);
     if (!strcmp(w, "e32_big"))   return e32_big();
     if (!strcmp(w, "e32_call"))  return e32_call();
+    if (!strcmp(w, "e32_dist")) return e32_dist(0x11111111);
+    if (!strcmp(w, "e32_arga")) return e32_arga(0x11111111);
+    if (!strcmp(w, "e32_argm")) return e32_argm();
     if (!strcmp(w, "e32_shl_imm")) return e32_shl_imm();
     if (!strcmp(w, "e32_shr_imm")) return e32_shr_imm();
     if (!strcmp(w, "e32_shl"))   return e32_shl(1);

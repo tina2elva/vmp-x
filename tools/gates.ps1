@@ -1,4 +1,4 @@
-﻿# gates.ps1 - run every local (Windows/amd64) gate in one shot.
+# gates.ps1 - run every local (Windows/amd64) gate in one shot.
 #
 #   powershell -NoProfile -File tools/gates.ps1
 #
@@ -22,6 +22,13 @@ function Step {
 
 Step "gofmt -l ."        { $out = (gofmt -l . | Out-String).Trim(); if ($out -ne "") { Write-Host $out; $script:stepCode = 1 } }
 Step "go vet ./..."      { go vet ./... }
+# 32-bit (i686/PE32) path. Before this gate existed, NOTHING built a 32-bit blob or packed a
+# 32-bit exe, which is how the i686 thunk defects (32-bit stores leaving the high half of each
+# u64 ctx slot as stack garbage, and a simulated ESP 4 bytes too low) stayed invisible so long.
+# It SKIPs with a loud line (exit 0) when the i686 toolchain is absent; set VMP_REQUIRE_I686=1
+# on any runner that is supposed to have it. Runs before go test so the artifacts it leaves
+# behind cannot confuse the C probes that go test uses.
+Step "32-bit payload (i686 blob + PE32 pack vs native)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_32bit.ps1") }
 Step "go test ./..."     { go test ./... }
 # Blob must build: the Go gates never compile C, which once let a broken source stay green.
 # vmpbuild wants -src relative to the repo root, so run it from there.
