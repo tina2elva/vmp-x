@@ -34,6 +34,10 @@ int e32_big(void) {
 
 /* pure shift: isolates the shift-class ALU_RI path (suspected after STATUS #478, where
  * a*100+b*10+c failed while a*b passed - b*10 compiles to shift/add sequences). */
+/* same shift, but on a CONSTANT LOCAL: no argument is read at all, so a wrong result
+ * here isolates the shift semantics itself from anything about caller-frame reads. */
+int e32_shl_imm(void) { int v = 1; return v << 3; }                  /* 8 */
+int e32_shr_imm(void) { unsigned v = 0x100; return (int)(v >> 4); }  /* 16 */
 int e32_shl(int a) { return a << 3; }                                /* 8 */
 int e32_shr(unsigned a) { return (int)(a >> 4); }                    /* 0x10 */
 
@@ -54,6 +58,8 @@ int main(int argc, char **argv) {
     if (!strcmp(w, "e32_args"))  return e32_args(1, 2, 3);
     if (!strcmp(w, "e32_big"))   return e32_big();
     if (!strcmp(w, "e32_call"))  return e32_call();
+    if (!strcmp(w, "e32_shl_imm")) return e32_shl_imm();
+    if (!strcmp(w, "e32_shr_imm")) return e32_shr_imm();
     if (!strcmp(w, "e32_shl"))   return e32_shl(1);
     if (!strcmp(w, "e32_shr"))   return e32_shr(0x100);
     if (!strcmp(w, "e32_dbl"))   return e32_dbl();

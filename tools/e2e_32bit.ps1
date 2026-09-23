@@ -72,6 +72,8 @@ $cases = @(
     @("e32_args",  123),   # cdecl multi-argument, read from the caller frame
     @("e32_big",    36),   # many locals: longer bytecode
     @("e32_call",   42),   # guest calls a native function and uses the result
+    @("e32_shl_imm", 8),   # CONSTANT-local shift: no argument read at all
+    @("e32_shr_imm", 16),  # same, right shift
     @("e32_shl",     8),   # pure shift left (isolates shift-class ALU_RI)
     @("e32_shr",    16),   # pure shift right
     @("e32_dbl",     4),   # floating point, no args
