@@ -7232,3 +7232,41 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
 **顺带记录一个交接事实**：`docs/HANDOFF.md` 已过期（它写"最新提交 35e478c、11 gates"，
 而当前是 12 gates），其 T1–T4 经逐条对照**都已实现**（T2 的其余取钥形态除外）；
 **活的待办以 `docs/TODO.md` 为准**。
+
+### 489. W3 第一步：**Linux/amd64 的主密钥外置取钥已实现并通过构建级验证**
+
+**做了什么**（提交内容见下）：
+
+1. `cmd/vmpbuild/main.go`：`-key-external` 的目标守卫从只允许 win/x64 改成**白名单**，
+   目前含 `win/x64` 与 `linux/amd64`；其余目标仍 fail-fast（理由见 #488 与代码注释）。
+2. `stub/win/x64/vm_interp.c`：
+   - C 侧 `#error` 守卫同步放宽为「win/x64 或 linux/amd64」；
+   - 新增 **Linux/amd64 取钥原语**（`VM_BLOB_TARGET_LINUX && __x86_64__`）：
+     `exit_group` 硬门、`/proc/self/environ` 取环境变量、`/proc/self/exe` + `.vmpkey` 取路径、
+     `open/read/close` 读文件（全部走本文件已有的 `vm_syscall3`，x86_64 号：read=0 open=2 close=3
+     readlink=89 exit_group=231）；
+   - `vm_ustr_t` / `vm_objattr_t` / `vm_iosb_t` / `vm_hexval` **移出 Windows 分支**（授权段也要用，
+     留在分支里会让 Linux 目标报 unknown type name / implicit declaration）；
+   - `vm_find_module` / `vm_get_proc` / `vm_peb_base` 在 Linux 侧给**安全失败桩**（返回 0）——
+     语义是"拿不到"：需要狗的 `kind>=2` 会**正确走硬门**，授权/验签因为拿不到 bcrypt 与时间而一律拒绝
+     （fail-closed）；Linux 侧的授权与狗留待单独一轮。
+
+**证据（构建级）**：
+
+    A) 非外置 linux/amd64：rc=0（改动没有破坏原有路径）
+    B) 外置 linux/amd64：rc=0，blob 45056 字节（此前是 undefined symbol vm_find_module）
+    C) 外置 blob 里 /proc/self/environ、/proc/self/exe、.vmpkey、VMPX_KEY_FILE 各 1 次、VMPX_KEY 2 次；
+       非外置 blob 里这些字符串 0 次 —— 证明新代码只进外置构建
+    D) tools/gates.ps1 = 12 gates / 0 failed；tools/preflight.ps1 = [+] preflight: OK
+
+**本轮踩到并已记录的老坑**：构建 linux blob 时**不能**把 `C:\msys64\mingw32\bin` 放进 PATH ——
+否则 x86-64 目标会被 32 位工具链编译，报出一堆 `-Wint-to-pointer-cast`，并让 `sizeof(vm_ctx_t) == VM_CTX_SIZE`
+的静态断言失败（看起来像代码问题，其实是工具链用错）。
+
+**未做项（下一步）**：
+1. **Linux 侧运行时验收**：本机无法执行 Linux 系统调用，必须在 CI 的 Linux 作业里做 ——
+   需要给 `tools/e2e.sh` 或一个 Linux 侧小探针加两条用例（不给密钥 ⇒ 恰好失败 / 给了 ⇒ 与原生一致）；
+   同时要确认 `vmpack` 在 Linux 目标上写出正确的 `vm_key_src.kind`（运行期取钥路由由它决定）。
+2. linux/arm64（同一形态，改 syscall 号；本机无 aarch64 工具链 ⇒ 只能靠 CI 验证）。
+3. 授权与狗在 Linux 上目前是 fail-closed 桩 ⇒ 若客户要在 Linux 上用狗，需单独一轮。
+4. i386 与 win/arm64 各自单独一步（32 位 PEB / ARM64 TEB）。

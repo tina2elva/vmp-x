@@ -773,8 +773,11 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
  * 密钥形式：环境变量 VMPX_KEY = 64 个十六进制字符（32 字节原始密钥）。 */
 #ifdef VM_KEY_EXTERNAL
 
-#if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32)))
-#error "VM_KEY_EXTERNAL 目前只有 Windows/x64 的取钥实现（vmpbuild 会先拦住别的目标）"
+/* 已实现取钥的平台：Windows/x64（PEB + ntdll）与 Linux/amd64（syscall）。
+ * 其它目标在这里就报错，vmpbuild 也会先拦住它们（两道守卫互为呼应）。 */
+#if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32))) && \
+    !(defined(VM_BLOB_TARGET_LINUX) && defined(__x86_64__))
+#error "VM_KEY_EXTERNAL 只有 Windows/x64 与 Linux/amd64 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
 static u8 vm_master_buf[32];
@@ -787,6 +790,120 @@ static void *vm_get_proc(u64 mod, const char *fn);
 
 /* 硬门：走 ntdll!NtTerminateProcess(-1, code) —— ntdll 的导出不转发，地址一定有效；
  * 万一取不到就 ud2（0xC000001D）。默认 code = 7 ⇒ 退出码 0xC0DE0007、无任何输出。 */
+
+/* Windows 侧的文件 API 结构体（NT 原语用）。**与平台无关地声明**：授权/验签那段（在 Linux 分支之外）
+ * 也要用它们，放进 Windows 分支里会让 Linux 目标报 unknown type name。 */
+typedef struct { u16 Length, MaximumLength; u16 *Buffer; } vm_ustr_t;
+typedef struct {
+    u32 Length, Pad;
+    void *RootDirectory;
+    vm_ustr_t *ObjectName;
+    u32 Attributes, Pad2;
+    void *SecurityDescriptor;
+    void *SecurityQualityOfService;
+} vm_objattr_t;
+typedef struct { void *Status; u64 Information; } vm_iosb_t;
+
+/* 十六进制字符 -> 数值（平台无关；Windows 与 Linux 两条取钥路径都用它解析 VMPX_KEY）。 */
+static u32 vm_hexval(u16 c) {
+    if (c >= (u16)'0' && c <= (u16)'9') return (u32)(c - (u16)'0');
+    if (c >= (u16)'a' && c <= (u16)'f') return (u32)(c - (u16)'a' + 10);
+    if (c >= (u16)'A' && c <= (u16)'F') return (u32)(c - (u16)'A' + 10);
+    return 0xFFFFFFFFu;
+}
+
+/* ============================ Linux/amd64 取钥原语 ============================
+ * blob 是 freestanding 的：不链接 libc，全部走 syscall(2)。本文件后面已定义 vm_syscall3
+ * （x86_64：rax=n, rdi/si/dx = a/b/c），这里只做前置声明。
+ * 系统调用号（x86_64）：read=0 open=2 close=3 readlink=89 exit_group=231。
+ * 与 Windows 侧的对应关系：PEB -> /proc/self/exe 与 /proc/self/environ；
+ * ntdll 文件读 -> open/read/close；NtTerminateProcess -> exit_group。
+ * 注意：POSIX 只暴露退出码的低 8 位，所以 Linux 上"硬门"可观测到的值是 0x07。 */
+#if defined(VM_BLOB_TARGET_LINUX) && defined(__x86_64__)
+static long vm_syscall3(long n, long a, long b, long c);
+
+#define VM_LX_READ 0
+#define VM_LX_OPEN 2
+#define VM_LX_CLOSE 3
+#define VM_LX_READLINK 89
+#define VM_LX_EXIT_GROUP 231
+
+static u8 vm_lx_a[400];       /* ASCII 路径/命令缓冲（.bss，别放帧上） */
+static u16 vm_lx_u16[400];    /* 上层要 u16 路径/值，这里做一次转换 */
+
+/* 授权/狗/PEB 这些在 Linux 上还没实现（它们的实现整段在 Windows 分支里）。
+ * 这里给**安全失败**的桩，让 stub 保持自包含，并且语义是"拿不到"：
+ *   - vm_key_from_sentinel() 会因为 h==0 直接返回 0 ⇒ kind>=2 的严格模式正确地走硬门；
+ *   - 授权/验签路径拿不到 bcrypt 与时间 ⇒ 一律拒绝（fail-closed），Linux 侧的授权留待单独一轮。 */
+static u64 vm_find_module(const char *name) { (void)name; return 0; }
+static void *vm_get_proc(u64 mod, const char *fn) { (void)mod; (void)fn; return 0; }
+static u64 vm_peb_base(void) { return 0; }
+
+static void vm_key_reject_code(u32 code) {
+    vm_syscall3(VM_LX_EXIT_GROUP, (long)(0xC0DE0000u | code), 0, 0);
+    __builtin_trap();
+}
+static void vm_key_reject(void) { vm_key_reject_code(7u); }
+
+/* 从 /proc/self/environ（NUL 分隔的 NAME=VALUE）里取值，转成 u16 返回。 */
+static const u16 *vm_env_get(const char *name) {
+    long fd = vm_syscall3(VM_LX_OPEN, (long)"/proc/self/environ", 0 /* O_RDONLY */, 0);
+    if (fd < 0) return 0;
+    long got = vm_syscall3(VM_LX_READ, fd, (long)vm_lx_a, (long)sizeof(vm_lx_a));
+    vm_syscall3(VM_LX_CLOSE, fd, 0, 0);
+    if (got <= 0) return 0;
+    u32 n = (u32)got, i = 0;
+    while (i < n) {
+        u32 j = i;
+        while (j < n && vm_lx_a[j]) j++;
+        u32 k = 0;
+        while (name[k] && i + k < j && vm_lx_a[i + k] == name[k]) k++;
+        if (name[k] == 0 && i + k < j && vm_lx_a[i + k] == 0x3D /* = */) {
+            const u8 *v = vm_lx_a + i + k + 1;
+            u32 m = 0;
+            while (v + m < vm_lx_a + j && m < 399) { vm_lx_u16[m] = (u16)v[m]; m++; }
+            vm_lx_u16[m] = 0;
+            return vm_lx_u16;
+        }
+        i = j + 1;
+    }
+    return 0;
+}
+
+/* 路径：优先环境变量 VMPX_KEY_FILE；否则 /proc/self/exe + ".vmpkey"。
+ * 返回 u16（与 Windows 侧同一签名），实际内容按字节当作 ASCII。 */
+static const u16 *vm_key_path(void) {
+    const u16 *ov = vm_env_get("VMPX_KEY_FILE");
+    u32 n = 0;
+    if (ov && *ov) {
+        while (ov[n] && n < 360) { vm_lx_u16[n] = ov[n]; n++; }
+        vm_lx_u16[n] = 0;
+        return vm_lx_u16;
+    }
+    long got = vm_syscall3(VM_LX_READLINK, (long)"/proc/self/exe", (long)vm_lx_a, (long)(sizeof(vm_lx_a) - 8));
+    if (got <= 0) return 0;
+    for (u32 i = 0; i < (u32)got; i++) vm_lx_u16[i] = (u16)vm_lx_a[i];
+    n = (u32)got;
+    const char *suf = ".vmpkey";
+    for (u32 i = 0; i < 7; i++) vm_lx_u16[n++] = (u16)(u8)suf[i];
+    vm_lx_u16[n] = 0;
+    return vm_lx_u16;
+}
+
+/* 文件读：把 u16 路径按字节转 ASCII，然后 open/read/close。 */
+static int vm_key_read_nt(const u16 *path, u8 *out, u32 cap, u32 *got) {
+    u32 n = 0;
+    while (path[n] && n < 380) { vm_lx_a[n] = (u8)path[n]; n++; }
+    vm_lx_a[n] = 0;
+    long fd = vm_syscall3(VM_LX_OPEN, (long)vm_lx_a, 0 /* O_RDONLY */, 0);
+    if (fd < 0) return 0;
+    long r = vm_syscall3(VM_LX_READ, fd, (long)out, (long)cap);
+    vm_syscall3(VM_LX_CLOSE, fd, 0, 0);
+    if (r < 0) return 0;
+    *got = (u32)r;
+    return 1;
+}
+#else  /* 下面是 Windows 目标（含 win/x64 与 win/x86）的实现 */
 static void vm_key_reject_code(u32 code) {
     typedef long (VM_WINAPI *termfn_t)(void *, u32);
     termfn_t tp = (termfn_t)vm_get_proc(vm_find_module("ntdll.dll"), "NtTerminateProcess");
@@ -831,13 +948,6 @@ static const u16 *vm_env_get(const char *name) {
     return 0;
 }
 
-static u32 vm_hexval(u16 c) {
-    if (c >= '0' && c <= '9') return (u32)(c - '0');
-    if (c >= 'a' && c <= 'f') return (u32)(c - 'a' + 10);
-    if (c >= 'A' && c <= 'F') return (u32)(c - 'A' + 10);
-    return 0xFFFFFFFFu;
-}
-
 /* ---- 密钥来源①：外部**文件**（部署默认形态；将来换成硬件狗时换的就是这一个函数） ----
  * 路径 = <产物全路径>.vmpkey（PEB -> ProcessParameters -> ImagePathName 拼出来，不调 API），
  * 环境变量 VMPX_KEY_FILE 可覆盖。文件内容接受两种写法：32 字节原始密钥，或 64 位 hex 文本
@@ -847,17 +957,6 @@ static u32 vm_hexval(u16 c) {
  * CreateFileA/ReadFile：kernel32 里那批 API 在部分 Windows 版本上是**转发导出**（导出项指向
  * "KERNELBASE.xxx" 字符串），要么正确解转发、要么就崩/拿不到真地址 —— 这条在 CI 上踩过
  * （见 STATUS #385）。ntdll 的导出从不转发，所以这里零风险。 */
-typedef struct { u16 Length, MaximumLength; u16 *Buffer; } vm_ustr_t;
-typedef struct {
-    u32 Length, Pad;
-    void *RootDirectory;
-    vm_ustr_t *ObjectName;
-    u32 Attributes, Pad2;
-    void *SecurityDescriptor;
-    void *SecurityQualityOfService;
-} vm_objattr_t;
-typedef struct { void *Status; u64 Information; } vm_iosb_t;
-
 static u16 vm_key_path_buf[360]; /* .bss：别在帧上放这么大一块 */
 
 static const u16 *vm_key_path(void) {
@@ -919,6 +1018,7 @@ static int vm_key_read_nt(const u16 *path, u8 *out, u32 cap, u32 *got) {
     *got = (u32)iosb.Information;
     return 1;
 }
+#endif /* VM_BLOB_TARGET_LINUX && __x86_64__ */
 
 /* 文件内容 -> 主密钥：32 字节原始，或 64 位 hex 文本（允许尾随空白）。 */
 static int vm_key_parse(const u8 *buf, u32 got) {

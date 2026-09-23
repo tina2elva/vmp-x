@@ -147,8 +147,13 @@ func main() {
 	// GetEnvironmentVariableA）。别的目标一律**构建失败** —— 宁可现在报错，也不要产出一个
 	// 注定起不来的产物（那会在部署现场变成"程序莫名其妙退出"）。
 	targetRel := filepath.ToSlash(strings.TrimPrefix(filepath.ToSlash(*src), "stub/"))
-	if *keyExternal && targetRel != "win/x64" {
-		fatalf("-key-external 目前只有 win/x64 的取钥实现（收到目标 %s）", targetRel)
+	// 1b 取钥实现按平台逐个落地；未落地的平台一律**构建失败**（见上面的理由）。
+	keyExternalOK := map[string]bool{
+		"win/x64":     true, // PEB -> KERNEL32 -> ntdll 取钥
+		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
+	}
+	if *keyExternal && !keyExternalOK[targetRel] {
+		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)
 	}
 	keyPath, keyHex, fieldMaskSalt, err := generateKeyFile(tmp, *keyExternal, *keyIn)
 	must(err)

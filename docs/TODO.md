@@ -691,3 +691,11 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
 为什么本轮没有直接动手：这是跨 vm_interp.c 大段守卫重构加构建器白名单加 CI 用例的改动，
 按仓库纪律（AGENTS.md：不要在预算不足时动主干）必须整轮做完并验证；本轮预算已验证不足以
 安全完成，故先把这个修正后的范围钉死，下一轮按（i）到（iv）一次做完。
+
+#### W3 进展（本轮）：Linux/amd64 构建级完成
+
+- [x] **Linux/amd64**：外置取钥已实现（syscall 版：/proc/self/environ、/proc/self/exe + .vmpkey、
+      open/read/close、exit_group 硬门），`vmpbuild` 白名单已放开该目标；构建级验证通过（STATUS #489）。
+- [ ] Linux/amd64 **运行时**验收：必须加进 `tools/e2e.sh`（CI 的 Linux 作业），本机跑不了 Linux syscall。
+- [ ] linux/arm64：同一形态换 syscall 号（read=63 openat=56 close=57 readlinkat=78 exit_group=94）。
+- [ ] Linux 侧授权与狗：目前是 fail-closed 桩。
