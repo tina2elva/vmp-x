@@ -659,3 +659,35 @@ vmp-x 当前不足逐条落档，每条都带 `文件:行` 依据。要点：**�
 2. 加 arm64 分支（`vm_syscall3_a64`，2502；syscall 号：read=63/open=56/close=57/readlink=78/exit_group=94）—— 本机无 aarch64 工具链 ⇒ 只能靠 CI 的 linux-arm64 作业验证；
 3. 放宽两处守卫 + 在 `tools/e2e.sh` 加验收用例（不给密钥 ⇒ 恰好失败；给了 ⇒ 与原生一致）；
 4. i386 与 win/arm64 各自单独一步（32 位 PEB / ARM64 TEB）。
+
+### W3 范围修正（调研后：比首版估计大）
+
+首版估计的接缝等于 4 个原语，过于乐观。真实情况（都读过代码）：
+
+1) 1b 与授权/验签在同一段（774 起，VM_KEY_EXTERNAL），里面大量依赖 Windows 专有符号：
+   - vm_key_reject_code（790）走 ntdll 的 NtTerminateProcess；
+   - vm_key_read_nt（891）走 ntdll 的 NtCreateFile/NtReadFile/NtClose；
+   - vm_key_from_sentinel（1184/1199）走 LdrLoadDll 与 hasp_login/hasp_read；
+   - 授权与验签（1020 起）走 bcrypt 的 SHA-256 与 ECDSA P-256；
+   - vm_key_path（863）与时间取法（968 起）走 PEB 与 GetSystemTimeAsFileTime。
+2) 这些符号对 Linux 目标是未声明的；vm_interp.c 的 1403/1408 守卫模式即为：
+   Windows 目标且非 VM_BLOB_TARGET_LINUX 才声明 vm_find_module / vm_get_proc。
+   第 1400-1402 行注释写明：曾经就是这样把 linux blob 编成非自包含的，CI 报过
+   undefined symbol vm_find_module。
+
+所以加 Linux 不能只补密钥原语，必须同时把不参与 Linux 编译的那部分（ntdll/bcrypt/
+LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确触发硬门）。
+
+修正后的 Linux/amd64 工作量：
+（i）  密钥路径的 Linux 原语：exit_group / proc-self-environ / proc-self-exe 加 .vmpkey /
+      open+read+close；
+（ii） 守卫：把 vm_key_reject_code、vm_key_path、vm_key_read_nt、vm_key_from_sentinel，
+      以及授权与验签整段，按 Windows 目标才编译包起来；Linux 侧 vm_key_from_sentinel 返回 0，
+      于是 kind 大于等于 2 的严格模式正确走硬门；授权与验签在 Linux 侧暂不支持（或单独一轮做）；
+（iii）cmd/vmpbuild/main.go:150 的白名单按平台逐个放开；
+（iv） 验收：tools/e2e.sh（CI 的 Linux 作业）加不给密钥必须恰好失败、给了必须与原生一致两条用例；
+      本机无法验证（Linux 系统调用不能在 Windows 上执行），必须靠 CI。
+
+为什么本轮没有直接动手：这是跨 vm_interp.c 大段守卫重构加构建器白名单加 CI 用例的改动，
+按仓库纪律（AGENTS.md：不要在预算不足时动主干）必须整轮做完并验证；本轮预算已验证不足以
+安全完成，故先把这个修正后的范围钉死，下一轮按（i）到（iv）一次做完。
