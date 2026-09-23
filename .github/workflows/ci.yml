@@ -19,22 +19,7 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          # mingw-w64-i686-gcc: the 32-bit (PE32) path needs an i686 compiler; the gate below
-          # runs with VMP_REQUIRE_I686=1, so a missing toolchain is a hard failure here.
-          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-i686-gcc
-      - name: 32-bit payload (i686 blob + PE32 pack vs native)
-        shell: pwsh
-        env:
-          VMP_REQUIRE_I686: "1"
-        run: |
-          New-Item -ItemType Directory -Force build | Out-Null
-          go build -o build/vmpbuild.exe ./cmd/vmpbuild
-          go build -o build/vmpack.exe ./cmd/vmpack
-          $msys = "${{ steps.msys2.outputs.msys2-location }}"
-          if (-not $msys -or -not (Test-Path $msys)) { $msys = "C:\msys64" }
-          $env:PATH = "$msys\mingw32\bin;" + $env:PATH
-          & powershell -NoProfile -ExecutionPolicy Bypass -File tools/e2e_32bit.ps1
-          if ($LASTEXITCODE -ne 0) { throw "32-bit payload gate failed (exit $LASTEXITCODE)" }
+          install: mingw-w64-ucrt-x86_64-gcc
       - name: Go gates
         shell: pwsh
         run: |

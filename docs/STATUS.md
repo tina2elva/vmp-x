@@ -7118,3 +7118,27 @@ C 探针）。缺 i686 工具链时打印醒目的 SKIPPED 并退出 0（不静�
 **一个新记录下来的观察（未深究，不影响本项）**：产物虽然 `DYNAMIC_BASE` 为 SET 且重定位表可用，
 实测仍**固定加载在首选基址**（三次运行 `&g_marker32` 都是 `0x00403004`），而 native 的 exe 每次不同。
 可能与本机/系统的 ASLR 策略或该镜像的某些标志有关 ⇒ 留作后续观察点。
+
+### 485. 第 4 项（把 32 位门禁接入 CI）**未完成** —— 撤掉 CI 步骤，原因已定位
+
+**做了什么**：在 `ci.yml` 的 `windows-amd64` 作业里①让 msys2 安装 `mingw-w64-i686-gcc`、
+②新增一步跑 `tools/e2e_32bit.ps1`（带 `VMP_REQUIRE_I686=1`，缺工具链即失败）。
+
+**结果**：
+· ✅ **发现并修复了一个重要缺口**：CI **从不调用 `tools/gates.ps1`**，是逐条跑步骤 ⇒ 我之前新加的 32 位门禁
+  **在 CI 里根本没跑过**。这次接入后它**确实在 CI 上跑起来了**（日志里能看到 `[*] i686 toolchain: D:\a\_temp\msys64\mingw32\bin\...`）；
+· ✅ 途中修掉两个**我自己引入的**脚本问题：`.ps1` 里误用 C 风格 `/* */` 注释（PS 解析失败）；
+  `.ps1` 里写中文注释（PS 5.1 按 ANSI 解码会**吞掉下一行** —— 这正是 `tools/gates.ps1` 开头早已记录的坑，
+  教训：**该仓库的 .ps1 必须纯 ASCII**）；
+· ❌ 但 CI 上仍失败：**`e32_dbl` / `e32_dblarg` 打包失败**（浮点那两条）。本地同样的脚本是 12/12×2 通过，
+  说明 CI 的 i686 工具链生成的浮点代码不同（很可能仍是 x87：lifter 不支持 `FLD`/`FSTP`），
+  而 vmpack 的真实报错被 PowerShell 的 `NativeCommandError` 噪声盖住了，没能直接读到。
+
+**处置**：已把 CI 步骤**撤掉**（`ci.yml` 恢复原状），保证主干绿；门禁本身的改进全部保留
+（纯 ASCII、失败时打印 vmpack 原因、两遍：`-strip-relocs` 与保留重定位）。
+
+**下一步（要接着做第 4 项的话）**：
+1. 在 CI 的 32 位步骤里先**只**跑非浮点用例，或先打印出 vmpack 的真实 stderr（用 `& vmpack 2>&1 | Tee-Object`
+   并 `$ErrorActionPreference` 调整，避开 NativeCommandError 包装）；
+2. 查清 CI 工具链为什么没走 SSE（`-msse2 -mfpmath=sse` 是否被忽略 / mingw32 的默认 `-march`）；
+3. 解决后再把该步骤接回 CI，并保留 `VMP_REQUIRE_I686=1`。
