@@ -623,3 +623,39 @@ vmp-x 当前不足逐条落档，每条都带 `文件:行` 依据。要点：**�
       run `35833541996`（纯文档提交 `7dff5ac`）首次失败 `E2EFAIL refill: tools/patch_refill.py failed`
       （`e2e: 164 passed, 1 failed`），**重跑同一作业即全绿** ⇒ 判定为偶发而非回归。
       建议：查该子用例是否有时间/路径依赖（它做的是"按函数尾声把被覆盖的 5 字节推回来"的对抗测试）。
+
+### W3 落地设计（1b 外置密钥多平台）—— 已完成调研，待实现
+
+**接缝已完全看清**（`stub/win/x64/vm_interp.c`，全部在 `#ifdef VM_KEY_EXTERNAL` 内）：
+
+```
+774  #ifdef VM_KEY_EXTERNAL
+776  #if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32)))
+777  #error "VM_KEY_EXTERNAL 目前只有 Windows/x64 的取钥实现（vmpbuild 会先拦住别的目标）"
+778  #endif
+```
+
+⇒ 要加 Linux，需要动 **两处守卫 + 四个平台专用原语**：
+
+| # | 位置 | Windows 现状 | Linux 需要 |
+|---|---|---|---|
+| 1 | `vm_key_reject_code()`（790） | `ntdll!NtTerminateProcess(-1, 0xC0DE0000\|code)` | `exit_group(code)` 系统调用（注意：POSIX 只暴露低 8 位 ⇒ Linux 侧可观测的是 `0x07`） |
+| 2 | `vm_env_block()`/`vm_env_get()`（799/808） | PEB → ProcessParameters(+0x20) → Environment(+0x80)，UTF-16 大小写不敏感 | 扫 `/proc/self/environ`（ASCII、NUL 分隔）；为不改上层，填进一个 static u16 缓冲再返回 |
+| 3 | `vm_key_path()`（863） | PEB → ImagePathName 拼 `<产物全路径>.vmpkey`，`VMPX_KEY_FILE` 可覆盖 | `VMPX_KEY_FILE` 优先；否则 `readlink(/proc/self/exe)` + `.vmpkey`（同样转 u16） |
+| 4 | `vm_key_read_nt()`（891） | ntdll `NtCreateFile/NtReadFile/NtClose` | `open(2)/read(0)/close(3)`（x86_64 用现成的 `vm_syscall3`，2601） |
+
+**另外两处（本步不做，但要记下）**：
+- `vm_key_from_sentinel()`（1184）是 `LoadLibrary` 式狗接口 ⇒ Linux 下应返回 0（= 不可用）⇒ `kind>=2` 严格模式会正确走硬门 ✓；
+- 授权 fake-file 路径用 `vm_now_unix()`（Windows 时间源）⇒ Linux 侧要另做（`clock_gettime`）⇒ 若在 Linux 上用授权需一并处理 ✗。
+
+**要改的外部守卫**：`cmd/vmpbuild/main.go:150` 的 `if *keyExternal && targetRel != "win/x64"` ⇒ 改成"允许已实现的平台白名单"，其余仍 fail-fast ✓。
+
+**验证的现实约束（重要）**：本机可以**构建** linux/amd64 blob ✓，并用 `payload_probe.exe` 在 Windows 上执行其中**位置无关的 x86-64 机器码** ✓；
+但**系统调用不能在 Windows 上执行** ✗ ⇒ 取钥路径的**真跑**必须在 CI 的 Linux 作业里做 ⇒
+**必须同时给 `tools/e2e.sh`（或一个 Linux 侧小探针）加一条"给了/没给密钥"的用例**，否则这条路径等于没有验收 ✗。
+
+**分步计划（建议）**：
+1. 加 Linux/amd64 的四个原语（守卫 `VM_BLOB_TARGET_LINUX && __x86_64__`），**先不放宽 vmpbuild 守卫** ⇒ 本机可验证"linux blob 仍能构建 + linux payload 关仍绿"；
+2. 加 arm64 分支（`vm_syscall3_a64`，2502；syscall 号：read=63/open=56/close=57/readlink=78/exit_group=94）—— 本机无 aarch64 工具链 ⇒ 只能靠 CI 的 linux-arm64 作业验证；
+3. 放宽两处守卫 + 在 `tools/e2e.sh` 加验收用例（不给密钥 ⇒ 恰好失败；给了 ⇒ 与原生一致）；
+4. i386 与 win/arm64 各自单独一步（32 位 PEB / ARM64 TEB）。
