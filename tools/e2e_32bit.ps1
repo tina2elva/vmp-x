@@ -107,7 +107,7 @@ foreach ($c in $cases) {
     if (Test-Path $outExe) { Remove-Item $outExe -Force }
     $pk = & ".\build\vmpack.exe" -exe "build/target32.exe" -func $fn -out $outExe -blob "build/gates_blob32.bin" -manifest "build/gates_blob32.json" 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outExe)) {
-        /* 不要吞掉 vmpack 的原因：这正是"重定位保留"这条路唯一的诊断信息。 */
+        # 不要吞掉 vmpack 的原因：这正是"重定位保留"这条路唯一的诊断信息。
         ($pk -split "`r?`n") | Where-Object { $_ -match "\[!\]|错误|空间|失败" } | Select-Object -First 3 | ForEach-Object { Write-Host ("      vmpack: " + $_.Trim()) }
         Fail ("packing " + $fn + " with relocations kept failed")
         continue
