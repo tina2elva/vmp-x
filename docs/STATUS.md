@@ -7062,3 +7062,28 @@ C 探针）。缺 i686 工具链时打印醒目的 SKIPPED 并退出 0（不静�
 
 **仍待定位的细节**（不影响结论）：那 4 字节由载荷里哪条指令压入 —— `jmp` 补丁本身不压栈，
 且 jmp 目标在载荷节里（objdump 默认不反汇编该节）。属于细枝末节，已记在源码注释里。
+
+### 483. 第 2 项：`__stdcall` 修复**重做成功**（上次失败的真正原因找到了）
+
+**上次为什么失败**（本轮复现并读到完整报错）：
+
+    win/x64/vm_interp.c:608:27: error: expected ) before * token
+
+我把 `VM_WINAPI` 宏插在了**第 600 行左右**，而**第一个使用它的 typedef 在第 608 行** ⇒ 那里宏还没定义 ⇒
+`typedef u64 (VM_WINAPI *fn_t)(...)` 直接编不过。**与 `__stdcall` 属性本身无关** —— 纯粹是"宏定义晚于
+首次使用"。上次我没看 diff、也没在本地构建 Linux blob 就提交了，才让它进了 CI。
+
+**本轮做法**：宏挪到第 59 行（首次使用在 618 行之前），并**本地构建三个平台**验证：
+
+    [stub/linux/amd64] OK    [stub/win/x64] OK    [stub/win/x86] OK
+
+**守护条件加强**（比上次更严）：仅当"i686 宿主**且**非 Linux 目标"才展开成属性：
+
+    VM_HOST_X86_32 && !VM_BLOB_TARGET_LINUX  =>  __attribute__((stdcall))
+    其它情况                                  =>  空
+
+⇒ x64 / arm64 / Linux 一律展开为空 ⇒ 对它们零影响。（`win/x64/vm_interp.c` 被**全部五个平台**共用，
+这一点已在 linux/amd64 与 linux/arm64 的 `BLOB.sources` 里确认。）
+
+**它修的是什么**：32 位 Windows 上 Win32/ntdll/bcrypt API 都是 `__stdcall`（callee 清栈）；
+按默认 cdecl 声明会让**调用方再清一次栈**，每次调用都轻微破坏宿主栈。x64 只有一种调用约定 ⇒ 无此问题。

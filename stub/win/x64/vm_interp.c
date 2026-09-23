@@ -50,6 +50,16 @@ extern u64 vm_last_call_sp;  /* 发起该调用时的 guest RSP */
 u32 vm_insn_size(u8 op);
 u64 vm_selftest(void *ctxp);
 
+/* 32-bit (i686) Windows blobs call Win32/ntdll/bcrypt APIs, which are __stdcall there: the
+ * CALLEE pops the arguments. Declaring them as default-cdecl function pointers makes the
+ * caller pop them again, corrupting the host stack a little on every such call. x64 has a
+ * single calling convention, so this is a no-op there (and the attribute must never reach a
+ * non-Windows target, hence VM_BLOB_TARGET_LINUX in the guard). */
+#if defined(VM_HOST_X86_32) && !defined(VM_BLOB_TARGET_LINUX)
+#define VM_WINAPI __attribute__((stdcall))
+#else
+#define VM_WINAPI
+#endif
 static u32 rd32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
 
 /* 客户机栈槽宽度：x86-32 是 4 字节（push eax 压 4 字节、call 压 4 字节返回地址），
@@ -605,7 +615,7 @@ static u64 vm_call_native(vm_ctx_t *vm, u64 addr) {
 }
 #else
 static u64 vm_call_native(vm_ctx_t *vm, u64 addr) {
-    typedef u64 (*fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
+    typedef u64 (VM_WINAPI *fn_t)(u64, u64, u64, u64, u64, u64, u64, u64);
     fn_t fn = (fn_t)addr;
     return fn(vm->regs[VRCX], vm->regs[VRDX], vm->regs[VR8], vm->regs[VR9],
               vm->regs[VR10], vm->regs[VR11], vm->regs[VR12], vm->regs[VR13]);
@@ -778,7 +788,7 @@ static void *vm_get_proc(u64 mod, const char *fn);
 /* 硬门：走 ntdll!NtTerminateProcess(-1, code) —— ntdll 的导出不转发，地址一定有效；
  * 万一取不到就 ud2（0xC000001D）。默认 code = 7 ⇒ 退出码 0xC0DE0007、无任何输出。 */
 static void vm_key_reject_code(u32 code) {
-    typedef long (*termfn_t)(void *, u32);
+    typedef long (VM_WINAPI *termfn_t)(void *, u32);
     termfn_t tp = (termfn_t)vm_get_proc(vm_find_module("ntdll.dll"), "NtTerminateProcess");
     if (tp) tp((void *)(long long)-1, 0xC0DE0000u | code);
     __builtin_trap();
@@ -879,9 +889,9 @@ static const u16 *vm_key_path(void) {
 }
 
 static int vm_key_read_nt(const u16 *path, u8 *out, u32 cap, u32 *got) {
-    typedef long (*create_t)(void **, u32, vm_objattr_t *, vm_iosb_t *, void *, u32, u32, u32, u32, void *, u32);
-    typedef long (*read_t)(void *, void *, void *, void *, vm_iosb_t *, void *, u32, void *, void *);
-    typedef long (*close_t)(void *);
+    typedef long (VM_WINAPI *create_t)(void **, u32, vm_objattr_t *, vm_iosb_t *, void *, u32, u32, u32, u32, void *, u32);
+    typedef long (VM_WINAPI *read_t)(void *, void *, void *, void *, vm_iosb_t *, void *, u32, void *, void *);
+    typedef long (VM_WINAPI *close_t)(void *);
     u64 nt = vm_find_module("ntdll.dll");
     create_t ncf = (create_t)vm_get_proc(nt, "NtCreateFile");
     read_t nrf = (read_t)vm_get_proc(nt, "NtReadFile");
@@ -971,7 +981,7 @@ static const u16 *vm_exe_path_suffix(const char *suffix, u16 *out, u32 cap) {
 
 /* 当前 UTC Unix 秒（FILETIME 100ns since 1601）。取不到返回 0（0 表示"时间不可用"）。 */
 static i64 vm_now_unix(void) {
-    typedef void (*gstft_t)(void *);
+    typedef void (VM_WINAPI *gstft_t)(void *);
     gstft_t f = (gstft_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "GetSystemTimeAsFileTime");
     if (!f) return 0;
     u64 ft = 0;
@@ -991,7 +1001,7 @@ static i64 vm_now_unix(void) {
 static u64 vm_load_lib(const u16 *name) {
     u64 nt = vm_find_module("ntdll.dll");
     if (!nt) return 0;
-    typedef long (*ldr_t)(u32 *, void *, vm_ustr_t *, void **);
+    typedef long (VM_WINAPI *ldr_t)(u32 *, void *, vm_ustr_t *, void **);
     ldr_t ldr = (ldr_t)vm_get_proc(nt, "LdrLoadDll");
     if (!ldr) return 0;
     vm_ustr_t us;
@@ -1013,12 +1023,12 @@ static int vm_license_verify(const u8 *msg, u32 msgLen, const u8 *sig64, const u
         bc = vm_load_lib(bcName);
     }
     if (!bc) { VM_LIC_FAIL(0x31u); return 0; }
-    typedef long (*open_t)(void **, const u16 *, const u16 *, u32);
-    typedef long (*imp_t)(void *, void *, const u16 *, void **, u8 *, u32, u32);
-    typedef long (*hash_t)(void *, void *, u8 *, u32, u8 *, u32, u32);
-    typedef long (*hdata_t)(void *, u8 *, u32, u32);
-    typedef long (*hfin_t)(void *, u8 *, u32, u32);
-    typedef long (*ver_t)(void *, void *, u8 *, u32, u8 *, u32, u32);
+    typedef long (VM_WINAPI *open_t)(void **, const u16 *, const u16 *, u32);
+    typedef long (VM_WINAPI *imp_t)(void *, void *, const u16 *, void **, u8 *, u32, u32);
+    typedef long (VM_WINAPI *hash_t)(void *, void *, u8 *, u32, u8 *, u32, u32);
+    typedef long (VM_WINAPI *hdata_t)(void *, u8 *, u32, u32);
+    typedef long (VM_WINAPI *hfin_t)(void *, u8 *, u32, u32);
+    typedef long (VM_WINAPI *ver_t)(void *, void *, u8 *, u32, u8 *, u32, u32);
     open_t bOpen = (open_t)vm_get_proc(bc, "BCryptOpenAlgorithmProvider");
     imp_t bImport = (imp_t)vm_get_proc(bc, "BCryptImportKeyPair");
     hash_t bHash = (hash_t)vm_get_proc(bc, "BCryptCreateHash");
@@ -1117,8 +1127,8 @@ static int vm_license_from_dongle(void) {
         h = vm_load_lib(wname);
     }
     if (!h) { VM_LIC_FAIL(0x36u); return 0; }
-    typedef i32 (*login_t)(u32, const char *, u32 *);
-    typedef i32 (*logout_t)(u32);
+    typedef i32 (VM_WINAPI *login_t)(u32, const char *, u32 *);
+    typedef i32 (VM_WINAPI *logout_t)(u32);
     login_t pLogin = (login_t)vm_get_proc(h, "hasp_login");
     logout_t pLogout = (logout_t)vm_get_proc(h, "hasp_logout");
     if (!pLogin || !pLogout) { VM_LIC_FAIL(0x37u); return 0; }
@@ -1195,9 +1205,9 @@ static int vm_key_from_sentinel(void) {
             h = vm_load_lib(wname);
         }
         if (!h) { vm_sentinel_fail_stage = 2; return 0; }
-        typedef i32 (*login_t)(u32, const char *, u32 *);
-        typedef i32 (*logout_t)(u32);
-        typedef i32 (*hread_t)(u32, u32, u32, u32, void *);
+        typedef i32 (VM_WINAPI *login_t)(u32, const char *, u32 *);
+        typedef i32 (VM_WINAPI *logout_t)(u32);
+        typedef i32 (VM_WINAPI *hread_t)(u32, u32, u32, u32, void *);
         login_t pLogin = (login_t)vm_get_proc(h, "hasp_login");
         logout_t pLogout = (logout_t)vm_get_proc(h, "hasp_logout");
         hread_t pRead = (hread_t)vm_get_proc(h, "hasp_read");
@@ -1431,7 +1441,7 @@ static u32 vm_antidebug_probe(void) {
     u64 nt = vm_find_module("ntdll.dll");
 
     /* ② 调试端口 / 调试对象句柄（进程级；真实调试器必然把它们置上） */
-    typedef long (*qip_t)(void *, u32, void *, u32, void *);
+    typedef long (VM_WINAPI *qip_t)(void *, u32, void *, u32, void *);
     qip_t qip = (qip_t)vm_get_proc(nt, "NtQueryInformationProcess");
     if (qip) {
         u64 out = 0;
@@ -1441,7 +1451,7 @@ static u32 vm_antidebug_probe(void) {
     }
 
     /* ③ 硬件断点寄存器的影子（Dr0..Dr3 / Dr7） */
-    typedef long (*gct_t)(void *, void *);
+    typedef long (VM_WINAPI *gct_t)(void *, void *);
     gct_t gct = (gct_t)vm_get_proc(nt, "NtGetContextThread");
     if (gct) {
         static u8 ctx[1232]; /* CONTEXT 全尺寸：API 会把整块写满 */
@@ -2841,7 +2851,7 @@ static void *vm_get_proc(u64 mod, const char *fn) { return vm_get_proc_d(mod, fn
 u64 vm_img_diag[4];
 
 static void vm_img_fail(u32 code) {
-    typedef void (*exitfn_t)(u32);
+    typedef void (VM_WINAPI *exitfn_t)(u32);
     exitfn_t ex = (exitfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "ExitProcess");
     if (ex) ex(0xC0DE0000u | code);
     __builtin_trap();
@@ -2924,7 +2934,7 @@ int vm_unpack_image(const void *tblp) {
         vm_reloc_dir((const u8 *)base, &rr, &rs);
         if (!rr) { vm_img_diag[0] = 2; vm_img_fail(2); return -2; } /* 需要重定位但表没了 */
     }
-    typedef int (*vpfn_t)(void *, u64, u32, u32 *);
+    typedef int (VM_WINAPI *vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
     if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }
     for (u32 i = 0; i < count; i++) {
