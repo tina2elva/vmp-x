@@ -97,7 +97,8 @@ foreach ($c in $cases) {
 }
 
 # Second pass: the same cases WITHOUT -strip-relocs, i.e. with the relocation table kept.
-# That configuration used to fail outright (".reloc 空间不足"): vmpack can now move the whole
+# That configuration used to fail outright (the old .reloc had no raw slack left):
+# vmpack can now move the whole relocation table into a new carrier section.
 # relocation table into a new carrier section (.vreloc) when the old .reloc has no raw slack.
 # It exercises the loader-relocation path, so it is worth a pass of its own.
 $pass2 = 0
@@ -107,8 +108,8 @@ foreach ($c in $cases) {
     if (Test-Path $outExe) { Remove-Item $outExe -Force }
     $pk = & ".\build\vmpack.exe" -exe "build/target32.exe" -func $fn -out $outExe -blob "build/gates_blob32.bin" -manifest "build/gates_blob32.json" 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outExe)) {
-        # 不要吞掉 vmpack 的原因：这正是"重定位保留"这条路唯一的诊断信息。
-        ($pk -split "`r?`n") | Where-Object { $_ -match "\[!\]|错误|空间|失败" } | Select-Object -First 3 | ForEach-Object { Write-Host ("      vmpack: " + $_.Trim()) }
+# Do not swallow the real reason from vmpack: it is the only diagnostic on this path.
+        ($pk -split "`r?`n") | Where-Object { $_ -match "\[!\]|error|reloc|failed|space" } | Select-Object -First 3 | ForEach-Object { Write-Host ("      vmpack: " + $_.Trim()) }
         Fail ("packing " + $fn + " with relocations kept failed")
         continue
     }
