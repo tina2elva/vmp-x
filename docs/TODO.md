@@ -616,3 +616,10 @@ vmp-x 当前不足逐条落档，每条都带 `文件:行` 依据。要点：**�
 - [ ] **W4**：狗参与密码学（`hasp_decrypt` 类**非导出密钥**）+ 会话/狗绑定（现有 `vm_key_from_sentinel` 只是取主密钥）
 - [ ] **W5**：`features` 语义 + 吊销/黑名单（与第 5 节授权层同批）
 - [ ] **W6**：反 dump / 反 trace 加固（成本乘数）
+
+## 7. 稳定性观察（记录用，非功能项）
+
+- [ ] `E2E x86-64` 里的 **`refill`（`tools/patch_refill.py`）出现过一次 flaky**：
+      run `35833541996`（纯文档提交 `7dff5ac`）首次失败 `E2EFAIL refill: tools/patch_refill.py failed`
+      （`e2e: 164 passed, 1 failed`），**重跑同一作业即全绿** ⇒ 判定为偶发而非回归。
+      建议：查该子用例是否有时间/路径依赖（它做的是"按函数尾声把被覆盖的 5 字节推回来"的对抗测试）。
