@@ -7517,3 +7517,46 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
 **win/x64、win/x86、linux/amd64、linux/arm64**（每个都覆盖"无密钥硬门 / 环境变量 / 文件"三形态）。
 
 **未做项**：① win/arm64（见上）；② Linux 侧授权与狗仍是 fail-closed 桩。
+
+### 497. 更正：CI **本来就有** windows-11-arm 原生 runner；win/arm64 外置取钥**实测会崩**（0xC0000005）⇒ 白名单保持关闭
+
+**先更正我自己的错误**：第 8/9/10 轮我断言"没有任何环境能执行 Windows/ARM64"——**这是错的**。
+CI 里本来就有 `windows-arm64-run` 作业，其 `runs-on: windows-11-arm`（**原生 ARM64 Windows**），
+而且它**确实会执行 ARM64 机器码的 blob**（该作业的 "run native vs protected" 步骤就是 native vs protected 退出码比对，
+一直是绿的）。我把 **windows-amd64 作业里一个步骤名**"ARM64 guest differential (host is still x86-64)"
+误当成了作业的 runner，据此得出"无处可执行"的错误结论，进而三轮把它归为环境阻塞。
+⇒ 教训：判断某能力是否可得，要读**作业的 runs-on**，不要读步骤名。
+
+**于是本轮真的去验证了 (c)**：
+1. 放开两行（C 侧 `#error` 守卫加 `__aarch64__`、`vmpbuild` 白名单加 `win/arm64`）；
+2. 新增 `tools/e2e_win_arm64.ps1`（纯 ASCII）：定位 clang → 建 freestanding ARM64 PE 目标 →
+   建**外置** Windows/ARM64 blob → 打包 → 三条形态（无密钥 / `VMPX_KEY` / `<产物>.vmpkey`）；
+3. 把它作为一步挂到 `windows-arm64-run`（原生 ARM64）作业上。
+
+**实测结果（CI run 35951042779，windows-arm64-run）**：
+
+    [*] clang   : C:\Program Files\LLVM\bin\clang.exe
+    [*] native rc=654184885 out=
+    [!] no key:        rc=-1073741819  (0xC0000005 = ACCESS_VIOLATION)
+    [!] VMPX_KEY:      rc=-1073741819
+    [!] .vmpkey file:  rc=-1073741819
+    [!] win/arm64 1b: 3 case(s) failed
+
+⇒ **三条崩溃码完全相同**，且**与有没有密钥无关** ⇒ 崩在**取钥之前/之中**，不是"密钥不对"；
+同一 runner 上**非外置**产物是正常的（该作业原有的 native vs protected 比对通过）。
+⇒ 也就是说 **win/arm64 的取钥路径存在真实缺陷**，而不是"看起来应该能跑"——正是 fail-fast 规则要防的
+"客户现场程序莫名其妙退出"。
+
+**处置**：
+- **撤回** `windows-arm64-run` 里新增的那一步（主干保绿）；
+- **`win/arm64` 白名单保持关闭**（现状 = fail-fast），并在白名单处写明实测崩溃码与复现方式；
+- **保留** `tools/e2e_win_arm64.ps1` 作为**现成的复现器**：把它作为一步加回该作业即可复现（证据 run 35951042779）。
+
+**顺带记下第二个探针校准教训**：我本机用 **Windows PowerShell 5.1** 的解析器检查 .ps1（通过），
+而 CI 用的是 **pwsh 7** ⇒ 漏掉了 `-Wl,-e,entry` 这种裸参数里的逗号（在 pwsh 7 的参数位置是数组运算符 ⇒ ParserError）。
+⇒ **.ps1 的解析检查必须用与 CI 相同的解析器**（本机没有 pwsh 7，只能靠 CI 兜）。
+
+**下一步定位建议（给接手的人）**：
+1. 先在 `vm_peb_base()` 的 `#elif defined(__aarch64__)` 分支做最小验证（`x18` → TEB、TEB+0x60 → PEB 在 Windows/ARM64 上是否成立）；
+2. 再看 `vm_find_module()`/`vm_get_proc_d()` 用到的那些 64 位 LDR/导出偏移在 ARM64 Windows 上是否一致；
+3. 手段：把 1b 段按函数逐层注释（二分）后用同一复现器收敛；或在崩溃前打印诊断（该作业是原生 Windows，stdout 可见）。

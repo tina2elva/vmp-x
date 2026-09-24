@@ -122,3 +122,8 @@ win/arm64 仍 fail-fast：CI 能编译它，但没有任何环境能执行 ARM64
 每个都有"无密钥硬门 / VMPX_KEY / 文件"三形态的运行时验收，且都已进 CI 常态回归。
 **win/arm64 环境阻塞**：代码只差两行，但本环境（含 CI）没有任何地方能执行 ARM64 机器码的 blob，
 本机亦无 clang ⇒ 无法验证 ⇒ 白名单保持 fail-fast。
+
+**G3 更正与进展（#497）**：外置密钥支持 win/x64、win/x86、linux/amd64、linux/arm64 四平台（三形态运行时验收齐备）。
+**win/arm64**：CI 里本来就有原生 ARM64 runner（`windows-11-arm`），本轮真的挂上验收跑了一次 —— 外置产物
+**固定 0xC0000005 崩溃**（三条一样、与密钥无关），非外置产物正常 ⇒ 取钥路径有真实缺陷，白名单保持 fail-fast，
+复现器 `tools/e2e_win_arm64.ps1` 已入库。
