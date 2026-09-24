@@ -362,3 +362,11 @@ jobs:
           try { $pg = Start-Process -FilePath (Join-Path $PWD "build/target_arm64.vmp") -Wait -PassThru -RedirectStandardOutput $soG -RedirectStandardError $seG; $rr2 = $pg.ExitCode } catch { $rr2 = -998 }
           Write-Host ("[*] green step: same product via Start-Process -> rc=" + $rr2)
           $global:LASTEXITCODE = 0
+      - name: 1b external master key (win/arm64 - no-reloc delta=0)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
+          Write-Host "probe step exit=$LASTEXITCODE"
+          Write-Host "--- build/probe.txt ---"
+          if (Test-Path build/probe.txt) { Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) } }
+          $global:LASTEXITCODE = 0
