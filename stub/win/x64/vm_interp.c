@@ -3249,7 +3249,19 @@ int vm_unpack_image(const void *tblp) {
          * 0xC0000005"（STATUS #527/#528）。Linux/arm64 侧本来就有这一步
          * （stub/linux/arm64/payload_probe.c 的注释写明"写完代码后必须 __builtin___clear_cache"），
          * Windows 侧此前漏了 —— x64 因 I-cache 天然一致而看不出问题，arm64 必崩。 */
-        __builtin___clear_cache((char *)dst, (char *)(dst + size));
+        /* **不用** __builtin___clear_cache：它会生成对 __clear_cache 的外部调用，而本 blob 是
+         * 自包含 freestanding 目标，合并器会拒绝该未定义符号（实测 "引用了未定义符号"）。
+         * 这里直接写 AArch64 的规定序列：dc cvau（清到 PoU）→ dsb ish → ic ivau → dsb ish → isb。 */
+        {
+            u64 a0 = (u64)dst & ~(u64)63;
+            u64 a1 = ((u64)dst + size + 63) & ~(u64)63;
+            u64 a;
+            for (a = a0; a < a1; a += 64) __asm__ __volatile__("dc cvau, %0" ::"r"(a) : "memory");
+            __asm__ __volatile__("dsb ish" ::: "memory");
+            for (a = a0; a < a1; a += 64) __asm__ __volatile__("ic ivau, %0" ::"r"(a) : "memory");
+            __asm__ __volatile__("dsb ish" ::: "memory");
+            __asm__ __volatile__("isb" ::: "memory");
+        }
 #endif
         VM_DBG_WIN("img:sec-post\n");
         /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）
