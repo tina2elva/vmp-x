@@ -153,7 +153,9 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：验证"无重定位表⇒放行"的运行期修复（见 STATUS #511）
+		// "win/arm64"：根因链已完全查清（#507→#508→#510→#511）：目标无 .reloc 且在 ASLR 下被搬动，
+		// 运行期**无法**还原增量。两次错误尝试都已回滚（清 DYNAMIC_BASE ⇒ 语义变了；无表放行 ⇒ 真崩）。
+		// 正解见 TODO：无表时**跳过 delta 调整**（视 delta=0 处理密文），或由 vmpack 建真 .reloc 节。
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)
