@@ -14,6 +14,15 @@
 
 /* 本 blob 的主密钥以宏形式由 cmd/vmpbuild 生成（VM_KEY_BYTES） */
 
+/* ---- 架构判定：AArch64 有两条路 ----
+ * GNU 目标（aarch64-linux-gnu、aarch64-w64-windows-gnu）定义 __aarch64__；
+ * 而**原生 Windows/ARM64** 上 clang 的默认目标是 aarch64-pc-windows-msvc，只定义 _M_ARM64。
+ * 只认 __aarch64__ 就会让 win/arm64 在 VM_KEY_EXTERNAL 下直接 #error，或退回 x86-64 的
+ * %gs:[0x60] 分支（在 ARM64 上根本不合法）。CI 的 windows-11-arm 作业用的正是原生 clang。 */
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define VM_ARCH_AARCH64 1
+#endif
+
 /* ---- 编译期校验：vm_abi.h 里的偏移必须与 vm_ctx_t 的真实布局一致 ---- */
 #define VM_STATIC_ASSERT(cond, name) typedef char vm_sa_##name[(cond) ? 1 : -1]
 /* ctx 的字节偏移只在"18 槽位 x86-64 客户机"布局下有意义；
@@ -775,12 +784,12 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
 
 /* 已实现取钥的平台：Windows(x64 / arm64 / x86) 与 Linux(amd64 / arm64)。
  * 其它目标在这里就报错，vmpbuild 也会先拦住它们（两道守卫互为呼应）。 */
-#if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(__aarch64__) || defined(VM_HOST_X86_32))) && \
-    !(defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(__aarch64__)))
+#if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64) || defined(VM_HOST_X86_32))) && \
+    !(defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64)))
 #error "VM_KEY_EXTERNAL 只有 Windows(x64/arm64/x86) 与 Linux(amd64/arm64) 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
-#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(__aarch64__)
+#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
 /* 临时诊断（仅 Windows/ARM64 编译）：外置模式在该平台固定 0xC0000005，
  * 在 vm_master() 的关键节点往 stderr 打标记，用来三分定位崩在哪一段。
  * 走 kernel32!GetStdHandle + WriteFile（vm_get_proc 会解析转发导出）；取不到就静默放弃，
@@ -879,7 +888,7 @@ static u32 vm_hexval(u16 c) {
  * 与 Windows 侧的对应关系：PEB -> /proc/self/exe 与 /proc/self/environ；
  * ntdll 文件读 -> open/read/close；NtTerminateProcess -> exit_group。
  * 注意：POSIX 只暴露退出码的低 8 位，所以 Linux 上"硬门"可观测到的值是 0x07。 */
-#if defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(__aarch64__))
+#if defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64))
 /* 两个架构的系统调用号与封装不同：
  *   x86_64：read=0 open=2 close=3 readlink=89 exit_group=231（3 参数够用）
  *   aarch64：read=63 close=57 exit_group=94，但**没有 open/readlink**，
@@ -2678,7 +2687,7 @@ static void vm_keep_verify_ref(vm_ctx_t *vm) {
  * TLS 回调 -> 入口点）。放在 .bss（不能有初始化器，否则落进只读的 .data 段）。 */
 static u32 vm_img_done;
 
-#if defined(VM_BLOB_TARGET_LINUX) && defined(__aarch64__)
+#if defined(VM_BLOB_TARGET_LINUX) && defined(VM_ARCH_AARCH64)
 /* ---- Linux/aarch64：与 x86-64 那条同构（只验签 + 原地解密），差别只在 syscall 约定：
  * 号放 x8、参数 x0..x2、svc #0；mprotect = 226、write = 64。基址同样用「表地址 - selfRVA」反推。 ---- */
 u64 vm_img_diag[4];
@@ -2883,11 +2892,11 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[0] = 0;
     return 0;
 }
-#elif defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(__aarch64__) || defined(VM_HOST_X86_32))
+#elif defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64) || defined(VM_HOST_X86_32))
 /* Windows 上取模块列表的入口：x86-64 走 gs:[0x60]，arm64 走 TEB(x18)+0x60（都是 PEB）。
  * Ldr 链表偏移、导出表解析两边完全一致，所以共用这一整段；只有取 PEB 这一行分架构。 */
 static u64 vm_peb_base(void) {
-#if defined(__aarch64__)
+#if defined(VM_ARCH_AARCH64)
     u64 teb;
     __asm__ volatile("mov %0, x18" : "=r"(teb));
     if (!teb) return 0;
