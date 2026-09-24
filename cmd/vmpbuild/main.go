@@ -153,7 +153,10 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：正在做校准 + 二分定位 0xC0000005（结论出来后按结果决定去留）
+		// "win/arm64"：定位中（见 STATUS #497-#499）。已确认崩溃发生在**任何 blob 代码执行之前**
+		// （用带标记的 blob 实测：一个标记都没打出来），且平台判定宏在原生 Windows/ARM64 的 clang 下
+		// 需要专门处理（__aarch64__ 与 _M_ARM64 实测都不成立）。
+		// 复现器 tools/e2e_win_arm64.ps1（含非外置产物的校准用例）已入库，白名单保持关闭。
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)
