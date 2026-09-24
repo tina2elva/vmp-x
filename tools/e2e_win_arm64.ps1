@@ -23,7 +23,12 @@ if (-not $objdump) { $objdump = "llvm-objdump" }
 Write-Host ("[*] clang   : " + $clang)
 Write-Host ("[*] objdump : " + $objdump)
 
-# vmpbuild takes ONE program for -cc, so wrap clang with the arm64-windows target.
+# IMPORTANT: pass clang exactly the way the (green) windows-arm64-run job does - plain "clang",
+# no --target wrapper. On this native ARM64 runner clang already targets Windows/ARM64 with the
+# ABI vmpbuild expects; forcing --target=aarch64-w64-windows-gnu produced a blob that crashed on
+# entry with 0xC0000005 *before any blob code ran* (and even in non-external mode).
+$ccArg = "clang"
+$wrap = ""  # kept for reference; not used anymore
 $wrap = Join-Path $PWD "build/clang-a64w.cmd"
 # Build the wrapper without backtick escapes or embedded quotes - that line used to be
 # written as ("@echo off`r`n`"" + $clang + ...) and pwsh rejected it with a ParserError on CI.
@@ -50,7 +55,7 @@ if (-not (Test-Path build/target_arm64.exe)) { Write-Host "[!] arm64 PE target b
 $keyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 Remove-Item build/vm_interp_win_arm64_ext.bin, build/vm_interp_win_arm64_ext.json -ErrorAction SilentlyContinue
 Write-Host "[*] building the Windows/arm64 external-key blob..."
-& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $wrap -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 30
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $ccArg -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 30
 if (-not (Test-Path build/vm_interp_win_arm64_ext.bin)) { Write-Host "[!] Windows/arm64 external blob build FAILED"; exit 1 }
 
 # ---- pack check_key / sum_to ----
@@ -62,7 +67,7 @@ if (-not (Test-Path build/target_arm64_ext.exe)) { Write-Host "[!] packing faile
 # Without this, "the external build crashes" could just mean "my pack invocation differs from the
 # one the (green) windows-arm64-run job uses". AGENTS.md discipline: calibrate the probe first.
 Remove-Item build/vm_interp_win_arm64_cal.bin, build/vm_interp_win_arm64_cal.json -ErrorAction SilentlyContinue
-& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_cal.bin -manifest build/vm_interp_win_arm64_cal.json -entry vm_entry -guest arm64 -merge go -cc $wrap -objdump $objdump 2>&1 | Select-Object -Last 6
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_cal.bin -manifest build/vm_interp_win_arm64_cal.json -entry vm_entry -guest arm64 -merge go -cc $ccArg -objdump $objdump 2>&1 | Select-Object -Last 6
 if (-not (Test-Path build/vm_interp_win_arm64_cal.bin)) { Write-Host "[!] CALIBRATION: non-external blob build failed"; exit 1 }
 & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_cal.bin -manifest build/vm_interp_win_arm64_cal.json -out build/target_arm64_cal.exe -report build/target_arm64_cal_vmp.json 2>&1 | Select-Object -Last 6
 if (-not (Test-Path build/target_arm64_cal.exe)) { Write-Host "[!] CALIBRATION: packing failed"; exit 1 }
