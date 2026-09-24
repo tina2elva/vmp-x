@@ -740,3 +740,10 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       而非外置产物在同一 runner 上正常 ⇒ 崩在取钥之前/之中。白名单保持关闭；复现器 
       `tools/e2e_win_arm64.ps1` 已就绪（加回该作业即可复现，run 35951042779）。
       **另需更正**：此前"没有环境能执行 Windows/ARM64"的判断是错的 —— 该作业本来就是原生 ARM64。
+
+## 8. 稳定性观察（追加）
+
+- [ ] `E2E x86-64` 的 **`antidebug`** 用例出现过一次 flaky：本机门禁 run 里 `E2EFAIL antidebug:
+      a single BeingDebugged signal flipped the verdict`（同批 `e2e: 164 passed, 1 failed`），
+      单独重跑同一脚本即 `165 passed, 0 failed`；同一 e2e 在 CI 上始终绿。
+      本机当时无显式调试器进程 ⇒ 属环境性偶发；建议查该用例的"单一路径不应翻转判定"在非干净环境下的敏感性。
