@@ -8127,3 +8127,32 @@ blob manifest 里的 `imageBase`），用于检验上一轮留下的矛盾：
 
 **同时要做的清理（下轮一并）**：CI 里现在挂着 3 个诊断步骤（inline 对照 / 启动可执行性 / 扩展名对照），
 它们都以清零退出码收尾（不影响绿），但属于噪声，应当在结论落地后移除，只保留复现器脚本。
+
+### 519. 完整轨迹拿到（22 行），并暴露一个关键矛盾：`delta` 本应为 0
+
+**先解决"读不到诊断"的原因**：复现器在**外置 blob 构建**处就 **fatal 中止**（因为白名单当时是关闭的），
+于是它后面所有 `Mark`（含我新加的 `base:` 三行）**根本没执行到** ⇒ 这才是"读不到"的真因（不是打印问题）。
+临时放开白名单后，一次拿到完整轨迹（CI run 35977490732，`build/probe.txt` 共 22 行）：
+
+    stage:start / stage:clang-ok / probe-early:exists=True / probe-early:5runs rc=-1059192830x5
+    stage:ext-packed exists=True / probe:start exists=True
+    probe:green-product rc=-1059192830 / probe:green-product 10runs rc=-1059192830x10
+    reloc:target-sections has-reloc=False / reloc:product has-reloc=False
+    base:target-exe ImageBase  0000000140000000
+    base:product    ImageBase  0000000140000000
+    base:manifest-imageBase-decimal=          ← 我的正则没匹配上（空）
+    strip-relocs via Start-Process: rc=-998 / strip-relocs via plain call: rc=0
+    cal-plain: rc=-1059192830 / cal-startprocess: rc=-1059192830
+    greenblob-pack: rc=-1059192830 / stage:done bad=2 calRc=-1059192830
+
+**关键矛盾**：`cmd/vmpack/main.go:654` 把 **`ImageBase: f.ImageBase`** 写进载荷表头，而实测**目标与产物的
+`ImageBase` 都是 `0x140000000`** ⇒ 若产物加载在首选基址，`delta` 应为 **0** ⇒ 运行期那条
+"`delta != 0` 且无重定位表 ⇒ 拒绝"**根本不该触发**；但它**确实**返回了 `0xC0DE0002`。
+⇒ 因此剩下的未知是两件事：**表头里的 `wantBase` 到底是多少**、以及**运行期算出的 `base` 与 `delta`**。
+（我在脚本里解析 manifest 的正则失败了，所以 `wantBase` 仍未读到。）
+
+**下一轮的直接做法**：把 `base` / `wantBase` / `delta` / `rr` **编码进退出码**，或写入一个诊断文件
+（例如 `vm_img_diag[]` 已有 4 个槽：base/wantBase/计数/diag ✓，把它们 dump 出来即可）⇒ 一次 CI 定案。
+
+**处置**：白名单重新关闭（fail-fast）；CI 里的诊断步骤与 trace dump 暂时保留（都以清零退出码收尾，不影响绿），
+结论落地后一并清理。
