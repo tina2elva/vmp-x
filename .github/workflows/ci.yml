@@ -353,6 +353,14 @@ jobs:
           # the same file returns 0x26FE11B5 here but 0xC0DE0002 in the very next step of this job.
           $rr = 0; & .\build\target_arm64.vmp; $rr = $LASTEXITCODE
           Write-Host ("[*] green step: second run of target_arm64.vmp -> rc=" + $rr)
+          # Same product again, but launched the way my step launches it (ShellExecute path via
+          # Start-Process). STATUS #506: if this FAILS while the plain call above succeeds, then the
+          # trigger is the launcher => ASLR active => win/arm64 product lacks a relocation table.
+          $soG = Join-Path $PWD "build/green_sp.out"
+          $seG = Join-Path $PWD "build/green_sp.err"
+          $rr2 = -999
+          try { $pg = Start-Process -FilePath (Join-Path $PWD "build/target_arm64.vmp") -Wait -PassThru -RedirectStandardOutput $soG -RedirectStandardError $seG; $rr2 = $pg.ExitCode } catch { $rr2 = -998 }
+          Write-Host ("[*] green step: same product via Start-Process -> rc=" + $rr2)
           $global:LASTEXITCODE = 0
       - name: 1b external master key (win/arm64 file-trace probe)
         shell: pwsh
