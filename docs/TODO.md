@@ -702,3 +702,9 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
 
 - [x] **Linux/amd64 运行时验收**：已在 `tools/e2e.sh` 里加三条（无密钥 rc=7 无输出 / VMPX_KEY / .vmpkey 文件），
       CI run 35838856135 全过（STATUS #490）。**Linux/amd64 至此构建级 + 运行时级双验收完成。**
+
+- [x] **linux/arm64**：已实现（aarch64 用 openat/readlinkat + 新增 4 参数 syscall 封装），
+      `tools/e2e_arm64.sh` 加了同一套验收，CI run 35946190183 全绿（STATUS #491）。
+      ⇒ **目标 (a) Linux/amd64 + Linux/arm64 完成。**
+- [ ] win/x86(i686)：32 位 PEB + 导出表遍历 + __stdcall（VM_WINAPI 宏已就位）
+- [ ] win/arm64：ARM64 TEB/PEB 取法

@@ -7301,3 +7301,40 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
    readlinkat=78 exit_group=94；然后在 `tools/e2e_arm64.sh`（CI 的 linux-arm64 作业，qemu）里加同一节三条验收。
 2. i386（32 位 PEB + __stdcall）与 win/arm64（ARM64 TEB/PEB）各自一步。
 3. Linux 侧授权与狗仍是 fail-closed 桩（需要时单独一轮）。
+
+### 491. W3 第三步：**Linux/arm64 完成**（目标 (a) 两个平台均闭环）；并记录一个 CI 教训
+
+**做法**：
+1. `stub/win/x64/vm_interp.c`：
+   - 新增 **aarch64 的 4 参数 syscall 封装** `vm_syscall4_a64`（aarch64 **没有** `open`/`readlink`，
+     只有 `openat=56` / `readlinkat=78`，都要 `AT_FDCWD` 这个第 4 参数）；
+   - 取号与调用按 arch 分离（`__x86_64__` 用 read=0 open=2 close=3 readlink=89 exit_group=231；
+     `__aarch64__` 用 read=63 close=57 openat=56 readlinkat=78 exit_group=94），
+     上层四个原语的代码保持一份（用 `vm_lx_sys3` 与 `VM_LX_OPEN_RO` / `VM_LX_READLINK_EXE` 两个宏统一）；
+   - C 侧 `#error` 守卫与 `cmd/vmpbuild` 白名单同时放开 linux/arm64。
+2. `tools/e2e_arm64.sh`：加同一套 1b 验收。
+
+**证据（CI run 35946190183，commit 2a15ccf，linux-arm64 作业）**：
+
+    [*] 1b 外置密钥（-key-external）验收...
+    [+] 1b: 无密钥 -> rc=7（硬门低 8 位）且无输出
+    [+] 1b: 有密钥(VMPX_KEY) -> 与原生一致
+    五作业全绿（windows-amd64 / linux-amd64 / linux-arm64 / windows-arm64-blob / windows-arm64-run）
+
+**本轮踩到并记下的教训（值得写进注释与文档）**：我一开始给 arm64 那段 `vmpbuild` 只写了 `-cc "$CC"`，
+漏了脚本原有的 `-guest arm64 -merge go -random-opcodes=false -objdump`。后果不是"编译不过"而是**静态断言炸**：
+缺 `-guest arm64` ⇒ 客户机退回 x86-64 ⇒ `VM_REG_COUNT` 变成 18 ⇒ ctx 布局断言生效，
+而 arm64 平台头的 `VM_CTX_*` 是按 arm64 客户机（35 槽位）写的 ⇒ `vm_sa_ctx_pc/codelen/code` 全部为负。
+⇒ **同一个平台目录的 blob，参数必须与非外置那次完全一致**（已在脚本里写成注释）。
+
+**两个平台的差异（如实记录）**：
+- **amd64**：三条都测（无密钥 / `VMPX_KEY` 环境变量 / `<产物>.vmpkey` 文件），全过；
+- **arm64**：测两条（无密钥 / `VMPX_KEY`）—— 文件那条依赖 `/proc/self/exe`，而 qemu-user 下该路径指向
+  宿主 qemu 而不是被仿真的 ELF，**不可靠**，故未纳入；arm64 的路径解析逻辑与 amd64 共用同一份源码，
+  差异只在 `readlink` 与 `readlinkat` 两个系统调用号上。
+
+**未做项（目标 (b)(c) 仍待做）**：
+1. **win/x86(i686)**：32 位 PEB（`fs:[0x30]`）+ 32 位导出表遍历 + 全部 API 走 `__stdcall`
+   （后者本会话早些时候已修：`VM_WINAPI` 宏）；
+2. **win/arm64**：Windows 在 ARM64 上不是 `gs:[0x60]`，要另写 TEB/PEB 取法；
+3. Linux 侧**授权与狗**仍是 fail-closed 桩。
