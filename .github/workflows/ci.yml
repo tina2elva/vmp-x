@@ -394,3 +394,20 @@ jobs:
           $rcB = "unset"; & $copy; $rcB = $LASTEXITCODE
           Write-Host ("[*] LAUNCH: copy rc=" + $rcB)
           $global:LASTEXITCODE = 0
+      - name: win/arm64 extension control (same bytes, .exe name)
+        shell: pwsh
+        run: |
+          # STATUS #516: in my steps even a fresh COPY of the green product cannot be launched,
+          # while my own freshly built .exe products do run here. Discriminator may be the .vmp
+          # extension itself in this context. Copy the very same bytes to a .exe name and compare.
+          $orig = Join-Path $PWD "build/target_arm64.vmp"
+          $asExe = Join-Path $PWD "build/target_arm64_as.vmp.exe"
+          Remove-Item $asExe -ErrorAction SilentlyContinue
+          Copy-Item $orig $asExe -ErrorAction SilentlyContinue
+          $rcA = "unset"; & $orig;  $rcA = $LASTEXITCODE
+          Write-Host ("[*] EXT: .vmp    rc=" + $rcA)
+          $rcB = "unset"; & $asExe; $rcB = $LASTEXITCODE
+          Write-Host ("[*] EXT: .vmp.exe rc=" + $rcB)
+          $rcC = "unset"; & .\build\target_arm64.exe; $rcC = $LASTEXITCODE
+          Write-Host ("[*] EXT: native .exe rc=" + $rcC)
+          $global:LASTEXITCODE = 0
