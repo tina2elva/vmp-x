@@ -785,6 +785,10 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
  * 在 vm_master() 的关键节点往 stderr 打标记，用来三分定位崩在哪一段。
  * 走 kernel32!GetStdHandle + WriteFile（vm_get_proc 会解析转发导出）；取不到就静默放弃，
  * 这样"什么标记都没有"本身也是信息（说明更早就崩了）。 */
+/* 这两个符号的前向声明在下面（本文件靠后的 Windows 段），这里再声明一次以免顺序问题。 */
+static u64 vm_find_module(const char *name);
+static void *vm_get_proc(u64 mod, const char *fn);
+
 static void vm_dbg_win(const char *s) {
     typedef void *(*gsh_t)(u32);
     typedef int (VM_WINAPI *wf_t)(void *, const void *, u32, u32 *, void *);

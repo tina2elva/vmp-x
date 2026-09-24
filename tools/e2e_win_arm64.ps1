@@ -50,7 +50,7 @@ if (-not (Test-Path build/target_arm64.exe)) { Write-Host "[!] arm64 PE target b
 $keyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 Remove-Item build/vm_interp_win_arm64_ext.bin, build/vm_interp_win_arm64_ext.json -ErrorAction SilentlyContinue
 Write-Host "[*] building the Windows/arm64 external-key blob..."
-& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $wrap -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 10
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $wrap -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 30
 if (-not (Test-Path build/vm_interp_win_arm64_ext.bin)) { Write-Host "[!] Windows/arm64 external blob build FAILED"; exit 1 }
 
 # ---- pack check_key / sum_to ----
