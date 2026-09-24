@@ -156,6 +156,22 @@ $prodHdr = (& $od2 -h build/target_arm64.vmp 2>&1 | Out-String)
 $prodRel = ($prodHdr -split "`n" | Where-Object { $_ -match "reloc" }) -join " ; "
 Mark ("reloc:product has-reloc=" + [bool]($prodHdr -match "reloc"))
 Mark ("reloc:product-line " + $prodRel.Trim())
+# ---- BASE BOOKKEEPING (STATUS #517 follow-up) ----
+# The product DOES run (.vmp.exe) and returns 0xC0DE0002 = "delta != 0 but no reloc table".
+# But an image without a reloc table cannot be moved by the loader at all - so delta != 0 is
+# itself suspicious: maybe the recorded wantBase disagrees with the image s real ImageBase.
+$imgo = (& $od2 -p build/target_arm64.exe 2>&1 | Out-String)
+$imgLine = ($imgo -split "`n" | Where-Object { $_ -match "ImageBase|image base" } | Select-Object -First 2) -join " ; "
+Mark ("base:target-exe " + $imgLine.Trim())
+$imgp = (& $od2 -p build/target_arm64.vmp 2>&1 | Out-String)
+$imgLineP = ($imgp -split "`n" | Where-Object { $_ -match "ImageBase|image base" } | Select-Object -First 2) -join " ; "
+Mark ("base:product " + $imgLineP.Trim())
+$manTxt = ""
+if (Test-Path build/vm_interp_win_arm64.json) { $manTxt = Get-Content build/vm_interp_win_arm64.json -Raw }
+$mb = ""
+if ($manTxt -match '"imageBase"\s*:\s*([0-9]+)') { $mb = $Matches[1] }
+Mark ("base:manifest-imageBase-decimal=" + $mb)
+if ($mb -ne "") { Mark ("base:manifest-imageBase-hex=0x" + ([int64]$mb).ToString("X")) }
 # A/B: pack the same funcs with -strip-relocs (clears DYNAMIC_BASE) and run it under Start-Process.
 & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64.bin -manifest build/vm_interp_win_arm64.json -out build/target_arm64_strip.vmp -strip-relocs 2>&1 | Out-Null
 if (Test-Path build/target_arm64_strip.vmp) {
