@@ -141,6 +141,34 @@ if (Test-Path $green) {
     Mark "probe:green-product MISSING"
 }
 
+# ---- RELOCATION DIAGNOSIS (STATUS #507): does the target even HAVE a relocation table? ----
+# If the freestanding lld-linked ARM64 target has no .reloc, then nothing can be carried into the
+# product, and with ASLR active (Start-Process / double-click) the entry self-decrypt cannot undo
+# the loader delta => vm_img_fail(2) => 0xC0DE0002. The green job never sees it because a plain
+# call loads at the preferred base (delta = 0).
+$od2 = (Get-Command llvm-objdump -ErrorAction SilentlyContinue).Source
+if (-not $od2) { $od2 = "llvm-objdump" }
+$hdr = (& $od2 -h build/target_arm64.exe 2>&1 | Out-String)
+$relSeen = ($hdr -split "`n" | Where-Object { $_ -match "reloc" }) -join " ; "
+Mark ("reloc:target-sections has-reloc=" + [bool]($hdr -match "reloc"))
+Mark ("reloc:target-line " + $relSeen.Trim())
+$prodHdr = (& $od2 -h build/target_arm64.vmp 2>&1 | Out-String)
+$prodRel = ($prodHdr -split "`n" | Where-Object { $_ -match "reloc" }) -join " ; "
+Mark ("reloc:product has-reloc=" + [bool]($prodHdr -match "reloc"))
+Mark ("reloc:product-line " + $prodRel.Trim())
+# A/B: pack the same funcs with -strip-relocs (clears DYNAMIC_BASE) and run it under Start-Process.
+& .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64.bin -manifest build/vm_interp_win_arm64.json -out build/target_arm64_strip.vmp -strip-relocs 2>&1 | Out-Null
+if (Test-Path build/target_arm64_strip.vmp) {
+    $soS = Join-Path $PWD "build/strip_sp.out"
+    $seS = Join-Path $PWD "build/strip_sp.err"
+    $rsS = -999
+    try { $ps2 = Start-Process -FilePath (Join-Path $PWD "build/target_arm64_strip.vmp") -Wait -PassThru -RedirectStandardOutput $soS -RedirectStandardError $seS; $rsS = $ps2.ExitCode } catch { $rsS = -998 }
+    Mark ("strip-relocs via Start-Process: rc=" + $rsS)
+    $rp = -999
+    & build/target_arm64_strip.vmp; $rp = $LASTEXITCODE
+    Mark ("strip-relocs via plain call: rc=" + $rp)
+} else { Mark "strip-relocs: pack failed" }
+
 # ---- CALIBRATION: the same flow, but with a NON-external blob ----
 # Without this, "the external build crashes" could just mean "my pack invocation differs from the
 # one the (green) windows-arm64-run job uses". AGENTS.md discipline: calibrate the probe first.
