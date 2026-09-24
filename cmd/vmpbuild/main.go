@@ -153,7 +153,15 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：跑"delta 量级编码进退出码"的诊断（#520）
+		// "win/arm64"：**未完成**（详见 STATUS #522 的收尾清单）。已确证的事实链：
+		//  ① `.vmp` 扩展名无法被 PowerShell 启动（同字节改名 .exe 即可）⇒ 该作业原有的 "native vs protected"
+		//     比对是**假通过**（$LASTEXITCODE 保留了 native 的值）；
+		//  ② 打包产物**能运行**，触发条件是 **ASLR 生效 + 目标没有 .reloc**（Windows/ARM64 的 freestanding 目标）；
+		//  ③ `delta` 是 0x8000 的**非零倍数**（真实重定位量级），而加载器在无表时不做任何 fixup；
+		//  ④ 运行期三次尝试（#510/#511/#512）与打包端两次尝试（#520/#521）均被实测否掉并回滚；
+		//     其中 #521 **建节成功**（has-reloc=True）但产物仍 0xC0000005 ⇒ 还有**别的绝对 VA 未登记**。
+		// 下一步：审计 vmpack 里所有"按首选基址写绝对 VA"的位置（已知 :735 站点、:767 TLS），
+		// 统一登记进 items，并在无 .reloc 的目标上建节（建节已验证可行）。修好前保持 fail-fast。
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)
