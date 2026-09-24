@@ -777,3 +777,8 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
 - [ ] **win/arm64 下一步实验**：让**绿步骤**也用 `Start-Process` 跑一次同一产物 ⇒ 若也失败，则铁证为
       「启动方式 ⇒ ASLR ⇒ 缺少重定位表」，随后去 `cmd/vmpack` 查 win/arm64 的重定位表生成/保留；
       再据此修好，让三形态全绿并放开白名单。证据基础见 STATUS #506。
+
+- [ ] **win/arm64 真 bug（与取钥无关）**：产物在 **ASLR 生效**时缺重定位表 ⇒ `0xC0DE0002` 退出。
+      铁证见 STATUS #507（同一文件同一步骤，裸调用成功 / Start-Process 失败）。下一步：
+      ① 用 `-strip-relocs` 产物在 Start-Process 下试跑；② 对比 win/arm64 与 win/x64 的 `.reloc` 数据目录；
+      ③ 修 `vmpack` 并**给所有平台加"Start-Process（ASLR 生效）启动"的验收**。

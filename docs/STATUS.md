@@ -7812,3 +7812,32 @@ CI 步骤随后 `Get-Content build/probe.txt` 打印。文件信号**不受输�
 
 **本轮方法论收获**：连续三个假设（ASLR 随机性、我的重建、启动方式）都被 CI 实验**排除**，
 而"把探针放进**对方步骤**里复跑"这一招直接给出了状态变化的证据 —— 值得记住。
+
+### 507. 铁证：win/arm64 产物在 **ASLR 生效**时缺重定位表（与 1b 取钥无关的真 bug）
+
+**决定性实验**：在**绿作业自己的步骤里**，对**同一个** `build/target_arm64.vmp`，先裸调用、再 `Start-Process`：
+
+    [*] green step: second run of target_arm64.vmp -> rc=654184885        ← 裸调用：成功
+    [*] green step: same product via Start-Process -> rc=-1059192830      ← Start-Process：失败
+
+⇒ **同一文件、同一步骤、同一秒**，唯一差别是**启动方式** ⇒ 结论确凿：
+
+- **裸调用**（`& .\build\target_arm64.vmp`）⇒ 进程加载在**首选基址**，`delta = 0` ⇒ 入口自解密**不走重定位分支**
+  ⇒ 看不出问题；
+- **`Start-Process`**（走 ShellExecute，ASLR 正常生效）⇒ `delta != 0` ⇒ 走重定位分支 ⇒ 发现
+  **产物里没有重定位目录** ⇒ `vm_img_fail(2)` ⇒ 退出码 `0xC0DE0002`。
+
+**为什么这是一个必须修的真 bug**：通过**双击 / ShellExecute / 任何正常启动方式**运行 win/arm64 产物时 ASLR 都生效，
+因此产物会**当场以 0xC0DE0002 退出、无任何输出** —— 正是 fail-fast 规则要防的"客户现场莫名其妙退出"。
+而它**与 1b 取钥完全无关**（无密钥硬门 `0xC0DE0007` 正确、`1b:enter`/`1b:fetched` 均已实测出现）。
+
+**嫌疑范围**：`cmd/vmpack` 在 **win/arm64** 上的重定位处理（与 x64 相比可能漏了：把 `.reloc` 搬进新节、
+或 `DIR64`/`HIGHLOW` 条目在新节里的搬运、或 `DYNAMIC_BASE` 与 `RELOCS_STRIPPED` 的组合）。
+注意本仓库 x64 侧早已有 `.vreloc` 承载节的实现（见 STATUS #484）—— 需要确认它在 arm64 路径上是否也被走到。
+
+**下一步（已定）**：① 用 `-strip-relocs` 生成一份产物，看 Start-Process 下是否变成"能跑"（若变好，
+说明问题就在**保留重定位**那条路）；② 直接对比 win/arm64 产物与 win/x64 产物的 `.reloc`/数据目录；
+③ 定位后修 `vmpack`，并**为所有平台加一条"通过 Start-Process（ASLR 生效）启动"的验收**，防止同类问题再现。
+
+**本轮方法论收获（连续四步排除法）**：ASLR 随机性 ✗、我的重建 ✗、启动方式 ✗（先在别处排除）→
+最后**把对照实验放进"对方步骤"里**，一步锁定真因。

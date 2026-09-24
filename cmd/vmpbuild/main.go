@@ -153,7 +153,9 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：跑"文件信号"探针（build/probe.txt）以拿到完整执行轨迹
+		// "win/arm64"：**另有一个与取钥无关的真 bug 未修** —— 产物在 ASLR 生效时缺重定位表：
+		// 裸调用（加载在首选基址）成功，而 Start-Process/双击（ASLR 生效）必以 0xC0DE0002 退出
+		// （STATUS #507，铁证：同一文件同一步骤只换启动方式）。修好前不放开白名单。
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)
