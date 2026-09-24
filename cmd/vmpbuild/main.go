@@ -153,9 +153,7 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		// "win/arm64"：CI（windows-11-arm，原生 ARM64）实测**会崩** 0xC0000005，且加诊断标记后
-		// 连 vm_master() 的入口标记都没打出来 ⇒ 崩在**取钥之前**（详细见 STATUS #497/#498）。
-		// 白名单保持关闭；复现器 tools/e2e_win_arm64.ps1 + 诊断代码（仅 aarch64 编译）都已入库。
+		"win/arm64":   true, // 临时放开：正在做校准 + 二分定位 0xC0000005（结论出来后按结果决定去留）
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)

@@ -58,6 +58,19 @@ Write-Host "[*] packing..."
 & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -out build/target_arm64_ext.exe -report build/target_arm64_ext_vmp.json 2>&1 | Select-Object -Last 8
 if (-not (Test-Path build/target_arm64_ext.exe)) { Write-Host "[!] packing failed"; exit 1 }
 
+# ---- CALIBRATION: the same flow, but with a NON-external blob ----
+# Without this, "the external build crashes" could just mean "my pack invocation differs from the
+# one the (green) windows-arm64-run job uses". AGENTS.md discipline: calibrate the probe first.
+Remove-Item build/vm_interp_win_arm64_cal.bin, build/vm_interp_win_arm64_cal.json -ErrorAction SilentlyContinue
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_cal.bin -manifest build/vm_interp_win_arm64_cal.json -entry vm_entry -guest arm64 -merge go -cc $wrap -objdump $objdump 2>&1 | Select-Object -Last 6
+if (-not (Test-Path build/vm_interp_win_arm64_cal.bin)) { Write-Host "[!] CALIBRATION: non-external blob build failed"; exit 1 }
+& .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_cal.bin -manifest build/vm_interp_win_arm64_cal.json -out build/target_arm64_cal.exe -report build/target_arm64_cal_vmp.json 2>&1 | Select-Object -Last 6
+if (-not (Test-Path build/target_arm64_cal.exe)) { Write-Host "[!] CALIBRATION: packing failed"; exit 1 }
+$calRc = 0; $calOut = (& (Join-Path $PWD "build/target_arm64_cal.exe") 2>&1) -join "|"; $calRc = $LASTEXITCODE
+Write-Host ("[*] CALIBRATION (non-external blob): rc=" + $calRc + " out=[" + $calOut + "]  native rc=" + $natRc)
+if ($calRc -ne $natRc) { Write-Host "[!] CALIBRATION FAILED: my own default-mode product does not match native => this harness differs from the green job, so any external-mode conclusion is confounded" }
+else { Write-Host "[+] CALIBRATION OK: default-mode product built by this harness matches native" }
+
 # ---- three cases: no key / VMPX_KEY env / <product>.vmpkey file ----
 $bad = 0
 function Fail([string]$m) { Write-Host ("[!] " + $m); $script:bad++ }
