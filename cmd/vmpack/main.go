@@ -685,6 +685,15 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 			// payload 节不参与整体加密，所以运行期不需要对它们做"先减后加"。
 		}
 
+		/* 目标**本身没有重定位目录**时（例如 freestanding / -nostdlib 链接的 arm64 目标：没有绝对引用
+		 * ⇒ lld 根本不生成 .reloc），"保留重定位与 ASLR"是**做不到**的：加载器按 delta 搬走镜像后，
+		 * 入口自解密没有表可读、无法还原增量 ⇒ 产物在双击 / ShellExecute 等 ASLR 生效的启动方式下必崩
+		 * （实测退出码 0xC0DE0002 = vm_img_fail(2)，见 STATUS #507/#508；而裸调用加载在首选基址，
+		 * delta=0，所以一直没暴露）。⇒ 这种情况下必须清掉 DYNAMIC_BASE，让加载器不要搬它。 */
+		if len(origRelocEntries(f)) == 0 {
+			clearDynamicBase(f)
+			fmt.Println("[!] 目标没有重定位目录 ⇒ 自动清除 DYNAMIC_BASE（否则 ASLR 生效时产物必崩）")
+		}
 	}
 	/* payload 的基址重定位与镜像加密**无关**：原来嵌在 if len(imgSecs)>0 里，
 	 * 于是 i386（跳过镜像加密）与 -no-enc-image 的情形下这段根本不执行 —— 实测因此
