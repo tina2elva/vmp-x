@@ -25,7 +25,11 @@ Write-Host ("[*] objdump : " + $objdump)
 
 # vmpbuild takes ONE program for -cc, so wrap clang with the arm64-windows target.
 $wrap = Join-Path $PWD "build/clang-a64w.cmd"
-Set-Content -Path $wrap -Value ("@echo off`r`n`"" + $clang + "`" --target=aarch64-w64-windows-gnu %*") -Encoding Ascii
+# Build the wrapper without backtick escapes or embedded quotes - that line used to be
+# written as ("@echo off`r`n`"" + $clang + ...) and pwsh rejected it with a ParserError on CI.
+$nl = [string][char]13 + [string][char]10
+$q = [string][char]34
+Set-Content -Path $wrap -Value ("@echo off" + $nl + $q + $clang + $q + " --target=aarch64-w64-windows-gnu %*") -Encoding Ascii
 
 & go build -o build/vmpbuild.exe ./cmd/vmpbuild
 & go build -o build/vmpack.exe ./cmd/vmpack
