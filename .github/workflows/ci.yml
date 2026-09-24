@@ -411,3 +411,15 @@ jobs:
           $rcC = "unset"; & .\build\target_arm64.exe; $rcC = $LASTEXITCODE
           Write-Host ("[*] EXT: native .exe rc=" + $rcC)
           $global:LASTEXITCODE = 0
+      - name: win/arm64 trace dump (always)
+        if: always()
+        shell: pwsh
+        run: |
+          # Dump the whole file-based trace unconditionally, so the diagnostics from every earlier
+          # step show up in ONE place (STATUS #518: the base: lines existed but I kept reading them
+          # from the wrong step).
+          if (Test-Path build/probe.txt) {
+            Write-Host "--- build/probe.txt (full) ---"
+            Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) }
+          } else { Write-Host "--- build/probe.txt missing ---" }
+          $global:LASTEXITCODE = 0
