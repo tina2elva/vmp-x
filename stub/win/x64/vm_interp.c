@@ -19,6 +19,12 @@
  * 而**原生 Windows/ARM64** 上 clang 的默认目标是 aarch64-pc-windows-msvc，只定义 _M_ARM64。
  * 只认 __aarch64__ 就会让 win/arm64 在 VM_KEY_EXTERNAL 下直接 #error，或退回 x86-64 的
  * %gs:[0x60] 分支（在 ARM64 上根本不合法）。CI 的 windows-11-arm 作业用的正是原生 clang。 */
+/* 诊断打印宏的**全局兜底**：真身（vm_dbg_win）只在外置+Windows+ARM64 的构建里定义，
+ * 但标记调用点散布在通用代码里 ⇒ 必须在这里先给一个 no-op，否则非外置构建会报"未声明"。 */
+#ifndef VM_DBG_WIN
+#define VM_DBG_WIN(x) ((void)0)
+#endif
+
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define VM_ARCH_AARCH64 1
 #elif !defined(VM_BLOB_TARGET_LINUX) && !defined(__x86_64__) && !defined(_M_X64) && !defined(VM_HOST_X86_32)
