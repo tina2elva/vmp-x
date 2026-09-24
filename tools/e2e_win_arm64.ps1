@@ -149,6 +149,21 @@ Remove-Item build/vm_interp_win_arm64_cal.bin, build/vm_interp_win_arm64_cal.jso
 if (-not (Test-Path build/vm_interp_win_arm64_cal.bin)) { Write-Host "[!] CALIBRATION: non-external blob build failed"; exit 1 }
 & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_cal.bin -manifest build/vm_interp_win_arm64_cal.json -out build/target_arm64_cal.exe -report build/target_arm64_cal_vmp.json 2>&1 | Select-Object -Last 6
 if (-not (Test-Path build/target_arm64_cal.exe)) { Write-Host "[!] CALIBRATION: packing failed"; exit 1 }
+# A/B on the LAUNCHER: the green step runs the product with a plain call (no pipeline, no shell),
+# and it succeeds there. Everything I ran so far went through a pipeline or Start-Process and
+# failed with a real-looking 0xC0DE0002. So compare both ways on the SAME exe.
+$calPlain = Join-Path $PWD "build/cal_plain.txt"
+Remove-Item $calPlain -ErrorAction SilentlyContinue
+$calRc2 = -999
+& (Join-Path $PWD "build/target_arm64_cal.exe") *> $calPlain; $calRc2 = $LASTEXITCODE
+$calOut2 = ""
+if (Test-Path $calPlain) { $calOut2 = ((Get-Content $calPlain -Raw) + "").Trim() }
+Mark ("cal-plain: rc=" + $calRc2 + " out=" + $calOut2)
+$soC = Join-Path $PWD "build/cal_sp.out"
+$seC = Join-Path $PWD "build/cal_sp.err"
+$calRc3 = -999
+try { $pc = Start-Process -FilePath (Join-Path $PWD "build/target_arm64_cal.exe") -Wait -PassThru -RedirectStandardOutput $soC -RedirectStandardError $seC; $calRc3 = $pc.ExitCode } catch { $calRc3 = -998 }
+Mark ("cal-startprocess: rc=" + $calRc3)
 $calRc = 0; $calOut = (& (Join-Path $PWD "build/target_arm64_cal.exe") 2>&1) -join "|"; $calRc = $LASTEXITCODE
 Write-Host ("[*] CALIBRATION (non-external blob): rc=" + $calRc + " out=[" + $calOut + "]  native rc=" + $natRc)
 if ($calRc -ne $natRc) { Write-Host "[!] CALIBRATION FAILED: my own default-mode product does not match native => this harness differs from the green job, so any external-mode conclusion is confounded" }
