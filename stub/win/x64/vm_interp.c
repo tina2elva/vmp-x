@@ -1727,6 +1727,7 @@ static void vm_antidebug(void) { }
 #endif
 
 int vm_run(vm_ctx_t *vm) {
+    VM_DBG_WIN("vm:run-entry\n"); /* 诊断：入口蹦床已成功调用到 VM 解释器（说明蹦床存活） */
     vm_antidebug();
     /* (4) 反调试定性后走**静默延后**：接下来几次直接给错结果，不给一个可定位的崩点。 */
     if (vm_dbg_defer) {
