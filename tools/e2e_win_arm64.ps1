@@ -100,6 +100,20 @@ if (Test-Path $green) {
     $gout = $gout.Trim()
     Write-Host ("[*] PROBE green-job product re-run: rc=" + $grc + " out=[" + $gout + "]")
     Mark ("probe:green-product rc=" + $grc + " out=" + $gout)
+    # 0xC0DE0002 = vm_img_fail(2) "needs relocation but the table is gone" -> smells like ASLR:
+    # the same file succeeded in the previous step of the same job. Run it 10 times and count.
+    $hist = @{}
+    for ($i = 1; $i -le 10; $i++) {
+        $ri = -999
+        try {
+            $pi = Start-Process -FilePath $green -Wait -PassThru -RedirectStandardOutput $so -RedirectStandardError $se
+            $ri = $pi.ExitCode
+        } catch { $ri = -998 }
+        if ($hist.ContainsKey($ri)) { $hist[$ri]++ } else { $hist[$ri] = 1 }
+    }
+    $line = "probe:green-product 10runs"
+    foreach ($k in $hist.Keys) { $line = $line + " rc=" + $k + "x" + $hist[$k] }
+    Mark $line
 } else {
     Write-Host "[*] PROBE green-job product not present"
     Mark "probe:green-product MISSING"
