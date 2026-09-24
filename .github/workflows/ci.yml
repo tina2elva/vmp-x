@@ -362,3 +362,19 @@ jobs:
           try { $pg = Start-Process -FilePath (Join-Path $PWD "build/target_arm64.vmp") -Wait -PassThru -RedirectStandardOutput $soG -RedirectStandardError $seG; $rr2 = $pg.ExitCode } catch { $rr2 = -998 }
           Write-Host ("[*] green step: same product via Start-Process -> rc=" + $rr2)
           $global:LASTEXITCODE = 0
+      - name: win/arm64 inline control (before and after my ps1)
+        shell: pwsh
+        run: |
+          # STATUS #513: a product packed from the GREEN step own blob still fails in my step,
+          # so the difference is step/process level. This control does NOT involve my .ps1 at
+          # first: if the green product runs fine here but not inside my .ps1, the difference is
+          # my script execution context; if it fails here too, it is the step process itself.
+          $rc0 = 0; & .\build\target_arm64.vmp; $rc0 = $LASTEXITCODE
+          Write-Host ("[*] INLINE-before: green product rc=" + $rc0)
+          $rc1 = 0; & .\build\target_arm64.exe; $rc1 = $LASTEXITCODE
+          Write-Host ("[*] INLINE-before: native target rc=" + $rc1)
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1 | Out-Null
+          Write-Host ("[*] my ps1 exit=" + $LASTEXITCODE)
+          $rc2 = 0; & .\build\target_arm64.vmp; $rc2 = $LASTEXITCODE
+          Write-Host ("[*] INLINE-after: green product rc=" + $rc2)
+          $global:LASTEXITCODE = 0
