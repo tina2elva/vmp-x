@@ -63,6 +63,16 @@ Write-Host "[*] packing..."
 & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -out build/target_arm64_ext.exe -report build/target_arm64_ext_vmp.json 2>&1 | Select-Object -Last 8
 if (-not (Test-Path build/target_arm64_ext.exe)) { Write-Host "[!] packing failed"; exit 1 }
 
+# ---- PROBE: re-run the product the (green) job built earlier in this same job ----
+# Discriminates two very different causes for the 0xC0DE0002 seen below:
+#   works here  => my construction differs from the green job;
+#   fails here  => the failure is order/state dependent, not about how I build.
+$green = Join-Path $PWD "build/target_arm64.vmp"
+if (Test-Path $green) {
+    $grc = 0; $gout = (& $green 2>&1) -join "|"; $grc = $LASTEXITCODE
+    Write-Host ("[*] PROBE green-job product re-run: rc=" + $grc + " out=[" + $gout + "]  (native rc=" + $natRc + ")")
+} else { Write-Host "[*] PROBE green-job product not present (build/target_arm64.vmp)" }
+
 # ---- CALIBRATION: the same flow, but with a NON-external blob ----
 # Without this, "the external build crashes" could just mean "my pack invocation differs from the
 # one the (green) windows-arm64-run job uses". AGENTS.md discipline: calibrate the probe first.
