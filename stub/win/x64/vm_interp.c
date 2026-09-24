@@ -3242,6 +3242,7 @@ int vm_unpack_image(const void *tblp) {
         VM_DBG_WIN("img:sec-verified\n");
         /* ④ 解密之后再把 delta 加回来（等价于加载器对明文做的那次重定位）。 */
         if (delta) vm_reloc_apply((const u8 *)base, delta, (u64)dst, (u64)dst + size);
+        VM_DBG_WIN("img:sec-post\n");
         /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）
          * PAGE_READONLY=0x02 / PAGE_READWRITE=0x04 / PAGE_EXECUTE_READ=0x20 / PAGE_EXECUTE_READWRITE=0x40 */
         u32 prot;
@@ -3252,6 +3253,7 @@ int vm_unpack_image(const void *tblp) {
         }
         vp(dst, size, prot, &old);
     }
+    VM_DBG_WIN("img:loop-done\n");
     vm_img_done = 1;
     vm_img_diag[0] = 0;
     return 0;
