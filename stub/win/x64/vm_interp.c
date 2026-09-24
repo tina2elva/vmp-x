@@ -19,6 +19,12 @@
  * 而**原生 Windows/ARM64** 上 clang 的默认目标是 aarch64-pc-windows-msvc，只定义 _M_ARM64。
  * 只认 __aarch64__ 就会让 win/arm64 在 VM_KEY_EXTERNAL 下直接 #error，或退回 x86-64 的
  * %gs:[0x60] 分支（在 ARM64 上根本不合法）。CI 的 windows-11-arm 作业用的正是原生 clang。 */
+/* 诊断打印宏的**全局兜底**：真身（vm_dbg_win）只在外置+Windows+ARM64 的构建里定义，
+ * 而标记调用点分布在通用代码里 ⇒ 必须先给出 no-op，否则非外置构建会报"未声明"（#523 踩过）。 */
+#ifndef VM_DBG_WIN
+#define VM_DBG_WIN(x) ((void)0)
+#endif
+
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define VM_ARCH_AARCH64 1
 #elif !defined(VM_BLOB_TARGET_LINUX) && !defined(__x86_64__) && !defined(_M_X64) && !defined(VM_HOST_X86_32)
@@ -3177,6 +3183,7 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[2] = wantBase;
     vm_img_diag[3]++;
     if (*(const u16 *)base != 0x5A4D) { vm_img_diag[0] = 1; vm_img_fail(1); return -1; } /* 反推出来的基址没有 MZ */
+    VM_DBG_WIN("img:mz-ok\n");
     /* (6)：以前是"实际基址 != 首选基址就拒绝执行"。现在保留重定位（ASLR 生效），
      * 基址不同是**正常**的：算出 delta，解密前后各做一次逆/正变换。只有"需要重定位却没有重定位表"
      * （被人为剥掉）才继续 fail-fast —— 那种情况下我们无法把加载器写进密文的增量还原出来。 */
@@ -3202,6 +3209,7 @@ int vm_unpack_image(const void *tblp) {
             return -2;
         }
     }
+    VM_DBG_WIN("img:delta-ok\n");
     typedef int (VM_WINAPI *vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
     if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }

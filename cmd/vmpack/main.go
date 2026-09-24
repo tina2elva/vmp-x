@@ -741,10 +741,13 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 			fmt.Printf("[*] blob 基址站点预置了 %d 个（追加重定位项=%v）", n, !stripRelocs)
 			fmt.Println()
 		}
+		/* **无条件**调用：即使 items 为空，也要让"目标没有 .reloc 就新建一个"那段被执行
+		 * （Windows/ARM64 的 freestanding 目标正是 items 为空、却需要这个节的情形）。
+		 * 对有重定位目录的目标（x64 等）：建节是 no-op、追加按 items 是否为空自然跳过 ⇒ 行为不变。 */
+		if err := appendRelocs(f, items); err != nil {
+			fatalf("补 payload 重定位项失败: %v", err)
+		}
 		if len(items) > 0 {
-			if err := appendRelocs(f, items); err != nil {
-				fatalf("补 payload 重定位项失败: %v", err)
-			}
 			fmt.Printf("[*] payload 里的绝对 VA 补了 %d 个重定位项（ASLR 下必须）", len(items))
 			fmt.Println()
 		}
@@ -1297,9 +1300,6 @@ func origRelocEntries(f *pe.File) [][2]uint32 {
 // appendRelocs 往 .reloc 尾部追加 DIR64 重定位项（按页分组），并同步数据目录 Size 与节 VirtualSize。
 // 只用于 payload 自己的绝对 VA —— 它们在**不被加密**的节里，加载器改了就是对的。
 func appendRelocs(f *pe.File, items [][2]uint32) error {
-	if len(items) == 0 {
-		return nil
-	}
 	const relocDir = 5
 	do := dirBase(f) + relocDir*8
 	rva := binary.LittleEndian.Uint32(f.Data[do:])
@@ -1324,6 +1324,12 @@ func appendRelocs(f *pe.File, items [][2]uint32) error {
 		size = 8
 		fmt.Printf("[!] 目标没有重定位目录 ⇒ 已新建 .reloc 节（RVA=0x%X）供 payload 站点使用", rva)
 		fmt.Println()
+	}
+	/* items 为空 ⇒ 没有需要追加的条目，到此为止。**这个判断必须在建节之后**：建节那一段正是要负责
+	 * "目标本来就没有 .reloc"的情形，而那种情形下 items 往往也是空的（#521 因把提前返回放在最前面
+	 * 而让建节永远不执行；也因去掉它而让 x64 的空 items 路径把产物写坏 ⇒ 现在两者兼得）。 */
+	if len(items) == 0 {
+		return nil
 	}
 	off, err := f.RVAtoOffset(rva)
 	if err != nil || off < 0 {
