@@ -791,7 +791,27 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
  * 其它目标在这里就报错，vmpbuild 也会先拦住它们（两道守卫互为呼应）。 */
 #if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64) || defined(VM_HOST_X86_32))) && \
     !(defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64)))
-#error "VM_KEY_EXTERNAL 只有 Windows(x64/arm64/x86) 与 Linux(amd64/arm64) 的取钥实现（vmpbuild 会先拦住别的目标）"
+/* 探针：本工具链到底定义了哪些架构宏。每个成立的宏各报一条 error，编译器会把它们全部打出来，
+ * 于是一次 CI 往返就能拿到完整画像（而不是靠猜）。确认后这条探针会被真正的判定取代。 */
+#  if defined(__x86_64__)
+#    error "probe: __x86_64__ IS defined"
+#  endif
+#  if defined(_M_X64)
+#    error "probe: _M_X64 IS defined"
+#  endif
+#  if defined(__aarch64__)
+#    error "probe: __aarch64__ IS defined"
+#  endif
+#  if defined(_M_ARM64)
+#    error "probe: _M_ARM64 IS defined"
+#  endif
+#  if defined(VM_HOST_X86_32)
+#    error "probe: VM_HOST_X86_32 IS defined"
+#  endif
+#  if defined(VM_GUEST_ARM64)
+#    error "probe: VM_GUEST_ARM64 IS defined"
+#  endif
+#  error "VM_KEY_EXTERNAL 只有 Windows(x64/arm64/x86) 与 Linux(amd64/arm64) 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
 #if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
