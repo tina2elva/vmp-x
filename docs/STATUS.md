@@ -8383,3 +8383,31 @@ blob manifest 里的 `imageBase`），用于检验上一轮留下的矛盾：
 以定位崩在 `VirtualProtect`、`vm_reloc_apply`（delta 逆变换）还是 `vm_aead_verify_aad`。
 预期嫌疑：**空 `.reloc`（只有 page=0/size=8 的 pad 块）** ⇒ `vm_reloc_apply` 遍历它没问题，
 但若加载器把它视为"有重定位表 ⇒ 可以搬动"而**实际没有任何条目**，镜像里任何绝对 VA 都会是过期的。
+
+### 527. **重大突破**：镜像解密完整跑通（含 AEAD 验签）—— (a) 线已打通，崩溃改在"解密之后"
+
+**证据（CI run 36009052221，复现器输出）**：
+
+    out=[1b:enter|1b:fetched|img:fn-entry|img:mz-ok|img:delta-ok|
+         img:sec-prot|img:sec-pre|img:sec-verified|img:sec-post|
+         img:sec-prot|img:sec-pre|img:sec-verified|img:sec-post|img:loop-done]
+
+**逐段确认**：
+
+| 阶段 | 结论 |
+|---|---|
+| `1b:enter` / `1b:fetched` | ✅ 取钥（外置）正常 |
+| `img:fn-entry` | ✅ 进了 Windows 镜像解密 |
+| `img:mz-ok` | ✅ 基址反推成功 |
+| `img:delta-ok` | ✅✅ **建节改动奏效**（`delta != 0 且无重定位表`的拒绝不再触发） |
+| `img:sec-prot` | ✅ `VirtualProtect` 成功（两节） |
+| `img:sec-pre` → `img:sec-verified` | ✅✅ **AEAD 验签通过** ⇒ delta 逆变换正确、打包与运行期一致 |
+| `img:sec-post` | ✅ delta 正变换（回写）成功 |
+| `img:loop-done` | ✅✅ **解密循环完整结束、函数走到 return 之前** |
+
+⇒ **结论**：**(a) 线（ASLR / 无 `.reloc` / 镜像解密）已经打通** ✓。
+崩溃（`0xC0000005`）发生在 **`vm_unpack_image` 返回之后** ⇒ 区域换成了：**入口蹦床后半段 / `vm_run` / 目标 `entry`**。
+这也再次证实**与取钥无关**（取钥标记出现在崩溃之前很远）。
+
+**下一步**：在 `vm_run` 入口（以及入口蹦床之后的路径）加标记，继续定位；
+另一条独立线索是 **strip 版能跑却返回 0**（≠ native），可能指向"打包后 `entry` 返回值传递"的缺陷。
