@@ -190,4 +190,19 @@ else
     exit 1
 fi
 
+# 第三种形态：VMPX_KEY_FILE 指向**绝对路径**的密钥文件。
+# 这一条刻意不走 <产物>.vmpkey（那条要 readlink(/proc/self/exe)，而 qemu-user 下它指向宿主 qemu，不可靠），
+# 于是 arm64 也能像 amd64/i686 一样覆盖"文件"形态的取钥路径。
+KEYABS="$PWD/build/arm64_key.vmpkey"
+printf %s "$KEY1B" > "$KEYABS"
+frc=0
+fout=$(VMPX_KEY_FILE="$KEYABS" $QEMU ./build/arm64_target_ext.vmp 2>&1) || frc=$?
+rm -f "$KEYABS"
+if [ "$frc" -eq 0 ] && [ "$fout" = "$native" ]; then
+    echo "[+] 1b: 有密钥(VMPX_KEY_FILE 绝对路径) -> 与原生一致"
+else
+    echo "[!] 1b: 有密钥(VMPX_KEY_FILE) rc=$frc；native=[$(printf %s "$native" | tr "\n" "|")] ext=[$(printf %s "$fout" | tr "\n" "|")]"
+    exit 1
+fi
+
 ok=1
