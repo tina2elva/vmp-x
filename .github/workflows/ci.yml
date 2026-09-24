@@ -405,3 +405,16 @@ jobs:
           } else { Write-Host "--- build/probe.txt missing (reproducer not run in this job) ---" }
           $global:LASTEXITCODE = 0
           $global:LASTEXITCODE = 0
+      - name: win/arm64 reproducer with stage markers
+        if: always()
+        shell: pwsh
+        run: |
+          # Runs the reproducer (it builds an EXTERNAL blob - only those carry the stage markers)
+          # and dumps its file trace, to see how far the product gets before the 0xC0000005
+          # that #521 left behind.
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
+          Write-Host ("[*] reproducer exit=" + $LASTEXITCODE)
+          if (Test-Path build/probe.txt) {
+            Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) }
+          } else { Write-Host "  TRACE| (missing)" }
+          $global:LASTEXITCODE = 0
