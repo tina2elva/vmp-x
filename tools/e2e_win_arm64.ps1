@@ -1,0 +1,80 @@
+# e2e_win_arm64.ps1 - 1b external-master-key acceptance for Windows/ARM64, run NATIVELY.
+#
+# This is the only environment that can execute the Windows/ARM64 blob: the other two arm64
+# CI jobs run on x86-64 hosts and only execute arm64 GUEST bytecode, while the blob itself is
+# ARM64 machine code. So this script is the runtime proof for platform (c).
+#
+# ASCII only: PS 5.1 reads .ps1 as ANSI, and a non-ASCII byte swallows the following line.
+
+$ErrorActionPreference = "Continue"
+if ($PSScriptRoot) { Set-Location (Join-Path $PSScriptRoot "..") }
+New-Item -ItemType Directory -Force -Path build | Out-Null
+
+# ---- locate clang (LLVM) ----
+$clang = (Get-Command clang -ErrorAction SilentlyContinue).Source
+if (-not $clang) {
+    foreach ($c in @("C:\Program Files\LLVM\bin\clang.exe", "C:\Program Files (x86)\LLVM\bin\clang.exe")) {
+        if (Test-Path $c) { $clang = $c; break }
+    }
+}
+if (-not $clang) { Write-Host "[!] clang not found (install LLVM first)"; exit 1 }
+$objdump = (Get-Command llvm-objdump -ErrorAction SilentlyContinue).Source
+if (-not $objdump) { $objdump = "llvm-objdump" }
+Write-Host ("[*] clang   : " + $clang)
+Write-Host ("[*] objdump : " + $objdump)
+
+# vmpbuild takes ONE program for -cc, so wrap clang with the arm64-windows target.
+$wrap = Join-Path $PWD "build/clang-a64w.cmd"
+Set-Content -Path $wrap -Value ("@echo off`r`n`"" + $clang + "`" --target=aarch64-w64-windows-gnu %*") -Encoding Ascii
+
+& go build -o build/vmpbuild.exe ./cmd/vmpbuild
+& go build -o build/vmpack.exe ./cmd/vmpack
+if (-not (Test-Path build/vmpbuild.exe) -or -not (Test-Path build/vmpack.exe)) { Write-Host "[!] go build failed"; exit 1 }
+
+# ---- the freestanding ARM64 PE test target (no Windows SDK needed) ----
+Write-Host "[*] building the arm64 PE test target..."
+& $clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib -fuse-ld=lld -Wl,-e,entry -Wl,-subsystem=console -o build/target_arm64.exe testdata/arm64/target_win.c 2>&1 | Select-Object -Last 8
+if (-not (Test-Path build/target_arm64.exe)) { Write-Host "[!] arm64 PE target build failed"; exit 1 }
+
+# ---- the Windows/ARM64 blob in EXTERNAL key mode ----
+$keyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+Remove-Item build/vm_interp_win_arm64_ext.bin, build/vm_interp_win_arm64_ext.json -ErrorAction SilentlyContinue
+Write-Host "[*] building the Windows/arm64 external-key blob..."
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $wrap -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 10
+if (-not (Test-Path build/vm_interp_win_arm64_ext.bin)) { Write-Host "[!] Windows/arm64 external blob build FAILED"; exit 1 }
+
+# ---- pack check_key / sum_to ----
+Write-Host "[*] packing..."
+& .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -out build/target_arm64_ext.exe -report build/target_arm64_ext_vmp.json 2>&1 | Select-Object -Last 8
+if (-not (Test-Path build/target_arm64_ext.exe)) { Write-Host "[!] packing failed"; exit 1 }
+
+# ---- three cases: no key / VMPX_KEY env / <product>.vmpkey file ----
+$bad = 0
+function Fail([string]$m) { Write-Host ("[!] " + $m); $script:bad++ }
+
+& build/target_arm64.exe | Out-Null; $natRc = $LASTEXITCODE
+$natOut = (& build/target_arm64.exe 2>&1) -join "|"
+Write-Host ("[*] native rc=" + $natRc + " out=" + $natOut)
+
+$pk = Join-Path $PWD "build/target_arm64_ext.exe"
+$keyFile = $pk + ".vmpkey"
+Remove-Item $keyFile -ErrorAction SilentlyContinue
+$env:VMPX_KEY = $null
+$o1 = (& $pk 2>&1) -join "|"; $r1 = $LASTEXITCODE
+if ($r1 -ne [int]0xC0DE0007) { Fail ("no key: rc=" + $r1 + " expected " + [int]0xC0DE0007 + " out=[" + $o1 + "]") }
+else { Write-Host "  [OK  ] 1b: no key -> 0xC0DE0007 (hard gate)" }
+
+$env:VMPX_KEY = $keyHex
+$o2 = (& $pk 2>&1) -join "|"; $r2 = $LASTEXITCODE
+$env:VMPX_KEY = $null
+if ($r2 -ne $natRc -or $o2 -ne $natOut) { Fail ("VMPX_KEY: rc=" + $r2 + " native=" + $natRc + " out=[" + $o2 + "]") }
+else { Write-Host "  [OK  ] 1b: VMPX_KEY -> matches native" }
+
+Set-Content -Path $keyFile -Value $keyHex -NoNewline -Encoding Ascii
+$o3 = (& $pk 2>&1) -join "|"; $r3 = $LASTEXITCODE
+Remove-Item $keyFile -ErrorAction SilentlyContinue
+if ($r3 -ne $natRc -or $o3 -ne $natOut) { Fail (".vmpkey file: rc=" + $r3 + " native=" + $natRc + " out=[" + $o3 + "]") }
+else { Write-Host "  [OK  ] 1b: .vmpkey file -> matches native" }
+
+if ($bad -eq 0) { Write-Host "[OK] win/arm64 1b external key: 3/3" } else { Write-Host ("[!] win/arm64 1b: " + $bad + " case(s) failed") }
+exit $bad

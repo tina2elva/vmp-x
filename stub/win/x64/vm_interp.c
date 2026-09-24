@@ -773,11 +773,11 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
  * 密钥形式：环境变量 VMPX_KEY = 64 个十六进制字符（32 字节原始密钥）。 */
 #ifdef VM_KEY_EXTERNAL
 
-/* 已实现取钥的平台：Windows/x64（PEB + ntdll）与 Linux/amd64、Linux/arm64（syscall）。
+/* 已实现取钥的平台：Windows(x64 / arm64 / x86) 与 Linux(amd64 / arm64)。
  * 其它目标在这里就报错，vmpbuild 也会先拦住它们（两道守卫互为呼应）。 */
-#if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_HOST_X86_32))) && \
+#if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(__aarch64__) || defined(VM_HOST_X86_32))) && \
     !(defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(__aarch64__)))
-#error "VM_KEY_EXTERNAL 只有 Windows/x64 与 Linux/amd64、Linux/arm64 的取钥实现（vmpbuild 会先拦住别的目标）"
+#error "VM_KEY_EXTERNAL 只有 Windows(x64/arm64/x86) 与 Linux(amd64/arm64) 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
 static u8 vm_master_buf[32];

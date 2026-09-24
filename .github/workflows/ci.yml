@@ -350,3 +350,14 @@ jobs:
           # 关键：GitHub 的 pwsh 包装器最后会 `exit $LASTEXITCODE`，而这里 $LASTEXITCODE 还是
           # 被保护程序自己的退出码（非 0）——不显式清零，比较通过了步骤也会被判失败。
           $global:LASTEXITCODE = 0
+      - name: 1b external master key (no key / VMPX_KEY / .vmpkey file)
+        shell: pwsh
+        run: |
+          # 1b external-key acceptance, run NATIVELY on this arm64 Windows runner.
+          # This job is the only place in CI where the Windows/ARM64 blob (ARM64 machine code,
+          # not guest bytecode) can actually execute - so it is the runtime proof for platform (c).
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error title=win/arm64 1b external key failed::exit $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
