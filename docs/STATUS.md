@@ -7338,3 +7338,36 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
    （后者本会话早些时候已修：`VM_WINAPI` 宏）；
 2. **win/arm64**：Windows 在 ARM64 上不是 `gs:[0x60]`，要另写 TEB/PEB 取法；
 3. Linux 侧**授权与狗**仍是 fail-closed 桩。
+
+### 492. W3 第四步：win/x86(i686) **部分完成**（环境变量通了，文件路径仍缺）—— 未放开白名单
+
+**本轮做的改动（保留，作为准备）**：
+
+1. `vm_get_proc_d` 的**导出目录基址**改为按位宽：i386 用 `24 + 96`（PE32），x64 用 `24 + 112`（PE32+）
+   —— 原来硬编码 112，i386 下会把别的字段当导出表；
+2. `RTL_USER_PROCESS_PARAMETERS` 的字段偏移按位宽：i386 的 `ImagePathName@+0x38`、`Environment@+0x48`
+   （x64 是 +0x60 / +0x80）；
+3. **PEB -> ProcessParameters** 的偏移也按位宽：i386 是 `+0x10`、x64 是 `+0x20`
+   —— 这一层最容易漏：只改 PP 内部偏移时，环境块与 ImagePathName 会**一起**读不到。
+
+（PEB/LDR 那一套宏 `VM_PEB_LDR_OFF` 等**早就**按位宽分好了，本轮没动。）
+
+**本机端到端实测（临时放开白名单做的，测完已撤回）**：
+
+    native            = 35
+    无密钥            = 0xC0DE0007  ✓ 硬门正确（低 8 位/整值都对）
+    VMPX_KEY 环境变量 = 35          ✓ 与原生一致
+    <产物>.vmpkey 文件 = 0xC0DE0007  ✗ 仍被拒
+    VMPX_KEY_FILE=绝对路径 = 0xC0DE0007 ✗ 仍被拒   ← 关键隔离实验
+
+⇒ 两个"文件"用例都失败，而**环境变量**用例成功 ⇒ 缺口不在路径推导，而在**文件读取**这一环：
+`vm_key_read_nt` 依赖 `vm_find_module("ntdll.dll")` + `vm_get_proc(NtCreateFile/NtReadFile/NtClose)`，
+即 **i386 下的模块遍历/导出遍历**还没真正跑通。
+
+**处置**：按 fail-fast 纪律，**`win/x86` 暂不加入 `vmpbuild` 白名单**（否则会产出"默认部署方式
+——`.vmpkey` 文件——不工作"的产物，比构建期报错更难查）；白名单里只留 win/x64 / linux/amd64 / linux/arm64。
+本轮的三处偏移修正保留（它们对已支持平台无影响，是 i386 的必要准备）。
+
+**下一步（i386 收尾）**：查 `vm_find_module`/`vm_get_proc_d` 在 i386 下为何取不到 ntdll 导出 ——
+可用本轮的隔离手法（`VMPX_KEY_FILE` + 本机 32 位产物）逐层验证：先确认 PEB->Ldr 链表能走通，
+再看导出目录/名字表解析；通了再把 `win/x86` 加回白名单，并把三条用例补进门禁。

@@ -708,3 +708,8 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       ⇒ **目标 (a) Linux/amd64 + Linux/arm64 完成。**
 - [ ] win/x86(i686)：32 位 PEB + 导出表遍历 + __stdcall（VM_WINAPI 宏已就位）
 - [ ] win/arm64：ARM64 TEB/PEB 取法
+
+- [ ] win/x86(i686)：**部分完成**（#492）—— PEB/LDR 宏早已按位宽分好；本轮又修了「导出目录基址」
+      「RTL_USER_PROCESS_PARAMETERS 的 ImagePathName/Environment 偏移」「PEB->ProcessParameters 偏移」三处；
+      本机实测 **VMPX_KEY 环境变量那条已与原生一致**，但 **<产物>.vmpkey 文件那条仍读不到**
+      （卡在 32 位模块/导出遍历）⇒ 按 fail-fast 纪律**白名单暂不放开**。

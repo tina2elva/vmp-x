@@ -812,6 +812,25 @@ static u32 vm_hexval(u16 c) {
     return 0xFFFFFFFFu;
 }
 
+/* PEB -> ProcessParameters 的偏移也按位宽：x64 是 +0x20，i386 是 +0x10。
+ * 只改 PP 内部偏移是不够的 —— 这一层用错，环境块与 ImagePathName 会一起读不到。 */
+#if defined(VM_HOST_X86_32)
+#define VM_PEB_PP_OFF      0x10u
+#else
+#define VM_PEB_PP_OFF      0x20u
+#endif
+
+/* RTL_USER_PROCESS_PARAMETERS 的字段偏移按位宽不同：
+ *   x64 : ImagePathName@+0x60、Environment@+0x80
+ *   i386: ImagePathName@+0x38、Environment@+0x48
+ * 用错就会把别的字段当成 UNICODE_STRING/环境块，取钥永远失败（表现为给了密钥仍被拒）。 */
+#if defined(VM_HOST_X86_32)
+#define VM_PP_IMAGE_OFF    0x38u
+#define VM_PP_ENV_OFF      0x48u
+#else
+#define VM_PP_IMAGE_OFF    0x60u
+#define VM_PP_ENV_OFF      0x80u
+#endif
 /* ============================ Linux/amd64 取钥原语 ============================
  * blob 是 freestanding 的：不链接 libc，全部走 syscall(2)。本文件后面已定义 vm_syscall3
  * （x86_64：rax=n, rdi/si/dx = a/b/c），这里只做前置声明。
@@ -932,9 +951,9 @@ static void vm_key_reject(void) { vm_key_reject_code(7u); }
 static const u16 *vm_env_block(void) {
     u64 peb = vm_peb_base();
     if (!peb) return 0;
-    const u8 *pp = *(const u8 *const *)(peb + 0x20);
+    const u8 *pp = *(const u8 *const *)(peb + VM_PEB_PP_OFF);
     if (!pp) return 0;
-    return *(const u16 *const *)(pp + 0x80);
+    return *(const u16 *const *)(pp + VM_PP_ENV_OFF);
 }
 
 /* 在环境块里按名字取右值（名字是 ASCII，大小写不敏感）。 */
@@ -989,9 +1008,9 @@ static const u16 *vm_key_path(void) {
     }
     u64 peb = vm_peb_base();
     if (!peb) return 0;
-    const u8 *pp = *(const u8 *const *)(peb + 0x20);
+    const u8 *pp = *(const u8 *const *)(peb + VM_PEB_PP_OFF);
     if (!pp) return 0;
-    const vm_ustr_t *ip = (const vm_ustr_t *)(pp + 0x60); /* ImagePathName */
+    const vm_ustr_t *ip = (const vm_ustr_t *)(pp + VM_PP_IMAGE_OFF); /* ImagePathName */
     if (!ip || !ip->Buffer || ip->Length < 2) return 0;
     u32 chars = (u32)(ip->Length / 2);
     if (chars > 330) chars = 330;
@@ -1083,7 +1102,7 @@ u32 vm_license_fail_stage;
 static const u16 *vm_exe_path_suffix(const char *suffix, u16 *out, u32 cap) {
     u64 peb = vm_peb_base();
     if (!peb) return 0;
-    const u8 *pp = *(const u8 *const *)(peb + 0x20);
+    const u8 *pp = *(const u8 *const *)(peb + VM_PEB_PP_OFF);
     if (!pp) return 0;
     const vm_ustr_t *ip = (const vm_ustr_t *)(pp + 0x60);
     if (!ip || !ip->Buffer || ip->Length < 2) return 0;
@@ -2872,6 +2891,26 @@ static int vm_name_eq(const char *a, const char *b) {
 #define vm_pread(p)         (*(const u64 *)(p))
 #endif
 
+/* 数据目录基址：PE32+ 在可选头 +112，PE32 在 +96。i386 宿主下被遍历的是 **32 位模块**
+ * （WoW64 的 kernel32/ntdll），所以必须用 +96；用错就会把别的字段当导出表，顺着垃圾 RVA 走。 */
+/* RTL_USER_PROCESS_PARAMETERS 的字段偏移同样按位宽不同：
+ *   x64 : ImagePathName@+0x60、Environment@+0x80
+ *   i386: ImagePathName@+0x38、Environment@+0x48
+ * 用错就会把别的字段当成 UNICODE_STRING/环境块 ⇒ 取钥永远失败（表现为"给了密钥还被拒"）。 */
+#if defined(VM_HOST_X86_32)
+#define VM_PP_IMAGE_OFF    0x38u
+#define VM_PP_ENV_OFF      0x48u
+#else
+#define VM_PP_IMAGE_OFF    0x60u
+#define VM_PP_ENV_OFF      0x80u
+#endif
+
+#if defined(VM_HOST_X86_32)
+#define VM_EXPORT_DIR_OFF  96
+#else
+#define VM_EXPORT_DIR_OFF  112
+#endif
+
 /* 只走 PEB -> Ldr -> InMemoryOrderModuleList（偏移见上面的宏）。 */
 static u64 vm_find_module(const char *name) {
     u64 peb = vm_peb_base();
@@ -2930,8 +2969,8 @@ static void *vm_get_proc_d(u64 mod, const char *fn, int depth) {
     u32 lfanew = *(const u32 *)(p + 0x3C);
     const u8 *pe = p + lfanew;
     if (*(const u32 *)pe != 0x00004550u) return 0;              /* "PE\0\0" */
-    u32 expRva = *(const u32 *)(pe + 24 + 112);
-    u32 expSize = *(const u32 *)(pe + 24 + 116);
+    u32 expRva = *(const u32 *)(pe + 24 + VM_EXPORT_DIR_OFF);
+    u32 expSize = *(const u32 *)(pe + 24 + VM_EXPORT_DIR_OFF + 4);
     if (!expRva) return 0;
     const u8 *exp = p + expRva;
     u32 nFuncs = *(const u32 *)(exp + 20);
