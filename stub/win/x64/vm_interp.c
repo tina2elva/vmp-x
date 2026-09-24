@@ -780,6 +780,28 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
 #error "VM_KEY_EXTERNAL 只有 Windows(x64/arm64/x86) 与 Linux(amd64/arm64) 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
+#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(__aarch64__)
+/* 临时诊断（仅 Windows/ARM64 编译）：外置模式在该平台固定 0xC0000005，
+ * 在 vm_master() 的关键节点往 stderr 打标记，用来三分定位崩在哪一段。
+ * 走 kernel32!GetStdHandle + WriteFile（vm_get_proc 会解析转发导出）；取不到就静默放弃，
+ * 这样"什么标记都没有"本身也是信息（说明更早就崩了）。 */
+static void vm_dbg_win(const char *s) {
+    typedef void *(*gsh_t)(u32);
+    typedef int (VM_WINAPI *wf_t)(void *, const void *, u32, u32 *, void *);
+    u64 k = vm_find_module("KERNEL32.DLL");
+    if (!k) return;
+    gsh_t gsh = (gsh_t)vm_get_proc(k, "GetStdHandle");
+    wf_t wf = (wf_t)vm_get_proc(k, "WriteFile");
+    if (!gsh || !wf) return;
+    void *h = gsh(0xFFFFFFF5u); /* STD_ERROR_HANDLE */
+    u32 n = 0, w = 0;
+    while (s[n] && n < 60) n++;
+    wf(h, s, n, &w, 0);
+}
+#define VM_DBG_WIN(x) vm_dbg_win(x)
+#else
+#define VM_DBG_WIN(x) ((void)0)
+#endif
 static u8 vm_master_buf[32];
 static u32 vm_master_ok; /* .bss：0 = 还没取，1 = 已取且 KCV 通过 */
 
@@ -1404,6 +1426,7 @@ static int vm_key_from_env(void) {
 
 const u8 *vm_master(void) {
     if (vm_master_ok) return vm_master_buf;
+    VM_DBG_WIN("1b:enter\n");
     /* 取钥顺序：① 外部文件（部署默认：与产物同目录的 <产物名>.vmpkey）
      *           ② 环境变量 VMPX_KEY（64 位 hex，方便临时/CI 用）
      * 两者都拿不到、或与 KCV 不符 -> 硬门 0xC0DE0007。将来上硬件狗时，
@@ -1416,6 +1439,7 @@ const u8 *vm_master(void) {
     } else if (!vm_key_from_file() && !vm_key_from_env()) {
         vm_key_reject();
     }
+    VM_DBG_WIN("1b:fetched\n");
     {   /* KCV 自检：在任何解密之前判定"手里这把主密钥对不对" */
         static const u8 want[VM_KEY_CHECK_LEN] = VM_KEY_CHECK_BYTES;
         u8 kcv[32];
