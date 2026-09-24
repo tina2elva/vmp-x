@@ -817,8 +817,9 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
 #  error "VM_KEY_EXTERNAL 只有 Windows(x64/arm64/x86) 与 Linux(amd64/arm64) 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
-/* 诊断打印助手：Windows/ARM64 目标就编译（**不要求**外置模式，否则默认模式的产物打不出标记）。 */
-#if defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64) && !defined(VM_BLOB_TARGET_LINUX)
+/* 诊断打印助手：只在**外置模式**的 Windows/ARM64 构建里编译 —— 它用的 vm_find_module/vm_get_proc
+ * 前向声明就在外置分支里（放宽守卫曾导致非外置构建编译失败、三个作业变红，见 #523）。 */
+#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
 /* 临时诊断（仅 Windows/ARM64 编译）：外置模式在该平台固定 0xC0000005，
  * 在 vm_master() 的关键节点往 stderr 打标记，用来三分定位崩在哪一段。
  * 走 kernel32!GetStdHandle + WriteFile（vm_get_proc 会解析转发导出）；取不到就静默放弃，
