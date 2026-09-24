@@ -3243,6 +3243,14 @@ int vm_unpack_image(const void *tblp) {
         VM_DBG_WIN("img:sec-verified\n");
         /* ④ 解密之后再把 delta 加回来（等价于加载器对明文做的那次重定位）。 */
         if (delta) vm_reloc_apply((const u8 *)base, delta, (u64)dst, (u64)dst + size);
+#if defined(VM_ARCH_AARCH64)
+        /* **ARM64 必须刷新指令缓存**：I-cache 与 D-cache 不保证一致，刚解密写入的代码若不刷新，
+         * 接下来执行的可能是旧数据/垃圾 ⇒ 实测现象正是"解密全部成功、紧接着在入口蹦床里
+         * 0xC0000005"（STATUS #527/#528）。Linux/arm64 侧本来就有这一步
+         * （stub/linux/arm64/payload_probe.c 的注释写明"写完代码后必须 __builtin___clear_cache"），
+         * Windows 侧此前漏了 —— x64 因 I-cache 天然一致而看不出问题，arm64 必崩。 */
+        __builtin___clear_cache((char *)dst, (char *)(dst + size));
+#endif
         VM_DBG_WIN("img:sec-post\n");
         /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）
          * PAGE_READONLY=0x02 / PAGE_READWRITE=0x04 / PAGE_EXECUTE_READ=0x20 / PAGE_EXECUTE_READWRITE=0x40 */
