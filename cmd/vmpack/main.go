@@ -1305,7 +1305,25 @@ func appendRelocs(f *pe.File, items [][2]uint32) error {
 	rva := binary.LittleEndian.Uint32(f.Data[do:])
 	size := binary.LittleEndian.Uint32(f.Data[do+4:])
 	if rva == 0 {
-		return fmt.Errorf("没有 .reloc 目录")
+		/* 目标**没有重定位目录**时自己建一个（STATUS #520）：
+		 * freestanding 链接的目标（例如 Windows/ARM64 的 testdata/arm64/target_win.c）没有绝对引用，
+		 * lld 因此不生成 .reloc。但 payload 里的绝对 VA 站点是打包端按**首选基址**预置的
+		 * （见上面 `uint32(f.ImageBase)+res.SectionRVA+cur`），一旦加载器把它装到别处（ASLR），
+		 * 这些站点就是过期的 ⇒ 运行期必然 0xC0000005。
+		 * 所以这里补一个 .reloc 节：先放一个合法的空块（page=0,size=8，无条目），
+		 * 随后本函数照常在它后面追加真正的条目，并把数据目录 5 指过去。 */
+		pad := make([]byte, 8) /* 空块：SizeOfBlock = 8，无条目 */
+		binary.LittleEndian.PutUint32(pad[4:], 8)
+		sec, serr := f.AddSection(".reloc", pad, 0x42000040) /* READ|INITIALIZED_DATA|DISCARDABLE */
+		if serr != nil {
+			return fmt.Errorf("目标没有 .reloc 且新建节失败: %w", serr)
+		}
+		binary.LittleEndian.PutUint32(f.Data[do:], sec.VirtualAddress)
+		binary.LittleEndian.PutUint32(f.Data[do+4:], 8)
+		rva = sec.VirtualAddress
+		size = 8
+		fmt.Printf("[!] 目标没有重定位目录 ⇒ 已新建 .reloc 节（RVA=0x%X）供 payload 站点使用", rva)
+		fmt.Println()
 	}
 	off, err := f.RVAtoOffset(rva)
 	if err != nil || off < 0 {
