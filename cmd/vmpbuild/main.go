@@ -153,7 +153,9 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：跑宏探针确定该工具链的架构宏（结论出来后按结果决定去留）
+		// "win/arm64"：定位中（#497-#500）。崩溃已消除（宏探针 + Windows ABI 检测修复），取钥代码已实测执行
+		// （stderr 标记 1b:enter / 1b:fetched 均出现），无密钥时硬门 0xC0DE0007 正确；剩余问题是产物以
+		// 0xC0DE0002（vm_img_fail(2)：需要重定位但表没了）失败，且**非外置产物同样如此** ⇒ 与密钥无关。
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)

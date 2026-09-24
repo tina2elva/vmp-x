@@ -7614,3 +7614,42 @@ CI 里本来就有 `windows-arm64-run` 作业，其 `runs-on: windows-11-arm`（
 
 **⑤ 处置**：白名单**重新关闭**（fail-fast）；撤掉 CI 里的诊断步骤（避免噪声）；**保留**复现器
 （含校准用例）与诊断代码，供下一轮直接续上。
+
+### 500. win/arm64 定位（第 3 轮）：**崩溃已消除**，取钥代码实测执行；剩余问题与密钥无关
+
+**① 宏探针（一次 CI 拿到完整画像，run 35955971985）**：
+
+    probe: __aarch64__ IS defined
+    probe: _M_ARM64 IS defined
+    probe: VM_GUEST_ARM64 IS defined
+    （未出现 __x86_64__ / _M_X64 / VM_HOST_X86_32）
+
+⇒ 我上一轮"`__aarch64__` 与 `_M_ARM64` 都不成立"的判断**也是错的**；真因是另一件事（见 ②）。
+
+**② 真因（vmpbuild 的 Windows ABI 检测）**：`cmd/vmpbuild/main.go` 原本只认：
+
+    compilerIsWindows = strings.Contains(machine, "mingw") || strings.Contains(machine, "w64")
+
+而原生 Windows/ARM64 上 `clang -dumpmachine` 返回 `aarch64-pc-windows-msvc` ⇒ **两个都不含** ⇒
+`VM_BLOB_USES_WIN64` 从未被定义 ⇒ 1b 的守卫误报 `#error`（探针那次就是它）。已放宽为同时认
+`windows` / `msvc` / `win32`，并撤回此前在 C 侧临时放宽的两处守卫（保持机制单一）。
+
+**③ 修复后的实测（run 35957001462）—— 崩溃彻底消失**：
+
+    native rc=654184885
+      [OK  ] 1b: no key -> 0xC0DE0007 (hard gate)      ← 硬门正确
+    [!] VMPX_KEY:     rc=-1059192830  out=[1b:enter|1b:fetched]
+    [!] .vmpkey file: rc=-1059192830  out=[1b:enter|1b:fetched]
+    [*] CALIBRATION (non-external blob): rc=-1059192830
+
+⇒ 三重意义：**(a)** `0xC0000005` 不再出现；**(b)** 两个 stderr 标记都打出来了 ⇒ 打印器**可达**（校准缺口闭合）
+且**取钥代码真的执行了**；**(c)** 无密钥时硬门 `0xC0DE0007` **正确**。
+
+**④ 剩余问题（与密钥无关）**：给密钥后（以及**非外置**的校准产物）都以 `0xC0DE0002` 退出。
+该码在本仓库是 `vm_img_fail(2)`：**"需要重定位但没有重定位表"**（入口自解密的诊断路径）。
+⇒ 也就是说剩下的问题在**镜像自解密/重定位**这一环，而不是取钥；而且它连"默认模式产物"都影响 ⇒
+**我的复现器与绿作业之间仍有最后一处差异未找到**（两边 `vmpbuild` 与 `vmpack` 的参数经逐字比对**完全一致**，
+差异只剩产物文件名/运行顺序等表面项）。
+
+**⑤ 处置**：白名单**重新关闭**（fail-fast）；撤掉 CI 探针步骤；保留复现器（含**校准用例**）与诊断标记，
+供下一轮直接续上。
