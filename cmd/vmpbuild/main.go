@@ -153,7 +153,9 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：跑"绿作业产物复跑"探针（结论出来后按结果决定去留）
+		// "win/arm64"：定位中（#497-#503）。崩溃已消除、取钥已实测执行、无密钥硬门正确；剩余
+		// 0xC0DE0002 在**非外置产物**上同样出现 ⇒ 与密钥无关。未结：CI 里探针一行都不打印（即使已
+		// 改为无条件），而它**之后**的校准却打印 ⇒ 部署脚本行为与本地文件矛盾，下一轮先查这一点。
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)
