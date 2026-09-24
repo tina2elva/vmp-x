@@ -37,7 +37,13 @@ if (-not (Test-Path build/vmpbuild.exe) -or -not (Test-Path build/vmpack.exe)) {
 
 # ---- the freestanding ARM64 PE test target (no Windows SDK needed) ----
 Write-Host "[*] building the arm64 PE test target..."
-& $clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib -fuse-ld=lld -Wl,-e,entry -Wl,-subsystem=console -o build/target_arm64.exe testdata/arm64/target_win.c 2>&1 | Select-Object -Last 8
+# Arguments go through an array: a bare -Wl,-e,entry argument is a ParserError under pwsh 7
+# (the comma is the array operator in argument position). Keep every comma-bearing flag quoted.
+$tgtArgs = @(
+    "--target=aarch64-w64-windows-gnu", "-O1", "-fno-tree-vectorize", "-nostdlib", "-fuse-ld=lld",
+    "-Wl,-e,entry", "-Wl,-subsystem=console", "-o", "build/target_arm64.exe", "testdata/arm64/target_win.c"
+)
+& $clang @tgtArgs 2>&1 | Select-Object -Last 8
 if (-not (Test-Path build/target_arm64.exe)) { Write-Host "[!] arm64 PE target build failed"; exit 1 }
 
 # ---- the Windows/ARM64 blob in EXTERNAL key mode ----
