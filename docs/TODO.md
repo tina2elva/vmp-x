@@ -730,3 +730,7 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
 - [ ] win/arm64：阻塞条件已两次确认 —— CI **能编译**（clang --target=aarch64-w64-windows-gnu）但
       **没有任何环境能执行** ARM64 机器码的 blob；本机也没有 clang。放开白名单只差 2 行，
       但会交出"运行时从未执行过"的取钥路径 ⇒ 按纪律保持 fail-fast，等 Windows on ARM 环境。
+
+- [!] **win/arm64：环境阻塞**（#496，第 8/9/10 三轮确认）—— 只差两行（C 守卫 + 白名单），
+      但**无环境可执行** ARM64 机器码的 blob，且本机连 clang 都没有（全盘搜索为空）⇒ 无法编译、无法运行、
+      无法验证 ⇒ 保持 fail-fast。解除条件：Windows on ARM 机器 / ARM64 Windows runner。

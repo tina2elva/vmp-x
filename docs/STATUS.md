@@ -7487,3 +7487,33 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
 或 CI 上加一个 ARM64 Windows 的 self-hosted runner）。
 
 **未做项**：① win/arm64（见上，需外部条件）；② Linux 侧授权与狗仍是 fail-closed 桩。
+
+### 496. win/arm64（目标 (c)）判定为**环境阻塞**：本机与 CI 都无法验证，按纪律不放开白名单
+
+**阻塞条件（第 8/9/10 三轮连续确认，且本轮已穷尽本地选项）**：
+
+1. **执行**：没有任何可用环境能运行 Windows/ARM64 取钥路径。
+   - CI 的 `windows-arm64-blob` / `windows-arm64-run` 都跑在 **x86-64 宿主**上，执行的是 **arm64 客户机字节码**；
+   - win/arm64 的 blob 本身是 **ARM64 机器码**，x64 宿主无法执行；qemu-user 不支持 Windows 目标。
+2. **编译**（本轮新证据）：本机**完全没有 clang** —— PATH、`C:\Program Files\LLVM`、Visual Studio 的 LLVM 目录、
+   scoop/choco 常见位置、以及**全盘 `clang.exe` 递归搜索**都是空；msys64 里只有 `clangarm64`（ARM64 原生二进制，
+   x64 上跑不了）⇒ **本机连交叉编译都做不了**。CI 侧倒是有 `clang --target=aarch64-w64-windows-gnu`，
+   但它只编**非外置**的 blob ⇒ 外置取钥代码在 CI 里同样**不会被编译**（除非放开白名单）。
+
+**代码现状（只差两行，已写进 TODO 供下次接手）**：
+- Windows 侧 `vm_peb_base()` **已有** `#elif defined(__aarch64__)` 分支（`x18` → TEB+0x60，与 x64 的 TEB+0x60 同构）；
+- LDR / RTL_USER_PROCESS_PARAMETERS / 导出目录 / NT 结构体这几套**都是 64 位版本**，与 x64 **共用**（ARM64 同为 64 位布局）；
+- 因此放开只需：C 侧 `#error` 守卫加 `|| defined(__aarch64__)`，`cmd/vmpbuild` 白名单加 `win/arm64`。
+
+**为什么不放开**：放开等于把一个**运行时从未执行过**的取钥路径投给客户。若那条 inline asm 或某个偏移有误，
+客户现场的表现正是 fail-fast 规则要防的"程序莫名其妙退出"；仓库纪律明确要求"不要在无法验证时动主干、
+不为通过检查而放宽阈值"。⇒ **保持 fail-fast**，把这块留给具备条件的环境。
+
+**解除办法（任选其一）**：① 一台 **Windows on ARM** 机器（本机或 CI self-hosted runner）⇒ 可直接跑三形态验收；
+② CI 上加一个 ARM64 Windows runner；③ 仅需编译级验证的话：在 CI 的 `windows-arm64-blob` 作业里，
+   临时放开白名单编一次外置 blob（并把产物作为证据留存）—— 但这只覆盖"能编译"，**不覆盖取钥正确性**。
+
+**至此目标 (a)(b) 全部完成，(c) 因环境受限阻塞**：已启用并各有运行时验收的平台为
+**win/x64、win/x86、linux/amd64、linux/arm64**（每个都覆盖"无密钥硬门 / 环境变量 / 文件"三形态）。
+
+**未做项**：① win/arm64（见上）；② Linux 侧授权与狗仍是 fail-closed 桩。

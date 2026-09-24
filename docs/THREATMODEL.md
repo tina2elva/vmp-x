@@ -117,3 +117,8 @@ PEB->ProcessParameters 偏移、以及 OBJECT_ATTRIBUTES / IO_STATUS_BLOCK 两�
 **G3 进展（#495）**：linux/arm64 补齐 `VMPX_KEY_FILE` 形态 ⇒ 四个已启用平台（win/x64、win/x86、linux/amd64、
 linux/arm64）全部覆盖"无密钥硬门 / 环境变量 / 文件"三种取钥形态，且都在 CI 常态回归里。
 win/arm64 仍 fail-fast：CI 能编译它，但没有任何环境能执行 ARM64 机器码的 blob。
+
+**G3 最终进展（#496）**：外置密钥已支持 **win/x64、win/x86、linux/amd64、linux/arm64** 四个平台，
+每个都有"无密钥硬门 / VMPX_KEY / 文件"三形态的运行时验收，且都已进 CI 常态回归。
+**win/arm64 环境阻塞**：代码只差两行，但本环境（含 CI）没有任何地方能执行 ARM64 机器码的 blob，
+本机亦无 clang ⇒ 无法验证 ⇒ 白名单保持 fail-fast。
