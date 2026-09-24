@@ -811,3 +811,10 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       拒绝无重定位表的目标。运行期三条路已全部实测否掉（#510/#511/#512），保护性拒绝已恢复。
 - [ ] 未解点：**为什么"清 DYNAMIC_BASE（delta=0）"会让产物退出码 ≠ native**（#510）—— 若要走近似解，
       必须先答这一条。
+
+- [ ] **【重大】修 win/arm64 的假通过测试**：`windows-arm64-run` 的 "run native vs protected" 用 `& *.vmp`
+      调用 —— Windows/PowerShell **不会**启动该扩展名，于是 `$LASTEXITCODE` 保留上一次的值（native 的），
+      比对**必然通过**、其实从未跑过被保护产物（STATUS #517）。修法：先显式重置 `$LASTEXITCODE`、
+      用可执行扩展名（复制成 `.exe`）或 `Start-Process` 启动，并**断言退出码确实变化过**。
+      ⚠️ 修好后该步骤会真的失败（因为 (a) 未修）⇒ 应与 (a) 的修复同轮做。
+- [ ] **修 (a)**：`vmpack` 为无 `.reloc` 的目标**新建节并写入需要的条目**（或构建期 fail-fast 拒绝）。
