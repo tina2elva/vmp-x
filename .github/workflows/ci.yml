@@ -378,3 +378,19 @@ jobs:
           $rc2 = 0; & .\build\target_arm64.vmp; $rc2 = $LASTEXITCODE
           Write-Host ("[*] INLINE-after: green product rc=" + $rc2)
           $global:LASTEXITCODE = 0
+      - name: win/arm64 launchability control (copy vs original)
+        shell: pwsh
+        run: |
+          # STATUS #515: in this step the green artifact cannot even be launched (empty
+          # $LASTEXITCODE, no error text), while artifacts built in this same step do launch.
+          # If a fresh COPY launches fine, the original file itself is being blocked (OS level).
+          $orig = Join-Path $PWD "build/target_arm64.vmp"
+          $copy = Join-Path $PWD "build/target_arm64_copy.vmp"
+          Remove-Item $copy -ErrorAction SilentlyContinue
+          Copy-Item $orig $copy -ErrorAction SilentlyContinue
+          Write-Host ("[*] LAUNCH: original exists=" + (Test-Path $orig) + " size=" + (Get-Item $orig -ErrorAction SilentlyContinue).Length)
+          $rcA = "unset"; & $orig; $rcA = $LASTEXITCODE
+          Write-Host ("[*] LAUNCH: original rc=" + $rcA)
+          $rcB = "unset"; & $copy; $rcB = $LASTEXITCODE
+          Write-Host ("[*] LAUNCH: copy rc=" + $rcB)
+          $global:LASTEXITCODE = 0
