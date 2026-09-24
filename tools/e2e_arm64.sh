@@ -160,8 +160,13 @@ fi
 # 硬门是 exit_group(0xC0DE0007)，POSIX 只看得到低 8 位 ⇒ 断言 rc=7 且无输出。
 echo "[*] 1b 外置密钥（-key-external）验收..."
 KEY1B=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-./build/vmpbuild -cc "$CC" -src stub/linux/arm64 -out build/vm_interp_arm64_ext.bin \
-    -manifest build/vm_interp_arm64_ext.json -entry vm_entry \
+# 参数必须与上面「非外置」那次**完全一致**（-guest arm64 / -merge go / -random-opcodes=false / -objdump），
+# 否则 VM_REG_COUNT 会退成 x86-64 的 18，而 arm64 平台头的 VM_CTX_* 是按 arm64 客户机（35 槽位）写的，
+# 于是 ctx 静态断言必然失败（CI 上就是这样红过一次）。
+./build/vmpbuild -src stub/linux/arm64 \
+    -out build/vm_interp_arm64_ext.bin -manifest build/vm_interp_arm64_ext.json \
+    -entry vm_entry -guest arm64 -merge go -random-opcodes=false \
+    -cc "$CC" -objdump "$OBJDUMP" \
     -key-external -key-in "$KEY1B" >/dev/null
 ./build/vmpack -exe build/arm64_target -func check_key -func sum_to \
     -blob build/vm_interp_arm64_ext.bin -manifest build/vm_interp_arm64_ext.json \
