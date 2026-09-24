@@ -7729,3 +7729,30 @@ CI 里本来就有 `windows-arm64-run` 作业，其 `runs-on: windows-11-arm`（
 **目标最终状态**：(a) Linux/amd64 + Linux/arm64 **完成**；(b) win/x86 **完成**；
 (c) win/arm64 **未完成**——但已从"环境阻塞"推进到"崩溃消除 + 取钥执行 + 硬门正确 + 剩余一个与非密钥相关的失败"，
 且每一步都有 CI 证据（run 号见 #489-#503）与可复现的探针。
+
+### 504. 探针谜题缩小到"输出被吞"：部署脚本确实含无条件探针（证据在手）
+
+**做了什么**：把 CI 步骤改成**先打印运行时脚本的哈希、行数与所有 `PROBE` 行**，再运行脚本 ——
+用来区分"脚本没被更新"与"控制流没走到"。
+
+**证据（CI run 35963405531，commit b34ba97）**：
+
+    [*] script hash = 8E3FF78EFB1DEDF09D2F658FCFE9570E36C3F51ED16EE62133349C8D6549E61E
+    [*] script lines = 115
+    [*] deployed:66: # ---- PROBE: re-run the product the (green) job built earlier in this same job ----
+    [*] deployed:73: Write-Host ("[*] PROBE start: looking for " + $green + " ; exists=" + (Test-Path $green))
+    [*] deployed:83: Write-Host ("[*] PROBE green-job product re-run: ...")
+    [*] deployed:85: Write-Host "[*] PROBE green-job product not present"
+
+⇒ **部署的脚本确实包含无条件探针（第 73 行）**，而且**位于它之后**的校准（第 88 行起）在日志里打印了
+⇒ 控制流**必然经过**第 73 行 ⇒ 但**没有任何 PROBE 行出现**。
+
+⇒ 这推翻了我上一轮的猜测（"部署脚本与本地不一致"）。现在只剩一个解释：**该行的输出被吞掉了**
+（pwsh 的输出流/异常路径问题；探针里那句 `& $green` 对 `.vmp` 文件的行为可能就是触发点，
+即使我加了 try/catch）。
+
+**下一轮的正解方向（已明确）**：**改用文件做信号** —— 脚本用 `Add-Content build/probe.txt ...` 记录结果，
+CI 步骤随后 `Get-Content build/probe.txt` 打印。文件信号**不受输出流怪异行为影响**，
+能把"探针是否执行、结果是什么"可靠地带出来。
+
+**处置**：白名单重新关闭、撤掉 CI 步骤（主干保绿、无噪声）；复现器与探针保留入库。
