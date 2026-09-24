@@ -713,3 +713,9 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       「RTL_USER_PROCESS_PARAMETERS 的 ImagePathName/Environment 偏移」「PEB->ProcessParameters 偏移」三处；
       本机实测 **VMPX_KEY 环境变量那条已与原生一致**，但 **<产物>.vmpkey 文件那条仍读不到**
       （卡在 32 位模块/导出遍历）⇒ 按 fail-fast 纪律**白名单暂不放开**。
+
+- [x] **win/x86(i686)**：完成（#493）—— 六处位宽修正（导出目录基址 / PP 字段偏移 / PEB-PP 偏移 /
+      两个 NT 结构体布局），本机三条用例全过（无密钥 0xC0DE0007、.vmpkey 与 VMPX_KEY 均与原生一致），
+      白名单已放开。
+- [ ] 把 i686 这三条用例补进 32 位门禁脚本（进 CI 常态回归）
+- [ ] win/arm64：ARM64 TEB/PEB 取法

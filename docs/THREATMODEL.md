@@ -105,3 +105,7 @@ win/x86 与 win/arm64 仍在两道守卫处 fail-fast。
 **G3 进展（#492）**：win/x86(i686) 已具备 PEB/PP/导出目录的 32 位偏移修正，且 `VMPX_KEY` 环境变量取钥
 在本机 32 位产物上**与原生一致**；但 `.vmpkey` 文件路径仍不通（32 位模块/导出遍历未跑通）⇒
 仍保持 fail-fast（白名单未放开）。
+
+**G3 进展（#493）**：win/x86(i686) 完成并放开白名单 ⇒ 白名单 = win/x64 / win/x86 / linux/amd64 / linux/arm64；
+仅 win/arm64 仍 fail-fast。i686 的难点是"位宽敏感点"：导出目录基址、RTL_USER_PROCESS_PARAMETERS 字段偏移、
+PEB->ProcessParameters 偏移、以及 OBJECT_ATTRIBUTES / IO_STATUS_BLOCK 两个结构体的布局。

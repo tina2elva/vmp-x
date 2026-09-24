@@ -7371,3 +7371,37 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
 **下一步（i386 收尾）**：查 `vm_find_module`/`vm_get_proc_d` 在 i386 下为何取不到 ntdll 导出 ——
 可用本轮的隔离手法（`VMPX_KEY_FILE` + 本机 32 位产物）逐层验证：先确认 PEB->Ldr 链表能走通，
 再看导出目录/名字表解析；通了再把 `win/x86` 加回白名单，并把三条用例补进门禁。
+
+### 493. W3 第五步：**win/x86(i686) 完成** —— 三条运行时用例本机全过，白名单已放开
+
+**根因（本轮定位）**：上一轮修好环境变量那条后，.vmpkey 文件那条仍被拒。本轮用 VMPX_KEY_FILE
+（绝对路径）做隔离实验 ⇒ 问题**不在**路径推导，而在 vm_key_read_nt 调 ntdll 时传的**结构体布局**：
+
+| 结构体 | x64（原来单一声明） | i386 正确值 |
+|---|---|---|
+| OBJECT_ATTRIBUTES | Length,Pad 有对齐填充 = 32 字节 | 无填充 = 24 字节 |
+| IO_STATUS_BLOCK | void* + u64 = 16 字节 | {NTSTATUS, ULONG} = 8 字节 |
+
+⇒ 按 x64 布局传给 32 位 ntdll 会被判为非法参数 ⇒ 文件永远读不到。已按 VM_HOST_X86_32 分开声明，
+并把只在 x64 分支存在的 Pad/Pad2 初始化一并分支。
+
+**第二个坑（已记录）**：上一轮撤回 win/x86 白名单后，我仍用同一命令"重建"blob，结果 vmpbuild
+**直接拒绝**、blob 没生成，测试跑的是**旧 blob** ⇒ 结构体修正等于没编译，表现为"修了还是失败"。
+⇒ 每次测试前先删 blob 并确认构建真的产出（仓库早记过这个坑）。
+
+**本机端到端证据（Windows 直接跑 32 位产物）**：
+
+    native              = 35
+    无密钥              = 0xC0DE0007  ✓ 硬门
+    <产物>.vmpkey 文件  = 35          ✓ 与原生一致
+    VMPX_KEY 环境变量   = 35          ✓ 与原生一致
+
+**i686 一共六处位宽修正**：① 导出目录基址（i386 用 24+96，x64 用 24+112）；
+② RTL_USER_PROCESS_PARAMETERS 的 ImagePathName/Environment 偏移（+0x38/+0x48）；
+③ PEB->ProcessParameters 偏移（+0x10）；④⑤ NT 结构体 OBJECT_ATTRIBUTES 与 IO_STATUS_BLOCK 的布局。
+（PEB/LDR 那套宏 VM_PEB_LDR_OFF/vm_pread 本仓库早已按位宽分好。）
+
+⇒ cmd/vmpbuild 白名单现在为：**win/x64、win/x86、linux/amd64、linux/arm64**；win/arm64 仍 fail-fast。
+
+**未做项**：① 这三条用例还没进 tools/e2e_32bit.ps1（进 CI 才能常态回归）；② win/arm64 未做；
+③ Linux 侧授权与狗仍是 fail-closed 桩。

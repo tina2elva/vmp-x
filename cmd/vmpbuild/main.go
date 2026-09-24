@@ -149,9 +149,8 @@ func main() {
 	targetRel := filepath.ToSlash(strings.TrimPrefix(filepath.ToSlash(*src), "stub/"))
 	// 1b 取钥实现按平台逐个落地；未落地的平台一律**构建失败**（见上面的理由）。
 	keyExternalOK := map[string]bool{
-		"win/x64": true, // PEB -> KERNEL32 -> ntdll 取钥
-		// "win/x86"：环境变量那条已在本机跑通，但 <产物>.vmpkey **文件**那条还读不到
-		// （卡在 32 位模块/导出遍历），按 fail-fast 纪律先不放开，等文件路径通了再加回来。
+		"win/x64":     true, // PEB -> KERNEL32 -> ntdll 取钥
+		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
 	}

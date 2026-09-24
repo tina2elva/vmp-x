@@ -794,6 +794,20 @@ static void *vm_get_proc(u64 mod, const char *fn);
 /* Windows 侧的文件 API 结构体（NT 原语用）。**与平台无关地声明**：授权/验签那段（在 Linux 分支之外）
  * 也要用它们，放进 Windows 分支里会让 Linux 目标报 unknown type name。 */
 typedef struct { u16 Length, MaximumLength; u16 *Buffer; } vm_ustr_t;
+#if defined(VM_HOST_X86_32)
+/* 32 位 Windows：OBJECT_ATTRIBUTES 里**没有**对齐填充（Length 后紧跟 RootDirectory）= 24 字节，
+ * IO_STATUS_BLOCK = { NTSTATUS Status; ULONG Information; } = 8 字节。
+ * 按 x64 布局（32 / 16 字节）传进去，ntdll 会判为非法参数 ⇒ 文件永远读不到。 */
+typedef struct {
+    u32 Length;
+    void *RootDirectory;
+    vm_ustr_t *ObjectName;
+    u32 Attributes;
+    void *SecurityDescriptor;
+    void *SecurityQualityOfService;
+} vm_objattr_t;
+typedef struct { u32 Status; u32 Information; } vm_iosb_t;
+#else
 typedef struct {
     u32 Length, Pad;
     void *RootDirectory;
@@ -803,6 +817,7 @@ typedef struct {
     void *SecurityQualityOfService;
 } vm_objattr_t;
 typedef struct { void *Status; u64 Information; } vm_iosb_t;
+#endif
 
 /* 十六进制字符 -> 数值（平台无关；Windows 与 Linux 两条取钥路径都用它解析 VMPX_KEY）。 */
 static u32 vm_hexval(u16 c) {
@@ -1038,9 +1053,15 @@ static int vm_key_read_nt(const u16 *path, u8 *out, u32 cap, u32 *got) {
     name.MaximumLength = (u16)(chars * 2 + 2);
     name.Buffer = (u16 *)path;
     vm_objattr_t oa;
+#if defined(VM_HOST_X86_32)
+    oa.Length = (u32)sizeof(oa); oa.RootDirectory = 0; oa.ObjectName = &name;
+    oa.Attributes = 0x40u; /* OBJ_CASE_INSENSITIVE */
+    oa.SecurityDescriptor = 0; oa.SecurityQualityOfService = 0;
+#else
     oa.Length = (u32)sizeof(oa); oa.Pad = 0; oa.RootDirectory = 0; oa.ObjectName = &name;
     oa.Attributes = 0x40u; /* OBJ_CASE_INSENSITIVE */
     oa.Pad2 = 0; oa.SecurityDescriptor = 0; oa.SecurityQualityOfService = 0;
+#endif
     vm_iosb_t iosb;
     iosb.Status = 0; iosb.Information = 0;
     void *h = 0;
