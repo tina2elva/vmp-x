@@ -782,3 +782,10 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       铁证见 STATUS #507（同一文件同一步骤，裸调用成功 / Start-Process 失败）。下一步：
       ① 用 `-strip-relocs` 产物在 Start-Process 下试跑；② 对比 win/arm64 与 win/x64 的 `.reloc` 数据目录；
       ③ 修 `vmpack` 并**给所有平台加"Start-Process（ASLR 生效）启动"的验收**。
+
+- [ ] **修 `cmd/vmpack`（下一轮）**：保留重定位那条路里检测"目标无重定位目录"⇒ **强制清 `DYNAMIC_BASE`**
+      并打印说明（否则 ASLR 生效时产物必崩，STATUS #508 已确认根因）。对**所有平台**都是保护。
+- [ ] **补"ASLR 启动"验收**：现有验收都走裸调用/探针映射，覆盖不到 ASLR —— 至少给 win/x64 与 win/arm64
+      加一条用 `Start-Process` 启动的用例（这正是本 bug 长期未被发现的原因）。
+
+- [ ] 查清 `strip-relocs via Start-Process: rc=-998` 的异常文本。

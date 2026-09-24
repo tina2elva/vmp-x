@@ -7841,3 +7841,38 @@ CI 步骤随后 `Get-Content build/probe.txt` 打印。文件信号**不受输�
 
 **本轮方法论收获（连续四步排除法）**：ASLR 随机性 ✗、我的重建 ✗、启动方式 ✗（先在别处排除）→
 最后**把对照实验放进"对方步骤"里**，一步锁定真因。
+
+### 508. 根因确认：win/arm64 的目标与产物**都没有重定位表** ⇒ ASLR 下必崩（与 1b 取钥无关）
+
+**诊断结果（CI run 35968267605）**：
+
+    TRACE| reloc:target-sections has-reloc=False      ← 原始 build/target_arm64.exe 没有 .reloc
+    TRACE| reloc:product         has-reloc=False      ← 打包后的产物自然也没有
+    TRACE| strip-relocs via plain call:    rc=0       ← 清掉 DYNAMIC_BASE 后正常返回
+    TRACE| strip-relocs via Start-Process: rc=-998    ← 该分支里 Start-Process 抛异常（待查，见未做项）
+
+**结论**：`testdata/arm64/target_win.c` 用 clang + lld 以 freestanding / `-nostdlib` 方式链接，
+镜像里**没有需要重定位的绝对引用** ⇒ lld **不生成 `.reloc`** ⇒ 产物当然也没有。
+于是：
+- **裸调用**（加载在首选基址，`delta = 0`）⇒ 入口自解密不走重定位分支 ⇒ 正常；
+- **ASLR 生效**（`Start-Process`、双击、任何 ShellExecute 路径）⇒ `delta != 0` ⇒ 需要重定位表才能还原，
+  而表不存在 ⇒ `vm_img_fail(2)` ⇒ **`0xC0DE0002`，无任何输出**。
+
+⇒ 这是**打包端应当拦住/处理的通用问题**，与 1b 取钥无关。现已确认三条事实：
+① 触发条件 = ASLR 生效（同一文件同一步骤，裸调用成功、Start-Process 失败，STATUS #507）；
+② 直接原因 = 目标与产物都没有重定位表（本节）；③ 与密钥无关（无密钥硬门 `0xC0DE0007` 正确、
+`1b:enter`/`1b:fetched` 均已实测出现）。
+
+**正确修法（下一轮实现）**：在 `cmd/vmpack/main.go` 保留重定位那条路（`!stripRelocs`）里，
+**检测目标是否真的存在重定位目录**（数据目录 5 的 RVA/Size）—— 若不存在，则**强制清除 `DYNAMIC_BASE`**
+并打印明确说明。理由：既然没有表、无法还原加载器增量，就**不能**继续声称支持 ASLR；
+否则产物在正常启动方式下必崩（正是 fail-fast 要防的现场事故）。
+该修法对**所有平台**都是保护（不只 arm64）：任何 freestanding/无绝对引用的目标都会命中。
+
+**另一个独立收获（值得单独记）**：本仓库现有的运行时验收（`& 产物` / 探针映射）**都不覆盖 ASLR**，
+所以这个 bug 一直没被发现。⇒ 应补一条"**通过 `Start-Process`（或等效的 ASLR 环境）启动**"的验收，
+至少加在 win/x64 与 win/arm64 上。
+
+**未做项**：① 上面的 `vmpack` 修改与验证；② 查清 `strip-relocs via Start-Process: rc=-998`
+（我对 `.vmp` 用 `Start-Process` 在另一处是成功的，这里却抛异常，需要看清异常文本）；
+③ 补"ASLR 启动"验收；④ 之后再放开 `win/arm64` 白名单并跑通三形态。
