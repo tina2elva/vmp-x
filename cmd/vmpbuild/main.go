@@ -153,7 +153,10 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：跑重定位诊断（目标/产物是否有 .reloc + strip-relocs 的 A/B）
+		// "win/arm64"：根因已定（目标无 .reloc ⇒ 产物在 ASLR 下崩，STATUS #507/#508）。曾尝试"无表则清
+		// DYNAMIC_BASE"，实测：裸调用从崩变为 rc=0，但**产物退出码不再等于 native**（delta=0 走了另一条
+		// 语义路径）⇒ 属真回归，已回滚（#510）。需要的是**让产物真正支持 ASLR**（例如由 vmpack 新建
+		// .reloc 节，或修好 delta=0 时的载荷预置语义），修好前保持 fail-fast。
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)

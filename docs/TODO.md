@@ -795,3 +795,8 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       以及镜像是否仍满足 ShellExecute 的要求）；② 查 native `testdata/arm64/target_win.c` 的退出码语义
       （654184885 = 0x26FE11B5 是否为设计值），再判断产物 rc=0 是否算错；
       ③ 两者清楚后让三形态全绿，再放开白名单并补"ASLR 启动"验收。
+
+- [ ] **win/arm64 正解（下一轮）**：让产物**真正支持 ASLR** —— A) `vmpack` 在目标无 `.reloc` 节时
+      **新建该节**并把 blob 的绝对 VA 站点写成重定位项（`appendRelocs` 已有"追加"能力，缺"建节"）；
+      或 B) 把"目标无重定位表"变成**构建期 fail-fast 错误**（明确拒绝，而非产出必崩/行为不同的产物）。
+      已排除的错误做法：清 `DYNAMIC_BASE` 绕过（会改变语义路径、使产物退出码 ≠ native，见 STATUS #510）。
