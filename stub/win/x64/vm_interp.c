@@ -817,7 +817,8 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
 #  error "VM_KEY_EXTERNAL 只有 Windows(x64/arm64/x86) 与 Linux(amd64/arm64) 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
-#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+/* 诊断打印助手：Windows/ARM64 目标就编译（**不要求**外置模式，否则默认模式的产物打不出标记）。 */
+#if defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64) && !defined(VM_BLOB_TARGET_LINUX)
 /* 临时诊断（仅 Windows/ARM64 编译）：外置模式在该平台固定 0xC0000005，
  * 在 vm_master() 的关键节点往 stderr 打标记，用来三分定位崩在哪一段。
  * 走 kernel32!GetStdHandle + WriteFile（vm_get_proc 会解析转发导出）；取不到就静默放弃，
@@ -3177,6 +3178,7 @@ int vm_unpack_image(const void *tblp) {
     vm_img_diag[2] = wantBase;
     vm_img_diag[3]++;
     if (*(const u16 *)base != 0x5A4D) { vm_img_diag[0] = 1; vm_img_fail(1); return -1; } /* 反推出来的基址没有 MZ */
+    vm_dbg_win("img:mz-ok\n"); /* 诊断：已算出镜像基址（aarch64 外置构建才编译） */
     /* (6)：以前是"实际基址 != 首选基址就拒绝执行"。现在保留重定位（ASLR 生效），
      * 基址不同是**正常**的：算出 delta，解密前后各做一次逆/正变换。只有"需要重定位却没有重定位表"
      * （被人为剥掉）才继续 fail-fast —— 那种情况下我们无法把加载器写进密文的增量还原出来。 */
@@ -3202,6 +3204,7 @@ int vm_unpack_image(const void *tblp) {
             return -2;
         }
     }
+    vm_dbg_win("img:delta-ok\n"); /* 诊断：delta/重定位判定已通过 */
     typedef int (VM_WINAPI *vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
     if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }

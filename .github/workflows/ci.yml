@@ -361,4 +361,19 @@ jobs:
           $rr2 = -999
           try { $pg = Start-Process -FilePath (Join-Path $PWD "build/target_arm64.vmp") -Wait -PassThru -RedirectStandardOutput $soG -RedirectStandardError $seG; $rr2 = $pg.ExitCode } catch { $rr2 = -998 }
           Write-Host ("[*] green step: same product via Start-Process -> rc=" + $rr2)
+      - name: win/arm64 decrypt stage markers
+        shell: pwsh
+        run: |
+          # STATUS #523: localize the remaining 0xC0000005 with stage markers written to stderr by
+          # the blob itself (img:mz-ok / img:delta-ok, plus the pre-existing 1b:enter/fetched).
+          $orig = Join-Path $PWD "build/target_arm64.vmp"
+          $asExe = Join-Path $PWD "build/target_arm64_probe.vmp.exe"
+          Remove-Item $asExe -ErrorAction SilentlyContinue
+          if (Test-Path $orig) { Copy-Item $orig $asExe -Force }
+          if (Test-Path $asExe) {
+            $out = ((& $asExe 2>&1 | Out-String) + "").Trim()
+            $rc = $LASTEXITCODE
+            Write-Host ("[*] STAGE: rc=" + $rc + " out=[" + $out + "]")
+          } else { Write-Host "[!] STAGE: no product to run" }
+          $global:LASTEXITCODE = 0
           $global:LASTEXITCODE = 0
