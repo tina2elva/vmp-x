@@ -349,6 +349,10 @@ jobs:
           Write-Host "[+] Windows/arm64 end-to-end: outputs match"
           # 关键：GitHub 的 pwsh 包装器最后会 `exit $LASTEXITCODE`，而这里 $LASTEXITCODE 还是
           # 被保护程序自己的退出码（非 0）——不显式清零，比较通过了步骤也会被判失败。
+          # Second run of the SAME product from this (previously succeeding) step - STATUS #505:
+          # the same file returns 0x26FE11B5 here but 0xC0DE0002 in the very next step of this job.
+          $rr = 0; & .\build\target_arm64.vmp; $rr = $LASTEXITCODE
+          Write-Host ("[*] green step: second run of target_arm64.vmp -> rc=" + $rr)
           $global:LASTEXITCODE = 0
       - name: 1b external master key (win/arm64 file-trace probe)
         shell: pwsh
