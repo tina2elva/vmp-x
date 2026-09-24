@@ -31,6 +31,28 @@ if (-not $objdump) { $objdump = "llvm-objdump" }
 Write-Host ("[*] clang   : " + $clang)
 Write-Host ("[*] objdump : " + $objdump)
 Mark ("stage:clang-ok clang=" + $clang)
+# ---- EARLY A/B probe: run the green product BEFORE this script rebuilds anything ----
+# The 10-run histogram showed the SAME file fails 10/10 in this step, while it succeeded in the
+# previous step of the same job => not ASLR, but something this step does deterministically.
+# Prime suspect: we recompile build/target_arm64.exe (the file the green .vmp was built from).
+$greenE = Join-Path $PWD "build/target_arm64.vmp"
+Mark ("probe-early:exists=" + (Test-Path $greenE))
+if (Test-Path $greenE) {
+    $soE = Join-Path $PWD "build/probe_early.out"
+    $seE = Join-Path $PWD "build/probe_early.err"
+    $hE = @{}
+    for ($i = 1; $i -le 5; $i++) {
+        $rE = -999
+        try {
+            $pE = Start-Process -FilePath $greenE -Wait -PassThru -RedirectStandardOutput $soE -RedirectStandardError $seE
+            $rE = $pE.ExitCode
+        } catch { $rE = -998 }
+        if ($hE.ContainsKey($rE)) { $hE[$rE]++ } else { $hE[$rE] = 1 }
+    }
+    $lE = "probe-early:5runs"
+    foreach ($k in $hE.Keys) { $lE = $lE + " rc=" + $k + "x" + $hE[$k] }
+    Mark $lE
+}
 
 # IMPORTANT: pass clang exactly the way the (green) windows-arm64-run job does - plain "clang",
 # no --target wrapper. On this native ARM64 runner clang already targets Windows/ARM64 with the
