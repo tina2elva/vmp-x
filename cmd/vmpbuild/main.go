@@ -153,9 +153,7 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		// "win/arm64"：**三次运行期尝试全部被实测否掉**（#510 清 DYNAMIC_BASE ⇒ 退出码≠native；
-		// #511 无表放行 ⇒ 0xC0000005；#512 视 delta=0 ⇒ 仍 0xC0000005）⇒ 运行期侧无解，
-		// 保护性拒绝保持。正解应在**打包端**：为目标新建真正的 .reloc 节（或构建期 fail-fast）。
+		"win/arm64":   true, // 临时放开：用"绿作业自己的 blob 打包"做 A/B（见 STATUS #513）
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)

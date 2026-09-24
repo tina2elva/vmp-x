@@ -192,6 +192,18 @@ $seC = Join-Path $PWD "build/cal_sp.err"
 $calRc3 = -999
 try { $pc = Start-Process -FilePath (Join-Path $PWD "build/target_arm64_cal.exe") -Wait -PassThru -RedirectStandardOutput $soC -RedirectStandardError $seC; $calRc3 = $pc.ExitCode } catch { $calRc3 = -998 }
 Mark ("cal-startprocess: rc=" + $calRc3)
+# ---- A/B: pack with the GREEN STEP's own blob/manifest (same funcs) ----
+# Isolates "my blob build differs" from "my pack invocation differs": the previous step in this
+# same job built build/vm_interp_win_arm64.bin + .json and packed a product that MATCHES native.
+$gBlob = "build/vm_interp_win_arm64.bin"
+$gMan = "build/vm_interp_win_arm64.json"
+if ((Test-Path $gBlob) -and (Test-Path $gMan)) {
+    & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob $gBlob -manifest $gMan -out build/target_arm64_greenblob.exe -report build/target_arm64_greenblob.json 2>&1 | Out-Null
+    if (Test-Path build/target_arm64_greenblob.exe) {
+        $rg = 0; & build/target_arm64_greenblob.exe; $rg = $LASTEXITCODE
+        Mark ("greenblob-pack: rc=" + $rg)
+    } else { Mark "greenblob-pack: pack failed" }
+} else { Mark "greenblob-pack: green blob/manifest not present" }
 $calRc = 0; $calOut = (& (Join-Path $PWD "build/target_arm64_cal.exe") 2>&1) -join "|"; $calRc = $LASTEXITCODE
 Write-Host ("[*] CALIBRATION (non-external blob): rc=" + $calRc + " out=[" + $calOut + "]  native rc=" + $natRc)
 if ($calRc -ne $natRc) { Write-Host "[!] CALIBRATION FAILED: my own default-mode product does not match native => this harness differs from the green job, so any external-mode conclusion is confounded" }
