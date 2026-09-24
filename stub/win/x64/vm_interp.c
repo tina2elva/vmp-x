@@ -3181,15 +3181,11 @@ int vm_unpack_image(const void *tblp) {
      * 基址不同是**正常**的：算出 delta，解密前后各做一次逆/正变换。只有"需要重定位却没有重定位表"
      * （被人为剥掉）才继续 fail-fast —— 那种情况下我们无法把加载器写进密文的增量还原出来。 */
     long long delta = wantBase ? (long long)(base - wantBase) : 0;
-    /* 没有重定位表 ⇒ 加载器**没有任何条目可用** ⇒ 它不可能把 delta 写进密文 ⇒ 对密文而言 delta 就是 0：
-     * 既不必拒绝（拒绝会让 freestanding 链接、本就无 .reloc 的目标在 ASLR 下完全不可用），
-     * 也不能做下面 ①/④ 的 delta 变换 —— vm_reloc_apply 要**走重定位表**才知道改哪些站点，
-     * 表不存在时它会走到垃圾上（实测：只去掉拒绝而留下变换 ⇒ 10/10 都是 0xC0000005，见 STATUS #511）。
-     * Windows/ARM64 的 freestanding 目标正是这种情况（#507/#508）。 */
+    /* 无重定位表 ⇒ 加载器无法搬动本镜像；而实测把它当 delta=0 继续也会崩（#512）⇒ 只能拒绝。 */
     if (delta != 0) {
         u32 rr, rs;
         vm_reloc_dir((const u8 *)base, &rr, &rs);
-        if (!rr) { vm_img_diag[0] = 2; delta = 0; } /* 无表：对密文按 delta=0 处理 */
+        if (!rr) { vm_img_diag[0] = 2; vm_img_fail(2); return -2; } /* 需要重定位但表没了：**必须**拒绝 */
     }
     typedef int (VM_WINAPI *vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
