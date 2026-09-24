@@ -7446,3 +7446,44 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
 **arm64 客户机字节码**，而 win/arm64 的 **blob 本身是 ARM64 机器码** —— 在 x86-64 宿主上根本无法执行。
 因此本环境（含 CI）**没有任何**能运行 Windows/ARM64 取钥路径的地方 ⇒ 按仓库纪律
 （不要在无法验证时动主干）该项暂不实现，白名单继续 fail-fast。
+
+### 495. arm64 补齐第三种密钥形态（VMPX_KEY_FILE）⇒ 四个平台三种形态齐平；并第二次确认 win/arm64 的阻塞条件
+
+**做法**：`tools/e2e_arm64.sh` 的 1b 一节补一条 **`VMPX_KEY_FILE` 指向绝对路径**的用例。
+这条刻意**不走** `<产物>.vmpkey` —— 后者要 `readlink("/proc/self/exe")`，而 **qemu-user 下该路径指向宿主 qemu**，
+不可靠；用绝对路径就绕开了它，于是 arm64 也能覆盖"文件"形态的取钥路径。
+
+**证据（CI run 35948396551，linux-arm64 作业，五作业全绿）**：
+
+    [+] 1b: 无密钥 -> rc=7（硬门低 8 位）且无输出
+    [+] 1b: 有密钥(VMPX_KEY) -> 与原生一致
+    [+] 1b: 有密钥(VMPX_KEY_FILE 绝对路径) -> 与原生一致
+
+**四个平台的覆盖现状**：
+
+| 平台 | 无密钥硬门 | VMPX_KEY | 文件形态 | 验收位置 |
+|---|---|---|---|---|
+| win/x64 | ✓ | ✓ | ✓ | 原有（STATUS #399 一带） |
+| linux/amd64 | ✓ | ✓ | ✓（`<产物>.vmpkey`） | CI `tools/e2e.sh` |
+| linux/arm64 | ✓ | ✓ | ✓（`VMPX_KEY_FILE`） | CI `tools/e2e_arm64.sh`（qemu） |
+| win/x86 | ✓ | ✓ | ✓（`<产物>.vmpkey`） | 32 位门禁（CI windows-amd64） |
+
+**win/arm64（目标 (c)）阻塞条件的第二次确认（本轮新查到的事实）**：
+
+1. `stub/win/arm64` **存在**，CI 的 `windows-arm64-blob` 作业**确实会编译** Windows/ARM64 的 blob
+   （用 `clang --target=aarch64-w64-windows-gnu` + `llvm-objdump`）⇒ **编译级验证在 CI 可得**；
+2. 但**没有任何环境能执行**它：`windows-arm64-run` 跑在 **x86-64 宿主**上，执行的是 **arm64 客户机字节码**，
+   而 win/arm64 的 blob 本身是 **ARM64 机器码**，x64 宿主无法执行；qemu-user 也不支持 Windows 目标；
+3. **本机连交叉编译都做不了**：PATH 上没有 clang，`C:\msys64\clangarm64` 是 **ARM64 原生**二进制（在 x64 上跑不了），
+   mingw64/ucrt64 里也**没有** clang ⇒ 本机的编译级验证不可得。
+
+**代码现状（好消息）**：Windows 侧的 PEB 取法**已经**有 `#elif defined(__aarch64__)` 分支（`x18` → TEB+0x60，
+与 x64 的 TEB+0x60 同构），而 LDR/PP/导出目录/NT 结构体那几套**都是 64 位版本**、与 x64 **共用**（ARM64 同样是 64 位布局）
+⇒ 真正要改的只有**两行**：C 侧 `#error` 守卫加 `|| defined(__aarch64__)`、`vmpbuild` 白名单加 `win/arm64`。
+
+**为什么本轮仍然不放开**：放开就等于把一个**运行时从未执行过**的取钥路径交给客户 —— 若那条 inline asm 或偏移有误，
+客户现场的表现正是 fail-fast 规则要避免的"程序莫名其妙退出"。按仓库纪律（不要在无法验证时动主干、
+不为通过检查而放宽阈值），**保持 fail-fast**，把决定权与所需条件留给下一次（需要一台 Windows on ARM，
+或 CI 上加一个 ARM64 Windows 的 self-hosted runner）。
+
+**未做项**：① win/arm64（见上，需外部条件）；② Linux 侧授权与狗仍是 fail-closed 桩。

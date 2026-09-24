@@ -724,3 +724,9 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       该门禁由 CI 的 windows-amd64 作业执行 ⇒ i686 取钥路径有常态回归（STATUS #494）。
 - [ ] win/arm64：**本环境无法验证**（CI 的两个 arm64 作业都在 x86-64 宿主上跑客户机字节码，
       跑不了 ARM64 机器码的 blob）⇒ 按纪律暂不实现，白名单继续 fail-fast。
+
+- [x] **linux/arm64 第三种形态**：`e2e_arm64.sh` 补 `VMPX_KEY_FILE`（绝对路径，绕开 qemu 下不可靠的
+      `/proc/self/exe`）⇒ 四个已启用平台都覆盖了"无密钥 / 环境变量 / 文件"三种形态（STATUS #495）。
+- [ ] win/arm64：阻塞条件已两次确认 —— CI **能编译**（clang --target=aarch64-w64-windows-gnu）但
+      **没有任何环境能执行** ARM64 机器码的 blob；本机也没有 clang。放开白名单只差 2 行，
+      但会交出"运行时从未执行过"的取钥路径 ⇒ 按纪律保持 fail-fast，等 Windows on ARM 环境。

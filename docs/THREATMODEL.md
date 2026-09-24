@@ -113,3 +113,7 @@ PEB->ProcessParameters 偏移、以及 OBJECT_ATTRIBUTES / IO_STATUS_BLOCK 两�
 **G3 进展（#494）**：i686 的三条运行时用例已进 32 位门禁（CI 的 windows-amd64 作业）⇒ 常态回归。
 至此白名单含 win/x64、win/x86、linux/amd64、linux/arm64 四个平台，且每个都有运行时验收；
 仅 win/arm64 未做——原因是本环境与 CI 都**没有**能执行 Windows/ARM64 机器码的地方，无法验证。
+
+**G3 进展（#495）**：linux/arm64 补齐 `VMPX_KEY_FILE` 形态 ⇒ 四个已启用平台（win/x64、win/x86、linux/amd64、
+linux/arm64）全部覆盖"无密钥硬门 / 环境变量 / 文件"三种取钥形态，且都在 CI 常态回归里。
+win/arm64 仍 fail-fast：CI 能编译它，但没有任何环境能执行 ARM64 机器码的 blob。
