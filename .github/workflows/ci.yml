@@ -350,3 +350,12 @@ jobs:
           # 关键：GitHub 的 pwsh 包装器最后会 `exit $LASTEXITCODE`，而这里 $LASTEXITCODE 还是
           # 被保护程序自己的退出码（非 0）——不显式清零，比较通过了步骤也会被判失败。
           $global:LASTEXITCODE = 0
+      - name: 1b external master key (win/arm64 file-trace probe)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
+          Write-Host "probe step exit=$LASTEXITCODE"
+          Write-Host "--- build/probe.txt (file-based trace, immune to output swallowing) ---"
+          if (Test-Path build/probe.txt) { Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) } }
+          else { Write-Host "  TRACE| (missing: script never even reached the top)" }
+          $global:LASTEXITCODE = 0

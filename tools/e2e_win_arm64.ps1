@@ -7,6 +7,14 @@
 # ASCII only: PS 5.1 reads .ps1 as ANSI, and a non-ASCII byte swallows the following line.
 
 $ErrorActionPreference = "Continue"
+
+# File-based trace: CI kept showing NO output from this script's later stages even though the
+# deployed copy demonstrably contained the lines (see STATUS #504). Writing to a FILE is immune to
+# whatever swallows the output stream, and the CI step prints this file no matter how we exit.
+$PROBE = "build/probe.txt"
+Remove-Item $PROBE -ErrorAction SilentlyContinue
+function Mark([string]$m) { Add-Content -Path $PROBE -Value ($m) -ErrorAction SilentlyContinue }
+Mark "stage:start"
 if ($PSScriptRoot) { Set-Location (Join-Path $PSScriptRoot "..") }
 New-Item -ItemType Directory -Force -Path build | Out-Null
 
@@ -22,6 +30,7 @@ $objdump = (Get-Command llvm-objdump -ErrorAction SilentlyContinue).Source
 if (-not $objdump) { $objdump = "llvm-objdump" }
 Write-Host ("[*] clang   : " + $clang)
 Write-Host ("[*] objdump : " + $objdump)
+Mark ("stage:clang-ok clang=" + $clang)
 
 # IMPORTANT: pass clang exactly the way the (green) windows-arm64-run job does - plain "clang",
 # no --target wrapper. On this native ARM64 runner clang already targets Windows/ARM64 with the
@@ -69,6 +78,7 @@ if (-not (Test-Path build/target_arm64_ext.exe)) { Write-Host "[!] packing faile
 #   fails here  => the failure is order/state dependent, not about how I build.
 # Unconditional and dependency-free: an earlier version referenced $natRc (defined later) and was
 # guarded by Test-Path, and it produced NO line at all in CI - so make it impossible to miss.
+Mark ("stage:ext-packed exists=" + (Test-Path "build/target_arm64_ext.exe"))
 $green = Join-Path $PWD "build/target_arm64.vmp"
 Write-Host ("[*] PROBE start: looking for " + $green + " ; exists=" + (Test-Path $green))
 if (Test-Path $green) {
@@ -81,6 +91,7 @@ if (Test-Path $green) {
         $gout = "EXCEPTION: " + $_.Exception.Message
     }
     Write-Host ("[*] PROBE green-job product re-run: rc=" + $grc + " out=[" + $gout + "]")
+    Mark ("probe:green-product rc=" + $grc + " out=" + $gout)
 } else {
     Write-Host "[*] PROBE green-job product not present"
 }
@@ -127,4 +138,5 @@ if ($r3 -ne $natRc -or $o3 -ne $natOut) { Fail (".vmpkey file: rc=" + $r3 + " na
 else { Write-Host "  [OK  ] 1b: .vmpkey file -> matches native" }
 
 if ($bad -eq 0) { Write-Host "[OK] win/arm64 1b external key: 3/3" } else { Write-Host ("[!] win/arm64 1b: " + $bad + " case(s) failed") }
+Mark ("stage:done bad=" + $bad + " calRc=" + $calRc)
 exit $bad
