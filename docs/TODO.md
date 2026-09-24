@@ -789,3 +789,9 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       加一条用 `Start-Process` 启动的用例（这正是本 bug 长期未被发现的原因）。
 
 - [ ] 查清 `strip-relocs via Start-Process: rc=-998` 的异常文本。
+
+- [ ] **win/arm64 续（下一步）**：① 查 `Start-Process` 报 `%1 is not a valid Win32 application` 的原因
+      （清 DYNAMIC_BASE 后裸调用可跑、ShellExecute 拒绝；检查 `clearDynamicBase` 改了哪些字段、
+      以及镜像是否仍满足 ShellExecute 的要求）；② 查 native `testdata/arm64/target_win.c` 的退出码语义
+      （654184885 = 0x26FE11B5 是否为设计值），再判断产物 rc=0 是否算错；
+      ③ 两者清楚后让三形态全绿，再放开白名单并补"ASLR 启动"验收。

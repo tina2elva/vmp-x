@@ -7876,3 +7876,30 @@ CI 步骤随后 `Get-Content build/probe.txt` 打印。文件信号**不受输�
 **未做项**：① 上面的 `vmpack` 修改与验证；② 查清 `strip-relocs via Start-Process: rc=-998`
 （我对 `.vmp` 用 `Start-Process` 在另一处是成功的，这里却抛异常，需要看清异常文本）；
 ③ 补"ASLR 启动"验收；④ 之后再放开 `win/arm64` 白名单并跑通三形态。
+
+### 509. 修复生效：目标无重定位目录时自动清 DYNAMIC_BASE ⇒ **裸调用从必崩变为成功**
+
+**改动**（`cmd/vmpack/main.go`，保留重定位那条路里）：用现成的 `origRelocEntries(f)` 检测目标是否真有
+重定位目录；若**没有**（freestanding / `-nostdlib` 链接的 arm64 目标就是这种），则**自动清除 `DYNAMIC_BASE`**
+并打印说明。理由：没有表就无法还原加载器增量，保留 ASLR 只会让产物在正常启动方式下必崩。
+对本来就有重定位表的目标（x64 等）**无影响**（本地 `go build` 与打包回归正常）。
+
+**验证（CI run 35968838313）**：
+
+    [!] 目标没有重定位目录 ⇒ 自动清除 DYNAMIC_BASE（否则 ASLR 生效时产物必崩）
+    TRACE| cal-plain: rc=0                    ← 此前恒为 -1059192830（崩），现在 rc=0（成功）
+    TRACE| stage:done bad=3 calRc=0
+
+⇒ **同一个校准产物，修复前"必崩"、修复后"裸调用成功"** —— 修复方向正确，且证实了根因分析。
+
+**同时暴露两个新现象（下一步要查）**：
+
+1. **所有 `Start-Process` 现在报 `%1 is not a valid Win32 application`**（此前它们能启动并返回 `0xC0DE0002`）。
+   即：清掉 `DYNAMIC_BASE` 后**裸调用能跑**，但 ShellExecute 拒绝执行该文件。候选：`clearDynamicBase` 改了
+   可选头里的某个字段（例如顺手动了 `ImageBase` 或节特性），或 ShellExecute 对"清基址"镜像有自己的判定。
+2. **产物 rc=0，而 native rc=654184885（0x26FE11B5）** ⇒ 三条用例仍判失败（`bad=3`）。但性质已变：
+   从"崩溃"变成"跑完但结果不同"。需要先查清 native 那个值是不是**设计返回值**（`testdata/arm64/target_win.c` 的语义），
+   再判断产物是否真的算错。
+
+**结论**：① 根因（无重定位表 + 保留 ASLR）已修 ✓；② win/arm64 的三形态验收仍**未通过**，
+但失败原因已从"产物必崩"推进到"两个可查的具体问题"；③ 与 1b 取钥依旧无关。
