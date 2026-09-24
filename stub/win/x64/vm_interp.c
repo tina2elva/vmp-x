@@ -3190,8 +3190,13 @@ int vm_unpack_image(const void *tblp) {
          *   code = 0x20 | (delta<0 ? 8 : 0) | ((|delta|>>12) & 7)   ⇒ 0xC0DE0020..0xC0DE002F
          * delta 越大，低位越大（每 0x1000 一档）。定案后这里会还原成 vm_img_fail(2)。 */
         if (!rr) {
-            long long ad = delta < 0 ? -delta : delta;
-            u32 code = 0x20u | (delta < 0 ? 8u : 0u) | (u32)(((unsigned long long)ad >> 12) & 7u);
+            /* 上一版已测出 |delta| < 0x1000 且非负（code=0x20）⇒ 它不是重定位偏移，而是记账小错。
+             * 这一版把 base 与 wantBase 的**低 12 位**各取高 3 位编码进来，看是哪一边"没页对齐"：
+             *   bits3..1 = (base & 0xFFF) >> 9     bits6..4 = (wantBase & 0xFFF) >> 9
+             * 两者都为 0 ⇒ 都页对齐（那 delta 的小量来自别处）；只有一个非 0 ⇒ 就是它偏了。 */
+            u32 lb = (u32)((base & 0xFFFu) >> 9) & 7u;
+            u32 lw = (u32)((wantBase & 0xFFFu) >> 9) & 7u;
+            u32 code = 0x20u | (lb << 1) | (lw << 4);
             vm_img_diag[0] = 2;
             vm_img_fail(code);
             return -2;
