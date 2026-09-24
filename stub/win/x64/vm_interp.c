@@ -19,9 +19,9 @@
  * 而**原生 Windows/ARM64** 上 clang 的默认目标是 aarch64-pc-windows-msvc，只定义 _M_ARM64。
  * 只认 __aarch64__ 就会让 win/arm64 在 VM_KEY_EXTERNAL 下直接 #error，或退回 x86-64 的
  * %gs:[0x60] 分支（在 ARM64 上根本不合法）。CI 的 windows-11-arm 作业用的正是原生 clang。 */
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 #define VM_ARCH_AARCH64 1
-#elif defined(VM_BLOB_USES_WIN64) && !defined(__x86_64__) && !defined(_M_X64) && !defined(VM_HOST_X86_32)
+#elif !defined(VM_BLOB_TARGET_LINUX) && !defined(__x86_64__) && !defined(_M_X64) && !defined(VM_HOST_X86_32)
 /* 原生 Windows/ARM64 上 clang 到底定义 __aarch64__ 还是 _M_ARM64（还是都不定义）取决于 LLVM 的
  * 构建方式 —— 实测两者都不成立。所以对 **Windows 目标**改用排除法：本仓库只有 x64 / x86-32 / arm64
  * 三种 Windows 宿主，既然既不是 x86-64 也不是 x86-32，那就是 ARM64。 */
@@ -789,6 +789,9 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
 
 /* 已实现取钥的平台：Windows(x64 / arm64 / x86) 与 Linux(amd64 / arm64)。
  * 其它目标在这里就报错，vmpbuild 也会先拦住它们（两道守卫互为呼应）。 */
+/* 注意：这里**不**用 VM_BLOB_USES_WIN64 —— 那是"宿主 ABI"标记，由 vmpbuild 检测后发出，
+ * 在原生 Windows/ARM64 runner 上实测**没有被定义**（探针证据见 STATUS #500）；用它会让 win/arm64
+ * 误报 #error。Windows 目标用"非 Linux + 已知架构"判定即可。 */
 #if !(defined(VM_BLOB_USES_WIN64) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64) || defined(VM_HOST_X86_32))) && \
     !(defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64)))
 /* 探针：本工具链到底定义了哪些架构宏。每个成立的宏各报一条 error，编译器会把它们全部打出来，

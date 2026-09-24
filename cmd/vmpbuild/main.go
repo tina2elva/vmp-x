@@ -661,7 +661,12 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	machine := ""
 	if out, derr := exec.Command(cc, "-dumpmachine").Output(); derr == nil {
 		machine = strings.ToLower(string(out))
-		compilerIsWindows = strings.Contains(machine, "mingw") || strings.Contains(machine, "w64")
+		// 必须覆盖**所有** Windows 目标三元组：mingw（x86_64-w64-mingw32）之外，还有原生 Windows/ARM64 上
+		// clang 的默认目标 aarch64-pc-windows-msvc —— 它既不含 "mingw" 也不含 "w64"，只认这两个会让
+		// win/arm64 漏掉 VM_BLOB_USES_WIN64（探针实测），进而让 1b 的守卫误报 #error（STATUS #500）。
+		compilerIsWindows = strings.Contains(machine, "mingw") || strings.Contains(machine, "w64") ||
+			strings.Contains(machine, "windows") || strings.Contains(machine, "msvc") ||
+			strings.Contains(machine, "win32")
 	}
 	// -mno-red-zone 是 x86 专有选项：aarch64-linux-gnu-gcc 之类会直接报 unrecognized。
 	// 只在 x86 宿主（或探测不到目标时）加上它。
