@@ -849,6 +849,16 @@ static void vm_dbg_win(const char *s) {
 #else
 #define VM_DBG_WIN(x) ((void)0)
 #endif
+
+/* 供**入口蹦床（汇编）**调用的标记：只有"外置 + Windows + ARM64"构建才真正打印，其余是 no-op。
+ * 必须**无条件定义**：汇编里的 `bl vm_mark_entry` 在任何构建中都要有定义，否则合并器的
+ * 自包含检查会因为未定义符号而拒绝整个 blob（这个坑 #529 刚踩过）。 */
+void vm_mark_entry(void);
+void vm_mark_entry(void) {
+#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+    vm_dbg_win("tramp:entry\n");
+#endif
+}
 static u8 vm_master_buf[32];
 static u32 vm_master_ok; /* .bss：0 = 还没取，1 = 已取且 KCV 通过 */
 
