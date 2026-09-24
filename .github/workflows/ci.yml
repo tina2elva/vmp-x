@@ -361,6 +361,11 @@ jobs:
           $rr2 = -999
           try { $pg = Start-Process -FilePath (Join-Path $PWD "build/target_arm64.vmp") -Wait -PassThru -RedirectStandardOutput $soG -RedirectStandardError $seG; $rr2 = $pg.ExitCode } catch { $rr2 = -998 }
           Write-Host ("[*] green step: same product via Start-Process -> rc=" + $rr2)
+          # This step s "native vs protected" comparison uses `& *.vmp`, which Windows/PowerShell
+          # cannot start, so both values are stale and always equal (STATUS #517); the real check
+          # lives in the dedicated step below. Exit explicitly so a trailing native exit code
+          # cannot decide this step s result (STATUS #523).
+          exit 0
       - name: win/arm64 real check (launch the product as .exe)
         if: always()
         shell: pwsh
