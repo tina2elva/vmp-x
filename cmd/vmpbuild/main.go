@@ -153,10 +153,7 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		// "win/arm64"：诊断进行中（#507-#519）。已确证：`.vmp` 扩展名无法被 PowerShell 启动（改名 .exe 即可，`#517`）；
-		// 产物能跑并返回 0xC0DE0002（"delta != 0 且无重定位表"拒绝）；目标与产物的 ImageBase 都是 0x140000000，
-		// 表头也写的是 f.ImageBase ⇒ **delta 本应为 0**，所以拒绝为何触发仍未解释 ⇒ 下一步把 base/wantBase/delta/rr
-		// 编码进退出码或写进文件。修好前保持 fail-fast。
+		"win/arm64":   true, // 临时放开：跑"delta 量级编码进退出码"的诊断（#520）
 	}
 	if *keyExternal && !keyExternalOK[targetRel] {
 		fatalf("-key-external 尚未实现该目标的取钥路径（收到目标 %s）", targetRel)

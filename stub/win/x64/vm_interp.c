@@ -3185,7 +3185,17 @@ int vm_unpack_image(const void *tblp) {
     if (delta != 0) {
         u32 rr, rs;
         vm_reloc_dir((const u8 *)base, &rr, &rs);
-        if (!rr) { vm_img_diag[0] = 2; vm_img_fail(2); return -2; } /* 需要重定位但表没了：**必须**拒绝 */
+        /* 拒绝是对的（#510/#511/#512 三次尝试均证明放行会真崩），但把 delta 的**符号与量级**
+         * 编码进退出码，以便一次运行就判定"delta 是真实的重定位偏移(大)还是记账小错(小)"：
+         *   code = 0x20 | (delta<0 ? 8 : 0) | ((|delta|>>12) & 7)   ⇒ 0xC0DE0020..0xC0DE002F
+         * delta 越大，低位越大（每 0x1000 一档）。定案后这里会还原成 vm_img_fail(2)。 */
+        if (!rr) {
+            long long ad = delta < 0 ? -delta : delta;
+            u32 code = 0x20u | (delta < 0 ? 8u : 0u) | (u32)(((unsigned long long)ad >> 12) & 7u);
+            vm_img_diag[0] = 2;
+            vm_img_fail(code);
+            return -2;
+        }
     }
     typedef int (VM_WINAPI *vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
