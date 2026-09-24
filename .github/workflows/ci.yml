@@ -350,3 +350,17 @@ jobs:
           # 关键：GitHub 的 pwsh 包装器最后会 `exit $LASTEXITCODE`，而这里 $LASTEXITCODE 还是
           # 被保护程序自己的退出码（非 0）——不显式清零，比较通过了步骤也会被判失败。
           $global:LASTEXITCODE = 0
+      - name: 1b external master key (win/arm64 probe - green product re-run)
+        shell: pwsh
+        run: |
+          # Print what the runner actually has on disk BEFORE running it: previous runs showed no
+          # PROBE line at all even after the probe was made unconditional, so first establish whether
+          # the deployed script even contains it (vs. control flow never reaching it).
+          Write-Host ("[*] script hash = " + (Get-FileHash tools/e2e_win_arm64.ps1 -Algorithm SHA256).Hash)
+          Write-Host ("[*] script lines = " + (Get-Content tools/e2e_win_arm64.ps1 | Measure-Object -Line).Lines)
+          $p = Select-String -Path tools/e2e_win_arm64.ps1 -Pattern "PROBE" | Select-Object -First 6
+          if ($p) { $p | ForEach-Object { Write-Host ("[*] deployed:" + $_.LineNumber + ": " + $_.Line.Trim()) } }
+          else { Write-Host "[!] deployed script has NO PROBE lines at all" }
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
+          Write-Host "probe step exit=$LASTEXITCODE"
+          $global:LASTEXITCODE = 0
