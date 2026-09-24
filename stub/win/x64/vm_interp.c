@@ -3184,7 +3184,12 @@ int vm_unpack_image(const void *tblp) {
     if (delta != 0) {
         u32 rr, rs;
         vm_reloc_dir((const u8 *)base, &rr, &rs);
-        if (!rr) { vm_img_diag[0] = 2; vm_img_fail(2); return -2; } /* 需要重定位但表没了 */
+        /* 没有重定位表时**不能**判死：表不存在 ⇒ 加载器没有任何条目可用 ⇒ 它不可能对镜像应用过
+		 * 增量。因此镜像字节仍是"首选基址下的原样"，按 delta 逆变换再解密是**安全**的。
+		 * 原实现直接 vm_img_fail(2)：对 freestanding 链接、本就没有 .reloc 的目标（例如
+		 * Windows/ARM64 的 testdata/arm64/target_win.c），产物在 ASLR 生效的启动方式下必崩
+		 * （实测 0xC0DE0002，见 STATUS #508/#510）。这里只记诊断码、继续执行。 */
+		if (!rr) { vm_img_diag[0] = 2; } /* 无表：仅记录，继续 */
     }
     typedef int (VM_WINAPI *vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
