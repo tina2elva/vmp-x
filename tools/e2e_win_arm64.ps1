@@ -80,20 +80,29 @@ if (-not (Test-Path build/target_arm64_ext.exe)) { Write-Host "[!] packing faile
 # guarded by Test-Path, and it produced NO line at all in CI - so make it impossible to miss.
 Mark ("stage:ext-packed exists=" + (Test-Path "build/target_arm64_ext.exe"))
 $green = Join-Path $PWD "build/target_arm64.vmp"
-Write-Host ("[*] PROBE start: looking for " + $green + " ; exists=" + (Test-Path $green))
+Mark ("probe:start exists=" + (Test-Path $green))
 if (Test-Path $green) {
-    $grc = 0
-    $gout = ""
+    # PowerShell refuses to run a .vmp document ("Cannot run a document in the middle of a pipeline",
+    # found via the file trace). Start-Process goes through CreateProcess, which runs any PE file.
+    $so = Join-Path $PWD "build/probe_green.out"
+    $se = Join-Path $PWD "build/probe_green.err"
+    Remove-Item $so, $se -ErrorAction SilentlyContinue
+    $grc = -999
     try {
-        $gout = (& $green 2>&1 | Out-String).Trim()
-        $grc = $LASTEXITCODE
+        $p = Start-Process -FilePath $green -Wait -PassThru -RedirectStandardOutput $so -RedirectStandardError $se
+        $grc = $p.ExitCode
     } catch {
-        $gout = "EXCEPTION: " + $_.Exception.Message
+        Mark ("probe:green-product EXCEPTION " + $_.Exception.Message)
     }
+    $gout = ""
+    if (Test-Path $so) { $gout = (Get-Content $so -Raw) }; if (Test-Path $se) { $gout = $gout + (Get-Content $se -Raw) }
+    if ($gout -eq $null) { $gout = "" }
+    $gout = $gout.Trim()
     Write-Host ("[*] PROBE green-job product re-run: rc=" + $grc + " out=[" + $gout + "]")
     Mark ("probe:green-product rc=" + $grc + " out=" + $gout)
 } else {
     Write-Host "[*] PROBE green-job product not present"
+    Mark "probe:green-product MISSING"
 }
 
 # ---- CALIBRATION: the same flow, but with a NON-external blob ----
