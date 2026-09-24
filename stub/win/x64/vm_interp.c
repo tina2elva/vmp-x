@@ -3231,12 +3231,15 @@ int vm_unpack_image(const void *tblp) {
         *(u32 *)(aad + 0) = rva;
         *(u32 *)(aad + 4) = size;
         u32 old = 0;
+        VM_DBG_WIN("img:sec-prot\n");
         if (!vp(dst, size, (flags & 1u) ? 0x40u : 0x04u /* 执行节 RWX，数据节 RW */, &old)) { vm_img_diag[0] = 5; vm_img_fail(5); return -5; }
         /* ① 先把加载器写进密文的 delta 减回去 —— 否则下面的验签必然失败、解密出来的也是垃圾。
          * 必须在 VirtualProtect 之后做：加载器已经把这些页设成了最终保护属性。 */
+        VM_DBG_WIN("img:sec-pre\n");
         if (delta) vm_reloc_apply((const u8 *)base, -delta, (u64)dst, (u64)dst + size);
         if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_img_fail(4); return -4; }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        VM_DBG_WIN("img:sec-verified\n");
         /* ④ 解密之后再把 delta 加回来（等价于加载器对明文做的那次重定位）。 */
         if (delta) vm_reloc_apply((const u8 *)base, delta, (u64)dst, (u64)dst + size);
         /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）

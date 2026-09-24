@@ -8357,3 +8357,29 @@ blob manifest 里的 `imageBase`），用于检验上一轮留下的矛盾：
 
 **当前状态**：白名单**临时开着**（复现器需要外置构建才能带标记 ✓）；CI 五作业全绿 ✓；
 真检查以 `::warning` 可见地报告不匹配 ✓。收尾时（或修好后）再决定去留。
+
+### 526. **突破**：五个标记全部打出来 —— 取钥正常、已进解密、建节改动奏效；崩溃在段解密循环内
+
+**证据（CI run 36007519101，复现器输出）**：
+
+    [!] VMPX_KEY:     rc=-1073741819 native=654184885 out=[1b:enter|1b:fetched|img:fn-entry|img:mz-ok|img:delta-ok]
+    [!] .vmpkey file: rc=-1073741819 native=654184885 out=[1b:enter|1b:fetched|img:fn-entry|img:mz-ok|img:delta-ok]
+
+**逐条结论**：
+
+| 标记 | 含义 |
+|---|---|
+| `1b:enter` / `1b:fetched` | ✅ **取钥路径正常**（外置密钥确实取到并校验通过） |
+| `img:fn-entry` | ✅ **确实进了我们的代码**（入口蹦床调到了 Windows 镜像解密） |
+| `img:mz-ok` | ✅ 基址反推成功（MZ 校验通过） |
+| `img:delta-ok` | ✅✅ **本轮建节改动奏效**：`delta != 0 且无重定位表` 的**保护性拒绝已不再触发**（`.reloc` 节被创建） |
+| （其后崩溃） | ❌ `0xC0000005` ⇒ **崩在段解密循环内部** |
+
+⇒ **这是 (a) 线上的一大步**：
+× 之前是"干净拒绝"（0xC0DE0002/0xC0DE0020），现在是**进到解密循环里**才崩；
+且**与取钥完全无关**这一点再次被证实（`1b:fetched` 出现在崩溃之前）。
+
+**下一步**：在循环内加细粒度标记（`img:sec-prot` / `img:sec-pre` / `img:sec-verified`），
+以定位崩在 `VirtualProtect`、`vm_reloc_apply`（delta 逆变换）还是 `vm_aead_verify_aad`。
+预期嫌疑：**空 `.reloc`（只有 page=0/size=8 的 pad 块）** ⇒ `vm_reloc_apply` 遍历它没问题，
+但若加载器把它视为"有重定位表 ⇒ 可以搬动"而**实际没有任何条目**，镜像里任何绝对 VA 都会是过期的。
