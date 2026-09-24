@@ -361,4 +361,40 @@ jobs:
           $rr2 = -999
           try { $pg = Start-Process -FilePath (Join-Path $PWD "build/target_arm64.vmp") -Wait -PassThru -RedirectStandardOutput $soG -RedirectStandardError $seG; $rr2 = $pg.ExitCode } catch { $rr2 = -998 }
           Write-Host ("[*] green step: same product via Start-Process -> rc=" + $rr2)
+      - name: win/arm64 real check (launch the product as .exe)
+        if: always()
+        shell: pwsh
+        run: |
+          # STATUS #517/#523: the old "native vs protected" comparison never actually ran the
+          # product (`& *.vmp` cannot be started by Windows/PowerShell, so $LASTEXITCODE kept the
+          # native value => permanent false pass). This step does a REAL run and a REAL compare.
+          # On mismatch it prints a ::error annotation (visible in the CI UI) but still exits 0,
+          # because the underlying issue (ASLR + a target with no .reloc) is still open - flip this
+          # to a hard failure as soon as that is fixed.
+          $sentinel = -12345
+          $n = $sentinel; & .\build\target_arm64.exe; $n = $LASTEXITCODE
+          $prod = Join-Path $PWD "build/target_arm64.vmp"
+          $asExe = Join-Path $PWD "build/target_arm64_real.vmp.exe"
+          Remove-Item $asExe -ErrorAction SilentlyContinue
+          if (Test-Path $prod) { Copy-Item $prod $asExe -Force }
+          $pr = $sentinel
+          if (Test-Path $asExe) { & $asExe; $pr = $LASTEXITCODE }
+          Write-Host ("[*] REAL: native=" + $n + " product=" + $pr + " sentinel=" + $sentinel)
+          if ($pr -eq $sentinel) {
+            Write-Host "::error title=win/arm64 real check::the product did not run at all"
+          } elseif ($pr -ne $n) {
+            Write-Host ("::error title=win/arm64 real check::mismatch native=" + $n + " product=" + $pr + " (KNOWN: ASLR + target without .reloc; STATUS #507-#523)")
+          } else {
+            Write-Host "[+] win/arm64 real check: the product matches native"
+          }
+          $global:LASTEXITCODE = 0
+      - name: win/arm64 trace dump (always)
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path build/probe.txt) {
+            Write-Host "--- build/probe.txt ---"
+            Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) }
+          } else { Write-Host "--- build/probe.txt missing (reproducer not run in this job) ---" }
+          $global:LASTEXITCODE = 0
           $global:LASTEXITCODE = 0
