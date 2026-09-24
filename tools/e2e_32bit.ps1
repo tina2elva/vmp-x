@@ -137,6 +137,50 @@ foreach ($c in $cases) {
     else { $pass2++ }
 }
 
+# ---- 1b external master key (-key-external) ---------------------------------------
+# Same three cases as the Linux e2e: without a key the hard gate must fire exactly
+# (0xC0DE0007), and both key forms must reproduce the native exit code.
+# Why here: this gate is the one that covers the 32-bit host path end to end --
+# PEB via fs:[0x30], the 32-bit LDR walk, the PE32 export directory at +96, and the
+# i386 OBJECT_ATTRIBUTES / IO_STATUS_BLOCK layouts.
+Write-Host "[*] 1b external key (i686): building an external-key blob..."
+$keyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+$blobExt = "build/gates_blob32_ext.bin"
+$manExt = "build/gates_blob32_ext.json"
+Remove-Item $blobExt, $manExt -ErrorAction SilentlyContinue
+$bk = & ".\build\vmpbuild.exe" -cc $ccName -src "stub/win/x86" -out $blobExt -manifest $manExt -entry vm_entry -guest x86-32 -merge go -random-opcodes=false -key-external -key-in $keyHex 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $blobExt)) {
+    ($bk -split "`r?`n") | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 4 | ForEach-Object { Write-Host ("      vmpbuild| " + $_.Trim()) }
+    Fail "1b: i686 external-key blob build failed"
+} else {
+    $fn1b = "e32_local"
+    $want1b = 35
+    $outExt = "build/target32_ext.exe"
+    $keyFile = $outExt + ".vmpkey"
+    Remove-Item $outExt, $keyFile -ErrorAction SilentlyContinue
+    $pk1b = & ".\build\vmpack.exe" -exe "build/target32.exe" -func $fn1b -out $outExt -blob $blobExt -manifest $manExt -strip-relocs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outExt)) {
+        ($pk1b -split "`r?`n") | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 4 | ForEach-Object { Write-Host ("      vmpack| " + $_.Trim()) }
+        Fail "1b: packing e32_local with the external-key blob failed"
+    } else {
+        & "build/target32.exe" $fn1b | Out-Null; $nat1b = $LASTEXITCODE
+        if ($nat1b -ne $want1b) { Fail ("1b: native=" + $nat1b + " but the case expects " + $want1b) }
+        & $outExt $fn1b | Out-Null; $rcNo = $LASTEXITCODE
+        if ($rcNo -ne [int]0xC0DE0007) { Fail ("1b no key: rc=" + $rcNo + " expected " + [int]0xC0DE0007) }
+        else { Write-Host "  [OK  ] 1b: no key -> 0xC0DE0007 (hard gate)" }
+        $env:VMPX_KEY = $keyHex
+        & $outExt $fn1b | Out-Null; $rcEnv = $LASTEXITCODE
+        $env:VMPX_KEY = $null
+        if ($rcEnv -ne $nat1b) { Fail ("1b VMPX_KEY: rc=" + $rcEnv + " native=" + $nat1b) }
+        else { Write-Host "  [OK  ] 1b: VMPX_KEY -> matches native" }
+        Set-Content -Path $keyFile -Value $keyHex -NoNewline
+        & $outExt $fn1b | Out-Null; $rcFile = $LASTEXITCODE
+        Remove-Item $keyFile -ErrorAction SilentlyContinue
+        if ($rcFile -ne $nat1b) { Fail ("1b .vmpkey file: rc=" + $rcFile + " native=" + $nat1b) }
+        else { Write-Host "  [OK  ] 1b: .vmpkey file -> matches native" }
+    }
+}
+
 if ($script:bad -eq 0) {
     Write-Host ("[OK] 32-bit e2e: " + $pass + "/" + $cases.Count + " match native (-strip-relocs)")
     Write-Host ("[OK] 32-bit e2e: " + $pass2 + "/" + $cases.Count + " match native (relocations kept)")

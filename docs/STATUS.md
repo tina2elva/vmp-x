@@ -7405,3 +7405,44 @@ W3 外置密钥扩到 i386/linux/arm64 > W4 狗参与密码学+会话绑定 > W5
 
 **未做项**：① 这三条用例还没进 tools/e2e_32bit.ps1（进 CI 才能常态回归）；② win/arm64 未做；
 ③ Linux 侧授权与狗仍是 fail-closed 桩。
+
+### 494. i686 的 1b 三条用例**进 32 位门禁**（进入 CI 常态回归）
+
+**做法**：在 `tools/e2e_32bit.ps1` 末尾（两遍打包对比之后、汇总之前）加一节 1b 外置密钥验收，
+三条用例与本仓库 Linux 侧完全同构：
+
+1. **不给密钥** ⇒ 必须恰好是硬门（`0xC0DE0007`；PowerShell 对 32 位进程报 `-1059192825`，脚本里用
+   `[int]0xC0DE0007` 比较，两种表示等价）；
+2. **`VMPX_KEY` 环境变量** ⇒ 退出码必须与原生一致；
+3. **`<产物>.vmpkey` 文件** ⇒ 退出码必须与原生一致。
+
+外置 blob 用与被测目标**同一套参数**构建（`-guest x86-32 -merge go -random-opcodes=false -key-external`）。
+脚本保持**纯 ASCII**（本仓库 .ps1 的硬要求：PS 5.1 按 ANSI 解码，非 ASCII 注释会吞掉下一行）。
+
+**证据（本机，门禁 rc=0）**：
+
+    [*] 1b external key (i686): building an external-key blob...
+      [OK  ] 1b: no key -> 0xC0DE0007 (hard gate)
+      [OK  ] 1b: VMPX_KEY -> matches native
+      [OK  ] 1b: .vmpkey file -> matches native
+    [OK] 32-bit e2e: 12/12 match native (-strip-relocs)
+    [OK] 32-bit e2e: 12/12 match native (relocations kept)
+    non-ASCII lines = 0
+
+⇒ 该门禁由 CI 的 windows-amd64 作业执行 ⇒ i686 的取钥路径**从此有常态回归**。
+
+**各平台现状（目标进展）**：
+
+| 平台 | 构建 | 运行时验收 | 白名单 |
+|---|---|---|---|
+| win/x64 | ✅ | ✅（原有） | ✅ |
+| linux/amd64 | ✅ | ✅（CI，三条） | ✅ |
+| linux/arm64 | ✅ | ✅（CI，两条） | ✅ |
+| win/x86 | ✅ | ✅（本机门禁，三条） | ✅ |
+| win/arm64 | ❌ 未做 | ❌ 本环境**无法**验证（见下） | ❌（fail-fast） |
+
+**关于 win/arm64（目标 (c)）的诚实说明**：本仓库 CI 里的 `windows-arm64-blob` / `windows-arm64-run`
+两个作业跑在 **x86-64 宿主**上（名称里的 "host is still x86-64" 就是这个意思），它们执行的是
+**arm64 客户机字节码**，而 win/arm64 的 **blob 本身是 ARM64 机器码** —— 在 x86-64 宿主上根本无法执行。
+因此本环境（含 CI）**没有任何**能运行 Windows/ARM64 取钥路径的地方 ⇒ 按仓库纪律
+（不要在无法验证时动主干）该项暂不实现，白名单继续 fail-fast。

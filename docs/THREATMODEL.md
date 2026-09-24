@@ -109,3 +109,7 @@ win/x86 与 win/arm64 仍在两道守卫处 fail-fast。
 **G3 进展（#493）**：win/x86(i686) 完成并放开白名单 ⇒ 白名单 = win/x64 / win/x86 / linux/amd64 / linux/arm64；
 仅 win/arm64 仍 fail-fast。i686 的难点是"位宽敏感点"：导出目录基址、RTL_USER_PROCESS_PARAMETERS 字段偏移、
 PEB->ProcessParameters 偏移、以及 OBJECT_ATTRIBUTES / IO_STATUS_BLOCK 两个结构体的布局。
+
+**G3 进展（#494）**：i686 的三条运行时用例已进 32 位门禁（CI 的 windows-amd64 作业）⇒ 常态回归。
+至此白名单含 win/x64、win/x86、linux/amd64、linux/arm64 四个平台，且每个都有运行时验收；
+仅 win/arm64 未做——原因是本环境与 CI 都**没有**能执行 Windows/ARM64 机器码的地方，无法验证。
