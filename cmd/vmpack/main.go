@@ -741,10 +741,19 @@ func packPE(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagic
 			fmt.Printf("[*] blob 基址站点预置了 %d 个（追加重定位项=%v）", n, !stripRelocs)
 			fmt.Println()
 		}
+		/* TLS 回调数组被搬进 payload 后，里面写的是**首选基址下的绝对 VA**（见下面的
+		 * setTLSCallbacks(f, tlsDir, f.ImageBase+uint64(res.ImgTlsArrayRVA))）。加载器把镜像装到
+		 * 别处时这个指针必须被修正，否则 TLS 回调会跳到旧地址、进程在**入口点之前**就 0xC0000005
+		 * （实测现象：连 vm_master() 的 stderr 标记都打不出来，STATUS #508-#521）。
+		 * 原来它只被写成绝对 VA、却从不登记重定位项 ⇒ ASLR 下必崩。 */
+		if res.ImgTlsArrayRVA != 0 {
+			items = append(items, [2]uint32{relType, res.ImgTlsArrayRVA})
+		}
+		/* 无条件调用：即使 items 为空，也要保证产物**有** .reloc 目录/节（见 appendRelocs 的注释）。 */
+		if err := appendRelocs(f, items); err != nil {
+			fatalf("补 payload 重定位项失败: %v", err)
+		}
 		if len(items) > 0 {
-			if err := appendRelocs(f, items); err != nil {
-				fatalf("补 payload 重定位项失败: %v", err)
-			}
 			fmt.Printf("[*] payload 里的绝对 VA 补了 %d 个重定位项（ASLR 下必须）", len(items))
 			fmt.Println()
 		}
@@ -1297,15 +1306,15 @@ func origRelocEntries(f *pe.File) [][2]uint32 {
 // appendRelocs 往 .reloc 尾部追加 DIR64 重定位项（按页分组），并同步数据目录 Size 与节 VirtualSize。
 // 只用于 payload 自己的绝对 VA —— 它们在**不被加密**的节里，加载器改了就是对的。
 func appendRelocs(f *pe.File, items [][2]uint32) error {
-	if len(items) == 0 {
-		return nil
-	}
+	/* 注意：**不能**在 items 为空时提前返回 —— 下面"目标没有 .reloc 目录就新建一个"的逻辑
+	 * 必须在 items 为空时也执行（STATUS #521：Windows/ARM64 的 freestanding 目标就是 items 为空，
+	 * 而它恰恰需要这个节来承载 TLS 回调指针的修正项）。真正的追加在后面按 groups 是否为空自然跳过。 */
 	const relocDir = 5
 	do := dirBase(f) + relocDir*8
 	rva := binary.LittleEndian.Uint32(f.Data[do:])
 	size := binary.LittleEndian.Uint32(f.Data[do+4:])
 	if rva == 0 {
-		/* 目标**没有重定位目录**时自己建一个（STATUS #520）：
+		/* 兜底：正常情况下 packPE 已经无条件调用过 ensureRelocSection（STATUS #521），
 		 * freestanding 链接的目标（例如 Windows/ARM64 的 testdata/arm64/target_win.c）没有绝对引用，
 		 * lld 因此不生成 .reloc。但 payload 里的绝对 VA 站点是打包端按**首选基址**预置的
 		 * （见上面 `uint32(f.ImageBase)+res.SectionRVA+cur`），一旦加载器把它装到别处（ASLR），
