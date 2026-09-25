@@ -8493,3 +8493,27 @@ grep 出决定性对比：
   定位并修掉的东西（不需要再碰汇编）。
 
 **下一步**：dump 出 `0x140011670` 处的字符串/结构 ⇒ 直接读出是哪一条检查失败（同一轮已把该 dump 加进复现器）。
+
+### 532. **最终定位**：失败的是"补丁 MAC 校验"（`vm_verify_table` 里的 `got != want` → `brk`）
+
+**链条（全部有证据）**：
+
+1. 产物入口 `0x1400116D0` 的指令是：保存 3 个参数 → `adrp/add` 取一个指针 → `bl 0x14000d6c8` →
+   `cbz w0` → **`brk #0`**（`#531`，产物字节级证据）；
+2. 这个入口是 `vmpack` 通过 `SetEntryRVA` 改写的"**加载期校验蹦床**"（`internal/inject/peunwind.go:141`
+   的注释："我们用它把加载期校验蹦床接管过去"）；
+3. 它调用的就是 `stub/win/x64/vm_interp.c:2648` 的 **`vm_verify_table(const u32 *t)`**；
+4. 该函数里唯一会 `__builtin_trap()` 的地方（除授权门禁外）是：
+
+       u32 got  = vm_patch_mac(master, vm_kdf_salt(selfRVA, funcRVA, codeLen), selfRVA, funcRVA, codeLen, p, len);
+       if (got != want) __builtin_trap();
+
+⇒ **结论**：运行期算出的**补丁 MAC** 与打包端写进表里的 `want` **不相等**，且**只在 ARM64 上**发生。
+
+**头号嫌疑**：MAC 覆盖的范围是 `p`（被补丁覆盖的那 `len` 个字节）。x86 的分支补丁是 `E9 rel32`（5 字节），
+而 **ARM64 的分支是 4 字节对齐的 `b`/`bl`（26 位位移）** ⇒ 若打包端在**写补丁**与**算 MAC** 两处对
+"长度/字节"的处理不一致（例如按 x86 的 5 字节算、或按未对齐的 4 字节写），MAC 必然对不上。
+
+**下一步（很具体）**：在 `cmd/vmpack` 里查 `vm_patch_mac` 的 Go 侧对应实现与**补丁写入**那两段，
+确认 ARM64 分支补丁的**长度**与**字节**在两处**完全一致**（同一函数最好），并加一条本地可验证的断言；
+修好后产物 `vm_verify_table` 应当通过 ⇒ 进程跑到 `vm_run` ⇒ 再看结果是否与 native 一致。
