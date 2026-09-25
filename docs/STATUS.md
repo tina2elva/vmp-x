@@ -8517,3 +8517,29 @@ grep 出决定性对比：
 **下一步（很具体）**：在 `cmd/vmpack` 里查 `vm_patch_mac` 的 Go 侧对应实现与**补丁写入**那两段，
 确认 ARM64 分支补丁的**长度**与**字节**在两处**完全一致**（同一函数最好），并加一条本地可验证的断言；
 修好后产物 `vm_verify_table` 应当通过 ⇒ 进程跑到 `vm_run` ⇒ 再看结果是否与 native 一致。
+
+### 533. MAC 不一致的**最可能 divergence 点**：salt 两侧来源不同
+
+把两侧的算式并排看（都是真实代码）：
+
+| 侧 | 算式 | salt 来源 |
+|---|---|---|
+| 打包端 `internal/inject/payload.go:402` | `PatchMAC(opt.Master, entrySalts[i], baseRVA+uint32(d), fn.RVA, uint32(len(fn.Code)), patch)` | **存好的** `entrySalts[i]` |
+| 运行期 `stub/win/x64/vm_interp.c:2674` | `vm_patch_mac(master, vm_kdf_salt(selfRVA, funcRVA, codeLen), selfRVA, funcRVA, codeLen, p, len)` | **现推** `vm_kdf_salt(...)` |
+
+而 `PatchMAC` 的算式是（`internal/inject/patchmac.go:26`）：`key = KDFEntry(master, funcRVA, salt ^ PatchMACConst)`，
+消息 = `patch || le32(selfRVA) || le32(funcRVA) || le32(codeLen)`。
+
+⇒ 只要 **`vm_kdf_salt(selfRVA, funcRVA, codeLen)` ≠ `entrySalts[i]`**，MAC 必然不等 ⇒ **`brk`** ⇒ `0xC000001D`。
+这是**纯函数 vs 存值**的对照，**本地即可复核**，不需要 CI。
+
+**另外两处已核对一致**（避免下一轮重复劳动）：
+- 补丁长度：`patchLens[i] = len(patch)`（`payload.go:405`）⇒ 表里存的就是实际长度；arm64 是 **8**（`mov x16,x30` + `b thunk`，`payload.go:370-378`），
+  x86-64 是 **5**（`E9 rel32`，`payload.go:379-387`）⇒ 与 `inject.go:42` 的注释一致；
+- 补丁字节：arm64 的 8 字节在上面的分支里就构造好了，且**同一个 `patch` 切片**既用于算 MAC、又被写进镜像。
+
+**下一步（本地优先，不必先跑 CI）**：
+1. 在 `internal/inject` 里找 `entrySalts` 的生成处，与 C 侧 `vm_kdf_salt`（`stub/win/x64/vm_kdf.c` 或同文件）**逐字节对照**；
+2. 若两者本该相同却不同 ⇒ 修其中一处（并加本地 KAT，两侧都盯住）；
+3. 若确实相同 ⇒ 再看 `selfRVA` 的取值：打包端传的是 `baseRVA+uint32(d)`（描述符 RVA），
+   运行期传的是表里解出的 `selfRVA` ⇒ 复核这两个 RVA 在 arm64 产物里是否真的一致。
