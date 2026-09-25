@@ -185,6 +185,12 @@ if (($erva -ne 0) -and (Test-Path build/target_arm64.vmp)) {
   $dd = (& $od2 -d ("--start-address=0x" + $st1.ToString("X")) ("--stop-address=0x" + $en1.ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
   $lines = ($dd -split "`n") | Select-Object -First 30
   foreach ($ln in $lines) { if ("" -ne $ln.Trim()) { Mark ("entry:bytes " + $ln.Trim()) } }
+  # The entry does: save args / adrp+add (x0 = pointer) / bl 0x14000d6c8 / cbz / brk #0.
+  # Dump the CALLEE (0x14000d6c8) - it lives in the payload section, which is NOT encrypted, so
+  # these are the real instructions of whatever check the entry trampoline calls.
+  $tva = 0x14000d6c8
+  $dd3 = (& $od2 -d ("--start-address=0x" + $tva.ToString("X")) ("--stop-address=0x" + ($tva + 0x70).ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
+  foreach ($ln in (($dd3 -split "`n") | Select-Object -First 22)) { if ("" -ne $ln.Trim()) { Mark ("target:code " + $ln.Trim()) } }
   # The first 8 instructions decode as: mov/mov/mov / adrp+add (x0 = a message pointer) /
   # bl (a check) / cbz / brk #0. So the crash is a DELIBERATE assertion trap, not corrupt code.
   # Dump the bytes at that pointer (0x140011670 in the run above) to learn WHICH check failed.
