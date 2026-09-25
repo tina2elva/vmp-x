@@ -2672,7 +2672,18 @@ void vm_verify_table(const u32 *t) {
         if (!len) continue; /* 没写校验值的条目（例如未接 KDF 的单测载荷）直接跳过 */
         const u8 *p = base + (i32)delta;
         u32 got = vm_patch_mac(master, vm_kdf_salt(selfRVA, funcRVA, codeLen), selfRVA, funcRVA, codeLen, p, len);
-        if (got != want) __builtin_trap();
+        if (got != want) {
+#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+            /* 诊断（#532）：补丁 MAC 不一致时，把关键量打出来 —— len 是否为 arm64 期望的 8、
+             * 以及 got/want 是否只是"字节顺序/长度"层面的差异。纯打印，不改行为。 */
+            extern void vm_dbg_trace(const char *tag, long v);
+            vm_dbg_trace("vf:len", (long)len);
+            vm_dbg_trace("vf:got", (long)got);
+            vm_dbg_trace("vf:want", (long)want);
+            vm_dbg_trace("vf:funcRVA", (long)funcRVA);
+#endif
+            __builtin_trap();
+        }
     }
 }
 
