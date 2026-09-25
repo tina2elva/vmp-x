@@ -173,11 +173,19 @@ Mark ("base:product " + $imgLineP.Trim())
 $ph = (& $od2 -p build/target_arm64.vmp 2>&1 | Out-String)
 $ent = ($ph -split "`n" | Where-Object { $_ -match "AddressOfEntryPoint|entry point" } | Select-Object -First 1)
 Mark ("entry:header " + ("" + $ent).Trim())
-if (Test-Path build/target_arm64.vmp.exe) {
-  $dd = (& $od2 -d --start-address=0x140001000 --stop-address=0x140001400 build/target_arm64.vmp.exe 2>&1 | Out-String)
-  $lines = ($dd -split "`n") | Select-Object -First 26
-  foreach ($ln in $lines) { Mark ("entry:bytes " + $ln.Trim()) }
-} else { Mark "entry:bytes (product .exe copy missing)" }
+$erva = 0
+if ("" -ne ("" + $ent)) {
+  $tok = (("" + $ent).Trim() -split "\s+")[-1]
+  try { $erva = [Convert]::ToUInt32($tok, 16) } catch { $erva = 0 }
+}
+Mark ("entry:rva=0x" + $erva.ToString("X"))
+if (($erva -ne 0) -and (Test-Path build/target_arm64.vmp)) {
+  $st1 = 0x140000000 + $erva
+  $en1 = $st1 + 0x180
+  $dd = (& $od2 -d ("--start-address=0x" + $st1.ToString("X")) ("--stop-address=0x" + $en1.ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
+  $lines = ($dd -split "`n") | Select-Object -First 30
+  foreach ($ln in $lines) { if ("" -ne $ln.Trim()) { Mark ("entry:bytes " + $ln.Trim()) } }
+} else { Mark "entry:bytes (no entry rva or no product)" }
 $manTxt = ""
 if (Test-Path build/vm_interp_win_arm64.json) { $manTxt = Get-Content build/vm_interp_win_arm64.json -Raw }
 $mb = ""
