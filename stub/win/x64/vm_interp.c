@@ -845,6 +845,7 @@ static void vm_dbg_win(const char *s) {
     while (s[n] && n < 60) n++;
     wf(h, s, n, &w, 0);
 }
+#undef VM_DBG_WIN
 #define VM_DBG_WIN(x) vm_dbg_win(x)
 #else
 #define VM_DBG_WIN(x) ((void)0)
@@ -2674,13 +2675,26 @@ void vm_verify_table(const u32 *t) {
         u32 got = vm_patch_mac(master, vm_kdf_salt(selfRVA, funcRVA, codeLen), selfRVA, funcRVA, codeLen, p, len);
         if (got != want) {
 #if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
-            /* 诊断（#532）：补丁 MAC 不一致时，把关键量打出来 —— len 是否为 arm64 期望的 8、
-             * 以及 got/want 是否只是"字节顺序/长度"层面的差异。纯打印，不改行为。 */
-            extern void vm_dbg_trace(const char *tag, long v);
-            vm_dbg_trace("vf:len", (long)len);
-            vm_dbg_trace("vf:got", (long)got);
-            vm_dbg_trace("vf:want", (long)want);
-            vm_dbg_trace("vf:funcRVA", (long)funcRVA);
+            /* 诊断（#532/#534）：把关键量打到 stderr。**必须自包含** —— 先前直接用 vm_dbg_trace 被
+             * 合并器的自包含自检拒绝（未定义符号），整个 blob 构建失败。这里自己格式化十六进制，
+             * 只复用已有的 vm_dbg_win。纯打印，不改行为。 */
+            extern void vm_dbg_win(const char *s);
+            char b[24];
+            u32 vals[4];
+            int k;
+            vals[0] = len; vals[1] = got; vals[2] = want; vals[3] = funcRVA;
+            for (k = 0; k < 4; k++) {
+                u32 v = vals[k];
+                int j;
+                for (j = 0; j < 8; j++) {
+                    u32 nib = (v >> (28 - 4 * j)) & 0xFu;
+                    b[j] = (char)(nib < 10u ? ('0' + nib) : ('a' + (nib - 10u)));
+                }
+                b[8] = '\n';
+                b[9] = 0;
+                vm_dbg_win(k == 0 ? "vf:len=" : (k == 1 ? "vf:got=" : (k == 2 ? "vf:want=" : "vf:fRVA=")));
+                vm_dbg_win(b);
+            }
 #endif
             __builtin_trap();
         }
