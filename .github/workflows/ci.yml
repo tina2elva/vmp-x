@@ -414,6 +414,22 @@ jobs:
           # that #521 left behind.
           pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
           Write-Host ("[*] reproducer exit=" + $LASTEXITCODE)
+      - name: win/arm64 full stderr capture
+        if: always()
+        shell: pwsh
+        run: |
+          # The in-memory stderr capture in the reproducer truncates, so the vf: diagnostics
+          # (printed by the blob right before the trap) never showed up. Redirect to a FILE and
+          # print it in full.
+          $prod = Join-Path $PWD "build/target_arm64.vmp.exe"
+          if (!(Test-Path $prod)) { Copy-Item (Join-Path $PWD "build/target_arm64.vmp") $prod -Force }
+          $env:VMPX_KEY = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+          & $prod 2> build/vf.err | Out-Null
+          Write-Output ("[*] VF: rc=" + $LASTEXITCODE)
+          if (Test-Path build/vf.err) {
+            Get-Content build/vf.err | ForEach-Object { Write-Output ("[*] VF: " + $_) }
+          } else { Write-Output "[*] VF: no stderr file" }
+          $global:LASTEXITCODE = 0
           if (Test-Path build/probe.txt) {
             Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) }
           } else { Write-Host "  TRACE| (missing)" }
