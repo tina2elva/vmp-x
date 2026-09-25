@@ -25,11 +25,6 @@
 #define VM_DBG_WIN(x) ((void)0)
 #endif
 
-/* 供**入口蹦床（汇编）**调用的标记 —— 定义必须无条件存在（汇编里的 bl 是无条件的，
- * 缺定义会被合并器的自包含检查拒绝，见 #529/#530）；这里只做前向声明，真身在本文件靠后的
- * Windows 段里（那里才有 vm_dbg_win）。 */
-void vm_mark_entry(void);
-
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define VM_ARCH_AARCH64 1
 #elif !defined(VM_BLOB_TARGET_LINUX) && !defined(__x86_64__) && !defined(_M_X64) && !defined(VM_HOST_X86_32)
@@ -854,15 +849,8 @@ static void vm_dbg_win(const char *s) {
 #else
 #define VM_DBG_WIN(x) ((void)0)
 #endif
-
 static u8 vm_master_buf[32];
 static u32 vm_master_ok; /* .bss：0 = 还没取，1 = 已取且 KCV 通过 */
-
-void vm_mark_entry(void) {
-#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
-    vm_dbg_win("tramp:entry\n");
-#endif
-}
 
 /* 这两个符号在本文件靠后的 Windows 段里定义 */
 static u64 vm_peb_base(void);

@@ -30,9 +30,6 @@ VM_ENTRY_SYMBOL:
     .endr
     str     x16, [sp, #(VM_CTX_OFF_REGS + 8*30)]
 
-    /* 诊断：确认蹦床真的开始执行（x30/x16 已存好，bl 覆盖 x30 无妨）。 */
-    bl      vm_mark_entry
-
     /* ---- ??????NZCV??it31..28??? VM ?????=1,Z=2,C=4,V=8??---- */
     mrs     x9, nzcv
     rbit    w9, w9
