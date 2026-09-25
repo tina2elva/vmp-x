@@ -185,6 +185,12 @@ if (($erva -ne 0) -and (Test-Path build/target_arm64.vmp)) {
   $dd = (& $od2 -d ("--start-address=0x" + $st1.ToString("X")) ("--stop-address=0x" + $en1.ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
   $lines = ($dd -split "`n") | Select-Object -First 30
   foreach ($ln in $lines) { if ("" -ne $ln.Trim()) { Mark ("entry:bytes " + $ln.Trim()) } }
+  # The first 8 instructions decode as: mov/mov/mov / adrp+add (x0 = a message pointer) /
+  # bl (a check) / cbz / brk #0. So the crash is a DELIBERATE assertion trap, not corrupt code.
+  # Dump the bytes at that pointer (0x140011670 in the run above) to learn WHICH check failed.
+  $msgVA = 0x140011670
+  $dd2 = (& $od2 -s ("--start-address=0x" + $msgVA.ToString("X")) ("--stop-address=0x" + ($msgVA + 0x60).ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
+  foreach ($ln in (($dd2 -split "`n") | Select-Object -First 8)) { if ("" -ne $ln.Trim()) { Mark ("entry:msg " + $ln.Trim()) } }
 } else { Mark "entry:bytes (no entry rva or no product)" }
 $manTxt = ""
 if (Test-Path build/vm_interp_win_arm64.json) { $manTxt = Get-Content build/vm_interp_win_arm64.json -Raw }
