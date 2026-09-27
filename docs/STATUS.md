@@ -9406,3 +9406,21 @@ arm64 外置 blob 编译通过、门禁 12/0。
 
 **本轮同时确认的对照事实**（`#566` run）：非外置产物是 `0xC000001D`（= 已修好的 `dc cvau` 那类非法指令形态），
 外置产物是 `0xC0000005` ⇒ **两者是不同的失败**，不能混为一谈。
+### 568. 两条新排除（本地）：**TLS 目录不存在**；**入口链的 `bl` 目标与符号精确吻合**
+
+**1) TLS**：三个产物（原目标 / `target_arm64.vmp` / `cmp.vmp`）的 `IMAGE_DIRECTORY_ENTRY_TLS` 均为 `rva=0 size=0`
+⇒ "TLS 回调数组按绝对 VA 写、搬基址后成为过期指针" 这条**排除**（与报告的 `imgTlsArrayRVA = 0` 一致）。
+
+**2) 入口链**（对最新本地产物 `cmp.vmp` 反汇编，Python 手解 ARM64 编码）：
+
+    产物 EntryPointRVA = 0x106A0（在载荷节内 = imgHook）
+      +0x00 mov x19, x0 / +0x04 mov x20, x1 / +0x08 mov x21, x2   (保存参数)
+      +0x0C adrp x0, #… / +0x10 add x0, x0, #…                   (取表地址)
+      +0x14 bl  -> RVA 0x9CC0
+    而 manifest: sectionRVA=0x5000, vm_unpack_image=0x4CC0 ⇒ 0x5000+0x4CC0 = 0x9CC0 ⇒ **精确吻合** ✓
+
+⇒ 入口蹦床 → `vm_unpack_image` 的链接**正确**（与此前对 EntryHook/TLS thunk 的静态验证一致）。
+
+**当前剩余边界（未变）**：外置产物 `0xC0000005`，且**在进入 `vm_unpack_image` 之前**（VEH 前移仍无输出，`#567`）。
+结合本轮：入口链正确、TLS 不存在 ⇒ 下一步应查**入口蹦床执行时的寄存器/参数**，以及
+**PE 加载期**本身（例如：入口蹦床能否被正常调用、`adrp/add` 算出的表地址在搬基址后是否正确）。
