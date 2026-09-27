@@ -28,6 +28,8 @@
 #ifndef VM_VEH_INSTALL
 #define VM_VEH_INSTALL() ((void)0)
 #endif
+/* 诊断全局的前置声明（定义在各自的 Windows/Linux 段里；未使用的 extern 在任何构建里都无害）。 */
+extern u64 vm_img_diag[4];
 /* 同样需要兜底：真身只在外置+Windows+ARM64 构建里定义 */
 #ifndef VM_DBG_FLUSH
 #define VM_DBG_FLUSH() ((void)0)
@@ -872,6 +874,30 @@ static void vm_dbg_flush(void) {
     void *h = gsh(0xFFFFFFF5u); /* STD_ERROR_HANDLE（已不再使用：stderr 在硬杀进程时会丢尾部） */
     u32 w = 0;
     (void)h;
+    /* 落盘前附上 vm_img_diag[0..3]：诊断码 / 运行时 base / wantBase / 计数（#559 的下一步）。
+     * dg1 就是**运行时 base** ⇒ RVA = veh:addr - dg1 ⇒ 可本地反汇编定位。 */
+    {
+        u32 dv[4];
+        int kk;
+        dv[0] = (u32)vm_img_diag[0]; dv[1] = (u32)vm_img_diag[1];
+        dv[2] = (u32)vm_img_diag[2]; dv[3] = (u32)vm_img_diag[3];
+        for (kk = 0; kk < 4; kk++) {
+            u32 v = dv[kk];
+            int jj, q;
+            char nm[10];
+            char pfx[5];
+            pfx[0] = 'd'; pfx[1] = 'g'; pfx[2] = (char)('0' + kk); pfx[3] = '='; pfx[4] = 0;
+            for (jj = 0; jj < 8; jj++) {
+                u32 nib = (v >> (28 - 4 * jj)) & 0xFu;
+                nm[jj] = (char)(nib < 10u ? ('0' + nib) : ('a' + (nib - 10u)));
+            }
+            nm[8] = '\n'; nm[9] = 0;
+            if (vm_dbg_used + 16u < sizeof(vm_dbg_buf)) {
+                for (q = 0; q < 4; q++) vm_dbg_buf[vm_dbg_used++] = pfx[q];
+                for (q = 0; q < 9; q++) vm_dbg_buf[vm_dbg_used++] = nm[q];
+            }
+        }
+    }
     if (!vm_dbg_used) return;
     /* 同时写文件。原因（实测）：`brk` 硬杀进程时，被重定向到文件/管道的句柄可能整体丢失输出，
      * 而 CreateFileA 拿到的是 OS 直接落盘的文件句柄 ⇒ 这是**唯一无损**的诊断通道
