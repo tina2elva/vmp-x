@@ -852,7 +852,9 @@ static void vm_dbg_win(const char *s) {
         typedef int (VM_WINAPI *ch_t)(void *);
         cfa_t cfa = (cfa_t)vm_get_proc(k, "CreateFileA");
         if (cfa) {
-            void *fh = cfa("vmpdiag.txt", 0x40000000u | 0x0004u, 3u, 0, 4u, 0x80u, 0);
+            /* 只传 FILE_APPEND_DATA：若同时带 GENERIC_WRITE，每次打开都从文件头开始写，
+             * 后写的短行会覆盖前写 ⇒ 诊断文件里只剩最后一行（实测踩到过）。 */
+            void *fh = cfa("vmpdiag.txt", 0x0004u, 3u, 0, 4u, 0x80u, 0);
             if (fh && fh != (void *)-1) {
                 wf(fh, s, n, &w, 0);
                 ch_t ch = (ch_t)vm_get_proc(k, "CloseHandle");
