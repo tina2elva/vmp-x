@@ -666,20 +666,42 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 	if len(opt.ImgSections) > 0 && opt.UnpackFn >= 0 && len(opt.ImgTlsCallbacks) > 0 {
 		align(16)
 		thunkRVA := baseRVA + uint32(len(data))
-		th := make([]byte, 0, 16)
-		th = append(th, 0x48, 0x8D, 0x0D) // lea rcx,[rip+disp32]
-		leaOff := len(th)
-		th = append(th, 0, 0, 0, 0)
-		th = append(th, 0xE8) // call vm_unpack_image
-		callOff := len(th)
-		th = append(th, 0, 0, 0, 0)
-		th = append(th, 0x85, 0xC0) // test eax, eax
-		th = append(th, 0x74, 0x02) // jz +2
-		th = append(th, 0x0F, 0x0B) // ud2（失败即 trap）
-		th = append(th, 0xC3)       // ret
-		binary.LittleEndian.PutUint32(th[leaOff:], uint32(int32(imgTableRVA)-int32(thunkRVA+uint32(leaOff+4))))
-		unpackRVA := baseRVA + uint32(opt.UnpackFn)
-		binary.LittleEndian.PutUint32(th[callOff:], uint32(int32(unpackRVA)-int32(thunkRVA+uint32(callOff+4))))
+		th := make([]byte, 0, 32)
+		if opt.Arch == ArchARM64 {
+			/* AArch64 版：adrp/add 取"解密表"地址 → bl vm_unpack_image → ret。
+			 * 与 x86 版同义（失败时 vm_unpack_image 内部会 vm_img_fail/trap，无需再 ud2）。
+			 * 以前这里**只有 x86 实现** ⇒ win/arm64 的 TLS 回调数组里被塞进 x86 字节 ⇒
+			 * 一旦目标注册了 TLS 回调（mingw 的 exe 几乎都有），回调在入口点之前执行 ⇒
+			 * 直接非法指令。这是与 EntryHook 同类的缺陷，一并补上。 */
+			put := func(v uint32) {
+				var b [4]byte
+				binary.LittleEndian.PutUint32(b[:], v)
+				th = append(th, b[:]...)
+			}
+			tblPage := imgTableRVA &^ 0xFFF
+			pcPage := thunkRVA &^ 0xFFF
+			delta := (int64(tblPage) - int64(pcPage)) >> 12
+			immlo := uint32(delta) & 0x3
+			immhi := (uint32(delta) >> 2) & 0x7FFFF
+			put(0x90000000 | (immlo << 29) | (immhi << 5))                                                    // adrp x0, page(表)
+			put(0x91000000 | ((imgTableRVA & 0xFFF) << 10))                                                   // add x0, x0, #(表 & 0xFFF)
+			put(arm64Branch(0x94000000, int64(baseRVA+uint32(opt.UnpackFn)), int64(thunkRVA)+int64(len(th)))) // bl
+			put(0xD65F03C0)                                                                                   // ret
+		} else {
+			th = append(th, 0x48, 0x8D, 0x0D) // lea rcx,[rip+disp32]
+			leaOff := len(th)
+			th = append(th, 0, 0, 0, 0)
+			th = append(th, 0xE8) // call vm_unpack_image
+			callOff := len(th)
+			th = append(th, 0, 0, 0, 0)
+			th = append(th, 0x85, 0xC0) // test eax, eax
+			th = append(th, 0x74, 0x02) // jz +2
+			th = append(th, 0x0F, 0x0B) // ud2（失败即 trap）
+			th = append(th, 0xC3)       // ret
+			binary.LittleEndian.PutUint32(th[leaOff:], uint32(int32(imgTableRVA)-int32(thunkRVA+uint32(leaOff+4))))
+			unpackRVA := baseRVA + uint32(opt.UnpackFn)
+			binary.LittleEndian.PutUint32(th[callOff:], uint32(int32(unpackRVA)-int32(thunkRVA+uint32(callOff+4))))
+		}
 		data = append(data, th...)
 		align(8)
 		imgTlsArrayRVA = baseRVA + uint32(len(data))
