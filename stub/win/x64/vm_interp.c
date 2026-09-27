@@ -844,6 +844,22 @@ static void vm_dbg_win(const char *s) {
     u32 n = 0, w = 0;
     while (s[n] && n < 60) n++;
     wf(h, s, n, &w, 0);
+    /* 同时写文件。原因（实测）：`brk` 硬杀进程时，被重定向到文件/管道的句柄可能整体丢失输出，
+     * 而 CreateFileA 拿到的是 OS 直接落盘的文件句柄 ⇒ 这是**唯一无损**的诊断通道
+     * （STATUS #539）。文件落在进程当前目录（CI 里就是仓库根）。 */
+    {
+        typedef void *(VM_WINAPI *cfa_t)(const char *, u32, u32, void *, u32, u32, void *);
+        typedef int (VM_WINAPI *ch_t)(void *);
+        cfa_t cfa = (cfa_t)vm_get_proc(k, "CreateFileA");
+        if (cfa) {
+            void *fh = cfa("vmpdiag.txt", 0x40000000u | 0x0004u, 3u, 0, 4u, 0x80u, 0);
+            if (fh && fh != (void *)-1) {
+                wf(fh, s, n, &w, 0);
+                ch_t ch = (ch_t)vm_get_proc(k, "CloseHandle");
+                if (ch) ch(fh);
+            }
+        }
+    }
 }
 #undef VM_DBG_WIN
 #define VM_DBG_WIN(x) vm_dbg_win(x)

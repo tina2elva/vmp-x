@@ -320,6 +320,10 @@ $env:VMPX_KEY_FILE = $null
 $env:VMPX_KEY = $keyHex
 $cmdOut = cmd.exe /c ("`"" + $pk + "`" 2> `"" + (Join-Path $PWD "build/raw.err") + "`"") 2>&1
 Mark ("raw rc=" + $LASTEXITCODE)
+# The blob now also writes vmpdiag.txt via CreateFileA/WriteFile - a channel that survives a hard
+# brk kill (redirection to a file/pipe loses the tail; STATUS #539).
+if (Test-Path "vmpdiag.txt") { $v = 0; foreach ($ln in (Get-Content "vmpdiag.txt")) { $v++; if ($v -le 80) { Mark ("diag| " + $ln) } } } else { Mark "diag (no file)" }
+Remove-Item "vmpdiag.txt" -ErrorAction SilentlyContinue
 if (Test-Path $rawErr) { $r = 0; foreach ($ln in (Get-Content $rawErr)) { $r++; if ($r -le 60) { Mark ("raw-err| " + $ln) } } } else { Mark "raw (no file)" }
 $env:VMPX_KEY = $null
 $null = & $pk 2> $dErr
