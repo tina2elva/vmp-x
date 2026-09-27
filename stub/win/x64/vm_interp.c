@@ -1020,8 +1020,16 @@ static void vm_veh_install(void) {
     add_t add;
     if (!mod) mod = vm_find_module("KERNEL32.DLL");
     if (!mod) return;
-    add = (add_t)vm_get_proc(mod, "RtlAddVectoredExceptionHandler");
-    if (add) add(1u /* first */, (void *)vm_veh_handler);
+    /* #571：**必须从 ntdll 取**这个函数。RtlAddVectoredExceptionHandler 的实现在 ntdll 里，
+     * 而 kernel32 中同名导出在部分 Windows 版本上是**转发项**（导出指向 "NTDLL.RtlAddVectored..." 字符串）⇒
+     * 用 vm_get_proc 直接取会拿到**指向字符串的地址**，调用即 AV（与 STATUS #385 同一类）。
+     * 因此这里优先 ntdll（前面已取到 mod=ntdll）⇒ 万一 mod 不是 ntdll 就退回 kernel32 并跳过注册。 */
+    {
+        u64 nt2 = vm_find_module("ntdll.dll");
+        add = nt2 ? (add_t)vm_get_proc(nt2, "RtlAddVectoredExceptionHandler") : 0;
+        if (!add && mod) add = (add_t)vm_get_proc(mod, "RtlAddVectoredExceptionHandler");
+        if (add) add(1u /* first */, (void *)vm_veh_handler);
+    }
 }
 #ifndef VM_NO_DIAG
 #undef VM_VEH_INSTALL
