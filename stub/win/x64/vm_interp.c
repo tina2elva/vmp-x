@@ -3265,6 +3265,7 @@ static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
         p += blk;
     }
     VM_DBG_WIN("ra:done\n");
+    VM_DBG_FLUSH(); /* walk 走完立即落盘：崩溃点就在这附近（STATUS #547） */
 }
 
 int vm_unpack_image(const void *tblp) {
