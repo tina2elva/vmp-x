@@ -9486,3 +9486,28 @@ arm64 外置 blob 编译通过、门禁 12/0。
 
 **下一轮**：在 `vm_veh_install()` 返回之后、以及表头两行读取**之后**各加一个 flush ⇒ 一次 run 即可把窗口劈成两半，
 确定是"VEH 注册"还是"表头读取"。
+### 572. 更正 #570 的推理；并把崩点锁死到"VEH 注册调用"
+
+**更正**：`VM_DBG_WIN("1b:enter")` 是**缓冲式**标记 ⇒ 它的"缺席"**不能**证明 `vm_master()` 未被进入。
+能说明问题的只有"**最后一次 flush 是哪个**"。`#570` 据此下的"崩在 vm_master 之前"结论**过强**，予以更正。
+
+**本轮改动**：给 `1b:enter`（`vm_master` 第一句）**加上 flush** ⇒ 这一行即可干净劈开窗口。
+
+**CI 结果（run 36313430295）**：marker 仍只有 `veh:install-begin` / `veh:mod-found` ⇒
+**`1b:enter` 依然不出现** ⇒ **`vm_master()` 从未被进入** ⇒ 崩点被锁死在：
+
+    veh:mod-found（veh_install 内）
+      -> [VEH 注册调用 add(1u, vm_veh_handler)]  [if (vm_img_done) return 0]  [*(u64*)(t+0), *(u32*)(t+8)]
+      -> vm_master()（**从未进入**）
+
+**本地排除表头读取**：对**外置**产物 `ext2.vmp` 做同一套蹦床反汇编 ——
+
+    ext2.vmp: EntryPointRVA=0x116A0；adrp page=0x11000 + add imm12=0x640 ⇒ 0x11640 = 它自己的 imgTableRVA ✓
+    cmp.vmp : EntryPointRVA=0x106A0；0x10000 + 0x640 = 0x10640 ✓
+
+⇒ 两者结构一致、表地址**精确正确** ⇒ `t` 是对的 ⇒ **表头读取不可能崩** ⇒
+⇒ **唯一剩下的嫌疑就是 VEH 注册调用本身**（`add(1u, vm_veh_handler)`）—— 这是我自己在 `#558` 引入的代码。
+
+**下一轮（一行实验，最干净）**：临时**去掉 VEH 注册那一行**（保留标记与 flush）⇒
+- 若产物随即能继续走到 `1b:enter`/`img:master-ok` ⇒ **确定是我的 VEH 在致病** ⇒ 改成"只在需要时注册"或换一种取证方式；
+- 若仍然崩在同一位置 ⇒ 嫌疑转向 `RtlAddVectoredExceptionHandler` 的**取址**本身（`vm_get_proc` 在 ntdll 上的行为）。
