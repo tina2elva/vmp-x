@@ -865,10 +865,10 @@ static void vm_dbg_flush(void) {
     gsh_t gsh = (gsh_t)vm_get_proc(k, "GetStdHandle");
     wf_t wf = (wf_t)vm_get_proc(k, "WriteFile");
     if (!gsh || !wf) return;
-    void *h = gsh(0xFFFFFFF5u); /* STD_ERROR_HANDLE */
+    void *h = gsh(0xFFFFFFF5u); /* STD_ERROR_HANDLE（已不再使用：stderr 在硬杀进程时会丢尾部） */
     u32 w = 0;
+    (void)h;
     if (!vm_dbg_used) return;
-    wf(h, vm_dbg_buf, vm_dbg_used, &w, 0);
     /* 同时写文件。原因（实测）：`brk` 硬杀进程时，被重定向到文件/管道的句柄可能整体丢失输出，
      * 而 CreateFileA 拿到的是 OS 直接落盘的文件句柄 ⇒ 这是**唯一无损**的诊断通道
      * （STATUS #539）。文件落在进程当前目录（CI 里就是仓库根）。 */
@@ -882,8 +882,10 @@ static void vm_dbg_flush(void) {
             void *fh = cfa("vmpdiag.txt", 0x0004u, 3u, 0, 4u, 0x80u, 0);
             if (fh && fh != (void *)-1) {
                 wf(fh, vm_dbg_buf, vm_dbg_used, &w, 0);
+                vm_dbg_used = 0; /* 落盘后清零：缓冲不再单调增长（STATUS #547 的干扰源之一） */
                 ch_t ch = (ch_t)vm_get_proc(k, "CloseHandle");
                 if (ch) ch(fh);
+                return;
             }
         }
     }
