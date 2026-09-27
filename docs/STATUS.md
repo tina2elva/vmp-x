@@ -8927,3 +8927,23 @@ grep 出决定性对比：
 2. 或把 flush 的输出限制为"**只在最后一次**写全量"（前面只写增量）；
 3. 再做同一次对照 ⇒ 若第 3 次 walk 也能走完，就说明"干扰量"确实是决定因素，
    进而可以放心地把诊断降到"**零**热路径开销 + 极少量落盘"，用干净产物跑三形态验收。
+
+### 548. **消除自身干扰后，两次重定位 walk 都能走完**（此前"第三次必崩"消失）
+
+**改动（一行级）**：① `vm_dbg_flush()` 落盘后**清零 `vm_dbg_used`**（缓冲不再单调增长）；
+② 去掉 stderr 写入，只保留 `CreateFileA/WriteFile` 的**文件通道**（少一次系统调用）。
+
+**结果（CI run 36301398460）**：
+
+    1b:enter|1b:fetched|img:fn-entry|img:mz-ok|img:delta-ok|img:sec-prot|img:sec-pre|
+    ra:enter|ra:dir|ra:rva=0x11000|ra:size=8|ra:walk|ra:done|        <- 第 1 次（-delta）
+    img:sec-xored|img:sec-verified|
+    ra:enter|ra:dir|ra:rva=0x11000|ra:size=8|ra:walk|ra:done|        <- 第 2 次（+delta）**也走完**
+
+⇒ 与 `#547` 对照：同样的代码路径，**减少干扰后崩溃点后移/消失** ⇒ **"干扰量"是决定因素**这一判断成立。
+
+**剩下的崩点**：`img:sec-post` 仍然缺席 ⇒ 它紧跟第二次 walk 之后；而 `sec-post` 之后的下一件事就是
+**它自己的 flush（一次系统调用）** ⇒ 需要一步实验区分"崩在 flush 调用"与"崩在产品代码"。
+
+**下一轮**：去掉 `vm_reloc_apply` 内部的那次 flush（只保留"每节一次"），并在 `sec-post` **之前**再插一个
+纯内存标记（零系统调用）⇒ 若新标记出现、`sec-post` 不出现 ⇒ 崩点就是那次 flush；反之则继续往里收。
