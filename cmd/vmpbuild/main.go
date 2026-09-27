@@ -153,7 +153,11 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：EntryHook/TLS thunk 已补 ARM64（#538），跑复现器看 vf: 诊断
+		// "win/arm64"：**未完成**（详见 STATUS #537-#549 的完整证据链与排除表）。已修两处平台级缺陷：
+		//  ① PE 的 EntryHook 与 TLS 回调 thunk **只有 x86 实现** ⇒ 已补 ARM64（#538）；
+		//  ② 目标无 .reloc 时自动建节（#525，x64 零影响）与 ARM64 的 I-cache 刷新（#529）。
+		// 仍存在一个**对二进制布局敏感**的运行期崩溃（#547-#549）：本地已排除 取钥/硬门、解密+AEAD、
+		// 重定位目录与 walk、补丁 MAC、自哈希、vm_code_off；无密钥硬门在 CI 实测恰好 0xC0DE0007 且无输出。
 		// "win/arm64"：**未完成**（收尾见 STATUS #537）。已确证的事实链（全部带 run 号）：
 		//  ① `.vmp` 扩展名无法被 PowerShell 启动 ⇒ 原 "native vs protected" 比对是**假通过**（#517）；
 		//  ② 修复了"目标无 .reloc 时的保护性拒绝"（建节，x64 零影响，本地门禁+CI 双证，#525/#529）；
