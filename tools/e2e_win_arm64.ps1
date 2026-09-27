@@ -309,7 +309,7 @@ Mark ("nokey rc=" + $sp0.ExitCode)
 $env:VMPX_KEY = $keyHex
 $dErr = "build/direct.err"
 Remove-Item $dErr -ErrorAction SilentlyContinue
-# PowerShell 的 `2> file` still goes through a managed pipeline, and a hard `brk` kill discards
+# PowerShell backtick-2> file still goes through a managed pipeline, and a hard brk kill discards
 # the buffered tail. cmd.exe s redirection gives the child a RAW file handle, so nothing is lost.
 $rawErr = "build/raw.err"
 Remove-Item $rawErr -ErrorAction SilentlyContinue
