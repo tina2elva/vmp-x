@@ -347,6 +347,28 @@ if (Test-Path build/vm_b_d0.bin) {
     Remove-Item "vmpdiag.txt" -ErrorAction SilentlyContinue
   } else { Mark "d0 pack failed" }
 } else { Mark "d0 blob build failed" }
+# ---- Variant C: encrypt ONLY .text (does the crash depend on which sections are encrypted?) ----
+& .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -out build/c.exe -report build/c.json -enc-image-sections ".text" 2>&1 | Out-Null
+if (Test-Path build/c.exe) {
+  Copy-Item build/c.exe build/c.vmp.exe -Force
+  $env:VMPX_KEY = $keyHex
+  $spc = Start-Process -FilePath (Join-Path $PWD "build/c.vmp.exe") -Wait -PassThru -NoNewWindow -RedirectStandardError "build/c.err" -RedirectStandardOutput "build/c.out"
+  Mark ("cOnlyText rc=" + $spc.ExitCode + " native=" + $natRc)
+  $env:VMPX_KEY = $null
+  if (Test-Path "vmpdiag.txt") { $y = 0; foreach ($ln in (Get-Content "vmpdiag.txt")) { $y++; if ($y -le 40) { Mark ("c-diag| " + $ln) } } } else { Mark "c-diag (no file)" }
+  Remove-Item "vmpdiag.txt" -ErrorAction SilentlyContinue
+} else { Mark "c pack failed" }
+# ---- Variant E: -strip-relocs (known: does not crash at preferred base; useful control) ----
+& .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -out build/e.exe -report build/e.json -strip-relocs 2>&1 | Out-Null
+if (Test-Path build/e.exe) {
+  Copy-Item build/e.exe build/e.vmp.exe -Force
+  $env:VMPX_KEY = $keyHex
+  $spe = Start-Process -FilePath (Join-Path $PWD "build/e.vmp.exe") -Wait -PassThru -NoNewWindow -RedirectStandardError "build/e.err" -RedirectStandardOutput "build/e.out"
+  Mark ("stripRelocs rc=" + $spe.ExitCode + " native=" + $natRc)
+  $env:VMPX_KEY = $null
+  if (Test-Path "vmpdiag.txt") { $x = 0; foreach ($ln in (Get-Content "vmpdiag.txt")) { $x++; if ($x -le 40) { Mark ("e-diag| " + $ln) } } } else { Mark "e-diag (no file)" }
+  Remove-Item "vmpdiag.txt" -ErrorAction SilentlyContinue
+} else { Mark "e pack failed" }
 if (Test-Path $rawErr) { $r = 0; foreach ($ln in (Get-Content $rawErr)) { $r++; if ($r -le 60) { Mark ("raw-err| " + $ln) } } } else { Mark "raw (no file)" }
 $env:VMPX_KEY = $null
 $null = & $pk 2> $dErr
