@@ -9467,3 +9467,22 @@ arm64 外置 blob 编译通过、门禁 12/0。
 
 **下一轮**：在 `vm_master()` **内部**再插 flush 点（环境变量路径 → `.vmpkey` 文件路径 → KCV 校验），
 一次 run 即可定位到**具体是哪一条取钥路径**出错；随后按 `#385` 的结论改用 ntdll/PEB 直读、避开 kernel32 转发导出。
+### 571. 把 VEH 注册改用 ntdll（卫生正确）但**症状未变** ⇒ 窗口缩到"VEH 注册 / 表头读取"
+
+**改动**：`RtlAddVectoredExceptionHandler` 改为**优先从 ntdll 取**（kernel32 只是兜底），理由同 `#385`
+（kernel32 里同名导出可能是转发项 ⇒ 直接调用会 AV）。arm64 构建通过、门禁 12/0。
+
+**结果（run 36312948455）**：marker 仍是只有 `veh:install-begin` / `veh:mod-found`；
+`no key: rc=-1073741819`、`VMPX_KEY: rc=-1073741819`、`noDiag rc=-1073741819` ⇒ **症状未变**。
+
+⇒ 因此崩点**不在** VEH 注册调用本身，而在这一小段窗口内：
+
+    veh:mod-found（veh_install 内）
+      -> [VEH 注册]  [if (vm_img_done) return 0]  [表头读取 *(u64*)(t+0), *(u32*)(t+8)]
+      -> vm_master() 的第一句 "1b:enter"（**从未出现**）
+
+⇒ 注意：`t` 由入口蹦床的 `adrp/add` 给出，而我**静态验算**过它精确等于 `imgTableRVA`（`#568`：page 0x10000 + off 0x640）
+⇒ 若运行期崩在表头读取，说明**运行期实际传入的 `t` 与静态推演不同**（例如蹦床被以不同寄存器约定调用）。
+
+**下一轮**：在 `vm_veh_install()` 返回之后、以及表头两行读取**之后**各加一个 flush ⇒ 一次 run 即可把窗口劈成两半，
+确定是"VEH 注册"还是"表头读取"。
