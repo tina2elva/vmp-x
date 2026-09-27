@@ -843,11 +843,10 @@ static u32 vm_dbg_used;
 /* 前向声明：真正的定义在文件靠后的 Windows 段里（诊断落盘时要附上它的 4 个数值）。 */
 extern u64 vm_img_diag[4];
 
-/* 前向声明：VEH 块在本文件靠前，而这两个函数的定义在靠后的 Windows 段里。 */
+#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+/* 前向声明（**必须与外置分支同守卫**：这两个函数只在该分支里定义，否则非外置构建会报"声明了 static 却没有定义"） */
 static void vm_dbg_win(const char *s);
 static void vm_dbg_flush(void);
-
-#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
 /* ---- VEH：把"异常码 + 异常地址"记进无损通道（STATUS #558） ----
  * 为什么用 VEH 而不是插标记：插标记会改变代码体积/热路径 ⇒ 实测会**移动崩溃点**（#542/#549）。
  * VEH 只在异常发生时执行一次，不改变正常路径。 */
