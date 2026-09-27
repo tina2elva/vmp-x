@@ -3460,14 +3460,14 @@ int vm_unpack_image(const void *tblp) {
          * 自包含 freestanding 目标，合并器会拒绝该未定义符号（实测 "引用了未定义符号"）。
          * 这里直接写 AArch64 的规定序列：dc cvau（清到 PoU）→ dsb ish → ic ivau → dsb ish → isb。 */
         {
-            u64 a0 = (u64)dst & ~(u64)63;
-            u64 a1 = ((u64)dst + size + 63) & ~(u64)63;
-            u64 a;
-            for (a = a0; a < a1; a += 64) __asm__ __volatile__("dc cvau, %0" ::"r"(a) : "memory");
-            __asm__ __volatile__("dsb ish" ::: "memory");
-            for (a = a0; a < a1; a += 64) __asm__ __volatile__("ic ivau, %0" ::"r"(a) : "memory");
-            __asm__ __volatile__("dsb ish" ::: "memory");
-            __asm__ __volatile__("isb" ::: "memory");
+            /* **不要**在 Windows 用户态直接执行 dc cvau / ic ivau / dsb ish：SCTLR_EL1.UCI 未置位时
+             * EL0 执行这类缓存维护指令会 trap ⇒ STATUS_ILLEGAL_INSTRUCTION (0xC000001D)。
+             * 实测证据（STATUS #561）：VEH 抓到出错地址处的字节正是 `dc cvau`（0xD50B7528 小端 28750bd5）。
+             * 正确做法：把刷新交给内核 —— FlushInstructionCache(GetCurrentProcess(), dst, size)。 */
+            typedef int (VM_WINAPI *fic_t)(void *, const void *, u64);
+            u64 k32 = vm_find_module("KERNEL32.DLL");
+            fic_t fic = k32 ? (fic_t)vm_get_proc(k32, "FlushInstructionCache") : 0;
+            if (fic) fic((void *)-1, (const void *)dst, (u64)size); /* -1 = GetCurrentProcess() */
         }
 #endif
         VM_DBG_WIN("img:sec-post\n");
