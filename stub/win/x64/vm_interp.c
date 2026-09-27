@@ -3399,6 +3399,7 @@ static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
 }
 
 int vm_unpack_image(const void *tblp) {
+    VM_VEH_INSTALL(); /* 装 VEH（#566）：必须在取钥 vm_master() 之前 —— 否则崩在取钥阶段就完全没有诊断 */
     if (vm_img_done) return 0;
     const u8 *t = (const u8 *)tblp;
     u64 wantBase = *(const u64 *)(t + 0);
@@ -3408,7 +3409,6 @@ int vm_unpack_image(const void *tblp) {
     u8 mi[32];
     vm_kdf_entry(master, VM_FIELD_MASK_IMAGE, VM_FIELD_MASK_SALT, mi);
     u32 count = vm_xor32(t + 12, mi + 0);
-    VM_VEH_INSTALL(); /* 装 VEH：之后的任何异常都会把 异常码/地址 写进 vmpdiag.txt（#558） */
     VM_DBG_WIN("img:fn-entry\n"); /* 诊断：已进入 Windows 镜像解密函数（入口蹦床最先调用的就是它） */
     /* 基址不能用 PEB->ImageBaseAddress：那是**宿主 EXE** 的基址。DLL 在被加载时，
      * 那个字段指向宿主进程的主镜像，于是 base != wantBase 永远成立（实测直接 -2）。
