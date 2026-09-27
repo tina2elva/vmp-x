@@ -9238,3 +9238,36 @@ VEH 是在**异常发生之后**运行 ⇒ 完全可以读取该地址 ✓。这
 
 **结论雏形**：崩溃是一条**非法指令**、地址稳定、且落在**代码区附近** ⇒ 很可能是"**跳到了错误地址**"或
 "**代码在内存里与文件不一致**"这两类之一。上面这 16 字节能一次性区分它们。
+### 561. **根因一确认并修好**：用户态执行 `dc cvau` 会 trap；解密循环首次完整跑完
+
+**证据链（全部来自 VEH 抓取的出错地址字节）**：
+
+    #560 前：veh:addr 处字节为 `28750bd5` = **dc cvau, x8**（就是 #529 自己写的刷新循环）
+    ⇒ Windows 用户态执行缓存维护指令（dc cvau / ic ivau / dsb ish）会 trap（SCTLR_EL1.UCI 未置位时 EL0 不允许）
+    ⇒ 表现正是 STATUS_ILLEGAL_INSTRUCTION (0xC000001D)
+
+**修法**：删掉 asm 序列，改用 `FlushInstructionCache(GetCurrentProcess(), dst, size)`（由内核做缓存维护）。
+代码改动 8 行；本地四种构建（arm64 外置 / amd64 默认 / amd64 外置 / release / i686）全过，门禁 12/0。
+
+**修复后的 CI（run 36308359198）—— 解密循环首次跑完**：
+
+    img:fn-entry | img:mz-ok | img:no-entries-delta0 | img:delta-ok
+    img:sec-prot | img:sec-pre | img:sec-xored | img:sec-verified | img:sec-post   <- 第 1 节完成
+    img:sec-prot | img:sec-pre | img:sec-xored | img:sec-verified | img:sec-post   <- 第 2 节完成
+    img:loop-done                                                                  <- **整个解密循环完成**
+
+⇒ 这是十几轮以来第一次让"解密路径"**全程走通**；第一个真因（`dc cvau`）确认并修好。
+
+**崩溃后移到新位置（同一 run）**：
+
+    veh:code=00000000c000001d
+    veh:addr=00007ff65def1054      dg1(base)=5def0000  ⇒ RVA = 0x1054
+    veh:-16..+16 = 2fed85cf b1fbb1e2 c7f7c09c f0d58eb6 | 00000000 00000000 00000000 00000000
+                                              ↑ 出错处**全零**
+
+⇒ RVA `0x1054` 落在**目标自身 `.text`**（RVA 0x1000、VSize 0xC4）内 ⇒ 现在的问题是：
+**执行跳进了一片全零区域**（非法指令 0x00000000）⇒ 典型"分支目标错误/未初始化"。
+
+**下一轮**：把 `veh:-16..+16` 的采样范围扩大（例如 ±64 字节）+ 同时 dump 目标 `.text` 解密后的前若干字节，
+并与**原始目标 exe** 的 `.text` 逐字节比对 ⇒ 区分"解密写错了位置/内容"与"跳转目标用错了地址"。
+两者都可以**本地**用 `llvm-objdump` 与原始 exe 完成比对。
