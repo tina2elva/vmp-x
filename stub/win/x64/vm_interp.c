@@ -832,13 +832,28 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
 static u64 vm_find_module(const char *name);
 static void *vm_get_proc(u64 mod, const char *fn);
 
+/* 诊断缓冲（.bss；在自哈希区间之外，不影响 vm_selfcheck）：热路径只写内存，**零系统调用**。
+ * 原因见 STATUS #542/#547：每次标记都 CreateFileA/WriteFile/CloseHandle 会移动崩溃点。 */
+static char vm_dbg_buf[2048];
+static u32 vm_dbg_used;
+
+static void vm_dbg_flush(void);
+
 static void vm_dbg_win(const char *s) {
-#ifdef VM_NO_DIAG
-    /* 诊断静默开关：用于判定"崩溃是否由诊断本身诱发"（STATUS #542/#543）。
-     * 打开后本函数不做任何系统调用，关键路径完全不被打扰。 */
-    (void)s;
-    return;
+#ifndef VM_NO_DIAG
+    u32 n = 0;
+    while (s[n] && n < 60) n++;
+    if (n && vm_dbg_used + n + 1u < sizeof(vm_dbg_buf)) {
+        u32 i;
+        for (i = 0; i < n; i++) vm_dbg_buf[vm_dbg_used++] = s[i];
+    }
 #endif
+    (void)s;
+}
+
+/* 落盘：只在"阶段边界"调用（STATUS #547）。先写 stderr，再用 OS 文件句柄追加写 vmpdiag.txt */
+static void vm_dbg_flush(void) {
+#ifndef VM_NO_DIAG
     typedef void *(*gsh_t)(u32);
     typedef int (VM_WINAPI *wf_t)(void *, const void *, u32, u32 *, void *);
     u64 k = vm_find_module("KERNEL32.DLL");
@@ -847,9 +862,9 @@ static void vm_dbg_win(const char *s) {
     wf_t wf = (wf_t)vm_get_proc(k, "WriteFile");
     if (!gsh || !wf) return;
     void *h = gsh(0xFFFFFFF5u); /* STD_ERROR_HANDLE */
-    u32 n = 0, w = 0;
-    while (s[n] && n < 60) n++;
-    wf(h, s, n, &w, 0);
+    u32 w = 0;
+    if (!vm_dbg_used) return;
+    wf(h, vm_dbg_buf, vm_dbg_used, &w, 0);
     /* 同时写文件。原因（实测）：`brk` 硬杀进程时，被重定向到文件/管道的句柄可能整体丢失输出，
      * 而 CreateFileA 拿到的是 OS 直接落盘的文件句柄 ⇒ 这是**唯一无损**的诊断通道
      * （STATUS #539）。文件落在进程当前目录（CI 里就是仓库根）。 */
@@ -862,12 +877,13 @@ static void vm_dbg_win(const char *s) {
              * 后写的短行会覆盖前写 ⇒ 诊断文件里只剩最后一行（实测踩到过）。 */
             void *fh = cfa("vmpdiag.txt", 0x0004u, 3u, 0, 4u, 0x80u, 0);
             if (fh && fh != (void *)-1) {
-                wf(fh, s, n, &w, 0);
+                wf(fh, vm_dbg_buf, vm_dbg_used, &w, 0);
                 ch_t ch = (ch_t)vm_get_proc(k, "CloseHandle");
                 if (ch) ch(fh);
             }
         }
     }
+#endif /* !VM_NO_DIAG */
 }
 #undef VM_DBG_WIN
 #define VM_DBG_WIN(x) vm_dbg_win(x)
@@ -2672,6 +2688,7 @@ u64 vm_selftest(void *ctxp) {
  * 根本不再进入 VM —— 放在解释器里的校验永远不会执行。只有加载期的检查能拦住它。 */
 void vm_verify_table(const u32 *t) {
     VM_DBG_WIN("vf:enter\n"); /* 诊断：EntryHook 确实调到了校验蹦床 */
+    vm_dbg_flush();
     u32 n, i;
     const u8 *base = (const u8 *)t;
     const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
@@ -2724,6 +2741,7 @@ void vm_verify_table(const u32 *t) {
                 vm_dbg_win(b);
             }
 #endif
+            vm_dbg_flush();
             __builtin_trap();
         }
     }
@@ -3356,6 +3374,7 @@ int vm_unpack_image(const void *tblp) {
         vp(dst, size, prot, &old);
     }
     VM_DBG_WIN("img:loop-done\n");
+    vm_dbg_flush();
     vm_img_done = 1;
     vm_img_diag[0] = 0;
     return 0;
