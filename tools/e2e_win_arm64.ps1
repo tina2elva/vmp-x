@@ -303,6 +303,16 @@ $nokeyErr = "build/nokey.err"
 Remove-Item $nokeyErr -ErrorAction SilentlyContinue
 $sp0 = Start-Process -FilePath $pk -Wait -PassThru -NoNewWindow -RedirectStandardError $nokeyErr -RedirectStandardOutput "build/nokey.out"
 Mark ("nokey rc=" + $sp0.ExitCode)
+# Isolation: SAME product, SAME key, but launched DIRECTLY with stderr redirected to a file.
+# - direct prints markers but Start-Process does not  => launch/redirect artifact, not the product
+# - neither prints                                     => the key path dies before 1b:enter
+$env:VMPX_KEY = $keyHex
+$dErr = "build/direct.err"
+Remove-Item $dErr -ErrorAction SilentlyContinue
+$null = & $pk 2> $dErr
+Mark ("direct rc=" + $LASTEXITCODE)
+if (Test-Path $dErr) { $m = 0; foreach ($ln in (Get-Content $dErr)) { $m++; if ($m -le 40) { Mark ("direct-err| " + $ln) } } }
+$env:VMPX_KEY = $null
 if (Test-Path $nokeyErr) { foreach ($ln in (Get-Content $nokeyErr)) { Mark ("nokey-err| " + $ln) } }
 # Same treatment for the NON-external product: it has no license gate, so if IT prints markers
 # under Start-Process (ASLR) but the external one does not, the fault is the license path; if BOTH
