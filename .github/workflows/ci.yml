@@ -412,4 +412,12 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
           Write-Host ("[*] reproducer exit=" + $LASTEXITCODE)
           if (Test-Path build/probe.txt) { Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) } }
+      - name: win/arm64 external reproducer (diagnostic, #553)
+        if: always()
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
+          Write-Host ("[*] reproducer exit=" + $LASTEXITCODE)
+          if (Test-Path build/probe.txt) { Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) } }
+          $global:LASTEXITCODE = 0
           $global:LASTEXITCODE = 0
