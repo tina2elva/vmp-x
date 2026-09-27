@@ -2647,6 +2647,7 @@ u64 vm_selftest(void *ctxp) {
  * 为什么必须在**加载期**做：回填（把被覆盖的几字节补回原生代码）之后，被保护函数
  * 根本不再进入 VM —— 放在解释器里的校验永远不会执行。只有加载期的检查能拦住它。 */
 void vm_verify_table(const u32 *t) {
+    VM_DBG_WIN("vf:enter\n"); /* 诊断：EntryHook 确实调到了校验蹦床 */
     u32 n, i;
     const u8 *base = (const u8 *)t;
     const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
@@ -2654,12 +2655,15 @@ void vm_verify_table(const u32 *t) {
     /* (2) 运行期强制：在这里（入口蹦床 = 入口点、main 之前）做授权校验。
      * 放在 vm_master() 里是错的：那条路径也被 TLS 回调走到，不能在回调里加载 DLL/调 CNG。
      * 只在外置密钥模式下编入（vmpack 也拒绝给非外置 blob 传 -license-*，所以不存在"静默无门禁"）。 */
+    VM_DBG_WIN("vf:lic-pre\n"); /* 诊断：即将做授权门禁 */
     if (!vm_license_check()) vm_key_reject();
+    VM_DBG_WIN("vf:lic-ok\n"); /* 诊断：授权门禁已通过 */
 #endif
     if (!t) return;
     u8 m[32];
     vm_kdf_entry(master, VM_FIELD_MASK_VERIFY, VM_FIELD_MASK_SALT, m);
     n = t[0];
+    VM_DBG_WIN("vf:loop\n"); /* 诊断：进入补丁 MAC 校验循环 */
     for (i = 0; i < n; i++) {
         /* (3)：每条 24 字节（delta/len/check/selfRVA/funcRVA/codeLen）整体加了掩码 ——
          * 只蒙 funcRVA 而留着 delta 是自欺欺人（delta 就等于 funcRVA - 表首 RVA）。 */

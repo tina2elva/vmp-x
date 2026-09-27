@@ -289,8 +289,10 @@ $o2 = (& $pk 2>&1) -join "|"; $r2 = $LASTEXITCODE
 # more with stderr redirected to a FILE and write every line into the trace (STATUS #538 follow-up).
 $errFile = "build/keycase.err"
 Remove-Item $errFile -ErrorAction SilentlyContinue
-$null = & $pk 2> $errFile
-Mark ("fullstderr rc=" + $LASTEXITCODE)
+# Start-Process -Wait guarantees the redirect target is flushed before we read it (a plain
+# `2> file` from the child could leave the file empty when the process dies hard).
+$sp = Start-Process -FilePath $pk -Wait -PassThru -NoNewWindow -RedirectStandardError $errFile -RedirectStandardOutput "build/keycase.out"
+Mark ("fullstderr rc=" + $sp.ExitCode)
 if (Test-Path $errFile) {
   $i = 0
   foreach ($ln in (Get-Content $errFile)) { $i++; if ($i -le 60) { Mark ("err| " + $ln) } }
