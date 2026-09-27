@@ -329,6 +329,24 @@ Mark ("raw rc=" + $LASTEXITCODE)
 # brk kill (redirection to a file/pipe loses the tail; STATUS #539).
 if (Test-Path "vmpdiag.txt") { $v = 0; foreach ($ln in (Get-Content "vmpdiag.txt")) { $v++; if ($v -le 80) { Mark ("diag| " + $ln) } } } else { Mark "diag (no file)" }
 Remove-Item "vmpdiag.txt" -ErrorAction SilentlyContinue
+# ---- Variant B: forced delta=0 (one more observation in the SAME run) ----
+$wrapD0 = Join-Path $PWD "build/clang-a64w-d0.cmd"
+Set-Content -Path $wrapD0 -Value ("@echo off" + $nl + $q + $clang + $q + " --target=aarch64-w64-windows-gnu -DVM_FORCE_DELTA0 %*") -Encoding Ascii
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_b_d0.bin -manifest build/vm_b_d0.json -entry vm_entry -guest arm64 -merge go -cc $wrapD0 -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 3 | Out-Null
+if (Test-Path build/vm_b_d0.bin) {
+  & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_b_d0.bin -manifest build/vm_b_d0.json -out build/d0.exe -report build/d0.json 2>&1 | Out-Null
+  if (Test-Path build/d0.exe) {
+    Copy-Item build/d0.exe build/d0.vmp.exe -Force
+    $env:VMPX_KEY = $keyHex
+    $bErr = "build/d0.err"
+    Remove-Item $bErr -ErrorAction SilentlyContinue
+    $spb = Start-Process -FilePath (Join-Path $PWD "build/d0.vmp.exe") -Wait -PassThru -NoNewWindow -RedirectStandardError $bErr -RedirectStandardOutput "build/d0.out"
+    Mark ("d0 rc=" + $spb.ExitCode + " native=" + $natRc)
+    $env:VMPX_KEY = $null
+    if (Test-Path "vmpdiag.txt") { $z = 0; foreach ($ln in (Get-Content "vmpdiag.txt")) { $z++; if ($z -le 60) { Mark ("d0-diag| " + $ln) } } } else { Mark "d0-diag (no file)" }
+    Remove-Item "vmpdiag.txt" -ErrorAction SilentlyContinue
+  } else { Mark "d0 pack failed" }
+} else { Mark "d0 blob build failed" }
 if (Test-Path $rawErr) { $r = 0; foreach ($ln in (Get-Content $rawErr)) { $r++; if ($r -le 60) { Mark ("raw-err| " + $ln) } } } else { Mark "raw (no file)" }
 $env:VMPX_KEY = $null
 $null = & $pk 2> $dErr
