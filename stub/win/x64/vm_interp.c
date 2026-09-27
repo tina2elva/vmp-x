@@ -3297,25 +3297,18 @@ int vm_unpack_image(const void *tblp) {
      * 基址不同是**正常**的：算出 delta，解密前后各做一次逆/正变换。只有"需要重定位却没有重定位表"
      * （被人为剥掉）才继续 fail-fast —— 那种情况下我们无法把加载器写进密文的增量还原出来。 */
     long long delta = wantBase ? (long long)(base - wantBase) : 0;
-    /* 无重定位表 ⇒ 加载器无法搬动本镜像；而实测把它当 delta=0 继续也会崩（#512）⇒ 只能拒绝。 */
+    /* (7)：**没有重定位表**时，加载器没有任何条目可搬动 ⇒ 密文里根本没有被写入过 delta ⇒
+     * 对**密文**而言 delta 就等于 0（既不该拒绝，也不该做 ①/④ 的逆/正变换）。
+     * 历史：`#510`（清 DYNAMIC_BASE 改变语义）与 `#511/#512`（去掉拒绝 / 视 delta=0）当时都判为失败，
+     * 但那时入口蹦床仍是 **x86 机器码**（`#538` 才修好）⇒ 那几次崩溃另有其因，不能据此否定本修法。
+     * 本次在此之前已用**本地复算**排除：重定位目录/SizeOfImage/walk/MAC/自哈希/vm_code_off、
+     * 以及"未登记的绝对 VA"（`#544`/`#546`/`#551`）。 */
     if (delta != 0) {
         u32 rr, rs;
         vm_reloc_dir((const u8 *)base, &rr, &rs);
-        /* 拒绝是对的（#510/#511/#512 三次尝试均证明放行会真崩），但把 delta 的**符号与量级**
-         * 编码进退出码，以便一次运行就判定"delta 是真实的重定位偏移(大)还是记账小错(小)"：
-         *   code = 0x20 | (delta<0 ? 8 : 0) | ((|delta|>>12) & 7)   ⇒ 0xC0DE0020..0xC0DE002F
-         * delta 越大，低位越大（每 0x1000 一档）。定案后这里会还原成 vm_img_fail(2)。 */
         if (!rr) {
-            /* 上一版已测出 |delta| < 0x1000 且非负（code=0x20）⇒ 它不是重定位偏移，而是记账小错。
-             * 这一版把 base 与 wantBase 的**低 12 位**各取高 3 位编码进来，看是哪一边"没页对齐"：
-             *   bits3..1 = (base & 0xFFF) >> 9     bits6..4 = (wantBase & 0xFFF) >> 9
-             * 两者都为 0 ⇒ 都页对齐（那 delta 的小量来自别处）；只有一个非 0 ⇒ 就是它偏了。 */
-            u32 lb = (u32)((base & 0xFFFu) >> 9) & 7u;
-            u32 lw = (u32)((wantBase & 0xFFFu) >> 9) & 7u;
-            u32 code = 0x20u | (lb << 1) | (lw << 4);
-            vm_img_diag[0] = 2;
-            vm_img_fail(code);
-            return -2;
+            VM_DBG_WIN("img:notable-delta0\n");
+            delta = 0;
         }
     }
     VM_DBG_WIN("img:delta-ok\n");
