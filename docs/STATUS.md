@@ -8850,3 +8850,21 @@ grep 出决定性对比：
 （`key = KDFEntry(master, funcRVA, salt ^ 0x9E3779B9)`，消息 = `patch || le32(selfRVA) || le32(funcRVA) || le32(codeLen)`）
 在本地算出 `check`，与产物描述符里烘焙的值比对；这正是 `vm_verify_table` 会 `brk` 的那一处。
 若也 MATCH ⇒ 说明"越过当前障碍后不会再撞 MAC"；若 MISMATCH ⇒ 直接就是根因。
+
+### 545. MAC/KDF 的**算法**层面已验证一致（Go↔C 双侧 KAT 全过）
+
+**本轮（本地，秒级）**：
+
+    --- PASS: TestKDFEntryMatchesC / TestKDFSaltDistinctAndStable / TestKDFDescriptorKeyMatchesC
+    --- PASS: TestKDFSectionKeyMatchesC / TestKDFEntryDistinctPerFunc
+    --- PASS: TestPatchMACMatchesC / TestPatchMACBindsContext
+    [OK  ] blob KDF KAT: vm_kdf_salt x5 + vm_kdf_entry x3 + patch_mac x1 match   ← 门禁里跑的 blob 级 KAT
+
+⇒ **Go 与 C 两侧的 KDF/MAC 算式逐字节一致** ⇒ 若 `vm_verify_table` 真的会 `brk`，原因只能在**输入**：
+`salt / selfRVA / funcRVA / codeLen / patch 字节` 在打包端与运行期取值不同，而**不是算式不同**。
+
+**下一轮的本地检查（决定性的"输入复算"）**：写一个小 Go 工具（放在 `build/`，不入库）——
+1. 用 `internal/inject` 自己的函数（`KDFEntry`/`KDFSaltForPlacement`/`PatchMAC`）与主密钥（本地构建用的 `-key-in`）；
+2. 从**产物**里读出两个函数的 `funcRVA`、`codeLen`、`patch 字节`（补丁字节在文件里是**明文**，就在函数入口）；
+3. 自己算 `check`，与产物描述符里烘焙的值（按 `inject.FieldMask` 反混淆后）比对；
+4. 若 **MATCH** ⇒ 可放心继续修入口/解密路径（MAC 不会成为下一个障碍）；若 **MISMATCH** ⇒ 直接定位到是哪个输入不一致。
