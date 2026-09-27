@@ -870,3 +870,14 @@ clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib -fuse-l
 
 ⚠️ 注意：`build/` 也在 `gofmt -l .` 的覆盖范围内 ⇒ 放在 `build/` 下的临时 Go 工具**必须 gofmt**，否则门禁红。
 ⚠️ WSL 里跑不了 **Windows PE**（qemu-aarch64 只跑 Linux ELF）⇒ 实机验证仍需 CI 的 `windows-11-arm`。
+
+### 最新边界（#567，接手指南更新）
+
+- **已闭环的真因**：用户态执行 `dc cvau`/`ic ivau`/`dsb ish` 会 trap（`0xC000001D`）⇒ 已改用 `FlushInstructionCache`（`#561`）；
+  修后**解密循环首次完整跑完**（`img:loop-done`）。
+- **已本地排除**：表解码（`selfRVA == imgTableRVA`、`.text` 在表内、`flags` 正确）、基址反推、MAC、自哈希、`vm_code_off`、
+  重定位目录与 walk、未登记绝对 VA、delta 变换、加密范围、诊断脚手架（零诊断产物同样崩，`#566`）。
+- **当前边界**：外置产物 `0xC0000005`，且**在进入 `vm_unpack_image` 之前**（VEH 前移到首行仍无输出，`#567`）⇒
+  下一步应在**入口蹦床 / TLS 回调 / PE 加载期**找（可本地反汇编 imgHook/EntryHook/TLS thunk 的机器码与目标地址）。
+- **有用的本地工具**：`build/imgtab`（用仓库 KDF 解码签密表）、`build/maccheck`（复算补丁 MAC）、`build/vascan.py`（扫绝对 VA）、
+  `build/paycmp.py`（节/字节比对）—— 全部**不入库、需 gofmt**、秒级。
