@@ -188,8 +188,11 @@ if (($erva -ne 0) -and (Test-Path build/target_arm64.vmp)) {
   # The entry does: save args / adrp+add (x0 = pointer) / bl 0x14000d6c8 / cbz / brk #0.
   # Dump the CALLEE (0x14000d6c8) - it lives in the payload section, which is NOT encrypted, so
   # these are the real instructions of whatever check the entry trampoline calls.
-  $tva = 0x14000d6c8
-  $dd3 = (& $od2 -d ("--start-address=0x" + $tva.ToString("X")) ("--stop-address=0x" + ($tva + 0x70).ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
+  # Start 0x40 bytes EARLIER so we can see whether 0x14000d6c8 is really a function entry
+  # (STATUS #536 follow-up: if a prologue sits right before it, my "mid-function" reading was
+  #  just a dump-window artifact and must be corrected).
+  $tva = 0x14000d688
+  $dd3 = (& $od2 -d ("--start-address=0x" + $tva.ToString("X")) ("--stop-address=0x" + ($tva + 0x90).ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
   foreach ($ln in (($dd3 -split "`n") | Select-Object -First 22)) { if ("" -ne $ln.Trim()) { Mark ("target:code " + $ln.Trim()) } }
   # The first 8 instructions decode as: mov/mov/mov / adrp+add (x0 = a message pointer) /
   # bl (a check) / cbz / brk #0. So the crash is a DELIBERATE assertion trap, not corrupt code.
