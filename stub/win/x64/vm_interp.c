@@ -3412,6 +3412,8 @@ int vm_unpack_image(const void *tblp) {
     u32 salt = *(const u32 *)(t + 8);
     /* (3)：表头的 count/selfRVA/保留 加了掩码（与 Go 侧 inject.FieldMask 同式）。 */
     const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
+    VM_DBG_WIN("img:master-ok\n"); /* #570：取钥之后立刻落盘（启动期一次 flush，代价可忽略） */
+    VM_DBG_FLUSH();
     u8 mi[32];
     vm_kdf_entry(master, VM_FIELD_MASK_IMAGE, VM_FIELD_MASK_SALT, mi);
     u32 count = vm_xor32(t + 12, mi + 0);
@@ -3421,6 +3423,8 @@ int vm_unpack_image(const void *tblp) {
      * 正确做法：表就在 payload 里，用"表的地址 - 表自身的 RVA"反推本镜像基址。 */
     u32 selfRVA = vm_xor32(t + 16, mi + 4);
     if (!selfRVA) return -1;
+    VM_DBG_WIN("img:table-ok\n"); /* #570：表头（count/selfRVA）读完 */
+    VM_DBG_FLUSH();
     u64 base = (u64)(const void *)t - (u64)selfRVA;
     vm_img_diag[0] = 0;
     vm_img_diag[1] = base;
@@ -3469,6 +3473,10 @@ int vm_unpack_image(const void *tblp) {
     typedef int (VM_WINAPI *vpfn_t)(void *, u64, u32, u32 *);
     vpfn_t vp = (vpfn_t)vm_get_proc(vm_find_module("KERNEL32.DLL"), "VirtualProtect");
     if (!vp) { vm_img_diag[0] = 3; vm_img_fail(3); return -3; }
+    VM_DBG_WIN("img:vp-ok\n"); /* #570：拿到 VirtualProtect 地址 */
+    VM_DBG_FLUSH();
+    VM_DBG_WIN("img:loop-start\n"); /* #570：即将进入第一个节循环 */
+    VM_DBG_FLUSH();
     for (u32 i = 0; i < count; i++) {
         const u8 *e = t + 24 + (u64)i * 32;   /* 表头 24 字节（imageBase/salt/count/selfRVA/保留） */
         u32 rva = vm_xor32(e + 0, mi + 12);
