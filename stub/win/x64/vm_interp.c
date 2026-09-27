@@ -989,7 +989,13 @@ static int VM_WINAPI vm_veh_handler(void *info) {
     return 0; /* EXCEPTION_CONTINUE_SEARCH：该崩还是崩，我们只负责记录 */
 }
 static void vm_veh_install(void) {
+    /* #569：先落盘一个标记再走模块链遍历 —— 若"外置产物崩在进入解密之前、且 VEH 不出手"
+     * 是因为 vm_find_module 的 PEB 模块链遍历本身出错，则这个标记会留在 vmpdiag.txt 里（第一次 flush）。 */
+    vm_dbg_win("veh:install-begin\n");
+    vm_dbg_flush();
     u64 mod = vm_find_module("ntdll.dll");
+    vm_dbg_win("veh:mod-found\n");
+    vm_dbg_flush();
     /* 顺便把**本镜像的节表**记进无损通道（#562）：只有知道各节的 RVA/VSize，
      * 才能把 veh:addr 换算出的 RVA 精确归到某个节（不同 clang 构建的布局不同）。 */
     {
