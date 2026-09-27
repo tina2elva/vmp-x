@@ -8761,3 +8761,27 @@ grep 出决定性对比：
 1. 让 `vm_reloc_apply` 对"空/极短重定位目录"**健壮**（walk 前先校验 `blk >= 8` 与不越界 ✓，并在 dirSize 为 0/8 时直接返回）；
 2. 或**不建空节**，改为把 payload 的绝对 VA 站点**真正登记**进 `.reloc`（本地可验证：反汇编 + 与 manifest 对齐）；
 3. 每次都要**先在本地 WSL 验证 blob 构建 + 反汇编**，再推 CI（本地门禁 + CI 五作业）。
+
+### 541. 外置路径的重定位目录探查：目录/SizeOfImage 均自洽，崩点在 walk 之后
+
+**背景**：`#540` 把崩溃定位到 `vm_reloc_apply(+delta)` 这一步；本轮把它的目录值打出来，并用**本地产物解析**逐条核对。
+
+**运行时读到的值（CI，外置产物）**：`ra:rva=0x00010000  ra:size=0x00000008`。
+
+**本地核对（WSL + python 解析 PE）**：
+
+    build/ne2.vmp     (非外置, 当前 vmpack)  BASERELOC rva=0xD000   → .reloc 恰在 0xD000  ✓
+    build/ext_new.vmp (外置,   当前 vmpack)  BASERELOC rva=0x10000  → .reloc 恰在 0x10000 ✓
+    ext_new.vmp: SizeOfImage=0x11000 ≥ SectionEnd=0x10008 ✓（覆盖到了最后那个节）
+
+⇒ **结论**：外置镜像因为节更多/更大，`.reloc` 被推到 **0x10000**；目录值**正确**、
+`SizeOfImage` **也覆盖了它** ⇒ `vm_reloc_apply` 里 `p = img + rva` 落在**已映射**区，
+且 walk 的边界检查（`blk < 8` / `blk > end-p` / `size < 8` / `size > 0x10000`）**都自洽** ⇒
+那个 8 字节空 pad 块**不应该**在这里崩。
+
+**顺带纠错**：我先前的两个假设都被本地证据否掉 ——（a）"目录写错" ✗（是**外置产物**节更多导致 `.reloc` 位于 0x10000，
+而非旧包的残留 ✓）；（b）"`SizeOfImage` 太小导致未映射" ✗（实测覆盖 ✓）。
+
+**下一轮**：在 walk 的**循环体内**与**循环之后**各加一个标记（`ra:iter` / `ra:done`），
+即可判定"崩在循环/循环之后"还是"崩在更晚的 `chacha20`/保护属性恢复"；本次研究全程**本地秒级**（WSL + python + 反汇编），
+未再消耗 CI 轮次做无谓的猜测。
