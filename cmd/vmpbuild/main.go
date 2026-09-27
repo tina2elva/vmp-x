@@ -153,7 +153,13 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开：跑复现器（外置构建才带分段标记）以定位 #521 遗留的 0xC0000005（#525）
+		// "win/arm64"：**未完成**（收尾见 STATUS #537）。已确证的事实链（全部带 run 号）：
+		//  ① `.vmp` 扩展名无法被 PowerShell 启动 ⇒ 原 "native vs protected" 比对是**假通过**（#517）；
+		//  ② 修复了"目标无 .reloc 时的保护性拒绝"（建节，x64 零影响，本地门禁+CI 双证，#525/#529）；
+		//  ③ 修复了 ARM64 缺失的**指令缓存刷新**（内联 dc cvau/ic ivau ⇒ 崩溃由 0xC0000005 变为 0xC000001D，#529）；
+		//  ④ 解密路径已被分段标记证实**完整跑通**（两节 VirtualProtect + delta 逆变换 + AEAD 验签全过，#527）；
+		//  ⑤ 剩余：入口之后执行到某条 `brk #0`/非法指令终止；分段定位到"解密之后、vm_run 之前"（#528），
+		//     但入口包装与其调用目标的对应关系**尚未可靠确定**（#535 的"跳到函数中段"已被 #537 收回）。
 		// "win/arm64"：**未完成**（详见 STATUS #522 的收尾清单）。已确证的事实链：
 		//  ① `.vmp` 扩展名无法被 PowerShell 启动（同字节改名 .exe 即可）⇒ 该作业原有的 "native vs protected"
 		//     比对是**假通过**（$LASTEXITCODE 保留了 native 的值）；
