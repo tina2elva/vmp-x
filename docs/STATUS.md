@@ -8734,3 +8734,30 @@ grep 出决定性对比：
 **未做项**：① 用"干净环境 + 单一密钥来源 + cmd 原生重定向"复测带密钥路径；② 若仍无输出 ⇒ 在 `vm_master()`
 **之前**加标记（入口链与 `vm_unpack_image` 内部更早处）；③ 三形态全绿 ⇒ 修 `windows-arm64-run` 判据为硬失败 ⇒
 放开白名单。
+
+### 540. **崩溃点精确到单步**：`if (delta) vm_reloc_apply(base, +delta, dst, dst+size)`
+
+**先解决"看不到诊断"的问题**（本轮的核心工具改进）：
+- 实测结论：`brk` 硬杀进程时，**stderr 经管道/文件重定向都会丢尾部**；`cmd.exe` 原生重定向也丢 ✗；
+- 因此让 blob **自己写文件**：`vm_dbg_win` 现在同时（a）写 `STD_ERROR_HANDLE`、（b）经 `CreateFileA`+`WriteFile` 追加写 `vmpdiag.txt` ✓；
+- 踩到并修掉一个坑：`CreateFileA` **只传 `FILE_APPEND_DATA`** ✓（同时带 `GENERIC_WRITE` 时每次打开都从偏移 0 写，短行会覆盖前一行 ⇒ 文件里只剩最后一行 ✓）。
+
+**完整轨迹（CI run 36297546284，外部密钥形态，每次启动都相同）**：
+
+    1b:enter | 1b:fetched | img:fn-entry | img:mz-ok | img:delta-ok |
+    img:sec-prot | img:sec-pre | img:sec-xored | img:sec-verified |   ← 到此为止
+
+而代码顺序是：
+
+    vm_reloc_apply(-delta)                     ← img:sec-pre 之后
+    vm_aead_verify_aad(...)                    ← 通过（sec-xored 说明已到 chacha20）
+    vm_chacha20_xor(...)                       ← img:sec-xored / img:sec-verified
+    if (delta) vm_reloc_apply(+delta, …)       ← img:sec-post 本应在这里出现 ⇒ **从未出现**
+
+⇒ **崩溃就在"把 delta 加回去"的 `vm_reloc_apply`** ✓ —— 它要遍历重定位表，而那张表正是**上一轮我新建的
+`.reloc` 节**（内容只有一个 8 字节空 pad 块：page=0 / size=8 / 无条目）⇒ 与 `#525` 的建节改动高度相关。
+
+**下一轮的直接动作**（三选一，按验证成本排序）：
+1. 让 `vm_reloc_apply` 对"空/极短重定位目录"**健壮**（walk 前先校验 `blk >= 8` 与不越界 ✓，并在 dirSize 为 0/8 时直接返回）；
+2. 或**不建空节**，改为把 payload 的绝对 VA 站点**真正登记**进 `.reloc`（本地可验证：反汇编 + 与 manifest 对齐）；
+3. 每次都要**先在本地 WSL 验证 blob 构建 + 反汇编**，再推 CI（本地门禁 + CI 五作业）。
