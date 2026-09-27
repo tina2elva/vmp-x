@@ -66,6 +66,11 @@ $wrap = Join-Path $PWD "build/clang-a64w.cmd"
 $nl = [string][char]13 + [string][char]10
 $q = [string][char]34
 Set-Content -Path $wrap -Value ("@echo off" + $nl + $q + $clang + $q + " --target=aarch64-w64-windows-gnu %*") -Encoding Ascii
+# Silent-diagnostics wrapper: lets us test whether the crash is CAUSED by the diagnostics
+# themselves (each marker costs CreateFileA/WriteFile/CloseHandle on the blob s own stack).
+# STATUS #542/#543: with fewer markers the crash already moved later, so this is the decisive test.
+$wrapNd = Join-Path $PWD "build/clang-a64w-nodiag.cmd"
+Set-Content -Path $wrapNd -Value ("@echo off" + $nl + $q + $clang + $q + " --target=aarch64-w64-windows-gnu -DVM_NO_DIAG %*") -Encoding Ascii
 
 & go build -o build/vmpbuild.exe ./cmd/vmpbuild
 & go build -o build/vmpack.exe ./cmd/vmpack
@@ -86,7 +91,7 @@ if (-not (Test-Path build/target_arm64.exe)) { Write-Host "[!] arm64 PE target b
 $keyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 Remove-Item build/vm_interp_win_arm64_ext.bin, build/vm_interp_win_arm64_ext.json -ErrorAction SilentlyContinue
 Write-Host "[*] building the Windows/arm64 external-key blob..."
-& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $ccArg -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 60
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $wrapNd -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 60
 if (-not (Test-Path build/vm_interp_win_arm64_ext.bin)) { Write-Host "[!] Windows/arm64 external blob build FAILED"; exit 1 }
 
 # ---- pack check_key / sum_to ----

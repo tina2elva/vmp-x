@@ -833,6 +833,12 @@ static u64 vm_find_module(const char *name);
 static void *vm_get_proc(u64 mod, const char *fn);
 
 static void vm_dbg_win(const char *s) {
+#ifdef VM_NO_DIAG
+    /* 诊断静默开关：用于判定"崩溃是否由诊断本身诱发"（STATUS #542/#543）。
+     * 打开后本函数不做任何系统调用，关键路径完全不被打扰。 */
+    (void)s;
+    return;
+#endif
     typedef void *(*gsh_t)(u32);
     typedef int (VM_WINAPI *wf_t)(void *, const void *, u32, u32 *, void *);
     u64 k = vm_find_module("KERNEL32.DLL");
