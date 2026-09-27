@@ -9424,3 +9424,25 @@ arm64 外置 blob 编译通过、门禁 12/0。
 **当前剩余边界（未变）**：外置产物 `0xC0000005`，且**在进入 `vm_unpack_image` 之前**（VEH 前移仍无输出，`#567`）。
 结合本轮：入口链正确、TLS 不存在 ⇒ 下一步应查**入口蹦床执行时的寄存器/参数**，以及
 **PE 加载期**本身（例如：入口蹦床能否被正常调用、`adrp/add` 算出的表地址在搬基址后是否正确）。
+### 569. **重大进展**：我们的代码确实在运行；模块链遍历正常；崩点收敛到"解密前段"
+
+**改动**：在 `vm_veh_install()` 里于模块链遍历**前后各 flush 一次**（两条标记 + dg0..dg3）。
+
+**CI 结果（run 36311880806，diag count = 60）**：
+
+    diag| veh:install-begin     <- VEH 安装开始
+    diag| dg0=0 dg1=0 dg2=0 dg3=0
+    diag| veh:mod-found         <- **vm_find_module("ntdll.dll") 成功**
+    diag| dg0=0 dg1=0 dg2=0 dg3=0
+
+**三条结论**：
+1. **我们的 Windows 解密代码确实被执行到** ⇒ 推翻"根本没进解密代码"（此前只是**没有早期 flush 点**，所以看不到）；
+2. **`vm_find_module` 的 PEB 模块链遍历正常** ⇒ "崩在模块遍历"排除；
+3. 崩溃在 `veh:mod-found` **之后**、下一个 flush（`img:loop-done`）**之前** ⇒ 崩点在**解密前段**：
+   `vm_master()` 取钥 / 表头读取 / `VirtualProtect` 取址 / 第一次循环入口之间。
+
+**注意**：`dg1=0` 是预期的（`vm_img_diag[1]=base` 在更后面才赋值）⇒ 这也再次印证 `#562` 的教训（探针要放在状态赋值之后）。
+
+**下一轮（几个 flush 点，启动期代价可忽略）**：在解密前段插 4 个 flush ——
+`img:master-ok`（`vm_master()` 之后）、`img:table-ok`（表头读完）、`img:vp-ok`（`VirtualProtect` 拿到）、`img:loop-start` ——
+一次 run 即可把崩点缩到**一两行代码**。
