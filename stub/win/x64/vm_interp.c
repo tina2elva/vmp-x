@@ -3285,6 +3285,7 @@ int vm_unpack_image(const void *tblp) {
         if (delta) vm_reloc_apply((const u8 *)base, -delta, (u64)dst, (u64)dst + size);
         if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_img_fail(4); return -4; }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        VM_DBG_WIN("img:sec-xored\n"); /* 诊断：解密完成（下一步是 +delta 回写与保护属性恢复） */
         VM_DBG_WIN("img:sec-verified\n");
         /* ④ 解密之后再把 delta 加回来（等价于加载器对明文做的那次重定位）。 */
         if (delta) vm_reloc_apply((const u8 *)base, delta, (u64)dst, (u64)dst + size);
