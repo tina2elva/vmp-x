@@ -347,6 +347,20 @@ if (Test-Path build/vm_b_d0.bin) {
     Remove-Item "vmpdiag.txt" -ErrorAction SilentlyContinue
   } else { Mark "d0 pack failed" }
 } else { Mark "d0 blob build failed" }
+# ---- Variant N: NO diagnostics at all (-DVM_NO_DIAG). Decisive control for #565. ----
+$wrapN = Join-Path $PWD "build/clang-a64w-nodiag2.cmd"
+Set-Content -Path $wrapN -Value ("@echo off" + $nl + $q + $clang + $q + " --target=aarch64-w64-windows-gnu -DVM_NO_DIAG %*") -Encoding Ascii
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_b_nd.bin -manifest build/vm_b_nd.json -entry vm_entry -guest arm64 -merge go -cc $wrapN -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 3 | Out-Null
+if (Test-Path build/vm_b_nd.bin) {
+  & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_b_nd.bin -manifest build/vm_b_nd.json -out build/nd.exe -report build/nd.json 2>&1 | Out-Null
+  if (Test-Path build/nd.exe) {
+    Copy-Item build/nd.exe build/nd.vmp.exe -Force
+    $env:VMPX_KEY = $keyHex
+    $spn = Start-Process -FilePath (Join-Path $PWD "build/nd.vmp.exe") -Wait -PassThru -NoNewWindow -RedirectStandardError "build/nd.err" -RedirectStandardOutput "build/nd.out"
+    Mark ("noDiag rc=" + $spn.ExitCode + " native=" + $natRc + " out=[" + ((Get-Content build/nd.out -ErrorAction SilentlyContinue) -join "") + "]")
+    $env:VMPX_KEY = $null
+  } else { Mark "noDiag pack failed" }
+} else { Mark "noDiag blob build failed" }
 # ---- Variant C: encrypt ONLY .text (does the crash depend on which sections are encrypted?) ----
 & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -out build/c.exe -report build/c.json -enc-image-sections ".text" 2>&1 | Out-Null
 if (Test-Path build/c.exe) {

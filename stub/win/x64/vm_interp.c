@@ -1017,8 +1017,10 @@ static void vm_veh_install(void) {
     add = (add_t)vm_get_proc(mod, "RtlAddVectoredExceptionHandler");
     if (add) add(1u /* first */, (void *)vm_veh_handler);
 }
+#ifndef VM_NO_DIAG
 #undef VM_VEH_INSTALL
 #define VM_VEH_INSTALL() vm_veh_install()
+#endif
 #undef VM_DBG_FLUSH
 #define VM_DBG_FLUSH() vm_dbg_flush()
 #else
