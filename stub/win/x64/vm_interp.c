@@ -948,6 +948,26 @@ static int VM_WINAPI vm_veh_handler(void *info) {
         u64 fa = *(const u64 *)(rec + 0x10);
         vm_veh_hex("veh:code=", (u64)(*(const u32 *)(rec + 0)));
         vm_veh_hex("veh:addr=", fa);
+        /* 事后取证（#565）：此刻 vm_img_diag[1] 多半已有值 ⇒ 解析本镜像的 PE 头，把入口点 RVA
+         * 与各节的 RVA/VSize 记下来（用于确认 CI 产物的 .text 是否也在 0x1000、入口是否也是 0x1054）。
+         * 注意：本段只在异常之后运行，**不改变热路径** ⇒ 不会移动崩溃点。 */
+        {
+            const u8 *bs = (const u8 *)vm_img_diag[1];
+            if (bs && *(const u16 *)bs == 0x5A4Du) {
+                u32 peo = *(const u32 *)(bs + 0x3C);
+                const u8 *ph = bs + peo;
+                u32 nsec = *(const u16 *)(ph + 6);
+                u32 optsz = *(const u16 *)(ph + 20);
+                u32 i2;
+                vm_veh_hex("pe:entryRVA=", (u64)(*(const u32 *)(ph + 24 + 16)));
+                vm_veh_hex("pe:nsec=", (u64)nsec);
+                for (i2 = 0; i2 < nsec && i2 < 8u; i2++) {
+                    const u8 *sh = ph + 24 + optsz + i2 * 40;
+                    vm_veh_hex("pe:secVA=", (u64)(*(const u32 *)(sh + 12)));
+                    vm_veh_hex("pe:secVS=", (u64)(*(const u32 *)(sh + 8)));
+                }
+            }
+        }
         /* 读取出错地址附近 32 字节（异常发生后再读通常安全：页本来就映射着）。
          * 这一步能一次性区分"数据被当成代码"与"内存里的代码被改写/搬动"。 */
         if (fa) {
