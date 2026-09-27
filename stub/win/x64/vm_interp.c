@@ -3306,8 +3306,27 @@ int vm_unpack_image(const void *tblp) {
     if (delta != 0) {
         u32 rr, rs;
         vm_reloc_dir((const u8 *)base, &rr, &rs);
-        if (!rr) {
-            VM_DBG_WIN("img:notable-delta0\n");
+        /* 判据是"**表里有没有真实条目**"，而不是"目录存不存在"：
+         * vmpack 会为目标无表的情形**新建一个只有空 pad 块的 .reloc**（`#525`）⇒ 目录非 0，
+         * 但加载器**一个站点都不会搬** ⇒ 密文里根本没有 delta ⇒ 必须按 delta=0 处理。 */
+        u32 real = 0;
+        if (rr && rs >= 8u) {
+            const u8 *rp = (const u8 *)base + rr;
+            u32 off = 0;
+            while (off + 8u <= rs) {
+                u32 page = *(const u32 *)(rp + off);
+                u32 blk = *(const u32 *)(rp + off + 4);
+                if (blk < 8u || off + blk > rs) break;
+                for (u32 e = 8; e + 2u <= blk; e += 2u) {
+                    u16 v = *(const u16 *)(rp + off + e);
+                    if (v >> 12) { real++; } /* 只看非 ABSOLUTE 的真实条目 */
+                }
+                off += blk;
+                (void)page;
+            }
+        }
+        if (!real) {
+            VM_DBG_WIN("img:no-entries-delta0\n");
             delta = 0;
         }
     }
