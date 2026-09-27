@@ -834,3 +834,39 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
 2. 重点怀疑**页/保护属性**：`vp(dst, size, …)` 覆盖的区间与 walk/解密访问的页是否一致（不同布局下边界不同）；
 3. 用 WSL 的 `llvm-objdump` 反汇编**实际产物**对应区域，逐条对照源码；
 4. 定位修好后 ⇒ 把 `windows-arm64-run` 的判据从 `::warning` 改为**硬失败** ⇒ 放开白名单 ⇒ 挂进 CI 常态回归。
+
+### 运行时侧"按首选基址寻址"逐处排查表（#554，接手指南补充）
+
+| 位置 | 寻址方式 | 结论 |
+|---|---|---|
+| `vm_unpack_image` 的 `base` | 由"表地址 − 表自身 RVA"反推 | ✅ 与加载基址一致（不是首选基址） |
+| 解密目标 `dst = base + rva` | base + RVA | ✅ 正确 |
+| `vm_verify_table` 的补丁站点 | `base + (funcRVA − descRVA)` 相对量 | ✅ 与基址无关 |
+| 函数 thunk / 入口补丁 | `bl` / `b`（PC 相对） | ✅ 与基址无关 |
+| TLS 回调数组 | **绝对 VA**（`ImageBase + thunkRVA`） | ⚠️ 该目标 **无 TLS**（`ImgTlsArrayRVA = 0`）⇒ 未使用；**别的目标要小心** |
+| `LOAD_CONFIG` / TLS 目录副本 | 该目标均为 0 | 未使用 |
+| 目标 exe 自身的节（明文扫描） | — | ✅ 0 个绝对 VA |
+| blob（PIC） | — | ✅ 0 个绝对 VA |
+
+### 本地工具链复现方法（WSL，秒级迭代）
+
+```bash
+# 0) 一次性准备（root）：
+wsl -u root -e bash -c "apt-get update -qq && apt-get install -y -qq clang lld llvm qemu-user"
+# 1) 在 Windows 侧交叉编译出 Linux 版工具（WSL 网络受限，Go 官方包下不来）：
+#    $env:GOOS="linux"; $env:GOARCH="amd64"; go build -o build/vmpbuild_linux ./cmd/vmpbuild
+#                                                      go build -o build/vmpack_linux  ./cmd/vmpack
+# 2) 包装器（绝对路径！相对路径会 fork/exec 失败）：
+#    printf '#!/bin/bash\nexec clang --target=aarch64-w64-windows-gnu "$@"\n' > /mnt/d/vmp-x/build/clang-a64w.sh
+# 3) 构建目标 + blob + 打包：
+clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib -fuse-ld=lld \
+      -Wl,-e,entry -Wl,-subsystem=console -o build/target_arm64.exe testdata/arm64/target_win.c
+./build/vmpbuild_linux -src stub/win/arm64 -out build/vmpb.bin -manifest build/vmpb.json \
+      -entry vm_entry -guest arm64 -merge go -cc /mnt/d/vmp-x/build/clang-a64w.sh \
+      -objdump llvm-objdump -key-external -key-in 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+./build/vmpack_linux -exe build/target_arm64.exe -func check_key -func sum_to \
+      -blob build/vmpb.bin -manifest build/vmpb.json -out build/target_arm64.vmp -report build/r.json
+```
+
+⚠️ 注意：`build/` 也在 `gofmt -l .` 的覆盖范围内 ⇒ 放在 `build/` 下的临时 Go 工具**必须 gofmt**，否则门禁红。
+⚠️ WSL 里跑不了 **Windows PE**（qemu-aarch64 只跑 Linux ELF）⇒ 实机验证仍需 CI 的 `windows-11-arm`。
