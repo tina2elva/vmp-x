@@ -9316,3 +9316,31 @@ VEH 是在**异常发生之后**运行 ⇒ 完全可以读取该地址 ✓。这
 2. **解密写错了**（字节 = 零或垃圾）⇒ 问题在 `dst`/`size`/`key`/`nonce` 的计算上。
 
 （注意 `#562` 的教训：探针必须放在**状态已赋值之后**；且放在**同一守卫分支**内、`edit` 前先 read 精确文本。）
+### 564. 本地用仓库 KDF 解码签密表：**表完全正确**（`selfRVA`=imgTableRVA、`.text` 在表内）
+
+**工具**：`build/imgtab/main.go`（本地、不入库、已 gofmt）——用 `inject.KDFEntry`/`inject.FieldMask`
+按 C 端同一布局解码产物表，并打印每条目的 `{rva,size,flags}`。
+
+**结果（`build/cmp.vmp`，本次用已知 `-key-in 000102..1f` 构建）**：
+
+    wantBase=0x140000000 salt=0x2C939956 count=2 selfRVA=0x10640  (imgTableRVA=0x10640 len=0x58)
+    report : sectionRVA=0x5000 sectionSize=0x7000 names=[.1jkh7cb .h41qguv .0kcwo75]
+    entry 0: rva=0x1000 size=0x200 flags=0x1     <- .text（可执行）
+    entry 1: rva=0x2000 size=0x200 flags=0x0     <- .rdata
+
+**结论（重要排除）**：
+1. `selfRVA` 与 `imgTableRVA` **精确一致** ⇒ 运行期 `base = &table - selfRVA` **必然**是真实镜像基址；
+   "基址/表地址反推错了" 这条**排除**；
+2. `.text`（RVA 0x1000、size 0x200）**确实在加密表里** ⇒ 入口 RVA 0x1054 落在其中，**理应被解密**；
+3. `flags=0x1` ⇒ Windows 侧算出 `PAGE_EXECUTE_READ`（写之前会临时改可写）。
+
+**仍须解释的矛盾（范围已缩到最小）**：
+
+    #563 证据：veh:addr - dg1 = 0x1054（= 原目标 EntryPointRVA）且该处字节全零
+    本地证据：原目标同位置是真实指令 f3 53 be a9；产物文件里是密文；表却表明 .text 会被解密
+
+⇒ 二者只能靠"运行期实际写了什么/写到哪"来区分，而**运行时探针会扰动崩溃点**（#564 之前的两次实测）。
+⇒ 因此下一步不再加探针，而是**扩展 VEH 的事后取证**（VEH 不改热路径 ⇒ 不扰动）：
+   在异常处理里按 PE 头**自行解析节表**（`base` 取自 `vm_img_diag[1]`，此刻已赋值 ⇒ 安全）并把
+   各节的 RVA/VSize **以及入口点 RVA** 记进无损通道 ⇒ 就能确认"CI 产物的 .text 是否也在 0x1000"。
+   （注意 #562 的教训：这段代码必须放在 base 已赋值之后、且与守卫一致。）

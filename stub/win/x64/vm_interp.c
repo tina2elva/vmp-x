@@ -3466,7 +3466,7 @@ int vm_unpack_image(const void *tblp) {
         if (delta) vm_reloc_apply((const u8 *)base, -delta, (u64)dst, (u64)dst + size);
         if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_img_fail(4); return -4; }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
-#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+#if 0 /* 探针已撤（#564）：实测它本身会扰动崩溃点；改用"本地用仓库 KDF 解码表项"的静态路线。 */
         /* 探针（#564）：解密**写完之后**立刻把 dst 的前 16 字节与 size 记进无损通道（状态已赋值 ⇒ 安全）。
          * 目的：区分"明文没写进 .text"与"写进去了但之后被清零"。
          * 必须与外置分支同守卫：本函数在非外置构建里也编译，而 vm_veh_hex/vm_dbg_win 只在外置分支定义。 */
