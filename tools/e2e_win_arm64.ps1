@@ -309,6 +309,15 @@ Mark ("nokey rc=" + $sp0.ExitCode)
 $env:VMPX_KEY = $keyHex
 $dErr = "build/direct.err"
 Remove-Item $dErr -ErrorAction SilentlyContinue
+# PowerShell 的 `2> file` still goes through a managed pipeline, and a hard `brk` kill discards
+# the buffered tail. cmd.exe s redirection gives the child a RAW file handle, so nothing is lost.
+$rawErr = "build/raw.err"
+Remove-Item $rawErr -ErrorAction SilentlyContinue
+$env:VMPX_KEY = $keyHex
+$cmdOut = cmd.exe /c ("`"" + $pk + "`" 2> `"" + (Join-Path $PWD "build/raw.err") + "`"") 2>&1
+Mark ("raw rc=" + $LASTEXITCODE)
+if (Test-Path $rawErr) { $r = 0; foreach ($ln in (Get-Content $rawErr)) { $r++; if ($r -le 60) { Mark ("raw-err| " + $ln) } } } else { Mark "raw (no file)" }
+$env:VMPX_KEY = $null
 $null = & $pk 2> $dErr
 Mark ("direct rc=" + $LASTEXITCODE)
 if (Test-Path $dErr) { $m = 0; foreach ($ln in (Get-Content $dErr)) { $m++; if ($m -le 40) { Mark ("direct-err| " + $ln) } } }
