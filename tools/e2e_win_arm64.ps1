@@ -291,8 +291,19 @@ $errFile = "build/keycase.err"
 Remove-Item $errFile -ErrorAction SilentlyContinue
 # Start-Process -Wait guarantees the redirect target is flushed before we read it (a plain
 # `2> file` from the child could leave the file empty when the process dies hard).
+# NOTE: set the key again here. The earlier line cleared it, so this capture used to run WITHOUT a
+# key and therefore hit the hard gate (vm_key_reject) - which is why its stderr looked empty.
+$env:VMPX_KEY = $keyHex
 $sp = Start-Process -FilePath $pk -Wait -PassThru -NoNewWindow -RedirectStandardError $errFile -RedirectStandardOutput "build/keycase.out"
 Mark ("fullstderr rc=" + $sp.ExitCode)
+# Separately: the NO-KEY hard gate must be exactly 0xC0DE0007 with no output.
+$env:VMPX_KEY = $null
+$env:VMPX_KEY_FILE = $null
+$nokeyErr = "build/nokey.err"
+Remove-Item $nokeyErr -ErrorAction SilentlyContinue
+$sp0 = Start-Process -FilePath $pk -Wait -PassThru -NoNewWindow -RedirectStandardError $nokeyErr -RedirectStandardOutput "build/nokey.out"
+Mark ("nokey rc=" + $sp0.ExitCode)
+if (Test-Path $nokeyErr) { foreach ($ln in (Get-Content $nokeyErr)) { Mark ("nokey-err| " + $ln) } }
 # Same treatment for the NON-external product: it has no license gate, so if IT prints markers
 # under Start-Process (ASLR) but the external one does not, the fault is the license path; if BOTH
 # are silent, the ASLR launch dies before the first marker (STATUS #539 follow-up).
