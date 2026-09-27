@@ -8868,3 +8868,40 @@ grep 出决定性对比：
 2. 从**产物**里读出两个函数的 `funcRVA`、`codeLen`、`patch 字节`（补丁字节在文件里是**明文**，就在函数入口）；
 3. 自己算 `check`，与产物描述符里烘焙的值（按 `inject.FieldMask` 反混淆后）比对；
 4. 若 **MATCH** ⇒ 可放心继续修入口/解密路径（MAC 不会成为下一个障碍）；若 **MISMATCH** ⇒ 直接定位到是哪个输入不一致。
+
+### 546. **本地复算：外置产物的补丁 MAC 完全 MATCH**（又排除一整类可能）
+
+**方法**：写了一个本地工具（`build/maccheck/main.go`，不入库），复用仓库自己的函数：
+`inject.KDFSaltForPlacement` + `inject.PatchMAC` + `internal/load/pe` 的 `RVAtoOffset`，
+按报告里的 `funcRVA/descRVA/bytecodeBytes/entryPatch` 重算 `check`，与产物里 `descRVA+60` 处的烘焙值比对。
+
+**结果（本地，秒级）**：
+
+    === external product (ext_new.vmp) ===            ← 验收用例实际测的就是这个
+    check_key  salt=0xE352D9E3 computed=0x3561C98D baked=0x3561C98D => MATCH ✓
+    sum_to     salt=0xF90D3445 computed=0x2F75D1BD baked=0x2F75D1BD => MATCH ✓
+
+    === non-external product (ne2.vmp) ===
+    computed=0x2287A947 baked=0xFBE28FA7 => MISMATCH    ← **我工具用错了密钥**：非外置产物用**全零** master
+                                                          （见 internal/inject/payload.go:412），不是 -key-in 的那把
+
+⇒ **结论**：外置产物的补丁 MAC 与运行期现推的值**一致** ⇒ `vm_verify_table` 的校验**会通过** ⇒
+   "MAC 不符导致 brk" 这条路**排除**。
+⇒ 顺带说明：`patch-in-file: DIFF` 也是预期现象 —— 函数入口在**被加密的 .text** 里，文件里是密文。
+
+**至此的排除表（全部有本地证据）**：
+
+| 可能 | 结论 | 证据 |
+|---|---|---|
+| 取钥/硬门 | ✅ 正常 | CI 实测 `nokey rc=0xC0DE0007` 且无输出 |
+| 镜像解密 + AEAD 验签 | ✅ 通过 | 分段标记跑到 `img:sec-verified` |
+| 重定位目录 walk | ✅ 会走完 | 少加诊断后 `ra:done` 出现 |
+| 自哈希 `vm_selfcheck` | ✅ 本地复算 MATCH | `#544` |
+| `vm_code_off` | ✅ 正确（0） | `#544` |
+| 补丁 MAC | ✅ 本地复算 MATCH | 本节 |
+| **入口链之后的下一个诊断点** | ❌ 仍崩 | 诊断越少、崩得越晚（`#542`） |
+
+**下一步**：既然 MAC/自哈希都清白，就集中查"**为什么诊断的存在会改变崩溃位置**"：
+① 先确认崩点是**真实**的还是诊断诱发的（把 hot-path 上的诊断降到 **0 次系统调用**：只置位内存标志，
+   在 `vm_verify_table` 入口**一次性**落盘）；② 若届时产物能跑到 `vm_run` ⇒ 说明诊断是主因；
+③ 若仍崩 ⇒ 用同一套本地位图定位到具体指令。
