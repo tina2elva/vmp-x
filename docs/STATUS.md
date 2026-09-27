@@ -9153,3 +9153,35 @@ MAC 与自哈希本地复算均 MATCH、无密钥硬门在 CI 实测恰好 `0xC0
 **下一轮的决定性观测**：在 blob 里安装 **VEH（`RtlAddVectoredExceptionHandler`）**，异常发生时把
 **异常码 + 异常地址**写进 `vmpdiag.txt`（走已有无损通道）⇒ **一次 run 给出崩溃指令的精确地址**，
 而且 VEH **不改变热路径**（不像插标记那样会移动崩点）。这是目前信息量最高、且不扰动被测对象的一步。
+
+### 558. VEH 尝试（第 61/90 轮）未落地：撞了三次自伤，已回退；教训与正确的重做方式
+
+**目标**：在 blob 里装 VEH（`RtlAddVectoredExceptionHandler`），异常时把 **异常码 + 异常地址**写进无损通道 ——
+它**不改热路径**，因此不会像插标记那样移动崩溃点（`#542`/`#549` 的教训）。
+
+**结果**：本地 arm64 外置与 amd64 均能构建 ✓，但**门禁红**（i686 与 x64 默认/release 构建失败）✗，
+连续三次修补未收敛 ⇒ 按纪律**回退 `stub/win/x64/vm_interp.c` 到 `8f158a4`**（最后一次全绿）⇒ 门禁恢复 **12/0** ✓。
+
+**三次自伤（都值得记住）**：
+1. 前向声明写成**无条件** ⇒ 非外置构建"声明了 static 却没有定义" ⇒ 失败；
+2. 把声明放进 `#if` 块时，**放在了使用它们的 VEH 代码之后** ⇒ `implicit declaration`；
+3. 我**更早**加在 `vm_reloc_apply` 里的十六进制打印块，在 `VM_DBG_WIN` 为 no-op 的构建里让局部数组
+   `hb` 变成"赋值但未使用" ⇒ i686/release 构建失败（日志里就有这条 warning）。
+
+**关键教训（正确姿势）**：本文件里凡是"只在外置/ARM64 分支里有定义"的东西，**统一走已经验证过的模式**：
+```c
+/* 文件顶部：无条件兜底 */
+#ifndef VM_SOMETHING
+#define VM_SOMETHING() ((void)0)
+#endif
+/* 真身所在的分支里：先 #undef，再 define */
+#undef VM_SOMETHING
+#define VM_SOMETHING() vm_something()
+```
+`VM_DBG_WIN` / `VM_DBG_FLUSH` 就是这么做的 ✓。我这次**偏离了这个模式**（把声明塞进条件块、顺序也不对）⇒ 立刻出问题。
+
+**下一轮重做 VEH 的清单**：
+1. 顶部无条件兜底 `VM_VEH_INSTALL()`（no-op）；
+2. 声明 `vm_dbg_win`/`vm_dbg_flush` 也走"顶部无条件 + 真身处 #undef/#define"的路径；
+3. 每次改动**只在本地把四种构建全过一遍**（arm64 外置 / amd64 默认 / amd64 外置 / i686）**再跑门禁**；
+4. 仍然遵守"一次 run 多观测"（`#556`）：VEH 版本与基线版本**在同一次 run 里对比**。
