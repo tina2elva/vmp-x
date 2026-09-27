@@ -3190,7 +3190,27 @@ static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
     if (!rva) return;
     /* 边界加固：目录可能很短（例如我们为目标新建的 .reloc 只有一个 8 字节空块），
      * 也可能被人为破坏 ⇒ 任何一步 walk 都必须先校验，绝不能越界读。 */
+    {
+        /* 自包含的十六进制打印（blob 无 libc）：把 rva/size 打出来，判定是否目录大小是垃圾值。 */
+        extern void vm_dbg_win(const char *s);
+        char hb[26];
+        u32 vals2[2];
+        int kk;
+        vals2[0] = rva; vals2[1] = size;
+        for (kk = 0; kk < 2; kk++) {
+            u32 v = vals2[kk];
+            int jj;
+            for (jj = 0; jj < 8; jj++) {
+                u32 nib = (v >> (28 - 4 * jj)) & 0xFu;
+                hb[jj] = (char)(nib < 10u ? ('0' + nib) : ('a' + (nib - 10u)));
+            }
+            hb[8] = '\n'; hb[9] = 0;
+            vm_dbg_win(kk == 0 ? "ra:rva=" : "ra:size=");
+            vm_dbg_win(hb);
+        }
+    }
     if (size < 8) { VM_DBG_WIN("ra:tiny\n"); return; }
+    if (size > 0x10000u) { VM_DBG_WIN("ra:hugesize\n"); return; } /* 目录大小异常 ⇒ 不 walk（防越界） */
     const u8 *p = img + rva;
     const u8 *end = p + size;
     while (p + 8 <= end) {
