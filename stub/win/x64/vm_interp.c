@@ -970,6 +970,26 @@ static int VM_WINAPI vm_veh_handler(void *info) {
 }
 static void vm_veh_install(void) {
     u64 mod = vm_find_module("ntdll.dll");
+    /* 顺便把**本镜像的节表**记进无损通道（#562）：只有知道各节的 RVA/VSize，
+     * 才能把 veh:addr 换算出的 RVA 精确归到某个节（不同 clang 构建的布局不同）。 */
+    {
+        const u8 *bs = (const u8 *)vm_img_diag[1];
+        if (bs && (*(const u16 *)bs == 0x5A4Du /* MZ */)) {
+            u32 peo = *(const u32 *)(bs + 0x3C);
+            const u8 *ph = bs + peo;
+            u32 nsec = *(const u16 *)(ph + 6);
+            u32 optsz = *(const u16 *)(ph + 20);
+            u32 i;
+            vm_veh_hex("sec:n=", (u64)nsec);
+            for (i = 0; i < nsec && i < 8u; i++) {
+                const u8 *sh = ph + 24 + optsz + i * 40;
+                u32 vs = *(const u32 *)(sh + 8);
+                u32 va = *(const u32 *)(sh + 12);
+                vm_veh_hex("sec:rva=", (u64)va);
+                vm_veh_hex("sec:vs=", (u64)vs);
+            }
+        }
+    }
     typedef u64 (VM_WINAPI *add_t)(u32, void *);
     add_t add;
     if (!mod) mod = vm_find_module("KERNEL32.DLL");
