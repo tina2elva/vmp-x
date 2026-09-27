@@ -3192,7 +3192,6 @@ static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
      * 也可能被人为破坏 ⇒ 任何一步 walk 都必须先校验，绝不能越界读。 */
     {
         /* 自包含的十六进制打印（blob 无 libc）：把 rva/size 打出来，判定是否目录大小是垃圾值。 */
-        extern void vm_dbg_win(const char *s);
         char hb[26];
         u32 vals2[2];
         int kk;
@@ -3205,8 +3204,8 @@ static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
                 hb[jj] = (char)(nib < 10u ? ('0' + nib) : ('a' + (nib - 10u)));
             }
             hb[8] = '\n'; hb[9] = 0;
-            vm_dbg_win(kk == 0 ? "ra:rva=" : "ra:size=");
-            vm_dbg_win(hb);
+            VM_DBG_WIN(kk == 0 ? "ra:rva=" : "ra:size=");
+            VM_DBG_WIN(hb);
         }
     }
     if (size < 8) { VM_DBG_WIN("ra:tiny\n"); return; }
