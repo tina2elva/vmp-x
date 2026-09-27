@@ -945,8 +945,25 @@ static int VM_WINAPI vm_veh_handler(void *info) {
     u64 rec = p ? *(const u64 *)(p + 0) : 0;
     if (rec && !vm_veh_hit) {
         vm_veh_hit = 1;
+        u64 fa = *(const u64 *)(rec + 0x10);
         vm_veh_hex("veh:code=", (u64)(*(const u32 *)(rec + 0)));
-        vm_veh_hex("veh:addr=", *(const u64 *)(rec + 0x10));
+        vm_veh_hex("veh:addr=", fa);
+        /* 读取出错地址附近 32 字节（异常发生后再读通常安全：页本来就映射着）。
+         * 这一步能一次性区分"数据被当成代码"与"内存里的代码被改写/搬动"。 */
+        if (fa) {
+            const u8 *q = (const u8 *)(fa - 16u);
+            char hx[66];
+            int i2;
+            for (i2 = 0; i2 < 32; i2++) {
+                u8 bb = q[i2];
+                u32 hi = (u32)(bb >> 4), lo = (u32)(bb & 0xFu);
+                hx[i2 * 2 + 0] = (char)(hi < 10u ? ('0' + hi) : ('a' + (hi - 10u)));
+                hx[i2 * 2 + 1] = (char)(lo < 10u ? ('0' + lo) : ('a' + (lo - 10u)));
+            }
+            hx[64] = '\n'; hx[65] = 0;
+            vm_dbg_win("veh:-16..+16=");
+            vm_dbg_win(hx);
+        }
         vm_dbg_flush(); /* 唯一的一次系统调用时刻 */
     }
     return 0; /* EXCEPTION_CONTINUE_SEARCH：该崩还是崩，我们只负责记录 */
