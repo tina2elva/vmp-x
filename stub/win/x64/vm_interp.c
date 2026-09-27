@@ -840,6 +840,60 @@ static void *vm_get_proc(u64 mod, const char *fn);
  * 原因见 STATUS #542/#547：每次标记都 CreateFileA/WriteFile/CloseHandle 会移动崩溃点。 */
 static char vm_dbg_buf[2048];
 static u32 vm_dbg_used;
+/* 前向声明：真正的定义在文件靠后的 Windows 段里（诊断落盘时要附上它的 4 个数值）。 */
+extern u64 vm_img_diag[4];
+
+/* 前向声明：VEH 块在本文件靠前，而这两个函数的定义在靠后的 Windows 段里。 */
+static void vm_dbg_win(const char *s);
+static void vm_dbg_flush(void);
+
+#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+/* ---- VEH：把"异常码 + 异常地址"记进无损通道（STATUS #558） ----
+ * 为什么用 VEH 而不是插标记：插标记会改变代码体积/热路径 ⇒ 实测会**移动崩溃点**（#542/#549）。
+ * VEH 只在异常发生时执行一次，不改变正常路径。 */
+static u32 vm_veh_hit;
+static void vm_veh_write_hex(const char *pfx, u64 v) {
+    char nm[18];
+    int j;
+    for (j = 0; j < 16; j++) {
+        u32 nib = (u32)((v >> (60 - 4 * j)) & 0xFu);
+        nm[j] = (char)(nib < 10u ? ('0' + nib) : ('a' + (nib - 10u)));
+    }
+    nm[16] = '\n'; nm[17] = 0;
+    vm_dbg_win(pfx);
+    vm_dbg_win(nm);
+}
+static int (VM_WINAPI *vm_veh_fn)(void *info);
+static int VM_WINAPI vm_veh_handler(void *info) {
+    /* info = EXCEPTION_POINTERS* ：{ ExceptionRecord*, ContextRecord* }
+     * EXCEPTION_RECORD 在 64 位下：+0x00 Code(DWORD)、+0x04 Flags、+0x08 Next、+0x10 ExceptionAddress(ptr)。 */
+    const u8 *p = (const u8 *)info;
+    u64 rec = *(const u64 *)(p + 0);
+    if (rec) {
+        u32 code = *(const u32 *)(rec + 0);
+        u64 addr = *(const u64 *)(rec + 0x10);
+        if (!vm_veh_hit) {
+            vm_veh_hit = 1;
+            vm_veh_write_hex("veh:code=", (u64)code);
+            vm_veh_write_hex("veh:addr=", addr);
+            vm_dbg_flush(); /* 一次性落盘（这是唯一的系统调用时刻） */
+        }
+    }
+    return 0; /* EXCEPTION_CONTINUE_SEARCH：交给系统继续处理（该崩还是崩） */
+}
+static void vm_veh_install(void) {
+    u64 ntdll = vm_find_module("ntdll.dll");
+    u64 k32 = vm_find_module("KERNEL32.DLL");
+    u64 mod = ntdll ? ntdll : k32;
+    typedef u64 (VM_WINAPI *add_t)(u32, void *);
+    if (!mod) return;
+    add_t add = (add_t)vm_get_proc(mod, "RtlAddVectoredExceptionHandler");
+    if (add) add(1u /* first */, (void *)vm_veh_handler);
+}
+#define VM_VEH_INSTALL() vm_veh_install()
+#else
+#define VM_VEH_INSTALL() ((void)0)
+#endif
 
 static void vm_dbg_flush(void);
 
@@ -881,6 +935,30 @@ static void vm_dbg_flush(void) {
              * 后写的短行会覆盖前写 ⇒ 诊断文件里只剩最后一行（实测踩到过）。 */
             void *fh = cfa("vmpdiag.txt", 0x0004u, 3u, 0, 4u, 0x80u, 0);
             if (fh && fh != (void *)-1) {
+                /* 落盘前附上 vm_img_diag 的 4 个数值：诊断码 / base / wantBase / 计数（#556）。
+                 * blob 没有 libc，用自包含的十六进制格式化。 */
+                {
+                    u32 dv[4];
+                    int kk;
+                    dv[0] = (u32)vm_img_diag[0]; dv[1] = (u32)vm_img_diag[1];
+                    dv[2] = (u32)vm_img_diag[2]; dv[3] = (u32)vm_img_diag[3];
+                    for (kk = 0; kk < 4; kk++) {
+                        u32 v = dv[kk];
+                        int jj, q;
+                        char nm[10];
+                        char pfx[5];
+                        pfx[0] = 'd'; pfx[1] = 'g'; pfx[2] = (char)('0' + kk); pfx[3] = '='; pfx[4] = 0;
+                        for (jj = 0; jj < 8; jj++) {
+                            u32 nib = (v >> (28 - 4 * jj)) & 0xFu;
+                            nm[jj] = (char)(nib < 10u ? ('0' + nib) : ('a' + (nib - 10u)));
+                        }
+                        nm[8] = '\n'; nm[9] = 0;
+                        if (vm_dbg_used + 16u < sizeof(vm_dbg_buf)) {
+                            for (q = 0; q < 4; q++) vm_dbg_buf[vm_dbg_used++] = pfx[q];
+                            for (q = 0; q < 9; q++) vm_dbg_buf[vm_dbg_used++] = nm[q];
+                        }
+                    }
+                }
                 wf(fh, vm_dbg_buf, vm_dbg_used, &w, 0);
                 vm_dbg_used = 0; /* 落盘后清零：缓冲不再单调增长（STATUS #547 的干扰源之一） */
                 ch_t ch = (ch_t)vm_get_proc(k, "CloseHandle");
@@ -3280,6 +3358,7 @@ int vm_unpack_image(const void *tblp) {
     u8 mi[32];
     vm_kdf_entry(master, VM_FIELD_MASK_IMAGE, VM_FIELD_MASK_SALT, mi);
     u32 count = vm_xor32(t + 12, mi + 0);
+    VM_VEH_INSTALL(); /* 装 VEH：任何后续异常都会被记进 vmpdiag.txt（#558；只在这一份 Windows 实现里装） */
     VM_DBG_WIN("img:fn-entry\n"); /* 诊断：已进入 Windows 镜像解密函数（入口蹦床最先调用的就是它） */
     /* 基址不能用 PEB->ImageBaseAddress：那是**宿主 EXE** 的基址。DLL 在被加载时，
      * 那个字段指向宿主进程的主镜像，于是 base != wantBase 永远成立（实测直接 -2）。
@@ -3297,6 +3376,11 @@ int vm_unpack_image(const void *tblp) {
      * 基址不同是**正常**的：算出 delta，解密前后各做一次逆/正变换。只有"需要重定位却没有重定位表"
      * （被人为剥掉）才继续 fail-fast —— 那种情况下我们无法把加载器写进密文的增量还原出来。 */
     long long delta = wantBase ? (long long)(base - wantBase) : 0;
+#ifdef VM_FORCE_DELTA0
+    /* 诊断开关（#556）：强制把 delta 当 0 ⇒ 与"加载器不搬镜像"等价的那条路径单独观察。 */
+    VM_DBG_WIN("img:force-delta0\n");
+    delta = 0;
+#endif
     /* (7)：**没有重定位表**时，加载器没有任何条目可搬动 ⇒ 密文里根本没有被写入过 delta ⇒
      * 对**密文**而言 delta 就等于 0（既不该拒绝，也不该做 ①/④ 的逆/正变换）。
      * 历史：`#510`（清 DYNAMIC_BASE 改变语义）与 `#511/#512`（去掉拒绝 / 视 delta=0）当时都判为失败，
