@@ -293,6 +293,16 @@ Remove-Item $errFile -ErrorAction SilentlyContinue
 # `2> file` from the child could leave the file empty when the process dies hard).
 $sp = Start-Process -FilePath $pk -Wait -PassThru -NoNewWindow -RedirectStandardError $errFile -RedirectStandardOutput "build/keycase.out"
 Mark ("fullstderr rc=" + $sp.ExitCode)
+# Same treatment for the NON-external product: it has no license gate, so if IT prints markers
+# under Start-Process (ASLR) but the external one does not, the fault is the license path; if BOTH
+# are silent, the ASLR launch dies before the first marker (STATUS #539 follow-up).
+$errFile2 = "build/ne.err"
+Remove-Item $errFile2 -ErrorAction SilentlyContinue
+if (Test-Path "build/target_arm64.vmp") {
+  $sp2 = Start-Process -FilePath "build/target_arm64.vmp.exe" -Wait -PassThru -NoNewWindow -RedirectStandardError $errFile2 -RedirectStandardOutput "build/ne.out"
+  Mark ("ne-fullstderr rc=" + $sp2.ExitCode)
+  if (Test-Path $errFile2) { $j = 0; foreach ($ln in (Get-Content $errFile2)) { $j++; if ($j -le 40) { Mark ("ne-err| " + $ln) } } }
+} else { Mark "ne-fullstderr (no product)" }
 if (Test-Path $errFile) {
   $i = 0
   foreach ($ln in (Get-Content $errFile)) { $i++; if ($i -le 60) { Mark ("err| " + $ln) } }
