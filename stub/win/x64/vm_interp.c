@@ -1665,6 +1665,8 @@ static int vm_key_from_env(void) {
 const u8 *vm_master(void) {
     if (vm_master_ok) return vm_master_buf;
     VM_DBG_WIN("1b:enter\n");
+    /* #572：**必须 flush** —— 缓冲式标记的"缺席"不能证明本函数没被进入（#570 的推理已据此更正）。 */
+    VM_DBG_FLUSH();
     /* 取钥顺序：① 外部文件（部署默认：与产物同目录的 <产物名>.vmpkey）
      *           ② 环境变量 VMPX_KEY（64 位 hex，方便临时/CI 用）
      * 两者都拿不到、或与 KCV 不符 -> 硬门 0xC0DE0007。将来上硬件狗时，
