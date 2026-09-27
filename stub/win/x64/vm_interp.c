@@ -3210,11 +3210,10 @@ static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
     }
     if (size < 8) { VM_DBG_WIN("ra:tiny\n"); return; }
     if (size > 0x10000u) { VM_DBG_WIN("ra:hugesize\n"); return; } /* 目录大小异常 ⇒ 不 walk（防越界） */
+    VM_DBG_WIN("ra:walk\n");
     const u8 *p = img + rva;
     const u8 *end = p + size;
-    VM_DBG_WIN("ra:walk\n");
     while (p + 8 <= end) {
-        VM_DBG_WIN("ra:iter\n");
         u32 page = *(const u32 *)p;
         u32 blk = *(const u32 *)(p + 4);
         if (blk < 8 || blk > (u32)((const u8 *)end - p)) { VM_DBG_WIN("ra:badblk\n"); break; }
