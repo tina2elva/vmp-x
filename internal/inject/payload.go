@@ -86,6 +86,38 @@ func buildImgHookARM64(hookRVA, imgTableRVA, unpackRVA, nextRVA uint32) []byte {
 	return t
 }
 
+// buildEntryHookARM64：Win/ARM64 的**加载期校验蹦床**（x86 侧同义实现见下面 EntryHook 分支）。
+// 形态与 buildImgHookARM64 一致：先保存 PE 入口用到的 x0/x1/x2，把"校验表"地址装进 x0，
+// 调 vm_verify_table（返回 void，失败时它自己 brk），恢复寄存器后跳到原始入口。
+//
+// 为什么必须有这个分支：EntryHook 原本**只有 x86 实现**，于是 win/arm64 的产物里被塞进了
+// x86 机器码（push rcx/rdx/r8 …），ARM64 一旦跳进去就是非法指令 —— 实测 0xC000001D，
+// 而且因为 imgHook（自解密蹦床）解密成功后才跳到这里，现象就是"解密全过、紧接着崩"。
+func buildEntryHookARM64(hookRVA, tableRVA, verifyRVA, entryRVA uint32) []byte {
+	t := make([]byte, 0, 48)
+	put := func(v uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], v)
+		t = append(t, b[:]...)
+	}
+	put(0xAA0003F3) // mov x19, x0
+	put(0xAA0103F4) // mov x20, x1
+	put(0xAA0203F5) // mov x21, x2
+	tblPage := tableRVA &^ 0xFFF
+	pcPage := hookRVA &^ 0xFFF
+	delta := (int64(tblPage) - int64(pcPage)) >> 12
+	immlo := uint32(delta) & 0x3
+	immhi := (uint32(delta) >> 2) & 0x7FFFF
+	put(0x90000000 | (immlo << 29) | (immhi << 5))                               // adrp x0, page(表)
+	put(0x91000000 | ((tableRVA & 0xFFF) << 10))                                 // add x0, x0, #(表 & 0xFFF)
+	put(arm64Branch(0x94000000, int64(verifyRVA), int64(hookRVA)+int64(len(t)))) // bl vm_verify_table
+	put(0xAA1303E0)                                                              // mov x0, x19
+	put(0xAA1403E1)                                                              // mov x1, x20
+	put(0xAA1503E2)                                                              // mov x2, x21
+	put(arm64Branch(0x14000000, int64(entryRVA), int64(hookRVA)+int64(len(t))))  // b 原始入口
+	return t
+}
+
 // Options 注入参数
 type Options struct {
 	SectionName string
@@ -479,7 +511,12 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		trampRVA := baseRVA + uint32(len(data))
 		t := make([]byte, 0, 48)
 		var callOff, jmpOff int
-		if opt.EntryHookSysV {
+		if opt.Arch == ArchARM64 {
+			/* win/arm64：必须用 ARM64 指令（x86 的 push rcx/… 在这里是非法指令，实测 0xC000001D）。
+			 * helper 内部已按绝对 RVA 算好位移，下面用 callOff < 0 跳过 x86 的回填。 */
+			t = buildEntryHookARM64(trampRVA, tableRVA, baseRVA+uint32(opt.VerifyFn), opt.EntryRVA)
+			callOff = -1
+		} else if opt.EntryHookSysV {
 			// System V（ELF）：入口处 rdx 里可能是 _start 需要的 rtld_fini，必须原样保留；
 			// r12 是 callee-saved，用它保存原始 rsp，被调用的 C 函数会替我们保住它。
 			t = append(t, 0x52)                   // push rdx
@@ -513,9 +550,11 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 			jmpOff = len(t)
 			t = append(t, 0, 0, 0, 0)
 		}
-		verifyRVA := baseRVA + uint32(opt.VerifyFn)
-		binary.LittleEndian.PutUint32(t[callOff:], uint32(int32(verifyRVA)-int32(trampRVA+uint32(callOff+4))))
-		binary.LittleEndian.PutUint32(t[jmpOff:], uint32(int32(opt.EntryRVA)-int32(trampRVA+uint32(jmpOff+4))))
+		if callOff >= 0 {
+			verifyRVA := baseRVA + uint32(opt.VerifyFn)
+			binary.LittleEndian.PutUint32(t[callOff:], uint32(int32(verifyRVA)-int32(trampRVA+uint32(callOff+4))))
+			binary.LittleEndian.PutUint32(t[jmpOff:], uint32(int32(opt.EntryRVA)-int32(trampRVA+uint32(jmpOff+4))))
+		}
 		data = append(data, t...)
 		entryHookRVA = trampRVA
 		entryHookLen = len(t)
