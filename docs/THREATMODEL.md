@@ -154,3 +154,7 @@ win/arm64 仍 fail-fast：CI 能编译它，但没有任何环境能执行 ARM64
 分段标记已证实**镜像解密完整跑通**（两节 `VirtualProtect` + delta 逆变换 + AEAD 验签全过）。
 未做项：固定产物后按**符号级**信息确认入口包装调用的函数并判断其失败原因；之后把 `windows-arm64-run` 的判据改为硬失败，
 再收 ③④。详见 `docs/STATUS.md #537` 与 `#507-#536`。
+**G3 更新（#549）**：外置密钥支持 **win/x64、win/x86、linux/amd64、linux/arm64** 四平台（各含三形态 CI 回归）；
+**win/arm64 未完成**（白名单关闭、fail-fast）。本目标已修并实证两处平台级缺陷（EntryHook/TLS thunk 的 ARM64 实现；
+无 `.reloc` 时建节 + ARM64 I-cache 刷新），并用本地复算排除了一整类可能（MAC/自哈希/`vm_code_off`/重定位目录/`SizeOfImage`）；
+剩余是一个**对二进制布局敏感**的运行期崩溃。完整证据链与接手指南见 `docs/STATUS.md #537-#549` 与 `docs/TODO.md`。
