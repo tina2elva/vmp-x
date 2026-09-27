@@ -3466,6 +3466,23 @@ int vm_unpack_image(const void *tblp) {
         if (delta) vm_reloc_apply((const u8 *)base, -delta, (u64)dst, (u64)dst + size);
         if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_img_fail(4); return -4; }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        /* 探针（#564）：解密**写完之后**立刻把 dst 的前 16 字节与 size 记进无损通道（状态已赋值 ⇒ 安全）。
+         * 目的：区分"明文没写进 .text"与"写进去了但之后被清零"。 */
+        vm_veh_hex("dec:dst=", (u64)(const void *)dst);
+        vm_veh_hex("dec:size=", (u64)size);
+        {
+            const u8 *dq = (const u8 *)dst;
+            char dh[34];
+            int di;
+            for (di = 0; di < 16; di++) {
+                u32 hi = (u32)(dq[di] >> 4), lo = (u32)(dq[di] & 0xFu);
+                dh[di * 2 + 0] = (char)(hi < 10u ? ('0' + hi) : ('a' + (hi - 10u)));
+                dh[di * 2 + 1] = (char)(lo < 10u ? ('0' + lo) : ('a' + (lo - 10u)));
+            }
+            dh[32] = '\n'; dh[33] = 0;
+            vm_dbg_win("dec:bytes=");
+            vm_dbg_win(dh);
+        }
         VM_DBG_WIN("img:sec-xored\n"); /* 诊断：解密完成（下一步是 +delta 回写与保护属性恢复） */
         VM_DBG_WIN("img:sec-verified\n");
         /* ④ 解密之后再把 delta 加回来（等价于加载器对明文做的那次重定位）。 */
