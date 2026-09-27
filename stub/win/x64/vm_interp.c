@@ -24,6 +24,10 @@
 #ifndef VM_DBG_WIN
 #define VM_DBG_WIN(x) ((void)0)
 #endif
+/* 同样需要兜底：真身只在外置+Windows+ARM64 构建里定义 */
+#ifndef VM_DBG_FLUSH
+#define VM_DBG_FLUSH() ((void)0)
+#endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define VM_ARCH_AARCH64 1
@@ -887,6 +891,8 @@ static void vm_dbg_flush(void) {
 }
 #undef VM_DBG_WIN
 #define VM_DBG_WIN(x) vm_dbg_win(x)
+#undef VM_DBG_FLUSH
+#define VM_DBG_FLUSH() vm_dbg_flush()
 #else
 #define VM_DBG_WIN(x) ((void)0)
 #endif
@@ -2688,7 +2694,7 @@ u64 vm_selftest(void *ctxp) {
  * 根本不再进入 VM —— 放在解释器里的校验永远不会执行。只有加载期的检查能拦住它。 */
 void vm_verify_table(const u32 *t) {
     VM_DBG_WIN("vf:enter\n"); /* 诊断：EntryHook 确实调到了校验蹦床 */
-    vm_dbg_flush();
+    VM_DBG_FLUSH();
     u32 n, i;
     const u8 *base = (const u8 *)t;
     const u8 *master = vm_master(); /* 1b：取钥 + KCV 校验（不通即 0xC0DE0007） */
@@ -2741,7 +2747,7 @@ void vm_verify_table(const u32 *t) {
                 vm_dbg_win(b);
             }
 #endif
-            vm_dbg_flush();
+            VM_DBG_FLUSH();
             __builtin_trap();
         }
     }
@@ -3374,7 +3380,7 @@ int vm_unpack_image(const void *tblp) {
         vp(dst, size, prot, &old);
     }
     VM_DBG_WIN("img:loop-done\n");
-    vm_dbg_flush();
+    VM_DBG_FLUSH();
     vm_img_done = 1;
     vm_img_diag[0] = 0;
     return 0;
