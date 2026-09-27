@@ -285,6 +285,16 @@ else { Write-Host "  [OK  ] 1b: no key -> 0xC0DE0007 (hard gate)" }
 
 $env:VMPX_KEY = $keyHex
 $o2 = (& $pk 2>&1) -join "|"; $r2 = $LASTEXITCODE
+# The in-memory capture above truncates, which hides the tail of the blob s diagnostics. Run once
+# more with stderr redirected to a FILE and write every line into the trace (STATUS #538 follow-up).
+$errFile = "build/keycase.err"
+Remove-Item $errFile -ErrorAction SilentlyContinue
+$null = & $pk 2> $errFile
+Mark ("fullstderr rc=" + $LASTEXITCODE)
+if (Test-Path $errFile) {
+  $i = 0
+  foreach ($ln in (Get-Content $errFile)) { $i++; if ($i -le 60) { Mark ("err| " + $ln) } }
+} else { Mark "fullstderr (no file)" }
 $env:VMPX_KEY = $null
 if ($r2 -ne $natRc -or $o2 -ne $natOut) { Fail ("VMPX_KEY: rc=" + $r2 + " native=" + $natRc + " out=[" + $o2 + "]") }
 else { Write-Host "  [OK  ] 1b: VMPX_KEY -> matches native" }
