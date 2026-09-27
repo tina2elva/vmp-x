@@ -3184,20 +3184,26 @@ static void vm_reloc_dir(const u8 *img, u32 *rvaOut, u32 *sizeOut) {
 
 static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
     u32 rva, size;
+    VM_DBG_WIN("ra:enter\n");
     vm_reloc_dir(img, &rva, &size);
+    VM_DBG_WIN("ra:dir\n");
     if (!rva) return;
+    /* 边界加固：目录可能很短（例如我们为目标新建的 .reloc 只有一个 8 字节空块），
+     * 也可能被人为破坏 ⇒ 任何一步 walk 都必须先校验，绝不能越界读。 */
+    if (size < 8) { VM_DBG_WIN("ra:tiny\n"); return; }
     const u8 *p = img + rva;
     const u8 *end = p + size;
     while (p + 8 <= end) {
         u32 page = *(const u32 *)p;
         u32 blk = *(const u32 *)(p + 4);
-        if (blk < 8 || p + blk > end) break;
+        if (blk < 8 || blk > (u32)((const u8 *)end - p)) { VM_DBG_WIN("ra:badblk\n"); break; }
         for (u32 o = 8; o + 2 <= blk; o += 2) {
             u16 v = *(const u16 *)(p + o);
             u32 type = (u32)(v >> 12), off = (u32)(v & 0xFFFu);
             if (!type) continue; /* ABSOLUTE：填充项 */
             u64 tgt = (u64)(img + page + off);
             if (tgt < lo || tgt + (type == 10 ? 8u : 4u) > hi) continue;
+            VM_DBG_WIN("ra:hit\n");
             if (type == 10) { /* IMAGE_REL_BASED_DIR64 */
                 u64 *q = (u64 *)tgt;
                 *q = (u64)((long long)*q + delta);
