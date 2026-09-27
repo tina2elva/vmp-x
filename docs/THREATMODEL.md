@@ -158,3 +158,9 @@ win/arm64 仍 fail-fast：CI 能编译它，但没有任何环境能执行 ARM64
 **win/arm64 未完成**（白名单关闭、fail-fast）。本目标已修并实证两处平台级缺陷（EntryHook/TLS thunk 的 ARM64 实现；
 无 `.reloc` 时建节 + ARM64 I-cache 刷新），并用本地复算排除了一整类可能（MAC/自哈希/`vm_code_off`/重定位目录/`SizeOfImage`）；
 剩余是一个**对二进制布局敏感**的运行期崩溃。完整证据链与接手指南见 `docs/STATUS.md #537-#549` 与 `docs/TODO.md`。
+**G3 最终（#555，目标第 60/60 轮）**：外置密钥支持 **win/x64、win/x86、linux/amd64、linux/arm64** 四平台（各含三形态 CI 回归）；
+**win/arm64 未完成**（白名单关闭、fail-fast）。本目标修好两处平台级缺陷（EntryHook/TLS thunk 的 ARM64 实现；无 `.reloc` 时建节 + ARM64 I-cache 刷新），
+修复了 native-vs-protected 的**假通过**，并把**本地秒级迭代能力**与**无损诊断通道**沉淀下来；
+同时用本地复算排除了一整类可能（MAC/自哈希/`vm_code_off`/重定位目录/`SizeOfImage`/未登记绝对 VA/delta 变换）。
+剩余问题一句话：**镜像被加载到别的基址后，某处仍按首选基址寻址**（运行时侧候选已逐处排除）。
+完整证据链、排除表、被否掉的路线与本地复现方法见 `docs/STATUS.md #537-#555` 与 `docs/TODO.md`。
