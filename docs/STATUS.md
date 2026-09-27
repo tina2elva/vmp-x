@@ -9446,3 +9446,24 @@ arm64 外置 blob 编译通过、门禁 12/0。
 **下一轮（几个 flush 点，启动期代价可忽略）**：在解密前段插 4 个 flush ——
 `img:master-ok`（`vm_master()` 之后）、`img:table-ok`（表头读完）、`img:vp-ok`（`VirtualProtect` 拿到）、`img:loop-start` ——
 一次 run 即可把崩点缩到**一两行代码**。
+### 570. **崩点被钉在 `vm_master()`（取钥）** —— 与历史记录及"只有外置崩"完全吻合
+
+**改动**：在解密前段插 4 个 flush 点（`img:master-ok` / `img:table-ok` / `img:vp-ok` / `img:loop-start`）。
+
+**CI 结果（run 36312429964，marker count = 12）**：
+
+    veh:install-begin / veh:mod-found / veh:install-begin / veh:mod-found / …
+    ⇒ **`img:master-ok` 一次都没有出现**
+
+**结论**：崩点在 `veh:mod-found`（`vm_veh_install` 内）之后、`img:master-ok`（`vm_master()` 之后）之前 ⇒ 只可能是：
+1. `vm_veh_install()` 的剩余部分（含 `RtlAddVectoredExceptionHandler` 取址与调用）；
+2. `if (vm_img_done) return 0;`（平凡）；
+3. 表头读取（平凡）；
+4. **`vm_master()` —— 取钥**。
+
+**为什么这条格外可信**：
+- `#385` 明确记录过"**取钥路径在 CI runner 上踩过 `0xC0000005`**"（kernel32 转发导出那次）；
+- **取钥代码只在 `VM_KEY_EXTERNAL` 构建里存在** ⇒ 与"**只有外置产物崩、非外置产物能跑到 `dc cvau` 那一步**"**完全吻合**。
+
+**下一轮**：在 `vm_master()` **内部**再插 flush 点（环境变量路径 → `.vmpkey` 文件路径 → KCV 校验），
+一次 run 即可定位到**具体是哪一条取钥路径**出错；随后按 `#385` 的结论改用 ntdll/PEB 直读、避开 kernel32 转发导出。
