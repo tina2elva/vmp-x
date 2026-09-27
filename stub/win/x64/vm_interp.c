@@ -24,6 +24,10 @@
 #ifndef VM_DBG_WIN
 #define VM_DBG_WIN(x) ((void)0)
 #endif
+/* VEH 安装宏同样兜底（#558 的教训：这类宏一律"顶部无条件兜底 + 真身处 #undef/#define"） */
+#ifndef VM_VEH_INSTALL
+#define VM_VEH_INSTALL() ((void)0)
+#endif
 /* 同样需要兜底：真身只在外置+Windows+ARM64 构建里定义 */
 #ifndef VM_DBG_FLUSH
 #define VM_DBG_FLUSH() ((void)0)
@@ -893,6 +897,45 @@ static void vm_dbg_flush(void) {
 }
 #undef VM_DBG_WIN
 #define VM_DBG_WIN(x) vm_dbg_win(x)
+
+/* ---- VEH：异常发生时把"异常码 + 异常地址"记进无损通道（#558；**不改热路径**）----
+ * 放在 vm_dbg_win/vm_dbg_flush 的**定义之后** ⇒ 不需要任何前向声明（这正是前两次踩坑的地方）。 */
+static u32 vm_veh_hit;
+static void vm_veh_hex(const char *pfx, u64 v) {
+    char nm[18];
+    int j;
+    for (j = 0; j < 16; j++) {
+        u32 nib = (u32)((v >> (60 - 4 * j)) & 0xFu);
+        nm[j] = (char)(nib < 10u ? ('0' + nib) : ('a' + (nib - 10u)));
+    }
+    nm[16] = '\n'; nm[17] = 0;
+    vm_dbg_win(pfx);
+    vm_dbg_win(nm);
+}
+static int VM_WINAPI vm_veh_handler(void *info) {
+    /* info = EXCEPTION_POINTERS* = { EXCEPTION_RECORD*, CONTEXT* }；
+     * EXCEPTION_RECORD（64 位）：+0x00 Code、+0x04 Flags、+0x08 Next、+0x10 ExceptionAddress。 */
+    const u8 *p = (const u8 *)info;
+    u64 rec = p ? *(const u64 *)(p + 0) : 0;
+    if (rec && !vm_veh_hit) {
+        vm_veh_hit = 1;
+        vm_veh_hex("veh:code=", (u64)(*(const u32 *)(rec + 0)));
+        vm_veh_hex("veh:addr=", *(const u64 *)(rec + 0x10));
+        vm_dbg_flush(); /* 唯一的一次系统调用时刻 */
+    }
+    return 0; /* EXCEPTION_CONTINUE_SEARCH：该崩还是崩，我们只负责记录 */
+}
+static void vm_veh_install(void) {
+    u64 mod = vm_find_module("ntdll.dll");
+    typedef u64 (VM_WINAPI *add_t)(u32, void *);
+    add_t add;
+    if (!mod) mod = vm_find_module("KERNEL32.DLL");
+    if (!mod) return;
+    add = (add_t)vm_get_proc(mod, "RtlAddVectoredExceptionHandler");
+    if (add) add(1u /* first */, (void *)vm_veh_handler);
+}
+#undef VM_VEH_INSTALL
+#define VM_VEH_INSTALL() vm_veh_install()
 #undef VM_DBG_FLUSH
 #define VM_DBG_FLUSH() vm_dbg_flush()
 #else
@@ -3280,6 +3323,7 @@ int vm_unpack_image(const void *tblp) {
     u8 mi[32];
     vm_kdf_entry(master, VM_FIELD_MASK_IMAGE, VM_FIELD_MASK_SALT, mi);
     u32 count = vm_xor32(t + 12, mi + 0);
+    VM_VEH_INSTALL(); /* 装 VEH：之后的任何异常都会把 异常码/地址 写进 vmpdiag.txt（#558） */
     VM_DBG_WIN("img:fn-entry\n"); /* 诊断：已进入 Windows 镜像解密函数（入口蹦床最先调用的就是它） */
     /* 基址不能用 PEB->ImageBaseAddress：那是**宿主 EXE** 的基址。DLL 在被加载时，
      * 那个字段指向宿主进程的主镜像，于是 base != wantBase 永远成立（实测直接 -2）。
