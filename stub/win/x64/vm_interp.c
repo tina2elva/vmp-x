@@ -3267,7 +3267,7 @@ static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
         p += blk;
     }
     VM_DBG_WIN("ra:done\n");
-    VM_DBG_FLUSH(); /* walk 走完立即落盘：崩溃点就在这附近（STATUS #547） */
+    /* 不再在 walk 内落盘：实测每次落盘都会移动崩溃点（#547/#548）⇒ 只有阶段边界才 flush。 */
 }
 
 int vm_unpack_image(const void *tblp) {
@@ -3372,7 +3372,6 @@ int vm_unpack_image(const void *tblp) {
         }
 #endif
         VM_DBG_WIN("img:sec-post\n");
-        VM_DBG_FLUSH(); /* 每个节落盘一次：崩溃也能留下已完成的阶段（STATUS #547） */
         /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）
          * PAGE_READONLY=0x02 / PAGE_READWRITE=0x04 / PAGE_EXECUTE_READ=0x20 / PAGE_EXECUTE_READWRITE=0x40 */
         u32 prot;
