@@ -194,6 +194,13 @@ if (($erva -ne 0) -and (Test-Path build/target_arm64.vmp)) {
   $tva = 0x14000d688
   $dd3 = (& $od2 -d ("--start-address=0x" + $tva.ToString("X")) ("--stop-address=0x" + ($tva + 0x90).ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
   foreach ($ln in (($dd3 -split "`n") | Select-Object -First 22)) { if ("" -ne $ln.Trim()) { Mark ("target:code " + $ln.Trim()) } }
+  # SAME-RUN symbol table + entry, so addresses can never be mixed across runs (STATUS #537 item 1).
+  # The question: is the entry wrapper s `bl` target a REAL function start (i.e. present in the
+  # symbol table), or does it land mid-function (which would mean a merge/relocation bug)?
+  $sym = (& $od2 -t build/target_arm64.vmp 2>&1 | Out-String)
+  foreach ($ln in (($sym -split "`n") | Select-Object -First 40)) { if ("" -ne $ln.Trim()) { Mark ("symtab " + $ln.Trim()) } }
+  $ent2 = (& $od2 -d ("--start-address=0x" + ($st1).ToString("X")) ("--stop-address=0x" + ($st1 + 0x20).ToString("X")) build/target_arm64.vmp 2>&1 | Out-String)
+  foreach ($ln in (($ent2 -split "`n") | Select-Object -First 14)) { if ("" -ne $ln.Trim()) { Mark ("entry2 " + $ln.Trim()) } }
   # The first 8 instructions decode as: mov/mov/mov / adrp+add (x0 = a message pointer) /
   # bl (a check) / cbz / brk #0. So the crash is a DELIBERATE assertion trap, not corrupt code.
   # Dump the bytes at that pointer (0x140011670 in the run above) to learn WHICH check failed.
