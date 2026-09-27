@@ -8825,3 +8825,28 @@ grep 出决定性对比：
 
 **下一轮更干净的实验**：不改编译期开关（避免布局变化），而是让 `vm_dbg_win` **只写文件、不写 stderr**，
 或把"每阶段落盘"降到"只在最关键的 2 个点落盘" ⇒ 在**布局完全不变**的前提下比较崩溃位置。
+
+### 544. 本地复核：`vm_code_off` 正确、**自哈希 MATCH**（两颗潜在 `brk` 雷被排除）
+
+**动机**：`#543` 的无效实验暴露出"按布局烘焙的值"很可疑，于是把 blob 里烘焙的三个全局**在本地读出来并复算**。
+
+**读到的值（外置 arm64 blob，`vmpb_a64_ext.bin`，manifest 给出各符号的 .bss 偏移）**：
+
+    vm_code_off      = 0x0        ← 正确（vm_entry 在 blob 偏移 0 ⇒ base = &vm_entry）
+    vm_self_len      = 0x7000
+    vm_self_hash     = 0x85CB4C21
+    vm_reloc_tab_off = 0x0        ← 无归零站点
+
+**本地复算（Python 按 `vm_selfcheck()` 的算式，FNV-1a over 前 0x7000 字节）**：
+
+    vm_self_len = 0x7000
+    baked hash  = 0x85CB4C21
+    local hash  = 0x85CB4C21   => MATCH ✓
+
+⇒ **结论**：`vm_selfcheck()` 不会因为哈希不符而 `__builtin_trap()`；`vm_code_off` 也是对的。
+⇒ 两颗"按布局烘焙"的潜在 `brk` 雷被**本地**排除（零 CI 往返）。
+
+**下一步（同样本地可做）**：用同样办法复核**补丁 MAC** —— 即按 `internal/inject/patchmac.go` 的算式
+（`key = KDFEntry(master, funcRVA, salt ^ 0x9E3779B9)`，消息 = `patch || le32(selfRVA) || le32(funcRVA) || le32(codeLen)`）
+在本地算出 `check`，与产物描述符里烘焙的值比对；这正是 `vm_verify_table` 会 `brk` 的那一处。
+若也 MATCH ⇒ 说明"越过当前障碍后不会再撞 MAC"；若 MISMATCH ⇒ 直接就是根因。
