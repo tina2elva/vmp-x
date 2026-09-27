@@ -313,6 +313,10 @@ Remove-Item $dErr -ErrorAction SilentlyContinue
 # the buffered tail. cmd.exe s redirection gives the child a RAW file handle, so nothing is lost.
 $rawErr = "build/raw.err"
 Remove-Item $rawErr -ErrorAction SilentlyContinue
+# Clear BOTH key sources, then set exactly one: earlier cases set VMPX_KEY_FILE, and if both are
+# present the product may take the file path (different code path, hence the "no output" runs).
+$env:VMPX_KEY = $null
+$env:VMPX_KEY_FILE = $null
 $env:VMPX_KEY = $keyHex
 $cmdOut = cmd.exe /c ("`"" + $pk + "`" 2> `"" + (Join-Path $PWD "build/raw.err") + "`"") 2>&1
 Mark ("raw rc=" + $LASTEXITCODE)

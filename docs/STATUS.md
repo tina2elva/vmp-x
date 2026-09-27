@@ -8683,3 +8683,54 @@ grep 出决定性对比：
 - **假通过比失败更危险**：这个平台的验收长期假通过，掩盖真问题很久（#517）；
 - **自包含自检很有价值**：它三次拦住我（`__clear_cache`、`vm_dbg_trace`、`vm_mark_entry`），是"blob 必须自包含"的机械保障；
 - **`.ps1` 必须纯 ASCII**（PS 5.1 按 ANSI 读，中文会破坏引号）；**改 ci.yml 必须整块替换步骤**（配 `tools/check_workflow.py` 检出重复键）。
+
+### 538. **两处真 bug 修复**：PE 的 `EntryHook` 与 TLS 回调 thunk **只有 x86 实现**
+
+**发现方式**：本地 WSL（clang 21 + llvm-objdump + 交叉编译的 Linux 版 vmpbuild/vmpack）构建 arm64 产物后
+反汇编入口链，发现入口点结尾的 `b` 落在一片**数据**上（`udf`/ASCII），字节为 `50 41 52 51` = 小端
+`51 52 41 50` = **x86 的 `push rcx; push rdx; push r8`** —— 即 ARM64 产物里被塞进了 **x86 机器码**。
+
+**根因**：`internal/inject/payload.go` 里两处手工发射机器码的存根**只写了 x86 分支**：
+- `EntryHook`（加载期校验蹦床，`payload.go:500-515` 一带）：`push rcx/rdx/r8` + `lea rcx,[rip+…]` + `call rel32` + `jmp rel32`；
+- TLS 回调 thunk（`payload.go:670-678`）：`lea rcx,[rip+…]` + `call vm_unpack_image` + `ud2` + `ret`。
+⇒ PE 侧这两个分支**没有按 `opt.Arch` 分流** ⇒ win/arm64 产物里是 x86 字节 ⇒ ARM64 执行 ⇒ **`0xC000001D`**。
+
+**修复**（提交 `b6640f3` / `85faf2a`）：
+- 新增 `buildEntryHookARM64`（形态与既有的 `buildImgHookARM64` 一致：保存 x0/x1/x2 → `adrp/add` 取表 →
+  `bl vm_verify_table` → 恢复 → `b 原始入口`）；
+- 新增 ARM64 版 TLS thunk（`adrp/add` → `bl vm_unpack_image` → `ret`）；
+- 两者都以 `callOff = -1` / `else` 的方式保证 **x86 与 SysV 路径字节不变** ⇒ x64 零影响。
+
+**本地（WSL）验证（同一次构建内对齐，避免跨 run 混用地址）**：
+
+    修复前 0x14000c640: 50415251     adr x17,… / <unknown>       ← x86 字节被当成 ARM64
+    修复后 0x14000c640: aa0003f3     mov x19, x0
+                        …
+                        97ffef31     bl 0x140008318             ← vm_verify_table（manifest 0x3318 ✓ 完全一致）
+                        17ffd27c     b  0x140001054 <entry>      ← 目标正是原始入口（objdump 标出符号名）
+
+⇒ 而且外置产物的入口链静态验证也通过：`bl 0x140009c58` = 载荷 + `0x4C58` = `vm_unpack_image`（manifest ✓）。
+
+**本地工具链（本目标新增能力）**：WSL(Ubuntu, root) + `clang 21` + `lld` + `llvm-objdump` + `qemu-aarch64`；
+`vmpbuild_linux`/`vmpack_linux` 由 **Windows 的 Go** 交叉编译得到（WSL 网络受限，Go 官方包下不来）⇒
+构建与定位从"每轮 5–8 分钟 CI"变成"**本地秒级**"，CI 只用于实机跑一次。
+
+### 539. 验收走向：**无密钥硬门已在 CI 实测通过**；带密钥路径的崩溃仍在，且诊断遇阻（已定位原因）
+
+**硬门（目标③ 形态①）实测**（多条 run，例如 36295837437 / 36296083226 / 36296348455）：
+
+    TRACE| nokey rc=-1059192825      ← = 0xC0DE0007 ✓ 且**没有任何输出** ✓
+
+⇒ **"无密钥必须恰好 0xC0DE0007 且无输出"** ⇒ **通过** ✓。
+
+**带密钥路径**：仍以 `0xC000001D` 结束，且**捕获不到任何 blob 输出**。排查过程中的三个结论：
+1. 先前的"空 stderr"是我自己的测试 bug —— 那个捕获是在脚本**清空 `VMPX_KEY`** 之后跑的 ⇒ 撞的是无密钥门禁（`vm_key_reject` 走 trap）；
+2. **管道捕获（`2>&1`）能看到标记**，而 `2> file` 与 `Start-Process -RedirectStandardError` 都看不到 ⇒
+   后者是 PowerShell 的受管管道，**硬 `brk` 杀进程时缓冲尾部会被丢弃**；
+3. 改用 `cmd.exe` 的**原生文件句柄重定向**后，**仍然没有任何输出** ⇒ 但同一把密钥在脚本**前面**的运行里**打出了标记** ⇒
+   两者只差**环境变量状态**：脚本第三种形态设置过 **`VMPX_KEY_FILE`**，而捕获块只设了 `VMPX_KEY` ⇒
+   已改为"**先清空两个来源、再只设一个**" ⇒ 下一轮复测即可判定。
+
+**未做项**：① 用"干净环境 + 单一密钥来源 + cmd 原生重定向"复测带密钥路径；② 若仍无输出 ⇒ 在 `vm_master()`
+**之前**加标记（入口链与 `vm_unpack_image` 内部更早处）；③ 三形态全绿 ⇒ 修 `windows-arm64-run` 判据为硬失败 ⇒
+放开白名单。
