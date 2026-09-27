@@ -3369,6 +3369,7 @@ int vm_unpack_image(const void *tblp) {
         }
 #endif
         VM_DBG_WIN("img:sec-post\n");
+        VM_DBG_FLUSH(); /* 每个节落盘一次：崩溃也能留下已完成的阶段（STATUS #547） */
         /* flags: bit0 = 可执行，bit1 = 可写（与打包端 inject.ImgSection 的约定一致）
          * PAGE_READONLY=0x02 / PAGE_READWRITE=0x04 / PAGE_EXECUTE_READ=0x20 / PAGE_EXECUTE_READWRITE=0x40 */
         u32 prot;
