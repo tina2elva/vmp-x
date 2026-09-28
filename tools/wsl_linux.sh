@@ -77,6 +77,12 @@ if [ "$ONLY" = "all" ] || [ "$ONLY" = "amd64" ]; then
   step "go test ./..."        go test ./...
   step "payload probe"        bash tools/verify_linux_payload.sh
   step "elf end-to-end"       bash tools/e2e.sh
+  # ELF 侧的布局门禁（PE 侧对应 tools/check_symmap.py）：程序头/载荷映射/逐字节一致/
+  # **bss 覆盖**（#585 那条）/重定位覆盖，且自带校准（--selftest）。
+  # 用 e2e.sh 刚留下的产物，所以必须排在它后面。
+  step "elf layout gate"      python3 tools/check_elf_layout.py \
+    --packed build/linux_target.vmp --manifest build/vm_interp_linux.json \
+    --blob build/vm_interp_linux.bin --report build/linux_vmp.json --selftest
   step "elf image encryption" bash tools/e2e_elf_image.sh --strict
 fi
 

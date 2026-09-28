@@ -1036,11 +1036,17 @@ EOF
 **老内核（含 6.6）全会踩；CI 的新内核逐段映射所以一直绿** —— 这就是本机 WSL 的价值。
 门禁里的 `KNOWN-FAIL` 豁免也已撤掉（它自己报了 "the exemption is stale, remove it"）。
 
-**新的未做项（承接 `#585`）**：
-- `check_symmap` 的 **ELF 对应物**：把"段映射/逐字节一致/`.rela` 覆盖 + 这条 **bss 不变式**"做成 Python 门禁
-  （现在本机可验证）。
+**✅ 已做（`STATUS #586`）：`check_symmap` 的 ELF 对应物** = `tools/check_elf_layout.py`
+（E1 程序头/顺序、E2 载荷段 vs report、E3 逐字节一致、**E4 bss 覆盖不变式**、E5 重定位覆盖；
+`--selftest` 六项校准全过），已接进 `tools/wsl_linux.sh`（⇒ 第 15 道门禁也覆盖 ELF 侧）。
+
+**仍未做**：
 - `#585` 的**取舍**：文件承载让产物变大（本例 ~262 KB）；若将来出现 `.bss` 很大的 ELF 目标，
   可改成运行期入口 `mmap(MAP_FIXED|ANONYMOUS)` 覆盖那段 bss（打包端+运行期两侧改动）。
+- ELF 的 `.rela.dyn/.rela.plt` 的"先减后加"应用器（`#390` 登记；E5 只在 ET_DYN 上真正生效）。
+- **Linux 反调试 `TracerPid`**（`#389` 登记）—— 下一项，本机现在可验证（`strace`/`gdb` attach 就会让它非 0）。
+- `TestARM64PayloadUnderQEMU` 的**测试隔离**（它按 `build/` 里有没有残留决定跑还是跳）。
+- DLL + 外置密钥（`#385`）、DPAPI 包装的取钥形态（`#393`）。
 
 **还等拍板的**：把两个 arm64 CI 作业从 workflow 停掉（用户已说 arm64 暂停；它们只是复现器，
 `continue-on-error` 不影响结论，但每次跑都要几分钟；停了要把"五作业全绿"的验收口径改成"三作业"）。

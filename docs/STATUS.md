@@ -9938,3 +9938,36 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
   自己 `mmap(MAP_FIXED|MAP_ANONYMOUS)` 覆盖那段 bss —— 那是"打包端 + 运行期"两侧改动，本轮**没做**；
   若将来出现 `.bss` 很大的 ELF 客户目标，再评估这条。
 - ELF 侧的 `check_symmap` 对应物（把这条 bss 不变式也纳入 Python 门禁）仍未做 —— 见 `docs/TODO.md`。
+
+### 586. ELF 侧的布局门禁 `tools/check_elf_layout.py`（PE 侧 `check_symmap` 的对应物，含 #585 的 bss 不变式）
+
+**做了什么**
+- 新工具 `tools/check_elf_layout.py`，只看**产物本身** + 同一份 blob 的 manifest/report：
+  - **E1 程序头清单**：每个 PT_LOAD 都在文件内可寻址、`p_offset ≡ p_vaddr (mod p_align)`、`memsz ≥ filesz`；
+    唯一允许的 VA 重叠是注入器的 **RW 覆盖段** —— 必须完全落在先出现的 RX 段之内、且**排在它之后**
+    （内核按表序 mmap、后者覆盖前者；顺序反了就会把解释器的可写窗口盖掉，`internal/inject/elf.go` 记过这次实测）。
+  - **E2 载荷段 vs report**：在 `imageBase + report.sectionRVA` 上有载荷段且 `filesz == sectionSize`；
+    有 bss 时在 `+bssOff` 上有 RW 覆盖段、大小恰好 `bssSize`。
+  - **E3 逐字节一致**：`[sectionRVA, +blobSize)` 的文件字节与 blob 完全相同。
+  - **E4 bss 覆盖不变式（`#585`）**：任何 `memsz > filesz` 的段，其 `PAGEALIGN(vaddr+filesz)` 必须**就是**全局 bss 边界，
+    否则内核整段不映射它 ⇒ 第一次写全局变量即 SIGSEGV。这条把 `#585` 那个"老内核才现形"的 bug 变成**静态可查**。
+  - **E5 重定位覆盖**：ET_DYN 时要求 payload 里的绝对 VA 都有 `R_*_RELATIVE` 项；ET_EXEC（当前支持的情形）如实打印 INFO。
+- **自校准**（`--selftest`，每次都跑）：破坏同余关系 / 让 report 的 `sectionRVA` 漂移 / 翻转 payload 一个字节 /
+  **人工"种"一个 bss**（不是"删一个已有的" —— 修完之后产物里已经没有带 bss 的段了，删无可删；
+  PE 侧的 C4 校准正是在这个坑上翻过一次车）/ 把 RW 覆盖段换到载荷段之前 ⇒ 六项必须各自被抓。
+- 接进 `tools/wsl_linux.sh`（紧跟 `e2e.sh` 之后，直接用它的产物）⇒ 也进了第 15 道门禁。
+
+**为什么需要它**：`#585` 那个缺陷"随便跑一次"就能发现，但 **CI 的新内核永远发现不了**。
+有了这条静态门禁，同类的"段布局/映射"缺陷不必依赖某个特定内核版本才能暴露。
+
+**证据**
+- WSL 里 `python3 tools/check_elf_layout.py … --selftest` → E1–E4 `[OK]`、E5 `[INFO]`、
+  `CAL mutation caught by pristine / E1 / E2 / E3 / E4 / E1-order` 六项全过，rc=0。
+- `tools/wsl_linux.ps1 -Only amd64` → **6 步全 OK**（含新加的 `elf layout gate`；其余 5 步是本轮之前就有的）。
+- 一个**容易写错、已踩过**的点：ELF 的 `report.sectionRVA` 是**相对镜像基址的 RVA**
+  （Go 侧 `Result.SectionRVA = baseVA - imageBase`），而程序头里是 VA。第一版直接拿 RVA 当 VA，
+  报 `no PT_LOAD at report.sectionRVA 0x1BB000`；现在统一换算（基址 = 最小 LOAD 的页对齐 vaddr）。
+
+**未做项**
+- E5 目前只在 ET_DYN 上真正生效（`-enc-image-elf` 只支持 ET_EXEC）；ELF 的 `.rela.dyn/.rela.plt` "先减后加"应用器仍未写（`#390` 登记）。
+- Linux 反调试（`/proc/self/status` 的 `TracerPid`）仍未做 —— 待下一项。
