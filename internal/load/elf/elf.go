@@ -298,6 +298,98 @@ func (f *File) AddLoadSegmentFromNote(payload []byte) (uint64, int64, error) {
 	return va, int64(fileOff), nil
 }
 
+// MakeBssFileBacked 把每个 "memsz > filesz" 的 PT_LOAD 改成**整段文件承载**
+// （filesz = memsz，原来的 .bss 那一截以 0 写进文件），并把该段的文件数据整体搬到文件尾。
+//
+// 为什么必须做（在本仓库实测出来的真 bug）：
+// Linux 内核对 bss 的映射是**一次性的全局区间**
+//
+//	set_brk(PAGEALIGN(max(p_vaddr+p_filesz)), PAGEALIGN(max(p_vaddr+p_memsz)))
+//
+// （fs/binfmt_elf.c 的老逻辑；WSL 的内核 6.6 实测如此），**不是**"每个 PT_LOAD 各映射自己的 bss"。
+// 一旦我们在某个 LOAD 的**上方**再加段（注入载荷必然如此），那个 LOAD 的
+// [p_vaddr+p_filesz, p_vaddr+p_memsz) 就再也不会被映射 —— 程序第一次写全局变量就 SIGSEGV：
+// 内核记录 "segfault at <bss 地址> ip ... error 6"（error 6 = 页不存在 + 写 + 用户态），
+// 实测崩在 Go 的 runtime.rt0_go 写 runtime.g0（0x5851e0，而 rw-p 映射只到 0x585000）。
+// 把 bss 变成文件承载后由 elf_map 直接映射，与"bss/brk 的全局区间"那套逻辑彻底解耦。
+//
+// 代价与副作用（如实登记）：
+//   - 文件变大：多出 (memsz-filesz) 个 0 字节，以及该段原有数据的**一份副本**（旧副本留在原地当死数据，
+//     因为"把 0 插到文件中间"会让后面所有节的 sh_offset 失准）；
+//   - 只有 PT_LOAD 被改写，节头表原样不动（旧副本仍可被 readelf 按节读到，不会指向垃圾）；
+//   - 该段通常只含 .data/.got/.bss，**不含函数体**，所以不会让 -wipe 的"原生机器码残留"回归。
+//
+// 返回被处理的段数。
+func (f *File) MakeBssFileBacked() int {
+	n := 0
+	for i := range f.Progs {
+		p := f.Progs[i]
+		if p.Type != PT_LOAD || p.Memsz <= p.Filesz {
+			continue
+		}
+		if p.Off+p.Filesz > uint64(len(f.Data)) {
+			continue // 文件里没有这段数据（不该发生）：跳过而不是越界
+		}
+		body := make([]byte, p.Filesz)
+		copy(body, f.Data[p.Off:p.Off+p.Filesz])
+
+		al := uint64(PageAlign)
+		if p.Align > al {
+			al = p.Align
+		}
+		newOff := AlignUp(uint64(len(f.Data)), al)
+		// ELF 要求 p_offset ≡ p_vaddr (mod p_align)；不满足就往后挪到同余的位置。
+		if newOff%al != p.Vaddr%al {
+			newOff += (p.Vaddr%al - newOff%al + al) % al
+		}
+		for uint64(len(f.Data)) < newOff {
+			f.Data = append(f.Data, 0)
+		}
+		f.Data = append(f.Data, body...)
+		f.Data = append(f.Data, make([]byte, p.Memsz-p.Filesz)...)
+
+		p.Off = newOff
+		p.Filesz = p.Memsz
+		f.Progs[i] = p
+		writePhdr(f.Data, int(f.Phoff)+i*PhdrSize, p)
+		n++
+	}
+	return n
+}
+
+// unmappedBss 返回"内核不会映射其 bss"的 PT_LOAD。
+//
+// 内核把 bss 当成**一个全局区间**：
+//
+//	set_brk(PAGEALIGN(max(vaddr+filesz)), PAGEALIGN(max(vaddr+memsz)))
+//
+// 所以一个 memsz>filesz 的段，只有当它的 PAGEALIGN(vaddr+filesz) **就是所有段的那个最大值**时，
+// 它的 bss 才会落在这个区间里；否则 bss 整段没有映射 —— 程序第一次写全局变量就 SIGSEGV
+// （内核 "segfault at <bss> ... error 6"＝页不存在 + 写）。
+//
+// 这是 MakeBssFileBacked 的判据，也是回归测试的校准点：探针必须能在"未修"时报出来。
+func (f *File) unmappedBss() []Program {
+	var top uint64
+	for _, p := range f.Progs {
+		if p.Type != PT_LOAD {
+			continue
+		}
+		if e := AlignUp(p.Vaddr+p.Filesz, PageAlign); e > top {
+			top = e
+		}
+	}
+	var bad []Program
+	for _, p := range f.Progs {
+		if p.Type != PT_LOAD || p.Memsz <= p.Filesz {
+			continue
+		}
+		if AlignUp(p.Vaddr+p.Filesz, PageAlign) < top {
+			bad = append(bad, p)
+		}
+	}
+	return bad
+}
+
 // SetLoadSegmentFlags 改一个已存在 PT_LOAD 的权限（用于"分段不可行时退回整体 RWX"）
 func (f *File) SetLoadSegmentFlags(va uint64, flags uint32) bool {
 	for i, p := range f.Progs {

@@ -143,3 +143,72 @@ func TestParseRejectsNonELF(t *testing.T) {
 		t.Fatal("应当拒绝非 ELF 输入")
 	}
 }
+
+// 回归：注入一个**更高地址**的段之后，原镜像里带 bss 的 PT_LOAD 必须仍"内核能映射到"，
+// 否则那段 bss 整段没有映射（第一次写全局变量 = SIGSEGV，内核记 error 6）。
+//
+// 用真实的 Go ELF 当夹具（target 不在就跳过），并且**先证明检查器会失败**：
+// 注入高层段后不修 ⇒ unmappedBss() 必须报出来；修完 ⇒ 必须为空。
+func TestBssStaysMappedAfterInjection(t *testing.T) {
+	src := "../../../build/linux_target"
+	if _, err := os.Stat(src); err != nil {
+		t.Skip("需要先构建 build/linux_target（GOOS=linux GOARCH=amd64 go build）")
+	}
+	f, err := Open(src)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	var hasBss bool
+	for _, p := range f.Progs {
+		if p.Type == PT_LOAD && p.Memsz > p.Filesz {
+			hasBss = true
+		}
+	}
+	if !hasBss {
+		t.Skip("夹具里没有 memsz>filesz 的段，本用例无意义")
+	}
+	if bad := f.unmappedBss(); len(bad) != 0 {
+		t.Fatalf("原镜像本身就有 %d 个 bss 不会被映射的段（夹具不对）", len(bad))
+	}
+
+	// 先注入一个更高地址的段：此时**故意不修**，检查器必须报出来（校准）
+	if _, _, err := f.AddLoadSegmentFromNote(make([]byte, 4096)); err != nil {
+		t.Fatalf("注入失败: %v", err)
+	}
+	bad := f.unmappedBss()
+	if len(bad) == 0 {
+		t.Fatal("校准失败：注入高层段之后检查器没有报出未映射的 bss（探针无效）")
+	}
+	t.Logf("校准 OK：未修时检查器报出 %d 个段（vaddr=0x%X）", len(bad), bad[0].Vaddr)
+
+	if n := f.MakeBssFileBacked(); n == 0 {
+		t.Fatal("MakeBssFileBacked 没有处理任何段")
+	} else {
+		t.Logf("MakeBssFileBacked 处理了 %d 个段", n)
+	}
+	if left := f.unmappedBss(); len(left) != 0 {
+		t.Fatalf("修复后仍有 %d 个段的 bss 不会被映射（vaddr=0x%X）", len(left), left[0].Vaddr)
+	}
+
+	// 用标准库独立复核：所有 LOAD 都文件承载，且满足 offset ≡ vaddr (mod align)
+	out := t.TempDir() + "/bss.elf"
+	if err := f.Save(out); err != nil {
+		t.Fatal(err)
+	}
+	g, err := stdelf.Open(out)
+	if err != nil {
+		t.Fatalf("标准库无法解析输出: %v", err)
+	}
+	defer g.Close()
+	for _, p := range g.Progs {
+		if p.Type != stdelf.PT_LOAD {
+			continue
+		}
+		if p.Filesz != p.Memsz {
+			t.Errorf("LOAD vaddr=0x%X 仍是 memsz(0x%X) > filesz(0x%X)", p.Vaddr, p.Memsz, p.Filesz)
+		}
+		if p.Align != 0 && p.Off%p.Align != p.Vaddr%p.Align {
+			t.Errorf("LOAD vaddr=0x%X: p_offset(0x%X) 与 p_vaddr 不同余 (mod 0x%X)", p.Vaddr, p.Off, p.Align)
+		}
+	}
+}

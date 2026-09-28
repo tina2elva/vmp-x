@@ -1028,10 +1028,19 @@ EOF
 - 结果：`linux-arm64` 两条（`e2e_arm64.sh` + aarch64 `e2e_elf_image.sh`）**本机全过**；`linux-amd64` 的 Go 门与载荷探针过，
   但 `e2e.sh` / `e2e_elf_image.sh` **红** —— 见下面这条新的未做项。
 
-**新增未做项（本机可复现，优先；门禁里标成 `KNOWN-FAIL`，且一旦开始通过会大声提醒删豁免）**：
-`linux/amd64` 的 ELF 产物 **SIGSEGV（rc=139）**，
-崩在 `runtime.rt0_go` 的 CPUID/全局写入段；已排除 Go 版本（1.24.5 同样）与"镜像加密"（`-no-enc-image` 同样），
-文件字节/符号地址级证据在 `STATUS #584`，下一步命令也已写好（`-no-enc-image-elf` + 解密后读 `0x46bb60` 的内存）。
+**✅ 已修（`STATUS #585`）：`linux/amd64` 的 ELF 产物 SIGSEGV** —— 根因是**内核只把 bss 当一个全局区间映射**
+（`set_brk(PAGEALIGN(max(vaddr+filesz)), PAGEALIGN(max(vaddr+memsz)))`），我们在更高地址加载荷段后，
+原 RW 段的 `.bss`（Go 的 `runtime.g0` 等全局变量，实测 219 KB）**整段没有映射** ⇒ 第一次写全局变量即崩
+（内核 `error 6`＝页不存在+写）。修法：打包端把带 bss 的 PT_LOAD 改成**文件承载**（`filesz=memsz`，
+`internal/load/elf` 的 `MakeBssFileBacked`），并加**校准过的**回归测试 `TestBssStaysMappedAfterInjection`。
+**老内核（含 6.6）全会踩；CI 的新内核逐段映射所以一直绿** —— 这就是本机 WSL 的价值。
+门禁里的 `KNOWN-FAIL` 豁免也已撤掉（它自己报了 "the exemption is stale, remove it"）。
+
+**新的未做项（承接 `#585`）**：
+- `check_symmap` 的 **ELF 对应物**：把"段映射/逐字节一致/`.rela` 覆盖 + 这条 **bss 不变式**"做成 Python 门禁
+  （现在本机可验证）。
+- `#585` 的**取舍**：文件承载让产物变大（本例 ~262 KB）；若将来出现 `.bss` 很大的 ELF 目标，
+  可改成运行期入口 `mmap(MAP_FIXED|ANONYMOUS)` 覆盖那段 bss（打包端+运行期两侧改动）。
 
 **还等拍板的**：把两个 arm64 CI 作业从 workflow 停掉（用户已说 arm64 暂停；它们只是复现器，
 `continue-on-error` 不影响结论，但每次跑都要几分钟；停了要把"五作业全绿"的验收口径改成"三作业"）。

@@ -23,7 +23,11 @@ cd "$(dirname "$0")/.."
 mkdir -p build
 ONLY="${1:-all}"
 FAIL=0
-KNOWN_FAIL="elf end-to-end,elf image encryption"
+# Currently EMPTY: the two linux/amd64 ELF steps were listed here for exactly one round (they
+# failed on this local kernel because the injector left the original .bss unmapped). STATUS #585
+# fixed that in the packer (MakeBssFileBacked), so the exemption was removed -- i.e. the
+# "stale exemption" path this mechanism forces you to notice actually fired.
+KNOWN_FAIL=""
 
 step() {
   local name="$1"; shift
@@ -94,5 +98,9 @@ if [ "$FAIL" -gt 0 ]; then
   echo "[FAIL] wsl_linux: $FAIL step(s) failed"
   exit 1
 fi
-echo "[OK  ] wsl_linux: no unexpected failures (known-failing steps are marked above)"
+if [ -n "$KNOWN_FAIL" ]; then
+  echo "[OK  ] wsl_linux: no unexpected failures (known-failing steps are marked above)"
+else
+  echo "[OK  ] wsl_linux: every step passed"
+fi
 exit 0

@@ -9891,3 +9891,50 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
   `arm64 elf image` OK；`elf end-to-end` 与 `elf image encryption` 红（`KNOWN-FAIL`，见上）。
 - CI：**run 36387327181（提交 465e7d9）五个作业全绿**
   （`windows-amd64` / `linux-amd64` / `linux-arm64` / `windows-arm64-blob` / `windows-arm64-run`）。
+
+### 585. **修掉 linux/amd64 ELF 的"原 .bss 整段没被映射"**：本机 WSL 复现 → 根因坐实 → 打包端修复 + 校准过的回归测试
+
+**根因（这次是坐实的，不是推测）**
+- Linux 内核对 bss 的映射是**一次性的全局区间**（`fs/binfmt_elf.c` 的老逻辑；WSL 内核 6.6 实测）：
+
+      set_brk(PAGEALIGN(max(p_vaddr + p_filesz)), PAGEALIGN(max(p_vaddr + p_memsz)))
+
+  **不是**"每个 PT_LOAD 各映射自己的 bss"。
+- 我们的注入必然在**更高地址**加段（载荷段）⇒ `max(vaddr+filesz)` 被抬到载荷之上 ⇒
+  原 RW 段的 `[p_vaddr+p_filesz, p_vaddr+p_memsz)`（Go 目标的 `.bss`，实测 `0x35AA0` = 219 KB，
+  `runtime.g0`/`m0`/所有全局变量都在里面）**整段没有映射**。
+- 症状：产物一进 `runtime.rt0_go` 就崩。内核记录
+  `segfault at 5851f0 ip 000000000047d40e ... error 6`（error 6 = 页**不存在** + 写 + 用户态），
+  gdb 显示 `rdi=0x5851e0`（= `runtime.g0`）、指令 `mov %rbx,0x10(%rdi)`，而 `rw-p` 映射只到 `0x585000`。
+- **为什么 CI 一直绿**：新内核把 bss 改成逐段映射（或新版 ELF 加载器重写），CI 看不见；
+  **老内核（生产上大量存在，含 6.6）全会踩** —— 这是"本机看到、CI 看不到"的反向案例。
+- 也解释了为什么 aarch64 那两条一直绿：它们跑在 **qemu-user** 下，qemu 自己按段映射，绕过了内核那套逻辑。
+
+**修复（打包端，不动运行期）**
+- 新增 `internal/load/elf/elf.go` 的 `MakeBssFileBacked()`：把每个 `memsz > filesz` 的 PT_LOAD 改成
+  **整段文件承载**（`filesz = memsz`，原 bss 那截以 0 写入），并把该段数据整体搬到文件尾
+  （页对齐，且保证 `p_offset ≡ p_vaddr (mod p_align)`）。这样由 `elf_map` 直接映射，与 bss/brk 的全局逻辑解耦。
+  - 只搬这一个段、**不动节头表** ⇒ 其它节的文件偏移全不变；旧副本留在原地当死数据
+    （代价：文件多出"该段数据副本 + bss 大小"）。
+  - 该段只含 `.data/.got/.bss`、**不含函数体** ⇒ 不会让 `-wipe` 的"原生机器码残留"回归。
+- `internal/inject/elf.go`：在 `AddLoadSegmentFromNote`（加高层段）**之前**调用它，并打印一行说明。
+- 新增判据函数 `unmappedBss()` 与**校准过的回归测试** `TestBssStaysMappedAfterInjection`：
+  用真实 Go ELF 当夹具，先证明"注入高层段后不修 ⇒ 检查器报出未映射的段"，再断言修完为空，
+  最后用 `debug/elf` 独立复核所有 LOAD 都 `filesz==memsz` 且同余关系成立。
+
+**证据**
+- 手工小样先验证方向：把现有产物那个 RW 段改成文件承载后运行 ⇒ `check-key 0` → **213**、
+  `sum-to 10` → **55**、`check-key 7` → **164**，全部 rc=0；映射变成 `0x57a000-0x5bb000 rw-p`（整段在了）。
+- 修完后在 WSL 跑 CI 的 linux/amd64 命令集：`elf end-to-end` **OK**、`elf image encryption` **OK**
+  （修前分别是 `e2e(linux): 1 passed, 16 failed` 与 MISMATCH）；`go build` / `go test` / `payload probe` 依旧 OK。
+- `tools/wsl_linux.sh` 里的 `KNOWN-FAIL` 豁免**已撤掉** —— 它自己先报了
+  `[NOTE] 'elf end-to-end' is marked KNOWN-FAIL but just PASSED -- the exemption is stale, remove it`
+  （即那条机制真的按设计起作用了）。
+- 单测：`go test -run TestBssStaysMappedAfterInjection -v ./internal/load/elf/` →
+  `校准 OK：未修时检查器报出 1 个段（vaddr=0x557000）` + `MakeBssFileBacked 处理了 1 个段` + **PASS**。
+
+**未做项 / 取舍（如实登记）**
+- 代价是**文件变大**（本例 +0x35AA0 个 0 + 0xA820 的段副本 ≈ 262 KB）。另一条更省空间的路是在运行期入口里
+  自己 `mmap(MAP_FIXED|MAP_ANONYMOUS)` 覆盖那段 bss —— 那是"打包端 + 运行期"两侧改动，本轮**没做**；
+  若将来出现 `.bss` 很大的 ELF 客户目标，再评估这条。
+- ELF 侧的 `check_symmap` 对应物（把这条 bss 不变式也纳入 Python 门禁）仍未做 —— 见 `docs/TODO.md`。

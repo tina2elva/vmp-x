@@ -76,6 +76,16 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		}
 	}
 
+	// 关键前置步骤：把"带 .bss 的 PT_LOAD"改成文件承载，**然后**才允许在更高地址加段。
+	// 原因（实测）：Linux 内核只把 [PAGEALIGN(max(vaddr+filesz)), PAGEALIGN(max(vaddr+memsz)))
+	// 这一段映射成 bss；我们的载荷段在更高地址 ⇒ 原 RW 段的 .bss 会整段没有映射 ⇒
+	// 程序第一次写全局变量就 SIGSEGV（内核 "segfault at <bss> ... error 6"；Go 目标的
+	// runtime.g0 就在里面）。老内核一路如此（WSL 6.6 实测），新内核改成逐段映射所以 CI 是绿的
+	// —— 也就是说**生产上大量老内核都会踩**，必须在打包端修。详见 MakeBssFileBacked 的注释。
+	if n := f.MakeBssFileBacked(); n > 0 {
+		fmt.Printf("[*] ELF：%d 个带 .bss 的段改成文件承载（否则高层载荷段会让内核漏映射这段 bss）\n", n)
+	}
+
 	newVA, payloadOff, err := f.AddLoadSegmentFromNote(pl.Data)
 	if err != nil {
 		return nil, err
