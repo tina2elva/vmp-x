@@ -881,3 +881,30 @@ clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib -fuse-l
   下一步应在**入口蹦床 / TLS 回调 / PE 加载期**找（可本地反汇编 imgHook/EntryHook/TLS thunk 的机器码与目标地址）。
 - **有用的本地工具**：`build/imgtab`（用仓库 KDF 解码签密表）、`build/maccheck`（复算补丁 MAC）、`build/vascan.py`（扫绝对 VA）、
   `build/paycmp.py`（节/字节比对）—— 全部**不入库、需 gofmt**、秒级。
+### 交接更新（#576，2025 最终状态）
+
+**已完成 / 已修复**
+- ✅ **本地秒级工具链**：WSL(clang+lld+llvm-objdump+qemu-aarch64) + Windows 交叉编译的 `vmpbuild_linux`/`vmpack_linux`；
+  本地复算工具：`build/imgtab`（仓库 KDF 解码签密表）、`build/maccheck`（复算补丁 MAC）、`build/vascan.py`（扫绝对 VA）、
+  `build/paycmp.py`/`build/entry.py`/`build/hook2.py`（节/字节/蹦床反汇编比对）—— 均不入库、需 gofmt、秒级。
+- ✅ **真因一（已修）**：Windows 用户态执行 `dc cvau`/`ic ivau`/`dsb ish` 会 trap（`0xC000001D`）⇒ 改用 `FlushInstructionCache`（`#561`）；
+  修后**解密循环首次完整跑完**（`img:loop-done`）。
+- ✅ **真因二（已修）**：PE 的 `EntryHook` 与 TLS 回调 thunk 原来只有 x86 实现 ⇒ 已补 ARM64（`#538`），本地反汇编实证。
+- ✅ **真因三（已修）**：目标无 `.reloc` 时自动建节（`#525`）与 ARM64 I-cache 刷新（`#529`）。
+- ✅ **测试可信度**：修掉 native-vs-protected 的"假通过"（`& *.vmp` 在 Windows 下不可启动）（`#517`/`#524`）。
+
+**已排除（全部有本地或 CI 证据）**
+取钥/硬门、入口链静态（含外置产物蹦床的 `adrp/add` 精确验算）、解密+AEAD、重定位目录与 `SizeOfImage`、walk、
+自哈希、`vm_code_off`、补丁 MAC、未登记绝对 VA、delta 变换、加密范围、诊断脚手架、**`vm_dbg_flush` 路径**、
+**导出查表**（`vm_get_proc`）、**VEH 注册调用**。
+
+**剩余问题（一句话）**
+> 外置产物 `0xC0000005`，崩点在 `vm_unpack_image` 内、**两次表头解引用**（`*(u64*)(t+0)`）附近；
+> 而 `install()` 已早退（`#574`）⇒ 前面只剩三行平凡代码 ⇒ **运行期的 `tblp` 是坏的**。
+
+**下一步（首选，一次 CI）**：在**蹦床汇编**里把 `x0` 与 `sp` 存进 `.bss`（纯内存、零系统调用），
+并在解密函数入口用一个纯内存标记记录"是否进入" ⇒ 区分 (a) 蹦床写错 `x0`，(b) 蹦床未被按预期调用。
+
+**注意（血的教训）**：任何"读取运行时状态"的探针必须放在**该状态已赋值之后**；
+任何"只在外置分支有定义"的符号必须走**顶部无条件兜底宏**模式；
+改动后**先把四种构建本地过一遍**（arm64 外置 / amd64 默认 / amd64 外置 / release / i686）**再跑门禁**。

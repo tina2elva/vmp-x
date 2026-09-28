@@ -168,3 +168,8 @@ win/arm64 仍 fail-fast：CI 能编译它，但没有任何环境能执行 ARM64
 修复后**解密路径首次完整跑通**；另用本地 KDF 工具证明签密表与基址反推均正确。
 外置产物的剩余崩溃（`0xC0000005`）已定位到"**进入解密代码之前**"（VEH 前移仍无输出）。
 完整证据链见 `docs/STATUS.md #537-#567`。
+**G3 交接（#576）**：win/arm64 **未完成**（白名单关闭、fail-fast）。已修复三个真因（用户态缓存维护指令 trap、
+EntryHook/TLS thunk 的 x86-only 存根、无 `.reloc` 建节 + I-cache 刷新），并修复了 native-vs-protected 的假通过；
+本地已排除一整类可能（含 `vm_dbg_flush` 路径、导出查表、VEH 注册），剩余问题收敛为一句：
+**外置产物在表头解引用处 `0xC0000005`，运行期 `tblp` 为坏值**（蹦床的 `adrp/add` 已本地验算正确）。
+完整证据链见 `docs/STATUS.md #537-#576`，接手指南与工具清单见 `docs/TODO.md`。
