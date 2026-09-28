@@ -9680,3 +9680,22 @@ arm64 构建通过、门禁 12/0、preflight OK。
 - 目标无 `.reloc` 时**自动建节**（`#525`，x64 已验证零影响）；
 - ARM64 解密后刷 I-cache：**改用 `FlushInstructionCache`**（`#561`，替换会 trap 的 `dc cvau` 序列）；
 - 修掉 native-vs-protected 的**假通过**（`#517`/`#524`）。
+### 582. 任务书与现状对齐（T1/T2 其实已完成）+ 修正过期的门禁数量
+
+**背景**：`docs/HANDOFF.md` 是权威任务书，但其 §2 仍写"仍未做：(1) 的接线、1b（主密钥外置+硬门）…"，
+而后继会话已经把它们做完了 ⇒ 若不更新，**下一个会话会重做**。
+
+**据实核对（都有仓库内证据）**：
+
+| 任务书条目 | 实际状态 | 证据 |
+|---|---|---|
+| **T1** 目标项 (1) 接线：每条目派生密钥 | ✅ **已完成** | 运行期 `vm_kdf_entry(master, rva, salt, key)` **逐节**现推；打包端 `inject.KDFSaltForPlacement` 同式；KAT 三重对齐（`TestKDFEntryMatchesC`/`TestKDFSaltDistinctAndStable`/`TestPatchMACMatchesC`）+ 门禁内 **blob 级 KAT**（`vm_kdf_salt x5 + vm_kdf_entry x3 + patch_mac x1 match`）|
+| **T2** 目标项 1b：主密钥外置 + 硬门 | ✅ **已完成** | 三形态（`VMPX_KEY` / `<产物>.vmpkey` / 无密钥）；无密钥 **恰好 `0xC0DE0007` 且无输出**（门禁 `[OK] 1b: no key -> 0xC0DE0007 (hard gate)`）；四平台各含三形态回归 |
+
+**本轮改动**：
+1. `docs/HANDOFF.md` §2 更新为"仍未做：(2)(3)(4)"，并把 T1/T2 的完成情况与证据写进该节；
+2. 修正过期数字：`11 gates → 12 gates`、`e2e 147 → 165`（`AGENTS.md`、`docs/HANDOFF.md` ×2、`docs/PE32.md`）；
+   —— `docs/STATUS.md` 中的 11 gates 是**历史记录**，按纪律**不修改历史**。
+
+**未做项**：T3（目标项 (2)，复用 Poly1305 的完整性校验 + 开销数字）、T4（表/描述符加密与混淆）、T5（反调试多路径）；
+win/arm64 已暂缓（`#581`，与 T1–T6 无关）。
