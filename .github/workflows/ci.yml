@@ -402,14 +402,7 @@ jobs:
           if (Test-Path build/probe.txt) {
             Write-Host "--- build/probe.txt ---"
             Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) }
-          } else { Write-Host "--- build/probe.txt missing (reproducer not run in this job) ---" }
-      - name: win/arm64 multi-observation run
-        if: always()
-        shell: pwsh
-        run: |
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/e2e_win_arm64.ps1
-          if (Test-Path build/probe.txt) { Get-Content build/probe.txt | ForEach-Object { Write-Host ("  TRACE| " + $_) } }
-          exit 0
+
           $global:LASTEXITCODE = 0
           $global:LASTEXITCODE = 0
       - name: win/arm64 reproducer (stage markers + vf diagnostics)
