@@ -1044,7 +1044,21 @@ EOF
 - `#585` 的**取舍**：文件承载让产物变大（本例 ~262 KB）；若将来出现 `.bss` 很大的 ELF 目标，
   可改成运行期入口 `mmap(MAP_FIXED|ANONYMOUS)` 覆盖那段 bss（打包端+运行期两侧改动）。
 - ELF 的 `.rela.dyn/.rela.plt` 的"先减后加"应用器（`#390` 登记；E5 只在 ET_DYN 上真正生效）。
-- **Linux 反调试 `TracerPid`**（`#389` 登记）—— 下一项，本机现在可验证（`strace`/`gdb` attach 就会让它非 0）。
+- **Linux 反调试 `TracerPid`**（`#389` 登记）—— **本轮试做后已回退**（预算不足不动主干），下面是可直接执行的配方 + 两个坑：
+  - 落点：`stub/win/x64/vm_interp.c` 的 `vm_antidebug()` 分支。把最后的
+    `#else static void vm_antidebug(void) { } #endif` 改成
+    `#elif defined(VM_BLOB_TARGET_LINUX) && defined(VM_KEY_EXTERNAL) && (x86_64 || VM_ARCH_AARCH64)`，
+    函数体读 `/proc/self/status` 的 `TracerPid`（`VM_LX_OPEN_RO` + `vm_lx_sys3(VM_LX_READ/VM_LX_CLOSE)`，
+    都已在同文件里），`TracerPid > 0` ⇒ `vm_dbg_mask |= 1` + `vm_dbg_defer = VM_DBG_DEFER_CALLS`（与 Windows 同款静默延后）。
+    Linux 侧**一条路径就定性**（正常进程 TracerPid 恒为 0，误报率极低）。
+  - **坑①**：那套 `VM_LX_*` 原语定义在 `#ifdef VM_KEY_EXTERNAL` 段里（约 1170 行）
+    ⇒ 守卫必须带上 `VM_KEY_EXTERNAL`（即：**Linux 反调试目前只在外置密钥构建里生效**，那正是部署形态）；
+    想对所有 Linux 构建生效，得把原语整块挪到守卫之外 —— **单独一轮做**（我第一次"顺手挪"就把预处理平衡搞坏了，
+    已回退；挪的时候必须连它的外层 `#endif` 一起搬）。
+  - **坑②（测试）**：必须用**外置产物 + 它自己的密钥**测，否则产物会先在硬门以 `rc=7` 退出、**根本不会进 VM**
+    （我两次测试就是这么无效的）。可用的观察：无 tracer 时 `check-key 10` = `143`；
+    在 `gdb` 下跑同一产物应**不再是 143**（实测 gdb 会把 TracerPid 置成 566/972）。
+    顺带记录：**"无 tracer 不误报"这一半已经验过**（带该改动的 `e2e.sh` 跑出 17/17，含 1b 三形态）。
 - `TestARM64PayloadUnderQEMU` 的**测试隔离**（它按 `build/` 里有没有残留决定跑还是跳）。
 - DLL + 外置密钥（`#385`）、DPAPI 包装的取钥形态（`#393`）。
 
