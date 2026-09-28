@@ -933,3 +933,36 @@ clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib -fuse-l
 
 **完成后**：按 ③④ 收尾（三形态与原生一致 ⇒ `windows-arm64-run` 判据改硬失败 ⇒ 白名单放开 ⇒ 纳入 CI 常态回归），
 并把本轮证据写入 `docs/STATUS.md`。
+### 最终操作卡（#581）：**按符号**核对"产物节映射 ↔ blob 内偏移"（可本地执行，无需 CI）
+
+**为什么是这条**：`#580` 已把剩余问题的性质修正为"**布局/映射不一致**"（任何改动都会移动崩点，
+最小改动甚至让崩溃退到第一次 flush 之前）。而合并器会**重新分布** blob 的 `.text/.rdata/.bss`，
+blob 内部却用 `vm_code_off`/`vm_self_len`/表 RVA 做地址推导 ⇒ 二者**必须逐符号核对**。
+
+**命令骨架（本地，秒级）**
+
+```bash
+# 1) 取 manifest 的符号表（blob 内偏移）
+python3 - <<EOF
+import json; m=json.load(open("build/<blob>.json"));
+for k,v in sorted(m["symbols"].items(), key=lambda kv: kv[1]):
+    if isinstance(v,int): print("%-28s blob_off=0x%X" % (k, v))
+EOF
+
+# 2) 取产物的节表（RVA / VSize / RawOff / RawSize）
+#    （build/paycmp.py 已有现成代码，直接复用）
+
+# 3) 关键等式：blob 的"节起点偏移"必须等于产物对应节的 RVA − 基址节 RVA
+#    blob 侧：由 manifest 的 section 符号（如 vm_code_off=0、vm_self_len）与 vmpbuild 的节归属推导；
+#    产物侧：SectionRVA（报告里的字段）+ 各符号 offset。
+```
+
+**判据**
+- 每个符号在"产物 RVA − 产物载荷节 RVA"与"manifest 偏移"**相等** ⇒ 映射一致 ⇒ 崩因在别处（回到 `#578` 的地址清单逐条比对）；
+- 有符号**不相等** ⇒ **那就是根因** ⇒ 修合并器/vmpack 的节分布逻辑（并加一条 gate 断言"符号偏移一致性"防止回归）。
+
+**附带任务（同一轮可做）**：把这条一致性检查**做成 gate**（新增一个 `tools/check_symmap.py` + 在 `tools/gates.ps1` 里挂一项），
+这样即便问题未解，也能保证"今后的产物至少满足符号映射一致"。
+
+**收尾清单（③④）**：定位并修复后 ⇒ 三形态与原生一致 ⇒ `windows-arm64-run` 判据从 `::warning` 改**硬失败** ⇒
+`cmd/vmpbuild` 白名单放开 `win/arm64` ⇒ 纳入 CI 常态回归 ⇒ 更新 `docs/STATUS.md` 与 G3。

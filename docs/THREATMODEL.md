@@ -173,3 +173,10 @@ EntryHook/TLS thunk 的 x86-only 存根、无 `.reloc` 建节 + I-cache 刷新�
 本地已排除一整类可能（含 `vm_dbg_flush` 路径、导出查表、VEH 注册），剩余问题收敛为一句：
 **外置产物在表头解引用处 `0xC0000005`，运行期 `tblp` 为坏值**（蹦床的 `adrp/add` 已本地验算正确）。
 完整证据链见 `docs/STATUS.md #537-#576`，接手指南与工具清单见 `docs/TODO.md`。
+**G3 最终（#581，90 轮收束）**：win/arm64 **未完成**（白名单临时开着；fail-fast 意图已文档化）。
+已修复三个真因（用户态缓存维护指令 trap ⇒ 改 `FlushInstructionCache`；`EntryHook`/TLS thunk 的 x86-only 存根 ⇒ 补 ARM64；
+无 `.reloc` 建节 + ARM64 I-cache 刷新）并修掉 native-vs-protected 的**假通过**；修复后**解密循环首次完整跑通**。
+已用本地证据排除一整类可能（重定位目录/`SizeOfImage`/walk/自哈希/`vm_code_off`/补丁 MAC/未登记绝对 VA/delta 变换/
+加密范围/诊断脚手架/`vm_dbg_flush` 路径/导出查表/VEH 注册）。剩余问题的**性质**已修正为"**产物节映射与 blob 内部地址推导不一致**"
+（判据：任何改动都会移动崩点，最小改动甚至让崩溃退到第一次 flush 之前）。
+接手指南、操作卡与工具清单见 `docs/TODO.md`；完整证据链见 `docs/STATUS.md #537-#581`。
