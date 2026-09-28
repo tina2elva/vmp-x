@@ -3426,6 +3426,10 @@ static void vm_reloc_apply(const u8 *img, long long delta, u64 lo, u64 hi) {
 }
 
 int vm_unpack_image(const void *tblp) {
+    /* #580（操作卡低风险一半）：**纯内存标记** —— 若本函数被进入过，dg3 的高位就是 1。
+     * 它会被后续任何 flush 一起带出（现有的 `veh:install-begin` / `veh:mod-found` 就会带 dg3）。
+     * 判据：dg3 高位 = 1 ⇒ `bl` 落地了（崩因在函数内部）；= 0 ⇒ `bl` 根本没落地。 */
+    vm_img_diag[3] |= 0x80000000u;
     VM_VEH_INSTALL(); /* 装 VEH（#566）：必须在取钥 vm_master() 之前 —— 否则崩在取钥阶段就完全没有诊断 */
     if (vm_img_done) return 0;
     const u8 *t = (const u8 *)tblp;
