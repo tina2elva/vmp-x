@@ -1046,8 +1046,16 @@ static void vm_veh_install(void) {
 #undef VM_VEH_INSTALL
 #define VM_VEH_INSTALL() vm_veh_install()
 #endif
+/* #576：**临时把所有 flush 变成空操作**（只保留纯内存缓冲）。
+ * 依据：`#575` 把嫌疑指向 `vm_dbg_flush()` 自身的导出查表（`vm_find_module(KERNEL32)` + `vm_get_proc(CreateFileA/WriteFile)`，
+ * 正是 `#385` 的转发导出高发区）⇒ 若产物在"零诊断系统调用"下能跑通 ⇒ 崩因就是诊断落盘路径自身。
+ * 这也与"每次加 flush 就把崩点往前推"（#542/#547/#549）的现象一致。 */
+#undef VM_DBG_FLUSH
+#define VM_DBG_FLUSH() ((void)0)
+#if 0
 #undef VM_DBG_FLUSH
 #define VM_DBG_FLUSH() vm_dbg_flush()
+#endif
 #else
 #define VM_DBG_WIN(x) ((void)0)
 #endif
