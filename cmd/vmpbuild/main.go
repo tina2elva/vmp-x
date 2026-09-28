@@ -101,6 +101,7 @@ func main() {
 	tmpRoot := flag.String("tmp", "", "临时目录（默认系统临时目录；必须是 ASCII 路径）")
 	objdump := flag.String("objdump", "objdump", "objdump 路径（用于测量解释器栈帧）")
 	release := flag.Bool("release", false, "release 构建：去掉全部诊断代码，描述符魔数每次构建随机")
+	diag := flag.Bool("diag", false, "把运行期诊断脚手架编进 blob（默认**关闭**；只在排查平台问题时打开）")
 	stageRoot := flag.String("stage-root", "stub", "要整体 stage 的源码树根（BLOB.sources 的路径相对它）")
 	randomOpcodes := flag.Bool("random-opcodes", true, "为本次构建生成随机的 VM 操作码映射（默认开启）")
 	guest := flag.String("guest", "x86-64", "客户机 ISA：x86-64（默认）或 arm64")
@@ -123,6 +124,12 @@ func main() {
 	// 之前放在 measureMaxFrame 旁边导致 -DVM_RELEASE 根本没进编译（.text 反而更大）。
 	if *release {
 		releaseBuild = true
+	}
+	// 诊断脚手架默认**不编进 blob**（1b/win-arm64 的那套标记 + VEH 取证，实测让外置 blob 大 ~8 KB）。
+	// 它过去只在"外置 + Windows + ARM64"的构建里生效，于是 release 构建也会带上它 —— 与 -release
+	// 自己的语义（去掉全部诊断代码）矛盾，且给产物留了一族可被扫描的诊断特征。现在改成显式开关。
+	if *diag && releaseBuild {
+		fatalf("-release 与 -diag 互斥：release 的语义就是去掉全部诊断代码")
 	}
 	// 描述符魔数**默认每次构建随机**（原来只有 -release 才随机，非 release 是固定的 "VMPK"，
 	// 那正是一个可被签名/扫描的 4 字节特征）。运行期不读这个字段（只在 manifest 里给打包器用），
@@ -211,7 +218,7 @@ func main() {
 	//   -merge go  ：内置直拼（COFF 没有 ld -r 的等价物，Windows/arm64 走这条）
 	objs := []string{*obj}
 	if *obj == "" {
-		objs, err = compile(*cc, *stageRoot, *src, tmp, opcodeValuesPath, keyPath, *guest, *verbose)
+		objs, err = compile(*cc, *stageRoot, *src, tmp, opcodeValuesPath, keyPath, *guest, *verbose, *diag)
 		must(err)
 	}
 	var merged *mergedBlob
@@ -665,7 +672,7 @@ func appendUnique(list []string, name string) []string {
 	return append(list, name)
 }
 
-func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, verbose bool) ([]string, error) {
+func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, verbose, diag bool) ([]string, error) {
 	// 把整个 stageRoot（默认 stub/）树按原样拷进 ASCII 临时目录。
 	// 这样平台目录之间可以互相引用（例如 Linux 复用 win/x64 的 vm_interp.c），
 	// 而不需要复制出会漂移的两份实现。
@@ -730,6 +737,11 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	if releaseBuild {
 		common = append(common, "-DVM_RELEASE=1",
 			fmt.Sprintf("-DVM_DESC_MAGIC=0x%Xu", releaseMagic))
+	}
+	// 诊断脚手架默认关闭：整段（标记 + VEH 事后取证）在 VM_NO_DIAG 下根本不参与编译，
+	// 因此 blob 里既没有那一族字符串，也没有那几条导出查表/落盘代码。要排查平台问题时用 -diag 打开。
+	if !diag {
+		common = append(common, "-DVM_NO_DIAG=1")
 	}
 
 	// 只编译 BLOB.sources 里显式列出的文件（测试/工具程序不能被链进 blob）
@@ -825,6 +837,12 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 		}
 		if compilerIsWindows {
 			args = append(args, "-DVM_BLOB_USES_WIN64=1")
+			// -diag：让诊断脚手架在 win/x64 上也编出来。它原来只存在于"外置 + Windows + ARM64"的
+			// 构建里，于是本机**根本编译不到、运行不到**那段代码 —— 改了它没有任何东西能证明还能用。
+			// 打开 -diag 后 x64 也产出带标记的 vmpdiag.txt ⇒ 那段代码在本机可编译、可运行、可进回归。
+			if diag && platformRel == "win/x64" {
+				args = append(args, "-DVM_DIAG_X64=1")
+			}
 			// 32 位 Windows 宿主（i686 mingw）：告诉 C 源"这是一条受支持的 Windows 宿主"，
 			// 但它**不等于** x86_64 —— 真·x64 的内联汇编块仍只在 __x86_64__/_M_X64 下编译。
 			if strings.Contains(machine, "i686") || strings.Contains(machine, "i386") {

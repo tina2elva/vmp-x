@@ -833,14 +833,16 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
 #  error "VM_KEY_EXTERNAL 只有 Windows(x64/arm64/x86) 与 Linux(amd64/arm64) 的取钥实现（vmpbuild 会先拦住别的目标）"
 #endif
 
-#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+#if !defined(VM_NO_DIAG) && defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && \
+    (defined(VM_ARCH_AARCH64) || defined(VM_DIAG_X64))
 /* 临时诊断（仅 Windows/ARM64 编译）：外置模式在该平台固定 0xC0000005，
  * 在 vm_master() 的关键节点往 stderr 打标记，用来三分定位崩在哪一段。
  * 走 kernel32!GetStdHandle + WriteFile（vm_get_proc 会解析转发导出）；取不到就静默放弃，
  * 这样"什么标记都没有"本身也是信息（说明更早就崩了）。 */
-/* 这两个符号的前向声明在下面（本文件靠后的 Windows 段），这里再声明一次以免顺序问题。 */
+/* 这三个符号的前向声明在下面（本文件靠后的 Windows 段），这里再声明一次以免顺序问题。 */
 static u64 vm_find_module(const char *name);
 static void *vm_get_proc(u64 mod, const char *fn);
+static u64 vm_peb_base(void); /* 落盘要读 PEB->ProcessParameters->CurrentDirectory 拼路径 */
 
 /* 诊断缓冲（.bss；在自哈希区间之外，不影响 vm_selfcheck）：热路径只写内存，**零系统调用**。
  * 原因见 STATUS #542/#547：每次标记都 CreateFileA/WriteFile/CloseHandle 会移动崩溃点。 */
@@ -861,19 +863,32 @@ static void vm_dbg_win(const char *s) {
     (void)s;
 }
 
-/* 落盘：只在"阶段边界"调用（STATUS #547）。先写 stderr，再用 OS 文件句柄追加写 vmpdiag.txt */
+/* 落盘：只在"阶段边界"调用（STATUS #547）。内存缓冲 + 这里一次性**追加**写 vmpdiag.txt。
+ *
+ * **只走 ntdll**：kernel32 的 GetStdHandle/WriteFile/CreateFileA/CloseHandle 在部分 Windows
+ * 版本上是**转发导出**（导出项不是代码，而是指向 "KERNELBASE.xxx" 字符串的 RVA），vm_get_proc
+ * 必须先正确解转发才拿得到真地址 —— STATUS #385 就是死在这条路上。取钥、硬门、VEH 注册此前
+ * 都已改成只用 ntdll（ntdll 的导出从不转发），落盘这一处是最后一个例外，现在也改掉。
+ *
+ * 文件仍落在**进程当前目录**（CI 里就是仓库根）—— 复现器 tools/e2e_win_arm64.ps1 就是按
+ * "vmpdiag.txt" 这个名字读它的，语义保持不变。 */
 static void vm_dbg_flush(void) {
 #ifndef VM_NO_DIAG
-    typedef void *(*gsh_t)(u32);
-    typedef int (VM_WINAPI *wf_t)(void *, const void *, u32, u32 *, void *);
-    u64 k = vm_find_module("KERNEL32.DLL");
-    if (!k) return;
-    gsh_t gsh = (gsh_t)vm_get_proc(k, "GetStdHandle");
-    wf_t wf = (wf_t)vm_get_proc(k, "WriteFile");
-    if (!gsh || !wf) return;
-    void *h = gsh(0xFFFFFFF5u); /* STD_ERROR_HANDLE（已不再使用：stderr 在硬杀进程时会丢尾部） */
-    u32 w = 0;
-    (void)h;
+    /* 本函数只在 64 位 Windows 目标上编译（守卫见本块顶部），所以直接按 64 位布局声明；
+     * 不复用文件后面的 vm_ustr_t/vm_objattr_t/vm_iosb_t，是为了不必把它们整块前移。 */
+    typedef struct { u16 Length, MaximumLength; u16 *Buffer; } dbg_str_t;
+    typedef struct { u32 Length; u32 Pad; void *RootDirectory; void *ObjectName; u32 Attributes; u32 Pad2;
+                     void *SecurityDescriptor; void *SecurityQualityOfService; } dbg_oa_t;
+    typedef struct { long Status; void *Information; } dbg_iosb_t;
+    typedef long (VM_WINAPI *dbg_create_t)(void **, u32, dbg_oa_t *, dbg_iosb_t *, void *, u32, u32, u32, u32, void *, u32);
+    typedef long (VM_WINAPI *dbg_write_t)(void *, void *, void *, void *, dbg_iosb_t *, const void *, u32, void *, void *);
+    typedef long (VM_WINAPI *dbg_close_t)(void *);
+    u64 nt = vm_find_module("ntdll.dll");
+    if (!nt) return;
+    dbg_create_t ncf = (dbg_create_t)vm_get_proc(nt, "NtCreateFile");
+    dbg_write_t nwf = (dbg_write_t)vm_get_proc(nt, "NtWriteFile");
+    dbg_close_t ncl = (dbg_close_t)vm_get_proc(nt, "NtClose");
+    if (!ncf || !nwf || !ncl) return;
     /* 落盘前附上 vm_img_diag[0..3]：诊断码 / 运行时 base / wantBase / 计数（#559 的下一步）。
      * dg1 就是**运行时 base** ⇒ RVA = veh:addr - dg1 ⇒ 可本地反汇编定位。 */
     {
@@ -899,26 +914,54 @@ static void vm_dbg_flush(void) {
         }
     }
     if (!vm_dbg_used) return;
-    /* 同时写文件。原因（实测）：`brk` 硬杀进程时，被重定向到文件/管道的句柄可能整体丢失输出，
-     * 而 CreateFileA 拿到的是 OS 直接落盘的文件句柄 ⇒ 这是**唯一无损**的诊断通道
-     * （STATUS #539）。文件落在进程当前目录（CI 里就是仓库根）。 */
-    {
-        typedef void *(VM_WINAPI *cfa_t)(const char *, u32, u32, void *, u32, u32, void *);
-        typedef int (VM_WINAPI *ch_t)(void *);
-        cfa_t cfa = (cfa_t)vm_get_proc(k, "CreateFileA");
-        if (cfa) {
-            /* 只传 FILE_APPEND_DATA：若同时带 GENERIC_WRITE，每次打开都从文件头开始写，
-             * 后写的短行会覆盖前写 ⇒ 诊断文件里只剩最后一行（实测踩到过）。 */
-            void *fh = cfa("vmpdiag.txt", 0x0004u, 3u, 0, 4u, 0x80u, 0);
-            if (fh && fh != (void *)-1) {
-                wf(fh, vm_dbg_buf, vm_dbg_used, &w, 0);
-                vm_dbg_used = 0; /* 落盘后清零：缓冲不再单调增长（STATUS #547 的干扰源之一） */
-                ch_t ch = (ch_t)vm_get_proc(k, "CloseHandle");
-                if (ch) ch(fh);
-                return;
-            }
-        }
+    /* 写文件而不是只写 stderr 的原因（实测）：`brk` 硬杀进程时，被重定向到文件/管道的句柄可能
+     * 整体丢失输出，而文件句柄写下去的是 OS 直接落盘的内容 ⇒ 这是**唯一无损**的诊断通道
+     * （STATUS #539）。
+     *
+     * \??\<CWD>\vmpdiag.txt：CWD 从 PEB -> ProcessParameters(+0x20) -> CurrentDirectory(+0x38)
+     * 直读（那里的 DosPath 本身就是 "\??\C:..." 形式），零 API 调用。 */
+    static u16 vm_dbg_path_buf[360]; /* .bss：别在帧上放这么大一块（vm_key_path_buf 同款） */
+    u32 n = 0;
+    u64 peb = vm_peb_base();
+    const u8 *pp = peb ? *(const u8 *const *)(peb + 0x20) : 0;
+    const dbg_str_t *cwd = pp ? (const dbg_str_t *)(pp + 0x38) : 0;
+    if (!cwd || !cwd->Buffer || cwd->Length < 8) return;
+    u32 cc = (u32)(cwd->Length / 2);
+    if (cc > 320) cc = 320;
+    /* DosPath **不保证**带 "\??\" 前缀（本机实测就是 "D:\..."）—— 缺了它 NtCreateFile 会以
+     * STATUS_OBJECT_PATH_SYNTAX_BAD (0xC000003B) 失败，症状是"诊断文件根本不出现"。这正是第一版
+     * 写不出文件的原因，用一个本机原生探针（同样的 NT 调用序列）复现并修掉。带前缀就原样用。 */
+    if (!(cc >= 4 && cwd->Buffer[0] == '\\' && cwd->Buffer[1] == '?' && cwd->Buffer[2] == '?' && cwd->Buffer[3] == '\\')) {
+        vm_dbg_path_buf[n++] = '\\'; vm_dbg_path_buf[n++] = '?';
+        vm_dbg_path_buf[n++] = '?';  vm_dbg_path_buf[n++] = '\\';
     }
+    for (u32 i = 0; i < cc; i++) vm_dbg_path_buf[n++] = cwd->Buffer[i];
+    if (vm_dbg_path_buf[n - 1] != '\\' && vm_dbg_path_buf[n - 1] != '/') vm_dbg_path_buf[n++] = '\\';
+    {
+        const char *suf = "vmpdiag.txt";
+        for (u32 i = 0; suf[i]; i++) vm_dbg_path_buf[n++] = (u16)(u8)suf[i];
+    }
+    vm_dbg_path_buf[n] = 0;
+    dbg_str_t nmsp;
+    nmsp.Length = (u16)(n * 2);
+    nmsp.MaximumLength = (u16)(n * 2 + 2);
+    nmsp.Buffer = vm_dbg_path_buf;
+    dbg_oa_t oa;
+    oa.Length = (u32)sizeof(oa); oa.Pad = 0; oa.RootDirectory = 0; oa.ObjectName = &nmsp;
+    oa.Attributes = 0x40u; /* OBJ_CASE_INSENSITIVE */
+    oa.Pad2 = 0; oa.SecurityDescriptor = 0; oa.SecurityQualityOfService = 0;
+    dbg_iosb_t iosb;
+    iosb.Status = 0; iosb.Information = 0;
+    void *fh = 0;
+    /* FILE_APPEND_DATA|SYNCHRONIZE / share read|write / OPEN_IF / NON_DIRECTORY|SYNCHRONOUS_IO_NONALERT。
+     * 只传 FILE_APPEND_DATA：若同时带 FILE_WRITE_DATA，每次打开都从文件头开始写，后写的短行会覆盖
+     * 先写的 ⇒ 诊断文件里只剩最后一行（实测踩到过）。 */
+    long st = ncf(&fh, 0x00100004u, &oa, &iosb, 0, 0x80u, 3u, 3u, 0x60u, 0, 0);
+    if (st < 0 || !fh) return;
+    iosb.Status = 0; iosb.Information = 0;
+    nwf(fh, 0, 0, 0, &iosb, vm_dbg_buf, vm_dbg_used, 0, 0);
+    if (iosb.Status >= 0) vm_dbg_used = 0; /* 落盘后清零：缓冲不再单调增长（STATUS #547 的干扰源之一） */
+    ncl(fh);
 #endif /* !VM_NO_DIAG */
 }
 #undef VM_DBG_WIN
@@ -2882,7 +2925,8 @@ void vm_verify_table(const u32 *t) {
         const u8 *p = base + (i32)delta;
         u32 got = vm_patch_mac(master, vm_kdf_salt(selfRVA, funcRVA, codeLen), selfRVA, funcRVA, codeLen, p, len);
         if (got != want) {
-#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+#if !defined(VM_NO_DIAG) && defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && \
+    (defined(VM_ARCH_AARCH64) || defined(VM_DIAG_X64))
             /* 诊断（#532/#534）：把关键量打到 stderr。**必须自包含** —— 先前直接用 vm_dbg_trace 被
              * 合并器的自包含自检拒绝（未定义符号），整个 blob 构建失败。这里自己格式化十六进制，
              * 只复用已有的 vm_dbg_win。纯打印，不改行为。 */
@@ -3433,7 +3477,8 @@ int vm_unpack_image(const void *tblp) {
     VM_VEH_INSTALL(); /* 装 VEH（#566）：必须在取钥 vm_master() 之前 —— 否则崩在取钥阶段就完全没有诊断 */
     if (vm_img_done) return 0;
     const u8 *t = (const u8 *)tblp;
-#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+#if !defined(VM_NO_DIAG) && defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && \
+    (defined(VM_ARCH_AARCH64) || defined(VM_DIAG_X64))
     /* #575：**在解引用之前**把 tblp 的数值本身落盘 —— 判定"运行期传入的表指针是否就是静态推演的那个"。
      * 上一轮已排除"导出查表"与"VEH 注册"（#574 的判定实验），窗口内只剩这两次解引用。 */
     vm_veh_hex("t=tblp=", (u64)(const void *)tblp);

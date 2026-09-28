@@ -65,6 +65,32 @@ jobs:
             exit $rc
           }
 
+      # Artifact-level gates on the very product e2e just packed: the packed image must keep the
+      # blob's internal layout (the interpreter derives every address from "payload base + blob
+      # offset") and every preferred-base absolute VA it stores must be registered in .reloc, or the
+      # product breaks as soon as ASLR moves it (STATUS #507/#508/#520, #580). Also checks that the
+      # diagnostic scaffolding is opt-in and lands through ntdll, not kernel32's forwarder exports.
+      # Runs tools/check_layout.ps1 -- the same script tools/gates.ps1 calls locally.
+      - name: Packed layout + diagnostics gate
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          $msys = "${{ steps.msys2.outputs.msys2-location }}"
+          if (-not $msys -or -not (Test-Path $msys)) { $msys = "C:\msys64" }
+          $goDir = Split-Path (Get-Command go -ErrorAction SilentlyContinue).Source
+          $env:PATH = "$goDir;$msys\ucrt64\bin;$msys\usr\bin;" + $env:PATH
+          $log = "build/ci_step.log"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tools/check_layout.ps1 *>&1 | Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            $fails = @(Select-String -Path $log -Pattern "\[!\]|\[FAIL\]|not caught|CAL " -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { $_.Line })
+            $tail = @(Get-Content $log -Tail 4 -ErrorAction SilentlyContinue)
+            $msg = (($fails + $tail) | ForEach-Object { $_ -replace "%", "%25" }) -join "%0A"
+            $msg = $msg -replace [char]13, ""
+            Write-Host "::error title=Packed layout + diagnostics gate (exit $rc)::$msg"
+            exit $rc
+          }
+
       - name: E2E DLL (3 cases)
         shell: pwsh
         run: |

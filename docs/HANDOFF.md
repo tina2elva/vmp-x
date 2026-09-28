@@ -17,7 +17,11 @@
   `df6ebba`(vm_kdf.c 进 blob)、`ed10ce6`(salt 派生+用例)、`0ee2fda`(salt 跨语言 KAT)。
 - 已完成且有三重确认（本机门禁 + 产品级回归 + CI）：**目标项 (1) 的全部前置**。
 - 已评估登记：#381 里 (5) 判"不做"、(6) 给出可实现方案排后；#382 定了 (2) 的选型。
-- **仍未做**：(2) 的实现、(3) 容器加密与混淆、(4) 反调试多路径。
+- **仍未做**：**无** —— (1)(1b)(2)(3)(4)(6) 已**全部落地**（逐项证据见下与 `docs/STATUS.md`）。
+  剩下的是**已登记的边界项**（不是本任务书的条目）：外部文件源之外的取钥形态（授权回调 / TPM-TEE）、
+  Linux 侧反调试、ELF 的 `.rela.dyn/.rela.plt` 应用器、DLL+外置密钥 —— 见 `docs/TODO.md`。
+  **⚠️ 交接提醒**：`docs/STATUS.md #582` 的"未做项"一栏仍写着 T3/T4/T5 未做，那是**沿用旧任务书的过期说法**；
+  以本节与 `#583` 为准。
 - **已由后续会话完成（本条原为"未做"，据实更新；证据见 docs/STATUS.md）**：
   - **T1（目标项 (1) 接线：每条目派生密钥）** ✅：运行期 `vm_kdf_entry(master, rva, salt, key)` 已**逐节**现推；
     打包端 `inject.KDFSaltForPlacement` 与之同式；KAT 三重对齐（`TestKDFEntryMatchesC` / `TestKDFSaltDistinctAndStable` /
@@ -25,10 +29,41 @@
   - **T2（目标项 1b：主密钥外置 + 硬门）** ✅：三种形态（`VMPX_KEY` 环境变量 / `<产物>.vmpkey` 文件 / 无密钥）；
     无密钥时 **恰好 `0xC0DE0007` 且无输出**（CI 实测，见门禁 `[OK] 1b: no key -> 0xC0DE0007 (hard gate)`）；
     密钥校验 tag 由主密钥派生；`linux/amd64`、`linux/arm64`、`win/x64`、`win/x86` 四平台各含三形态回归。
+  - **T3（目标项 (2)：完整性校验改带密钥 MAC）** ✅（`#386`，提交 `4eda829`）：入口补丁校验从**无盐 FNV**
+    换成 `PatchMAC = Poly1305(KDFEntry(master, funcRVA, salt ^ 0x9E3779B9), patch || selfRVA || funcRVA || codeLen)`
+    —— 按 `#382` 的选型**复用已有 Poly1305，没有新写 SHA/HMAC**；运行期只有 `vm_kdf.c:vm_patch_mac()` **一份**实现
+    （原来两处各自内联 FNV，正是"两侧各改一半"的温床）。三处 KAT 把公式钉死（C 主机端 `kdf_kat.c`、Go `patchmac_test.go`、
+    **blob 级** `kdf_blob_kat.c`），e2e 增加"把入口前 N 字节改回原生"的**回填**用例（必须拒绝执行，实测 `0xC000001D`）。
+    **"校验开销占比"数字**：`bench check_key` 50 万次 —— 不带校验 15361 ticks vs 带 MAC 15274 ticks
+    ⇒ **差异 <1%（在噪声内）** ⇒ 按实测**不做抽样**（这是评估结论，不是漏做；将来校验变重再加计数器即可）。
+  - **T4（目标项 (3)：容器/记录明文收口）** ✅（`#387`，提交 `aa71dae` + `664eccc`）：描述符魔数**默认每次构建随机**
+    （原来非 release 固定 `"VMPK"`，是可被签名/扫描的 4 字节特征）；描述符偏移 8..32 的 6 个 u32、
+    原镜像解密表的**表头 12..24 与每条目 0..12**、加载期校验表**每条 24 字节**，分别与 `KDFEntry(master, 域常量, FieldMaskSalt)`
+    逐字节异或；掩码种子每构建随机、**无主密钥推不出**；门禁 `tools/field_mask_check.py` 且**已校准**（把掩码改成空操作 ⇒ 5 处失败）。
+    踩坑：aarch64 入口汇编里**写死**了魔数 `"VMPK"` 并据此判断"thunk 前有没有描述符" ⇒ 已改用 `VM_DESC_MAGIC_LO/HI` 宏。
+  - **T5（目标项 (4)：反调试多路径 + 失败静默延后）** ✅（`#389`，提交 `eff45b1`）：四条路径 ——
+    `PEB.BeingDebugged` / `ntdll!NtQueryInformationProcess`（DebugPort + DebugObjectHandle）/
+    `ntdll!NtGetContextThread` 的 `Dr0..Dr3/Dr7`（**刻意不读 Dr6**，它复位时非 0，读了必误报）/ 一次性宽松 `rdtsc` 时间差。
+    判定按**路径位掩码** ⇒ **≥2 条不同路径**才算定性（按计数会因两个调用点把同一路径算两次 ⇒ 实测 flagged 输出 782→824）；
+    定性后**不 trap**，而是静默延后 `VM_DBG_DEFER_CALLS`(=3) 次调用返回错值 ⇒ 没有"一眼可定位的崩点"。
+    时间差路径的阈值被实机噪声顶到过 1e7 cycles（会误报），提到 **1e9 cycles**；校准用例 `tools/antidebug_flag_test.py`。
+  - **T6（目标项 (6)：保留重定位 + ASLR）** ✅（`#390`，提交 `942ce55`，**默认行为**）：`vmpack` 不再拆重定位表/清 `DYNAMIC_BASE`
+    （旧行为留在应急开关 `-strip-relocs` 后）；运行期四步"**按 DIR64 减回 delta → AEAD 验签 → 解密 → 把 delta 加回去**"，
+    打包端往 `.reloc` 追加 7 个 DIR64（TLS 回调数组的 3 个非零项 + TLS 目录副本的 4 个 VA 字段）。
+    静态证据 `tools/pe_reloc_info.py`、动态证据 `tools/aslr_probe.py`（产物确实被加载器搬到 `0x7FF6…`）。
+  - **另（本轮收尾技术债，不属于 T1–T6）** ✅：
+    ① 诊断脚手架改为**默认不编进 blob**（`-diag` 显式打开；外置 blob 实测省 **~8 KB**，且不再与 `-release` 的语义矛盾）；
+    ② 诊断落盘从 kernel32 的**转发导出高风险区**（`CreateFileA/WriteFile/GetStdHandle/CloseHandle`）改走 **ntdll**
+    （`NtCreateFile/NtWriteFile/NtClose`，ntdll 的导出从不转发 —— 与取钥/硬门/VEH 一致）；
+    ③ 门禁从 **12 道加到 14 道**：新增"产物节映射 ↔ blob 偏移一致性 / payload 逐字节一致 / `.reloc` 覆盖 / `SizeOfImage`"
+    （`tools/check_symmap.py`，**自校准**）与"诊断是否 opt-in、是否只走 ntdll"两道。
   - **另**：win/arm64 一度推进后被**暂缓（fail-fast，白名单关闭）**，详见 `docs/STATUS.md #537-#581`；
     该平台与本任务书 T1–T6 无关，不影响其它平台。
 
 ## 3. 任务（按顺序做，做完一项再做下一项）
+
+> **状态：T1–T6 与下面的收尾技术债已全部完成**（证据见 §2 与 `docs/STATUS.md`）。
+> 本节保留**当时的原始任务描述**，作为**验收口径的留档**（行号可能已经漂移，动手前先 `grep` 真实文本）。
 **T1（最高优先）目标项 (1) 接线：每条目派生密钥**
 1. 打包端 `cmd/vmpack/main.go`：
    - 三处把"单个 `aead`"换成"每条目 `aead_f = AEAD(KDFEntry(master, rva, salt))`"：
@@ -39,7 +74,7 @@
 2. 运行期 `stub/win/x64/vm_interp.c`：七处 `u8 key[32] = VM_KEY_BYTES;`（约 558/659/679/1344/1454/1544/1695 行）
    改成"按该条目的 rva/salt 现推 `K_f`"。C 侧 salt 必须与 Go 的 `KDFSaltForPlacement` 一致
    （`vm_kdf_salt()` 已实现，KAT 已对齐，直接调用即可）。
-3. 验证顺序：重建 blob → `tools/gates.ps1`（要求 **12 gates / 0 failed**）→ 本机产品级回归
+3. 验证顺序：重建 blob → `tools/gates.ps1`（要求 **14 gates / 0 failed**）→ 本机产品级回归
    （见第 5 节 demo64 命令）→ push → 等 CI **五个作业全绿**。
 4. 补一条单测："不同 RVA ⇒ 不同 salt ⇒ 不同 key"（`internal/inject/kdf_test.go` 已有 salt 用例，可扩展）。
 
@@ -94,7 +129,7 @@
 - **不要**为了让检查通过而放宽阈值或只保某一个平台。
 
 ## 7. 验收标准（每项都要给证据）
-1. `tools/gates.ps1` = **12 gates / 0 failed**；e2e **165 passed / 0 failed**；dll 3/3；arm64 客户机 OK；
+1. `tools/gates.ps1` = **14 gates / 0 failed**；e2e **165 passed / 0 failed**；dll 3/3；arm64 客户机 OK；
 2. 本机产品级回归：demo64 三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 输出除 base 两行外一致；
 3. CI **五个作业全绿**（run 号写进 STATUS）；
 4. `docs/STATUS.md` 追加一条：做了什么、证据（含 run 号与命令）、**未做项**。
@@ -110,7 +145,7 @@
 
 ## 附录 B：验收证据清单（缺一不可）
 1. `tools/preflight.ps1` → `[+] preflight: OK`；
-2. `tools/gates.ps1` → `total 11 gates, 0 failed`（e2e 147/0、dll 3/3、arm64 客户机 OK）；
+2. `tools/gates.ps1` → `total 14 gates, 0 failed`（e2e 165/0、dll 3/3、arm64 客户机 OK）；
 3. demo64：三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 仅 base/地址两行不同、退出码 0=0；
 4. CI 五个作业全绿，run 号写进 STATUS。
 

@@ -963,9 +963,37 @@ EOF
 
 **附带任务（同一轮可做）**：把这条一致性检查**做成 gate**（新增一个 `tools/check_symmap.py` + 在 `tools/gates.ps1` 里挂一项），
 这样即便问题未解，也能保证"今后的产物至少满足符号映射一致"。
+**✅ 已完成（`docs/STATUS.md #583`）**：新增 `tools/check_symmap.py`，已挂进 `tools/gates.ps1`（门禁 12 → **14** 道）。
+它**只看产物本身 + 同一份 blob 的 manifest/report**，所以不是"用 vmpack 自己的账本验自己"：
+- **C1 `SizeOfImage` / 节清单**：头字段自洽、每节落在 `SizeOfImage` 内、节不重叠、入口点落在可执行节；
+- **C2 节映射与符号**：manifest 的 `[0,blobSize)` 必须是 `产物 RVA = sectionRVA + blobOffset` 的一一映射，
+  三段 payload（R+X / R+W / R+X）按 `SectionAlignment` 串联，report 里每个 RVA 都落在 payload 区间内，符号都在 blob 内；
+- **C3 payload 逐字节一致**：产物在 `sectionRVA+o` 的字节 == blob 的第 o 字节（**这一条就是"合并器重新分布节"的直接判据**）；
+- **C4 重定位覆盖**：payload 里出现的**首选基址绝对 VA**（8 字节对齐）必须有 DIR64 项覆盖 ——
+  这正是 `#507/#508/#520` 那一类"写了绝对 VA 却没登记 ⇒ ASLR 一搬就崩"的缺陷；
+  （唯一豁免：解密表表头第一个 u64 是 `opt.ImageBase`，它是**比较常量**不是指针，登记了反而会破坏 delta 计算。）
+**自校准**（`--selftest`，每次门禁都跑）：把 `SizeOfImage` 抬高 / 让 report 的 `sectionRVA` 漂移 / 翻转 payload 一个字节 /
+把一条 DIR64 改成 ABSOLUTE ⇒ **每个检查都必须抓到自己的那次变异**，否则门禁自己红。另外用真实开关校准过：
+`-strip-relocs` 的产物在 `--require-aslr` 下必红（并打印 7 个"需要首选基址"的 VA）。
 
 **收尾清单（③④）**：定位并修复后 ⇒ 三形态与原生一致 ⇒ `windows-arm64-run` 判据从 `::warning` 改**硬失败** ⇒
 `cmd/vmpbuild` 白名单放开 `win/arm64` ⇒ 纳入 CI 常态回归 ⇒ 更新 `docs/STATUS.md` 与 G3。
+
+### 收尾技术债（不属于 win/arm64，**已完成**，见 `docs/STATUS.md #583`）
+
+1. **诊断脚手架默认不编进 blob** ✅ —— 原来它只在"外置 + Windows + ARM64"的构建里生效，于是**默认就编进去**
+   （外置 blob 实测大 **~8 KB**：42112 vs 50304），还与 `-release` 自己的语义（"去掉全部诊断代码"）矛盾。
+   现在默认定义 `VM_NO_DIAG`（整段连编译都不编译），要排查平台问题时用 **`vmpbuild -diag`** 显式打开；
+   `-release` + `-diag` 直接报错（互斥）。
+   **顺带把那段代码变成可验证的**：`-diag` 在 **win/x64** 上也会编出脚手架（`-DVM_DIAG_X64`），
+   于是本机/runner 能真正**编译并运行**它（此前那段代码没有任何门禁/作业会碰）。
+2. **诊断落盘改走 ntdll** ✅ —— 原来是 kernel32 的 `GetStdHandle/CreateFileA/WriteFile/CloseHandle`，
+   而 kernel32 里这批 API 在部分 Windows 版本上是**转发导出**（导出项指向 `"KERNELBASE.xxx"` 字符串），
+   `vm_get_proc` 得先正确解转发才拿得到真地址 —— `STATUS #385` 就是死在这条路上。
+   现改为 `ntdll!NtCreateFile/NtWriteFile/NtClose`（ntdll 的导出从不转发），路径仍是"进程 CWD 下的 `vmpdiag.txt`"。
+   **踩到的坑（已修，值得留档）**：`PEB->ProcessParameters->CurrentDirectory.DosPath` **不保证**带 `\??\` 前缀
+   （本机实测就是 `D:\...`）⇒ 缺前缀时 `NtCreateFile` 返回 `0xC000003B`（`STATUS_OBJECT_PATH_SYNTAX_BAD`），
+   症状是"诊断文件根本不出现"。用一个本机原生探针（同样的 NT 调用序列）复现并定位，修好后端到端跑通。
 ### win/arm64：**已暂缓**（cancelled / deferred，见 STATUS #581）
 
 - 现状：`cmd/vmpbuild` 白名单**关闭**（构建即拒绝，fail-fast）；CI 两个 arm64 作业带 `continue-on-error` ⇒ 整体保持绿。

@@ -1,4 +1,4 @@
-﻿# preflight.ps1 - fast sanity checks before any real work (AGENTS.md acceptance item 1).
+# preflight.ps1 - fast sanity checks before any real work (AGENTS.md acceptance item 1).
 #
 # Contract: prints "[+] preflight: OK" and exits 0 when everything checks out;
 # otherwise prints one "[!] ..." line per problem and exits 1.
@@ -6,7 +6,7 @@
 # ASCII-only output on purpose: this runs on Windows CI runners whose console code page
 # is not UTF-8 (see AGENTS.md).
 #
-# This is NOT a replacement for tools/gates.ps1 (the 11 real gates) - it is the cheap
+# This is NOT a replacement for tools/gates.ps1 (the 14 real gates) - it is the cheap
 # subset you can run in a few seconds before touching anything.
 param(
   [switch]$Quiet

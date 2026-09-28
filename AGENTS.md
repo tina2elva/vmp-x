@@ -19,7 +19,7 @@
 
 ## 完成一项的验收（缺一不可，全部要有证据）
 1. `powershell -NoProfile -ExecutionPolicy Bypass -File tools/preflight.ps1` → `[+] preflight: OK`；
-2. `tools/gates.ps1` → `total 12 gates, 0 failed`（e2e 165/0、dll 3/3、arm64 客户机 OK）；
+2. `tools/gates.ps1` → `total 14 gates, 0 failed`（e2e 165/0、dll 3/3、arm64 客户机 OK）；
 3. CI **五个作业全绿**（`gh run list` 取 run 号）；
 4. `docs/STATUS.md` 追加一条：做了什么、证据（含 run 号与命令）、**未做项**。
 

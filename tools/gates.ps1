@@ -81,6 +81,32 @@ Step "image residue (original .text not readable in the packed file)" {
     python tools/image_residue.py --src build/target.exe --packed build/target_vmp.exe --section .text,.rdata,.data
     if ($LASTEXITCODE -ne 0) { Write-Host "[!] original code still readable in the packed image"; $script:stepCode = 1 }
 }
+# The packed image must keep the blob's internal layout, because the interpreter derives every
+# address from "payload base + blob offset"; and every preferred-base absolute VA the packer
+# writes into the payload must be registered in .reloc, or the product breaks as soon as ASLR
+# actually moves it (STATUS #507/#508/#520; #580 reduced the win/arm64 failure to exactly this
+# "section mapping vs blob-internal address derivation" class). check_symmap.py re-derives the
+# mapping from the PRODUCT's own section table and self-calibrates on mutated copies, so this
+# gate cannot silently turn into a no-op. It runs on the artifacts e2e.ps1 just built.
+# The packed image must keep the blob's internal layout, because the interpreter derives every
+# address from "payload base + blob offset"; and every preferred-base absolute VA the packer writes
+# into the payload must be registered in .reloc, or the product breaks as soon as ASLR actually
+# moves it (STATUS #507/#508/#520; #580 reduced the win/arm64 failure to exactly this "section
+# mapping vs blob-internal address derivation" class). The check self-calibrates on mutated copies,
+# so it cannot silently degrade into a no-op. Both steps live in tools/check_layout.ps1 so CI runs
+# the very same code as this local run.
+Step "packed layout (symbol mapping / payload identity / reloc coverage)" {
+    & powershell -NoProfile -File (Join-Path $PSScriptRoot "check_layout.ps1") -Layout
+}
+# The diagnostic scaffolding (markers + VEH post-mortem) used to be compiled into every "external
+# key + Windows + ARM64" blob unconditionally -- which contradicted -release ("drop all
+# diagnostics") and cost ~8 KB. It is opt-in now (-diag), and its file sink goes through ntdll only:
+# kernel32's CreateFileA/WriteFile can be FORWARDER exports, and calling a forwarder's RVA as code
+# is exactly how #385 died on the CI runner. -diag also builds the scaffolding for win/x64, so this
+# gate compiles AND runs it instead of leaving code that nothing ever exercises.
+Step "diagnostics are opt-in and land through ntdll" {
+    & powershell -NoProfile -File (Join-Path $PSScriptRoot "check_layout.ps1") -Diag
+}
 Step "e2e_dll.ps1"       { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_dll.ps1") }
 Step "guest differential (arm64 + x86-32)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_arm64guest.ps1") }
 Step "linux payload (executed on Windows)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "verify_linux_payload.ps1") }

@@ -91,7 +91,7 @@ if (-not (Test-Path build/target_arm64.exe)) { Write-Host "[!] arm64 PE target b
 $keyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 Remove-Item build/vm_interp_win_arm64_ext.bin, build/vm_interp_win_arm64_ext.json -ErrorAction SilentlyContinue
 Write-Host "[*] building the Windows/arm64 external-key blob..."
-& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $ccArg -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 60
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_interp_win_arm64_ext.bin -manifest build/vm_interp_win_arm64_ext.json -entry vm_entry -guest arm64 -merge go -cc $ccArg -objdump $objdump -key-external -key-in $keyHex -diag 2>&1 | Select-Object -Last 60
 if (-not (Test-Path build/vm_interp_win_arm64_ext.bin)) { Write-Host "[!] Windows/arm64 external blob build FAILED"; exit 1 }
 
 # ---- pack check_key / sum_to ----
@@ -332,7 +332,7 @@ Remove-Item "vmpdiag.txt" -ErrorAction SilentlyContinue
 # ---- Variant B: forced delta=0 (one more observation in the SAME run) ----
 $wrapD0 = Join-Path $PWD "build/clang-a64w-d0.cmd"
 Set-Content -Path $wrapD0 -Value ("@echo off" + $nl + $q + $clang + $q + " --target=aarch64-w64-windows-gnu -DVM_FORCE_DELTA0 %*") -Encoding Ascii
-& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_b_d0.bin -manifest build/vm_b_d0.json -entry vm_entry -guest arm64 -merge go -cc $wrapD0 -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 3 | Out-Null
+& .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_b_d0.bin -manifest build/vm_b_d0.json -entry vm_entry -guest arm64 -merge go -cc $wrapD0 -objdump $objdump -key-external -key-in $keyHex -diag 2>&1 | Select-Object -Last 3 | Out-Null
 if (Test-Path build/vm_b_d0.bin) {
   & .\build\vmpack.exe -exe build/target_arm64.exe -func check_key -func sum_to -blob build/vm_b_d0.bin -manifest build/vm_b_d0.json -out build/d0.exe -report build/d0.json 2>&1 | Out-Null
   if (Test-Path build/d0.exe) {
@@ -348,6 +348,9 @@ if (Test-Path build/vm_b_d0.bin) {
   } else { Mark "d0 pack failed" }
 } else { Mark "d0 blob build failed" }
 # ---- Variant N: NO diagnostics at all (-DVM_NO_DIAG). Decisive control for #565. ----
+# NOTE: since STATUS #583 diagnostics are OFF by default (vmpbuild defines VM_NO_DIAG unless -diag
+# is given), so this variant is now the same code path as a plain -key-external build; the wrapper
+# below is kept because it documents the intent and is harmless (both define VM_NO_DIAG = 1).
 $wrapN = Join-Path $PWD "build/clang-a64w-nodiag2.cmd"
 Set-Content -Path $wrapN -Value ("@echo off" + $nl + $q + $clang + $q + " --target=aarch64-w64-windows-gnu -DVM_NO_DIAG %*") -Encoding Ascii
 & .\build\vmpbuild.exe -src stub/win/arm64 -out build/vm_b_nd.bin -manifest build/vm_b_nd.json -entry vm_entry -guest arm64 -merge go -cc $wrapN -objdump $objdump -key-external -key-in $keyHex 2>&1 | Select-Object -Last 3 | Out-Null

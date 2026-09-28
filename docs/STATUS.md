@@ -9699,3 +9699,92 @@ arm64 构建通过、门禁 12/0、preflight OK。
 
 **未做项**：T3（目标项 (2)，复用 Poly1305 的完整性校验 + 开销数字）、T4（表/描述符加密与混淆）、T5（反调试多路径）；
 win/arm64 已暂缓（`#581`，与 T1–T6 无关）。
+
+### 583. 收尾技术债三件（诊断 opt-in / 落盘改走 ntdll / 把"产物布局一致性"提升为门禁）；并更正 #582 的"未做项"
+
+**⚠️ 先更正两处会误导下一个会话的记录（`#582` 与 `docs/HANDOFF.md §2`）**
+
+`#582` 的"未做项"一栏写"T3/T4/T5 未做"，`docs/HANDOFF.md` §2 第 20 行也写"仍未做：(2)(3)(4)"——
+两句都是**沿用旧任务书的过期说法**。据实核对（提交都在 `main` 上、产物都在仓库里、CI run 号可查）：
+
+| 任务书条目 | 实际状态 | 证据（提交 / 产物 / CI） |
+|---|---|---|
+| **T3** 目标项 (2)：完整性校验改带密钥 MAC | ✅ **已完成** | `4eda829`（`#386`）：`internal/inject/patchmac.go` + `stub/win/x64/vm_kdf.c:vm_patch_mac()`（**复用已有 Poly1305，未新写 SHA/HMAC**）；三处 KAT（C 主机 / Go 单测 / **blob 级**）；e2e 加"入口回填必须被拒"的用例；**开销占比数字**：`bench check_key` 50 万次 —— 不带校验 15361 ticks vs 带 MAC 15274 ticks（**差异 <1%**）⇒ 按实测**不抽样**。CI **35498251605** 五作业绿。 |
+| **T4** 目标项 (3)：容器/记录明文收口 | ✅ **已完成** | `aa71dae` + `664eccc`（`#387`）：描述符魔数默认每次构建随机；描述符 8..32 的 6 个 u32、解密表表头/条目、加载期校验表逐条加 `FieldMask`；`tools/field_mask_check.py`（**已校准**：掩码置空即 5 处失败）。CI **35503599178** 五作业绿。 |
+| **T5** 目标项 (4)：反调试多路径 + 失败静默延后 | ✅ **已完成** | `eff45b1`（`#389`）：四条路径（PEB / NtQueryInformationProcess / NtGetContextThread 的 Dr0..Dr3+Dr7 / rdtsc 时间差），按**路径位掩码**判定 ⇒ ≥2 条不同路径才定性；定性后静默延后 3 次调用；校准用例 `tools/antidebug_flag_test.py`。CI **35505772344** 五作业绿。 |
+| **T6** 目标项 (6)：保留重定位 + ASLR | ✅ **已完成** | `942ce55`（`#390`）：默认不再拆重定位表/清 `DYNAMIC_BASE`；运行期"先减 delta → 验签 → 解密 → 再加回"；`tools/pe_reloc_info.py` + `tools/aslr_probe.py`。CI **35510546729** 五作业绿。 |
+
+⇒ 本轮把 `docs/HANDOFF.md` §2/§3 改成"**仍未做：无**"，并写明剩余的是**已登记的边界项**（授权回调 / TPM-TEE、
+Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书条目。
+
+**本轮做了什么：三件收尾技术债（都不属于 win/arm64，对全平台有效）**
+
+**① 诊断脚手架改成 opt-in，默认不编进 blob**
+- 那段脚手架（标记 + VEH 事后取证）原来只在"外置 + Windows + ARM64"的构建里生效，于是**默认就编进去**：
+  外置 blob 实测 **42112 vs 50304 字节（大 ~8 KB）**（`#565`），而且与 `-release` 自己的语义
+  （"去掉全部诊断代码"）**矛盾**（`-release` 的守卫根本没盖到这段）。
+- 现在 `vmpbuild` **默认**发 `-DVM_NO_DIAG=1`；要排查平台问题时用 **`-diag`** 显式打开；`-release` 与 `-diag` **互斥**（直接报错）。
+  `vm_interp.c` 里三处守卫都加上 `!defined(VM_NO_DIAG)`，整段**连编译都不编译**（不只是函数体变空）。
+- **顺带把"没有东西会编译它"这个真问题修掉**：`-diag` 在 **win/x64** 上也编出脚手架（`-DVM_DIAG_X64`）。
+  此前那段代码在本机**任何构建都编译不到**（arm64 工具链本机没有、外置 arm64 又被白名单挡着）⇒
+  等于"改了也没有任何东西能证明它还能用"。现在它在本机可编译、可运行、可进回归。
+
+**② 诊断落盘从 kernel32 改走 ntdll**
+- 原来用 `GetStdHandle / CreateFileA / WriteFile / CloseHandle`：kernel32 里这批 API 在部分 Windows 版本上是
+  **转发导出**（导出项不是代码，而是指向 `"KERNELBASE.xxx"` 字符串的 RVA）⇒ `vm_get_proc` 必须先正确解转发，
+  否则就是"跳到只读字符串页" —— `#385` 正是死在这条路上（CI **35497237045**）。
+- 现改为 `ntdll!NtCreateFile / NtWriteFile / NtClose`（ntdll 的导出**从不转发**），与取钥/硬门/VEH 注册一致；
+  文件仍是"**进程 CWD 下的 `vmpdiag.txt`**"（复现器 `tools/e2e_win_arm64.ps1` 的读取契约不变）。
+- **踩到的坑（已修，留档）**：`PEB->ProcessParameters->CurrentDirectory.DosPath` **不保证**带 `\??\` 前缀
+  （本机实测就是 `D:\...`）⇒ 缺前缀时 `NtCreateFile` 返回 `0xC000003B`（`STATUS_OBJECT_PATH_SYNTAX_BAD`），
+  症状是"诊断文件根本不出现"。用一个**本机原生探针**（同样的 NT 调用序列、同样的结构体布局）复现并定位：
+
+      sizeof(OBJECT_ATTRIBUTES)=48 ✓
+      cwd=[D:\vmp-x\build\ntrun\]  path=[D:\vmp-x\build\ntrun\vmpdiag.txt]
+      NtCreateFile status=0xC000003B   <-- 缺 \??\ 前缀
+      （补前缀后）status=0x00000000 / NtWriteFile status=0x00000000 info=13 / 文件出现 ✓
+
+**③ "产物布局一致性"提升为门禁（门的数量 12 → 14）**
+- 新工具 `tools/check_symmap.py`：**只看产物本身 + 同一份 blob 的 manifest/report**（不是"用 vmpack 自己的账本验自己"），
+  四项检查 ——
+  **C1** `SizeOfImage`/节清单自洽、节不重叠、入口点在可执行节；
+  **C2** `产物 RVA = sectionRVA + blobOffset` 的一一映射：三段 payload 按 `SectionAlignment` 串联、report 的每个 RVA 都落在
+  payload 区间内、manifest 的节与符号都在 blob 内（**这就是 `#580` 说的"节映射 ↔ blob 内地址推导"那一类**）；
+  **C3** payload 在 `sectionRVA+o` 的字节与 blob 第 o 字节**逐字节相同**（合并器"重新分布节"的直接判据）；
+  **C4** payload 里所有**首选基址绝对 VA**（8 字节对齐的 u64）都必须被 `.reloc` 的 DIR64 项覆盖 ——
+  正是 `#507/#508/#520` 那一类"写了绝对 VA 却没登记 ⇒ ASLR 一搬就崩"。
+  唯一豁免：解密表表头第一个 u64 是 `opt.ImageBase`，它是**比较常量**（运行期用它算 delta），登记了反而错。
+- **自校准**（`--selftest`，每次门禁都跑）：抬高 `SizeOfImage` / 让 report 的 `sectionRVA` 漂移 / 翻转 payload 一个字节 /
+  把一条 DIR64 改成 ABSOLUTE ⇒ **五个检查各自都要抓到自己那次变异**，抓不到门禁自己红。
+  另用**真实开关**校准：`-strip-relocs` 的产物在 `--require-aslr` 下必红（并打印 7 个"需要首选基址"的 VA）。
+- 这两道门禁止写在一个脚本 `tools/check_layout.ps1`（`-Layout` / `-Diag`），`tools/gates.ps1` 与 **CI 的
+  `windows-amd64` 作业**调的是**同一份代码**（此前 CI 根本不跑 `gates.ps1`，新门禁若只在本地就等于没有 CI 覆盖）。
+
+**证据**
+- `powershell -NoProfile -ExecutionPolicy Bypass -File tools/preflight.ps1` → `[+] preflight: OK`。
+- `tools/gates.ps1` → **total 14 gates, 0 failed**（`build/gates_accept.log`；其中 e2e **165 passed / 0 failed**、
+  dll 3/3、arm64 客户机 OK、**两道新门禁各自 OK**）。
+  反证/参考：第一次跑出了 `e2e: 164 passed, 1 failed`（`E2EFAIL refill: tools/patch_refill.py failed`），
+  **单独复跑该用例与整套复跑都是 165/0** ⇒ 是"测试进程还占着产物文件"那一类**已知**偶发（`#429/#434`），
+  不是本轮引入；两次 `gates` 日志（`build/gates_final.log` / `gates_final2.log`）都留档。
+- 新门禁的自校准输出（每次运行都会打印）：`CAL mutation caught by pristine/C1/C2/C3/C4` 全 OK。
+- `-diag` 的 A/B（预处理级，强制 `VM_KEY_EXTERNAL + VM_BLOB_USES_WIN64 + VM_ARCH_AARCH64` 后比较）：
+
+      A 默认（带 -DVM_NO_DIAG）：veh:install-begin=0  vm_dbg_win 定义=0  vm_veh_install 定义=0
+      B -diag           ：veh:install-begin=1  vm_dbg_win 定义=1  vm_veh_install 定义=1
+
+- `-diag` 的**端到端**（本机 win/x64，外置密钥）：产物 `check_key 10` → `143`、rc=0，
+  且 **CWD 下真的出现 `vmpdiag.txt`**，内容为 `veh:install-begin / veh:mod-found / t=tblp=… / 1b:enter …`；
+  同一 blob 里 `CreateFileA` **已消失**、`NtWriteFile` 在 ⇒ ② 的"只走 ntdll"是产物级事实而不是代码阅读结论。
+- CI：**（待填：本轮 push 后的 run 号与五作业结论）**。
+
+**未做项（如实登记）**
+- `win/arm64` 仍**暂缓**（`#581`）：白名单关闭、两个 arm64 作业 `continue-on-error`；本轮**没有**碰那个缺陷。
+- `tools/check_symmap.py` 只覆盖 **PE**；ELF 侧（`.rela` 的"先减后加"、`SizeOfImage` 的对应物）没做 ——
+  Linux 载荷另有 `verify_linux_payload.ps1` 门禁覆盖"能跑"，但不覆盖这套布局一致性。
+- ① 的"省 ~8 KB"是 `#565` 在 **arm64 外置**上的实测值；本机没有 aarch64 工具链，**无法本地复测这 8 KB**，
+  本轮的本地证据是"默认真的不编那段代码"（预处理 A/B + 产物里搜不到标记）。
+- ② 的 NT 调用序列在本机 **win/x64** 上端到端验证过；**arm64 上的同一段代码仍未被任何作业编译或运行**
+  （要等白名单重开）—— 这也是为什么把它做成 `-diag` 在 x64 上可用：至少同一份源码有编译/运行覆盖。
+- `vmpbuild -tmp <dir> -keep` 这个组合在本机会报 `vm_interp.c: No such file or directory`（与本次改动无关的
+  既有小坑，没修；正常构建与 `-diag` 构建都不受影响）。
