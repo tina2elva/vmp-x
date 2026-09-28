@@ -1000,7 +1000,7 @@ EOF
    （本机实测就是 `D:\...`）⇒ 缺前缀时 `NtCreateFile` 返回 `0xC000003B`（`STATUS_OBJECT_PATH_SYNTAX_BAD`），
    症状是"诊断文件根本不出现"。用一个本机原生探针（同样的 NT 调用序列）复现并定位，修好后端到端跑通。
 
-### 本机 Linux 侧验证：**WSL 可用**（待决策，本轮只登记，见 `docs/STATUS.md #583`）
+### 本机 Linux 侧验证：**已落地**（WSL；见 `docs/STATUS.md #584`）
 
 **背景**：本轮 CI 连红两次，两次都**不是产物坏了**，而是"检查对产物形状做了环境相关的假设"
 （本机 gcc 的目标有 TLS 目录 ⇒ payload 里 7 个绝对 VA；跑机的 gcc 目标没有 ⇒ 0 个）。
@@ -1018,13 +1018,23 @@ EOF
 | `windows-amd64` | 本机 `tools/gates.ps1` 已覆盖 | CI 的**额外**价值只剩"**另一套** Windows 工具链"（新装的 msys2 gcc） |
 | `windows-arm64-blob` / `windows-arm64-run` | 不能（要真 arm64 Windows） | 与本轮范围无关，且两者都是 `continue-on-error` |
 
-**建议（等拍板再做）**
-1. **内循环**改成 `tools/gates.ps1`（Windows）+ WSL 里的 Linux 脚本；CI 只在**一项做完**时跑一次作验收记录
-   （`AGENTS.md` 要求写 run 号）；
-2. 若同意，加一个 `tools/wsl_linux.ps1` 当 Windows 侧入口（交叉编译 Go 工具 → 进 WSL 跑 `e2e_arm64.sh` 等），
-   并挂进 `preflight`/`gates` 作为可选的一步；
-3. 若愿意给 `sudo`（或手工 `apt-get install -y gcc go`），`linux-amd64` 也能做到与 CI 同源；
-4. 可选：把两个 arm64 作业从 workflow 停掉（它们现在只是**复现器**，不影响结论，但每次跑都要时间）。
+**已落地（`STATUS #584`）**
+- 装齐（`sudo` 已可用）：`gcc 15` / `go`(1.26，另装了 1.24.5 备用) / `gdb` / `aarch64-linux-gnu-gcc` /
+  `aarch64-linux-gnu-{objdump,ld,as}` / `qemu-aarch64`；WSL 里 `GOPROXY=https://goproxy.cn,direct`（**用户级设置，未进仓库**）。
+- 新增 `tools/wsl_linux.sh`（WSL 里跑 CI 两套 Linux 命令）+ `tools/wsl_linux.ps1`（Windows 侧入口：同步 → 跑 → 汇报；
+  缺 WSL 时醒目 SKIP，`VMP_REQUIRE_WSL=1` 变硬失败）；`tools/gates.ps1` 加**第 15 道**门（`-NoWsl` 可跳过）。
+- 仓库同步进 **WSL 的 ext4**（`~/vmp-x`），**不与 Windows 的 `build/` 共用**：这些脚本会写 `build/vm_interp.bin`，
+  而它是 `vmpack` 的默认 blob，共用会把 Windows 门禁静默搞坏。
+- 结果：`linux-arm64` 两条（`e2e_arm64.sh` + aarch64 `e2e_elf_image.sh`）**本机全过**；`linux-amd64` 的 Go 门与载荷探针过，
+  但 `e2e.sh` / `e2e_elf_image.sh` **红** —— 见下面这条新的未做项。
+
+**新增未做项（本机可复现，优先；门禁里标成 `KNOWN-FAIL`，且一旦开始通过会大声提醒删豁免）**：
+`linux/amd64` 的 ELF 产物 **SIGSEGV（rc=139）**，
+崩在 `runtime.rt0_go` 的 CPUID/全局写入段；已排除 Go 版本（1.24.5 同样）与"镜像加密"（`-no-enc-image` 同样），
+文件字节/符号地址级证据在 `STATUS #584`，下一步命令也已写好（`-no-enc-image-elf` + 解密后读 `0x46bb60` 的内存）。
+
+**还等拍板的**：把两个 arm64 CI 作业从 workflow 停掉（用户已说 arm64 暂停；它们只是复现器，
+`continue-on-error` 不影响结论，但每次跑都要几分钟；停了要把"五作业全绿"的验收口径改成"三作业"）。
 ### win/arm64：**已暂缓**（cancelled / deferred，见 STATUS #581）
 
 - 现状：`cmd/vmpbuild` 白名单**关闭**（构建即拒绝，fail-fast）；CI 两个 arm64 作业带 `continue-on-error` ⇒ 整体保持绿。

@@ -9813,3 +9813,72 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
   （要等白名单重开）—— 这也是为什么把它做成 `-diag` 在 x64 上可用：至少同一份源码有编译/运行覆盖。
 - `vmpbuild -tmp <dir> -keep` 这个组合在本机会报 `vm_interp.c: No such file or directory`（与本次改动无关的
   既有小坑，没修；正常构建与 `-diag` 构建都不受影响）。
+
+### 584. 本机 Linux 验证落地（新第 15 道门禁：在 WSL 里跑 CI 的两套 Linux 命令）＋ 首次本机验证就**复现出一个 CI 看不见的 linux/amd64 ELF 崩法**
+
+**做了什么（把 CI 的 Linux 两半搬回本机）**
+- WSL（`Ubuntu 26.04.1 LTS`、16 核）装齐：`gcc 15.2`、`go`（apt 给 1.26；CI 按 `go.mod` 用 1.24.5，两个都试过）、
+  `gdb`、`aarch64-linux-gnu-gcc`、`aarch64-linux-gnu-{objdump,ld,as}`、`qemu-aarch64`。
+- 仓库**同步进 WSL 的 ext4**（`~/vmp-x`），**不与 Windows 的 `build/` 共用** —— 这些脚本会写 `build/vm_interp.bin`，
+  而它正是 `vmpack` 的默认 blob（`-blob` 的默认值就是它），共用会把 Windows 门禁静默搞坏。
+- 新增 `tools/wsl_linux.sh`（在 WSL 里跑 CI 两个 Linux 作业的**原样命令**）与 `tools/wsl_linux.ps1`
+  （Windows 侧入口：同步 → 进 WSL 跑 → 汇报；**缺 WSL 时醒目 SKIP**，`VMP_REQUIRE_WSL=1` 变硬失败）。
+- `tools/gates.ps1` 加**第 15 道**门（`-NoWsl` 可跳过；与 32 位那道同款：缺环境就醒目 SKIP，不静默）。
+- 这道门把 `linux/amd64` 那两个 ELF 步骤标成 **`KNOWN-FAIL`**（就是下面那条未修缺陷）：它们**照样跑**、照样把失败行打出来，
+  只是**不计入门禁失败**；而且**一旦其中一个开始通过，脚本会打印 `[NOTE] … the exemption is stale, remove it`**
+  —— 豁免不会悄悄活过它的 bug。（同款先例：两个 `windows-arm64-*` 作业在平台暂缓期间就是 `continue-on-error`，见 `#581`。）
+- WSL 里 `proxy.golang.org` 不通：按**用户级**设了 `go env -w GOPROXY=https://goproxy.cn,direct`
+  （**本机设置，没有写进仓库**）。
+
+**证据（本机 WSL）**
+
+| 步骤 | 结果 |
+|---|---|
+| `go build ./...` / `go test ./...`（Linux 原生） | **OK** |
+| `tools/verify_linux_payload.sh` | **OK** |
+| `CC=aarch64-linux-gnu-gcc OBJDUMP=… QEMU=qemu-aarch64 tools/e2e_arm64.sh` | **OK** |
+| `e2e_elf_image.sh --strict`（aarch64 env） | **OK** |
+| `tools/e2e.sh`（linux/amd64 ELF 端到端） | **FAIL** —— `e2e(linux): 1 passed, 16 failed`，产物 rc=**139** |
+| `tools/e2e_elf_image.sh --strict`（amd64） | **FAIL** —— `[MISMATCH] 原生与加密后输出不同` |
+
+⇒ **`linux-arm64` 那条 CI 作业本机已完全可替代**；`linux-amd64` 不是"跑不起来"，而是**本机复现出一个 CI 绿的失败**。
+
+**复现出来的失败：已定位到最后一层（未修，如实交接）**
+- 原生目标正常：`./build/linux_target check-key 0` → `213`、rc=0。
+- 产物：`./build/linux_target.vmp check-key 0` → **SIGSEGV（rc=139）**；`sum-to` 同样；**两个入口都崩**。
+- gdb：崩在 `runtime.rt0_go` 的 **CPUID/全局写入**那一小段 —— Go 1.26 报 `asm_amd64.s:196 MOVQ BX, g_stackguard0(DI)`；
+  Go 1.24.5 报 `asm_amd64.s:189 MOVB $1, runtime·isIntel(SB)`（`rip=0x46bb7a`，`rbx=0x756e6547`＝cpuid 刚拿到的 "Genu"）。
+- **排除 ①：不是 Go 版本。** 装 `go1.24.5`（= CI 按 `go.mod` 用的版本）重建**工具与目标**，`e2e.sh` 症状**逐条相同**（仍 1 passed / 16 failed）。
+- **排除 ②：不是镜像加密（这条还需再确认一次，见下）。** `vmpack -no-enc-image` 重打包，产物**仍然 rc=139**。
+- **符号地址两边一致**：`nm` 对原生与产物给出一模一样的 `runtime.isIntel=0x58007b`、`runtime.g0=0x560840`、
+  `runtime.m0=0x5614e0`、`runtime.rt0_go=0x46bb20`。
+- **但**同一 RVA `0x46bb60` 的文件字节**不一样**：原生是明文代码（`742c81fb 47656e75 …`，就是 cpuid/"Genu"/"Intel" 那段），
+  产物是**高熵字节**（`c8dea596 f0f3d93f …`）；`gdb` 按 `$rip` 反汇编得到 `insb/outsb` 这类**特权 I/O 指令**
+  ⇒ "执行到的代码"与"文件里那段"对不上（要么自解密没落到这个地址，要么 `-no-enc-image` 对 ELF 没生效）。
+- **段表差异（可疑点）**：原生是 `PHDR`+`NOTE`+`3×LOAD`+`GNU_STACK`；产物的程序头里 **`PHDR`/`NOTE` 没了**，
+  被换成两条载荷 `LOAD`（`0x584000 R E`、`0x58b000 RW`），原有三条 LOAD（含 `0x556000 RW memsz=0x2db00`，
+  `isIntel` 就在其中）原样保留 ⇒ 载荷段没有与它们重叠。
+- **性质**：本机**首次**验证 Linux 路径、而 CI 一直绿 ⇒ 属于"**新工具链（gcc 15 / binutils 2.4x / glibc 2.43 / Go 1.26）
+  下暴露的既有路径问题**"，与本轮改动无关（本轮改动都在 Windows 侧与门禁侧：`stub/win/x64/*`、`cmd/vmpbuild` 的 `-diag`、`tools/*`）。
+- **下一步（命令已备好）**：① 用 `-no-enc-image-elf` 再打一次（确认 `-no-enc-image` 是否只覆盖 PE；若是，则"排除②"要重做）；
+  ② 在入口蹦床/解密函数里把 `e_entry`、`vm_unpack_image` 的返回码与**解密后 `0x46bb60` 处的内存字节**记进 `#558` 那套无损通道；
+  ③ 或直接在 gdb 里 `break vm_unpack_image` → `finish` → `x/16xb 0x46bb60`，一眼定案"内存里是明文还是密文"。
+
+**顺带发现的一个测试隔离坑（已在本机 runner 里绕开，未改测试）**
+- `internal/inject/arm64_qemu_test.go` 的 `TestARM64PayloadUnderQEMU` 只在
+  `build/vm_interp_arm64.{bin,json}` 与 `build/payload_probe_arm64` **不存在**时 SKIP，存在时**真跑**。
+  于是"`go test ./...` 过不过"取决于**这台机器之前有没有跑过 `tools/e2e_arm64.sh`**：
+  第一次在 WSL 跑（build/ 是空的）⇒ SKIP ⇒ 绿；第二次（build/ 里有 e2e_arm64.sh 的产物）⇒ 真跑 ⇒
+  `BuildPayload 失败: f: AArch64 分支超出 ±128MB（需要 16 字节绝对跳转，暂不支持）` ⇒ 红。
+  CI 的 checkout 永远是干净的，所以 CI 看不到这个组合（`linux-arm64` 作业跑 e2e 脚本、Go 门在另一个作业里）。
+  `tools/wsl_linux.sh` 因此在 `go test` 之前**显式删掉这三个残留**（精确复现 CI 的干净 checkout），
+  并把这条登记在这里 —— 测试本身的隔离性没动（那是另一件事，见下）。
+
+**未做项**
+- 上面那个 linux/amd64 ELF 崩法（根因未定，已排除两项，并有文件字节/符号地址级证据）。
+- `TestARM64PayloadUnderQEMU` 的**测试隔离**没修（只在 runner 里绕开）：它应当自己决定用哪个 blob
+  （临时目录里自己编一个，或显式要求环境变量），而不是"看 build/ 里有什么就跑什么"。
+- `tools/check_symmap.py` 的 **ELF 对应物**（PE 四项已覆盖；ELF 的段映射/`.rela` 覆盖没做）—— 现在**本机可验证**了。
+- **Linux 反调试**（`/proc/self/status` 的 `TracerPid`，`#389` 登记）—— 现在**本机可验证**（`strace`/`gdb` attach 会让它非 0）。
+- DLL + 外置密钥（`#385`）、DPAPI 包装的取钥形态（`#393`）。
+- `win/arm64` 按用户决定**完全暂缓**：本轮没有碰；两个 arm64 CI 作业仍是 `continue-on-error`。

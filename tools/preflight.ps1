@@ -6,7 +6,7 @@
 # ASCII-only output on purpose: this runs on Windows CI runners whose console code page
 # is not UTF-8 (see AGENTS.md).
 #
-# This is NOT a replacement for tools/gates.ps1 (the 14 real gates) - it is the cheap
+# This is NOT a replacement for tools/gates.ps1 (the 15 real gates) - it is the cheap
 # subset you can run in a few seconds before touching anything.
 param(
   [switch]$Quiet

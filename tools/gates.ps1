@@ -6,6 +6,10 @@
 # unless it has a BOM, so non-ASCII bytes (e.g. Chinese comments) can swallow a following
 # line and turn a Step call into part of a comment -- a gate that silently never runs.
 # That is exactly what happened here before (the linux-payload step disappeared).
+param(
+    # -NoWsl: skip the WSL Linux suite (tools/wsl_linux.ps1) while iterating on the Windows side.
+    [switch]$NoWsl
+)
 Set-Location (Join-Path $PSScriptRoot "..")
 $script:results = @()
 
@@ -29,6 +33,15 @@ Step "go vet ./..."      { go vet ./... }
 # on any runner that is supposed to have it. Runs before go test so the artifacts it leaves
 # behind cannot confuse the C probes that go test uses.
 Step "32-bit payload (i686 blob + PE32 pack vs native)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "e2e_32bit.ps1") }
+# The Linux halves (ELF payload on amd64 + arm64 under qemu-user) used to be CI-only. A WSL
+# distro with gcc + the aarch64 cross toolchain + qemu-user runs EXACTLY the commands those
+# two CI jobs run, so this brings them into the local loop (STATUS #583). It syncs the tree
+# into the WSL filesystem first, so the Linux build/ cannot collide with the Windows one.
+# SKIPs loudly (exit 0) when WSL is absent -- set VMP_REQUIRE_WSL=1 to make that a hard failure.
+Step "linux payloads via WSL (CI's linux-amd64/arm64 command set)" {
+    if ($NoWsl) { Write-Host "[SKIP] skipped with -NoWsl" }
+    else { & powershell -NoProfile -File (Join-Path $PSScriptRoot "wsl_linux.ps1") }
+}
 Step "go test ./..."     { go test ./... }
 # Blob must build: the Go gates never compile C, which once let a broken source stay green.
 # vmpbuild wants -src relative to the repo root, so run it from there.

@@ -74,7 +74,7 @@
 2. 运行期 `stub/win/x64/vm_interp.c`：七处 `u8 key[32] = VM_KEY_BYTES;`（约 558/659/679/1344/1454/1544/1695 行）
    改成"按该条目的 rva/salt 现推 `K_f`"。C 侧 salt 必须与 Go 的 `KDFSaltForPlacement` 一致
    （`vm_kdf_salt()` 已实现，KAT 已对齐，直接调用即可）。
-3. 验证顺序：重建 blob → `tools/gates.ps1`（要求 **14 gates / 0 failed**）→ 本机产品级回归
+3. 验证顺序：重建 blob → `tools/gates.ps1`（要求 **15 gates / 0 failed**）→ 本机产品级回归
    （见第 5 节 demo64 命令）→ push → 等 CI **五个作业全绿**。
 4. 补一条单测："不同 RVA ⇒ 不同 salt ⇒ 不同 key"（`internal/inject/kdf_test.go` 已有 salt 用例，可扩展）。
 
@@ -129,7 +129,7 @@
 - **不要**为了让检查通过而放宽阈值或只保某一个平台。
 
 ## 7. 验收标准（每项都要给证据）
-1. `tools/gates.ps1` = **14 gates / 0 failed**；e2e **165 passed / 0 failed**；dll 3/3；arm64 客户机 OK；
+1. `tools/gates.ps1` = **15 gates / 0 failed**；e2e **165 passed / 0 failed**；dll 3/3；arm64 客户机 OK；
 2. 本机产品级回归：demo64 三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 输出除 base 两行外一致；
 3. CI **五个作业全绿**（run 号写进 STATUS）；
 4. `docs/STATUS.md` 追加一条：做了什么、证据（含 run 号与命令）、**未做项**。
@@ -145,7 +145,7 @@
 
 ## 附录 B：验收证据清单（缺一不可）
 1. `tools/preflight.ps1` → `[+] preflight: OK`；
-2. `tools/gates.ps1` → `total 14 gates, 0 failed`（e2e 165/0、dll 3/3、arm64 客户机 OK）；
+2. `tools/gates.ps1` → `total 15 gates, 0 failed`（e2e 165/0、dll 3/3、arm64 客户机 OK）；
 3. demo64：三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 仅 base/地址两行不同、退出码 0=0；
 4. CI 五个作业全绿，run 号写进 STATUS。
 
