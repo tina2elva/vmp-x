@@ -9882,3 +9882,12 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
 - **Linux 反调试**（`/proc/self/status` 的 `TracerPid`，`#389` 登记）—— 现在**本机可验证**（`strace`/`gdb` attach 会让它非 0）。
 - DLL + 外置密钥（`#385`）、DPAPI 包装的取钥形态（`#393`）。
 - `win/arm64` 按用户决定**完全暂缓**：本轮没有碰；两个 arm64 CI 作业仍是 `continue-on-error`。
+
+**证据（本轮最终状态）**
+- 本机：`tools/preflight.ps1` → `[+] preflight: OK`；`tools/gates.ps1` → **total 15 gates, 0 failed**
+  （第 15 道 `linux payloads via WSL` **exit 0**，其中两个 amd64 ELF 步骤显示为 `KNOWN-FAIL`；
+  其余：e2e **165 passed / 0 failed**、dll **3/3**、arm64 客户机 OK、linux 载荷（在 Windows 上跑）OK）。
+- WSL 那一侧（同一轮内重复跑）：`go build` / `go test` OK、`payload probe` OK、`arm64 end-to-end` OK、
+  `arm64 elf image` OK；`elf end-to-end` 与 `elf image encryption` 红（`KNOWN-FAIL`，见上）。
+- CI：**run 36387327181（提交 465e7d9）五个作业全绿**
+  （`windows-amd64` / `linux-amd64` / `linux-arm64` / `windows-arm64-blob` / `windows-arm64-run`）。
