@@ -17,7 +17,16 @@
   `df6ebba`(vm_kdf.c 进 blob)、`ed10ce6`(salt 派生+用例)、`0ee2fda`(salt 跨语言 KAT)。
 - 已完成且有三重确认（本机门禁 + 产品级回归 + CI）：**目标项 (1) 的全部前置**。
 - 已评估登记：#381 里 (5) 判"不做"、(6) 给出可实现方案排后；#382 定了 (2) 的选型。
-- 仍未做：**(1) 的接线**、1b（主密钥外置 + 硬门）、(2) 的实现、(3) 容器加密与混淆、(4) 反调试多路径。
+- **仍未做**：(2) 的实现、(3) 容器加密与混淆、(4) 反调试多路径。
+- **已由后续会话完成（本条原为"未做"，据实更新；证据见 docs/STATUS.md）**：
+  - **T1（目标项 (1) 接线：每条目派生密钥）** ✅：运行期 `vm_kdf_entry(master, rva, salt, key)` 已**逐节**现推；
+    打包端 `inject.KDFSaltForPlacement` 与之同式；KAT 三重对齐（`TestKDFEntryMatchesC` / `TestKDFSaltDistinctAndStable` /
+    `TestPatchMACMatchesC` + 门禁里的 **blob 级 KAT**：`vm_kdf_salt x5 + vm_kdf_entry x3 + patch_mac x1 match`）。
+  - **T2（目标项 1b：主密钥外置 + 硬门）** ✅：三种形态（`VMPX_KEY` 环境变量 / `<产物>.vmpkey` 文件 / 无密钥）；
+    无密钥时 **恰好 `0xC0DE0007` 且无输出**（CI 实测，见门禁 `[OK] 1b: no key -> 0xC0DE0007 (hard gate)`）；
+    密钥校验 tag 由主密钥派生；`linux/amd64`、`linux/arm64`、`win/x64`、`win/x86` 四平台各含三形态回归。
+  - **另**：win/arm64 一度推进后被**暂缓（fail-fast，白名单关闭）**，详见 `docs/STATUS.md #537-#581`；
+    该平台与本任务书 T1–T6 无关，不影响其它平台。
 
 ## 3. 任务（按顺序做，做完一项再做下一项）
 **T1（最高优先）目标项 (1) 接线：每条目派生密钥**
@@ -30,7 +39,7 @@
 2. 运行期 `stub/win/x64/vm_interp.c`：七处 `u8 key[32] = VM_KEY_BYTES;`（约 558/659/679/1344/1454/1544/1695 行）
    改成"按该条目的 rva/salt 现推 `K_f`"。C 侧 salt 必须与 Go 的 `KDFSaltForPlacement` 一致
    （`vm_kdf_salt()` 已实现，KAT 已对齐，直接调用即可）。
-3. 验证顺序：重建 blob → `tools/gates.ps1`（要求 **11 gates / 0 failed**）→ 本机产品级回归
+3. 验证顺序：重建 blob → `tools/gates.ps1`（要求 **12 gates / 0 failed**）→ 本机产品级回归
    （见第 5 节 demo64 命令）→ push → 等 CI **五个作业全绿**。
 4. 补一条单测："不同 RVA ⇒ 不同 salt ⇒ 不同 key"（`internal/inject/kdf_test.go` 已有 salt 用例，可扩展）。
 
@@ -85,7 +94,7 @@
 - **不要**为了让检查通过而放宽阈值或只保某一个平台。
 
 ## 7. 验收标准（每项都要给证据）
-1. `tools/gates.ps1` = **11 gates / 0 failed**；e2e **147 passed / 0 failed**；dll 3/3；arm64 客户机 OK；
+1. `tools/gates.ps1` = **12 gates / 0 failed**；e2e **165 passed / 0 failed**；dll 3/3；arm64 客户机 OK；
 2. 本机产品级回归：demo64 三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 输出除 base 两行外一致；
 3. CI **五个作业全绿**（run 号写进 STATUS）；
 4. `docs/STATUS.md` 追加一条：做了什么、证据（含 run 号与命令）、**未做项**。
