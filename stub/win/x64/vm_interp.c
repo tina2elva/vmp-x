@@ -3429,6 +3429,12 @@ int vm_unpack_image(const void *tblp) {
     VM_VEH_INSTALL(); /* 装 VEH（#566）：必须在取钥 vm_master() 之前 —— 否则崩在取钥阶段就完全没有诊断 */
     if (vm_img_done) return 0;
     const u8 *t = (const u8 *)tblp;
+#if defined(VM_KEY_EXTERNAL) && defined(VM_BLOB_USES_WIN64) && defined(VM_ARCH_AARCH64)
+    /* #575：**在解引用之前**把 tblp 的数值本身落盘 —— 判定"运行期传入的表指针是否就是静态推演的那个"。
+     * 上一轮已排除"导出查表"与"VEH 注册"（#574 的判定实验），窗口内只剩这两次解引用。 */
+    vm_veh_hex("t=tblp=", (u64)(const void *)tblp);
+    VM_DBG_FLUSH();
+#endif
     u64 wantBase = *(const u64 *)(t + 0);
     u32 salt = *(const u32 *)(t + 8);
     /* (3)：表头的 count/selfRVA/保留 加了掩码（与 Go 侧 inject.FieldMask 同式）。 */
