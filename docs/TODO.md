@@ -966,3 +966,8 @@ EOF
 
 **收尾清单（③④）**：定位并修复后 ⇒ 三形态与原生一致 ⇒ `windows-arm64-run` 判据从 `::warning` 改**硬失败** ⇒
 `cmd/vmpbuild` 白名单放开 `win/arm64` ⇒ 纳入 CI 常态回归 ⇒ 更新 `docs/STATUS.md` 与 G3。
+### win/arm64：**已暂缓**（cancelled / deferred，见 STATUS #581）
+
+- 现状：`cmd/vmpbuild` 白名单**关闭**（构建即拒绝，fail-fast）；CI 两个 arm64 作业带 `continue-on-error` ⇒ 整体保持绿。
+- 已交付（保留）：ARM64 `EntryHook`/TLS thunk、无 `.reloc` 建节、ARM64 I-cache 刷新改 `FlushInstructionCache`、测试假通过修复。
+- 重启入口：上文"最终操作卡（#581）"（蹦床记录 `x0`/`sp` + 按符号核对产物 RVA ↔ manifest 偏移）。

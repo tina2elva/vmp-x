@@ -180,3 +180,8 @@ EntryHook/TLS thunk 的 x86-only 存根、无 `.reloc` 建节 + I-cache 刷新�
 加密范围/诊断脚手架/`vm_dbg_flush` 路径/导出查表/VEH 注册）。剩余问题的**性质**已修正为"**产物节映射与 blob 内部地址推导不一致**"
 （判据：任何改动都会移动崩点，最小改动甚至让崩溃退到第一次 flush 之前）。
 接手指南、操作卡与工具清单见 `docs/TODO.md`；完整证据链见 `docs/STATUS.md #537-#581`。
+**G3 收束（#581）**：**win/arm64 暂缓（cancelled / deferred）** —— `cmd/vmpbuild` 已关闭其白名单（fail-fast，构建即拒绝）；
+两个 arm64 CI 作业带 `continue-on-error: true` ⇒ 整体 workflow 保持 `success`。已保留并交付：ARM64 `EntryHook`/TLS thunk 实现、
+无 `.reloc` 建节、ARM64 I-cache 刷新改用 `FlushInstructionCache`、native-vs-protected 假通过修复。
+剩余缺陷性质已定位为"产物节映射与 blob 内部地址推导不一致"（判据：任何改动都会移动崩点）。
+重启入口见 `docs/TODO.md`（操作卡）与 `docs/STATUS.md #537-#581`。

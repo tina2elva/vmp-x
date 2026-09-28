@@ -153,7 +153,13 @@ func main() {
 		"win/x86":     true, // 同上，但 PEB 走 fs:[0x30]，LDR/PP/导出目录与 NT 结构体都是 32 位版本
 		"linux/amd64": true, // syscall(2)：/proc/self/environ + <产物>.vmpkey（open/read/close）
 		"linux/arm64": true, // 同上，但 aarch64 只有 openat/readlinkat（多一个 AT_FDCWD 参数）
-		"win/arm64":   true, // 临时放开（#556）：一次 run 多观测（基线 + 强制 delta=0 + vm_img_diag）
+		// "win/arm64"：**已暂缓（cancelled / deferred，见 STATUS #581）**。
+		// 剩余缺陷性质 = "产物节映射与 blob 内部地址推导不一致"，表现为**任何改动都会移动崩点**
+		//   （最小改动甚至让崩溃退到第一次 flush 之前）⇒ 需要"不改变被测对象"的观测手段，
+		//   而现手段（CI 一轮 6 分钟 + 本地无法运行 Windows PE）不足以收敛。
+		// 已保留的成果（均平台守卫，对其它平台零影响）：EntryHook/TLS thunk 的 ARM64 实现、
+		//   无 .reloc 时建节、ARM64 I-cache 刷新改用 FlushInstructionCache。
+		// 重启入口：docs/TODO.md 的"最终操作卡（#581）"与 docs/STATUS.md #537-#581。
 		// "win/arm64"：**未完成**（详见 STATUS #537-#555 的完整证据链与排除表）。已修两处平台级缺陷：
 		//  ① PE 的 EntryHook 与 TLS 回调 thunk **只有 x86 实现** ⇒ 已补 ARM64（#538）；
 		//  ② 目标无 .reloc 时自动建节（#525，x64 零影响）与 ARM64 的 I-cache 刷新（#529）。
