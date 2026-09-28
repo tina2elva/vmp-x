@@ -999,6 +999,32 @@ EOF
    **踩到的坑（已修，值得留档）**：`PEB->ProcessParameters->CurrentDirectory.DosPath` **不保证**带 `\??\` 前缀
    （本机实测就是 `D:\...`）⇒ 缺前缀时 `NtCreateFile` 返回 `0xC000003B`（`STATUS_OBJECT_PATH_SYNTAX_BAD`），
    症状是"诊断文件根本不出现"。用一个本机原生探针（同样的 NT 调用序列）复现并定位，修好后端到端跑通。
+
+### 本机 Linux 侧验证：**WSL 可用**（待决策，本轮只登记，见 `docs/STATUS.md #583`）
+
+**背景**：本轮 CI 连红两次，两次都**不是产物坏了**，而是"检查对产物形状做了环境相关的假设"
+（本机 gcc 的目标有 TLS 目录 ⇒ payload 里 7 个绝对 VA；跑机的 gcc 目标没有 ⇒ 0 个）。
+这类"本机看不见"在本仓库出现过多次（`#385` 的 kernel32 转发导出）⇒ 值得减少对 CI 往返的依赖。
+
+**本机现状（实测）**：WSL = `Ubuntu 26.04.1 LTS`、16 核，仓库在 `/mnt/d/vmp-x`，
+脚本是 **LF**（bash 可直接跑）。**已有** `clang`、`aarch64-linux-gnu-gcc`、
+`aarch64-linux-gnu-{objdump,ld,as}`、`qemu-aarch64`、`objdump`、`ld`、`git`、`python3`；
+**缺** 宿主 `gcc`、`go`、`make`；**`sudo` 需要密码** ⇒ 不能自己 `apt-get install`。
+
+| CI 作业 | 本机可替代性 | 差什么 |
+|---|---|---|
+| `linux-arm64`（`e2e_arm64.sh` + `e2e_elf_image.sh`，qemu） | **能**（工具链齐全） | 只缺 WSL 里的 **Go**（脚本里那三条 `go build`）：把 Windows 下载的 Go tarball 解到 `~` 即可（无需 sudo），或把三个工具用 `GOOS=linux GOARCH=arm64` 从 Windows 交叉编译好 |
+| `linux-amd64`（`verify_linux_payload.sh` / `e2e.sh` / `e2e_elf_image.sh`） | **基本能** | 缺宿主 x86-64 `gcc`（有 `clang` 可试，但与 CI 的 gcc 不同源） |
+| `windows-amd64` | 本机 `tools/gates.ps1` 已覆盖 | CI 的**额外**价值只剩"**另一套** Windows 工具链"（新装的 msys2 gcc） |
+| `windows-arm64-blob` / `windows-arm64-run` | 不能（要真 arm64 Windows） | 与本轮范围无关，且两者都是 `continue-on-error` |
+
+**建议（等拍板再做）**
+1. **内循环**改成 `tools/gates.ps1`（Windows）+ WSL 里的 Linux 脚本；CI 只在**一项做完**时跑一次作验收记录
+   （`AGENTS.md` 要求写 run 号）；
+2. 若同意，加一个 `tools/wsl_linux.ps1` 当 Windows 侧入口（交叉编译 Go 工具 → 进 WSL 跑 `e2e_arm64.sh` 等），
+   并挂进 `preflight`/`gates` 作为可选的一步；
+3. 若愿意给 `sudo`（或手工 `apt-get install -y gcc go`），`linux-amd64` 也能做到与 CI 同源；
+4. 可选：把两个 arm64 作业从 workflow 停掉（它们现在只是**复现器**，不影响结论，但每次跑都要时间）。
 ### win/arm64：**已暂缓**（cancelled / deferred，见 STATUS #581）
 
 - 现状：`cmd/vmpbuild` 白名单**关闭**（构建即拒绝，fail-fast）；CI 两个 arm64 作业带 `continue-on-error` ⇒ 整体保持绿。

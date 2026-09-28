@@ -9787,7 +9787,21 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
   这个"空"的分支在本地用**重构出来的跑机形态**（把 payload 里 7 个 VA 槽清零 + 把对应 7 条 DIR64 改成 ABSOLUTE +
   把 report 的 TLS 字段清零）验证过：`-> OK（INFO）`；同一产物只要 report 仍声称搬了 TLS ⇒ `-> FAIL`。
   自校准也补了反向那次变异（把一条已覆盖的槽清零 ⇒ 方向 ② 必须抓到）：`CAL mutation caught by C4-reg / C4-bogus` 都 OK。
-- CI **第二次**：**run （待填）** —— 五作业结论（待填）。
+- CI **第二次**：run **36383166041** —— 这次**产物检查全过**（C1/C2/C3/C4 与"诊断"两道都 OK），红的是**自校准**：
+  `[FAIL] CAL mutation NOT caught by C4 (no payload DIR64 entry exists to un-register)` —— 同一个根因的**上一层**：
+  我让"卸掉一条 DIR64 项"当校准，而跑机上**根本没有** payload DIR64 项可卸 ⇒ **校准跑不起来**（校准跑不起来 = 没有校准）。
+  已改成**形状无关**：主方向改成"往一个**没有** DIR64 覆盖的 8 字节槽位**种**一个 VA"（任何产物形状都跑得起来）；
+  反方向（卸一条 DIR64 / 把已覆盖的槽清零）只在真的存在 payload DIR64 时才跑，否则打印**醒目的 `[SKIP]`** 并说明"该谓词在这件产物上没有输入"。
+  **本地把两种形状都验过**：正常产物 7 个 VA ⇒ `pristine/C1/C2/C3/C4-plant/C4-unreg/C4-bogus` 七项全被抓；
+  重构出来的跑机形状（payload VA 清零 + 对应 DIR64 改成 ABSOLUTE + report 的 TLS 字段清零）⇒ 产物 OK（INFO）、
+  `C4-plant` 被抓、`C4-unreg` 打印 SKIP、坏校准计数 = 0。
+- CI **第三次**：run **36383767934（提交 f40fbf7）五个作业全绿** ← **本轮验收的 run 号**
+  （`linux-amd64` / `linux-arm64` / `windows-amd64` / `windows-arm64-blob` / `windows-arm64-run` 全 success；
+  其中 windows-amd64 的那一步 `Packed layout + diagnostics gate` 绿）。
+- **这两次红值的教训（写下来）**：都不是产物有问题，而是**我的检查对"产物形状"做了环境相关的假设**
+  （本机 gcc 的目标有 TLS 目录 ⇒ payload 里 7 个绝对 VA；跑机的 gcc 目标没有 ⇒ 0 个）。
+  同一类"本机看不见"在本仓库已出现过多次（`#385` 的 kernel32 转发导出）。**处置**：把不变量写成**形状无关**的，
+  自校准也必须**在任何形状下都跑得起来**（跑不起来就醒目 SKIP，绝不静默通过）。
 
 **未做项（如实登记）**
 - `win/arm64` 仍**暂缓**（`#581`）：白名单关闭、两个 arm64 作业 `continue-on-error`；本轮**没有**碰那个缺陷。
