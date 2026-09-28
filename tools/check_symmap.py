@@ -14,12 +14,14 @@ in a way that would make the check vacuous: the product is the object under test
         the report's RVAs must agree with the section table the product actually has.
   C3  payload byte identity
         product bytes at (sectionRVA + o) == blob byte o for every o in [0, blobSize).
-  C4  relocation coverage
-        while DYNAMIC_BASE is set, every preferred-base absolute VA (8-byte aligned u64 in
-        [ImageBase, ImageBase+SizeOfImage)) stored anywhere in the payload must have a
-        DIR64 entry in .reloc. This is the "an absolute VA was written but never
-        registered" defect class (STATUS #507/#508/#520) that makes a product crash only
-        when ASLR actually moves it.
+  C4  relocation coverage (both directions)
+        while DYNAMIC_BASE is set: every preferred-base absolute VA (8-byte aligned u64 in
+        [ImageBase, ImageBase+SizeOfImage)) stored anywhere in the payload must have a DIR64
+        entry in .reloc -- the "an absolute VA was written but never registered" defect class
+        (STATUS #507/#508/#520) that makes a product crash only when ASLR actually moves it --
+        and every DIR64 entry inside the payload must cover a slot that really holds such a VA.
+        A target that legitimately has none (crt without a TLS directory => nothing to write)
+        is reported as INFO, but only after checking that the report did not emit a TLS copy.
 
 Why this gate exists: the win/arm64 investigation (STATUS #580) reduced the remaining
 failure to "the product's section mapping and the blob's internal address derivation
@@ -432,16 +434,39 @@ def check_reloc_coverage(pe, report, rep, require_aslr):
         rep.fail("C4", "DYNAMIC_BASE is set but IMAGE_FILE_RELOCS_STRIPPED is also set")
     if not pe.reloc_rva or not pe.reloc_size:
         rep.fail("C4", "DYNAMIC_BASE is set but the product has no BASERELOC directory")
+    # Both directions, so this stays meaningful on a target that happens to have no payload-level
+    # absolute VAs at all (e.g. a crt that emits no TLS directory -- the CI runner's gcc does not):
+    #   (a) every absolute VA stored in the payload must be covered by a DIR64 entry, else the
+    #       loader will not fix it up and the product breaks as soon as ASLR moves it;
+    #   (b) every DIR64 entry inside the payload must cover a slot that really holds an in-image VA,
+    #       else the loader adds delta to something that is not an address.
+    payload_relocs = [r for (r, t) in pe.reloc_entries() if t == 10 and lo <= r < hi]
     uncovered = [(r, v) for (r, v) in cands if r not in cov]
     for r, v in uncovered[:8]:
         rep.lines.append("[----] C4    RVA 0x%X holds 0x%X but no DIR64 entry covers it" % (r, v))
     if uncovered:
         rep.fail("C4", "%d of %d absolute VA(s) in the payload have no DIR64 relocation (the loader will not fix them)"
                  % (len(uncovered), len(cands)))
-    if not cands:
-        rep.fail("C4", "no absolute VA found in the payload at all: this check cannot vouch for anything")
-    rep.ok("C4", "%d payload absolute VA(s) all covered by DIR64 entries (%d reloc entries total, %d base constant(s) exempt)"
-           % (len(cands), len(pe.reloc_entries()), len(base_consts)))
+    cand_rvas = set(r for (r, _) in cands)
+    bogus = [r for r in payload_relocs if r not in cand_rvas]
+    for r in bogus[:8]:
+        rep.lines.append("[----] C4    DIR64 entry at RVA 0x%X covers a slot that holds no in-image VA" % r)
+    if bogus:
+        rep.fail("C4", "%d of %d payload DIR64 entry(ies) cover a slot that is not an absolute VA"
+                 % (len(bogus), len(payload_relocs)))
+    if not cands and not payload_relocs:
+        # Empty is legitimate ONLY when the packer had nothing to write. If the report says it
+        # emitted a TLS directory copy, that copy holds VAs and they must have been registered.
+        tls_dir = int(report.get("tlsDirRVA") or 0)
+        tls_arr = int(report.get("imgTlsArrayRVA") or 0)
+        if tls_dir or tls_arr:
+            rep.fail("C4", "the report emitted a TLS copy (tlsDirRVA=0x%X imgTlsArrayRVA=0x%X) but the payload holds "
+                           "no absolute VA and no DIR64 entry" % (tls_dir, tls_arr))
+        rep.info("C4", "no payload absolute VA to relocate (imagebase=0x%X sizeofimage=0x%X, no TLS copy emitted): "
+                       "nothing for the loader to fix" % (pe.imagebase, pe.sizeofimage))
+        return
+    rep.ok("C4", "%d payload absolute VA(s) all covered by DIR64 entries (%d payload entry(ies) of %d total, "
+                 "%d base constant(s) exempt)" % (len(cands), len(payload_relocs), len(pe.reloc_entries()), len(base_consts)))
 
 
 # --------------------------------------------------------------------------- driver
@@ -545,7 +570,15 @@ def selftest(packed, manifest, report, blob, require_aslr):
                             struct.pack_into("<H", d, e, v & 0x0FFF)  # type -> ABSOLUTE
                             return
                     q += blk
-            results.append(("C4", *_expect_fail(run_checks(mutate_copy(packed, m4, tmp, "c4"), manifest, report, blob, require_aslr, True), "C4")))
+            results.append(("C4-reg", *_expect_fail(run_checks(mutate_copy(packed, m4, tmp, "c4"), manifest, report, blob, require_aslr, True), "C4")))
+            # M5 (C4, the other direction): blank a covered slot, so a DIR64 entry now covers
+            # something that is not an absolute VA any more
+            slotoff = pe0.va_to_off(target)
+
+            def m5(d):
+                for k in range(8):
+                    d[slotoff + k] = 0
+            results.append(("C4-bogus", *_expect_fail(run_checks(mutate_copy(packed, m5, tmp, "c4b"), manifest, report, blob, require_aslr, True), "C4")))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

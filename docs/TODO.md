@@ -969,9 +969,14 @@ EOF
 - **C2 节映射与符号**：manifest 的 `[0,blobSize)` 必须是 `产物 RVA = sectionRVA + blobOffset` 的一一映射，
   三段 payload（R+X / R+W / R+X）按 `SectionAlignment` 串联，report 里每个 RVA 都落在 payload 区间内，符号都在 blob 内；
 - **C3 payload 逐字节一致**：产物在 `sectionRVA+o` 的字节 == blob 的第 o 字节（**这一条就是"合并器重新分布节"的直接判据**）；
-- **C4 重定位覆盖**：payload 里出现的**首选基址绝对 VA**（8 字节对齐）必须有 DIR64 项覆盖 ——
+- **C4 重定位覆盖（两个方向）**：① payload 里出现的**首选基址绝对 VA**（8 字节对齐）必须有 DIR64 项覆盖 ——
   这正是 `#507/#508/#520` 那一类"写了绝对 VA 却没登记 ⇒ ASLR 一搬就崩"的缺陷；
+  ② payload 里的每条 DIR64 也必须指向一个**真的持有 in-image VA** 的槽位。
   （唯一豁免：解密表表头第一个 u64 是 `opt.ImageBase`，它是**比较常量**不是指针，登记了反而会破坏 delta 计算。）
+  **空的情况怎么判**（这一条是被 CI 教出来的）：跑机上的 gcc 目标**没有 TLS 目录** ⇒ 打包端根本不往 payload 写绝对 VA，
+  于是"必须找到至少一个 VA"这种启发式会**误红**（本机 7 个、跑机 0 个）。
+  现在只有当 report 明说**没有**输出 TLS 副本（`tlsDirRVA == 0 && imgTlsArrayRVA == 0`）时"空"才合法（打印 INFO）；
+  若 report 声称搬了 TLS 副本却既没 VA 也没 DIR64 项 ⇒ **FAIL**（那才是真漏登记）。
 **自校准**（`--selftest`，每次门禁都跑）：把 `SizeOfImage` 抬高 / 让 report 的 `sectionRVA` 漂移 / 翻转 payload 一个字节 /
 把一条 DIR64 改成 ABSOLUTE ⇒ **每个检查都必须抓到自己的那次变异**，否则门禁自己红。另外用真实开关校准过：
 `-strip-relocs` 的产物在 `--require-aslr` 下必红（并打印 7 个"需要首选基址"的 VA）。

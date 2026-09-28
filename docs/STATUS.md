@@ -9751,8 +9751,9 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
   **C2** `产物 RVA = sectionRVA + blobOffset` 的一一映射：三段 payload 按 `SectionAlignment` 串联、report 的每个 RVA 都落在
   payload 区间内、manifest 的节与符号都在 blob 内（**这就是 `#580` 说的"节映射 ↔ blob 内地址推导"那一类**）；
   **C3** payload 在 `sectionRVA+o` 的字节与 blob 第 o 字节**逐字节相同**（合并器"重新分布节"的直接判据）；
-  **C4** payload 里所有**首选基址绝对 VA**（8 字节对齐的 u64）都必须被 `.reloc` 的 DIR64 项覆盖 ——
-  正是 `#507/#508/#520` 那一类"写了绝对 VA 却没登记 ⇒ ASLR 一搬就崩"。
+  **C4 重定位覆盖（两个方向）**：① payload 里所有**首选基址绝对 VA**（8 字节对齐的 u64）都必须被 `.reloc` 的
+  DIR64 项覆盖 —— 正是 `#507/#508/#520` 那一类"写了绝对 VA 却没登记 ⇒ ASLR 一搬就崩"；
+  ② payload 里的每条 DIR64 项也都必须**指向一个真的持有 in-image VA 的槽位**（否则加载器会往一个不是地址的值上加 delta）。
   唯一豁免：解密表表头第一个 u64 是 `opt.ImageBase`，它是**比较常量**（运行期用它算 delta），登记了反而错。
 - **自校准**（`--selftest`，每次门禁都跑）：抬高 `SizeOfImage` / 让 report 的 `sectionRVA` 漂移 / 翻转 payload 一个字节 /
   把一条 DIR64 改成 ABSOLUTE ⇒ **五个检查各自都要抓到自己那次变异**，抓不到门禁自己红。
@@ -9776,7 +9777,17 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
 - `-diag` 的**端到端**（本机 win/x64，外置密钥）：产物 `check_key 10` → `143`、rc=0，
   且 **CWD 下真的出现 `vmpdiag.txt`**，内容为 `veh:install-begin / veh:mod-found / t=tblp=… / 1b:enter …`；
   同一 blob 里 `CreateFileA` **已消失**、`NtWriteFile` 在 ⇒ ② 的"只走 ntdll"是产物级事实而不是代码阅读结论。
-- CI：**（待填：本轮 push 后的 run 号与五作业结论）**。
+- CI **第一次**：run **36382345601** —— `linux-amd64` / `linux-arm64` / `windows-arm64-blob` / `windows-arm64-run` 四绿，
+  **`windows-amd64` 红在新增的那一步**：`[FAIL] C4 no absolute VA found in the payload at all`（C1/C2/C3 与"诊断"那两道都 OK）。
+  **根因不是产物坏了，是我那条规则写错了**：跑机上的 gcc 目标**没有 TLS 目录** ⇒ 打包端**根本不往 payload 里写绝对 VA**
+  （本机那份 gcc 目标有 TLS，所以本机永远是 7 个）。"必须找到至少一个 VA"是个**环境相关的**启发式，不是不变量。
+  已改成**双向不变量**（VA ↔ DIR64 必须互相解释），并给"空"这种情况补了一条**有牙齿**的判据：
+  只有当 report 明说**没有**输出 TLS 副本（`tlsDirRVA == 0 && imgTlsArrayRVA == 0`）时空才合法；
+  report 说搬了 TLS 副本却没有 VA 也没有 DIR64 项 ⇒ **FAIL**（那就是真漏登记）。
+  这个"空"的分支在本地用**重构出来的跑机形态**（把 payload 里 7 个 VA 槽清零 + 把对应 7 条 DIR64 改成 ABSOLUTE +
+  把 report 的 TLS 字段清零）验证过：`-> OK（INFO）`；同一产物只要 report 仍声称搬了 TLS ⇒ `-> FAIL`。
+  自校准也补了反向那次变异（把一条已覆盖的槽清零 ⇒ 方向 ② 必须抓到）：`CAL mutation caught by C4-reg / C4-bogus` 都 OK。
+- CI **第二次**：**run （待填）** —— 五作业结论（待填）。
 
 **未做项（如实登记）**
 - `win/arm64` 仍**暂缓**（`#581`）：白名单关闭、两个 arm64 作业 `continue-on-error`；本轮**没有**碰那个缺陷。
