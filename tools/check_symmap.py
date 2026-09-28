@@ -543,21 +543,53 @@ def selftest(packed, manifest, report, blob, require_aslr):
             d[off] ^= 0xFF
         results.append(("C3", *_expect_fail(run_checks(mutate_copy(packed, m3, tmp, "c3"), manifest, report, blob, require_aslr, True), "C3")))
 
-        # M4 (C4): un-register one payload DIR64 entry (turn it into ABSOLUTE)
+        # M4 (C4, direction "every VA must be covered"): PLANT an absolute VA in a payload slot that
+        # no DIR64 entry covers. Deliberately shape-independent: un-registering an existing entry is
+        # impossible on a product whose payload never stores a VA at all (the CI runner's gcc target
+        # has no TLS directory, so the packer writes none), and a calibration that cannot run is not
+        # a calibration -- that is exactly how this gate went red on run 36383166041.
         names = report.get("sectionNames") or []
         secs = [pe0.by_name(n) for n in names]
         secs = [s for s in secs if s is not None]
         lo = min(s["va"] for s in secs)
         hi = max(s["va"] + s["vsize"] for s in secs)
+        cov0 = pe0.reloc_covered_rvas((10,))
+        img_table_rva = int(report.get("imgTableRVA") or 0)
+        planted = None
+        for s in secs:
+            for rel in range(0, s["vsize"] - 7, 8):
+                rva = s["va"] + rel
+                if rva in cov0 or rva == img_table_rva:
+                    continue
+                if pe0.va_to_off(rva) is None:
+                    continue
+                planted = rva
+                break
+            if planted is not None:
+                break
+        if planted is None:
+            results.append(("C4-plant", False, "no uncovered 8-aligned payload slot to plant a VA in"))
+        else:
+            poff = pe0.va_to_off(planted)
+            # a VA that is inside the image but (a) not the exempt base constant and (b) not covered
+            planted_val = pe0.imagebase + 0x1000
+
+            def m4(d):
+                struct.pack_into("<Q", d, poff, planted_val)
+            results.append(("C4-plant", *_expect_fail(run_checks(mutate_copy(packed, m4, tmp, "c4"), manifest, report, blob, require_aslr, True), "C4")))
+
+        # M5 (C4, the reverse direction): un-register one payload DIR64 entry, so the entry is gone
+        # while the VA it covered remains. Needs an entry to exist; when the payload has none the
+        # reverse predicate has no inputs at all, so skip LOUDLY instead of pretending to check.
         target = None
         for rva, t in pe0.reloc_entries():
             if t == 10 and lo <= rva < hi:
                 target = rva
                 break
         if target is None:
-            results.append(("C4", False, "no payload DIR64 entry exists to un-register"))
+            print("[SKIP] CAL  C4-unreg: this product's payload has no DIR64 entry (nothing to un-register)")
         else:
-            def m4(d):
+            def m5(d):
                 pe = PE(bytes(d))
                 p = pe.va_to_off(pe.reloc_rva)
                 end = p + pe.reloc_size
@@ -570,15 +602,15 @@ def selftest(packed, manifest, report, blob, require_aslr):
                             struct.pack_into("<H", d, e, v & 0x0FFF)  # type -> ABSOLUTE
                             return
                     q += blk
-            results.append(("C4-reg", *_expect_fail(run_checks(mutate_copy(packed, m4, tmp, "c4"), manifest, report, blob, require_aslr, True), "C4")))
-            # M5 (C4, the other direction): blank a covered slot, so a DIR64 entry now covers
-            # something that is not an absolute VA any more
+            results.append(("C4-unreg", *_expect_fail(run_checks(mutate_copy(packed, m5, tmp, "c4"), manifest, report, blob, require_aslr, True), "C4")))
+            # M6 (C4, reverse direction): blank a covered slot so a DIR64 entry now covers something
+            # that is not an absolute VA any more
             slotoff = pe0.va_to_off(target)
 
-            def m5(d):
+            def m6(d):
                 for k in range(8):
                     d[slotoff + k] = 0
-            results.append(("C4-bogus", *_expect_fail(run_checks(mutate_copy(packed, m5, tmp, "c4b"), manifest, report, blob, require_aslr, True), "C4")))
+            results.append(("C4-bogus", *_expect_fail(run_checks(mutate_copy(packed, m6, tmp, "c4b"), manifest, report, blob, require_aslr, True), "C4")))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
