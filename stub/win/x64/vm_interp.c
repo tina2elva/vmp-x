@@ -1020,6 +1020,11 @@ static void vm_veh_install(void) {
     add_t add;
     if (!mod) mod = vm_find_module("KERNEL32.DLL");
     if (!mod) return;
+    /* #574：实验 —— 到此为止：**跳过导出查表与注册**（只保留上面的标记与落盘）。
+     * 目的：验证崩因是否在 `vm_get_proc(ntdll, "RtlAddVectoredExceptionHandler")` 的导出查表。
+     * 若跳过之后产物能继续走到下一个标记（`1b:enter` / `img:master-ok`）⇒ 就是它。 */
+    (void)mod;
+    return;
     /* #571：**必须从 ntdll 取**这个函数。RtlAddVectoredExceptionHandler 的实现在 ntdll 里，
      * 而 kernel32 中同名导出在部分 Windows 版本上是**转发项**（导出指向 "NTDLL.RtlAddVectored..." 字符串）⇒
      * 用 vm_get_proc 直接取会拿到**指向字符串的地址**，调用即 AV（与 STATUS #385 同一类）。
