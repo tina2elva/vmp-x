@@ -908,3 +908,28 @@ clang --target=aarch64-w64-windows-gnu -O1 -fno-tree-vectorize -nostdlib -fuse-l
 **注意（血的教训）**：任何"读取运行时状态"的探针必须放在**该状态已赋值之后**；
 任何"只在外置分支有定义"的符号必须走**顶部无条件兜底宏**模式；
 改动后**先把四种构建本地过一遍**（arm64 外置 / amd64 默认 / amd64 外置 / release / i686）**再跑门禁**。
+### 操作卡：下一步唯一实验（一次 CI 定案）——含精确地址，可直接执行
+
+**背景（已由产物机器码确认，无需再验证）**
+- 入口蹦床：`bl vm_unpack_image` → `cbz w0,+8` → `brk #0` ⇒ 实测为 `0xC0000005` 而非 `0x80000003`
+  ⇒ **`vm_unpack_image` 从未返回**，崩点在函数内部（`#579`）。
+- 该函数内的观测点（VA）：`vm_unpack_image @ 0x140009CB0`、`vm_img_diag[1] @ 0x1400150C0`、
+  `vm_dbg_win @ 0x14000B4D8`、序言第一次调用 `@ 0x14000A528`（`#578`）。
+- 已知：`vm_dbg_flush` 路径、导出查表、VEH 注册**都不是崩因**（`#573`/`#574`/`#576`）。
+
+**实验（唯一动作）**：在**蹦床汇编**里记录 `x0`（表指针）与 `sp`，并用**纯内存标记**记录"是否进入了函数"。
+
+1. 在 `internal/inject/payload.go` 的 `buildImgHookARM64` 里，于 `bl vm_unpack_image` **之前**加两条 `str`：
+   把 `x0` 与 `sp` 存进两个 `payload` 内的保留字（`.bss`/表尾空闲 16 字节，**不要**新增节）；
+2. 在 `stub/win/x64/vm_interp.c` 的 Windows `vm_unpack_image` 开头，用一个**纯内存**标记（例：`vm_img_diag[3] |= 0x80000000u;`，
+   **不要**用 `VM_DBG_WIN`+flush）表示"已进入函数"；
+3. 产物在崩溃后由**已存在的**下一次 flush（`img:master-ok` 等）自然带出这些值；若一次都到不了 flush，
+   则改在**蹦床**里把 `x0` 直接写入 `vmpdiag.txt`（蹦床内调用一次 `vm_dbg_flush` 亦可，代价仅一次）。
+
+**判据**
+- `x0` = `base + imgTableRVA`（且 `base` 与 `vm_img_diag[1]` 一致）⇒ 表指针是对的 ⇒ 崩因在**函数内部**的某条指令（对着 `0x140009CB0` 的序言逐条比对）；
+- `x0` 是 **0 或垃圾** ⇒ 蹦床/寄存器约定问题 ⇒ 检查 `buildImgHookARM64` 生成的 `adrp/add` 与调用点；
+- 若"是否进入函数"的标记**没出现** ⇒ 说明 `bl` **根本没落地**（例如入口点被改写、或页不可执行）。
+
+**完成后**：按 ③④ 收尾（三形态与原生一致 ⇒ `windows-arm64-run` 判据改硬失败 ⇒ 白名单放开 ⇒ 纳入 CI 常态回归），
+并把本轮证据写入 `docs/STATUS.md`。
