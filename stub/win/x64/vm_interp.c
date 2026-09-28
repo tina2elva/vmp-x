@@ -1028,7 +1028,13 @@ static void vm_veh_install(void) {
         u64 nt2 = vm_find_module("ntdll.dll");
         add = nt2 ? (add_t)vm_get_proc(nt2, "RtlAddVectoredExceptionHandler") : 0;
         if (!add && mod) add = (add_t)vm_get_proc(mod, "RtlAddVectoredExceptionHandler");
-        if (add) add(1u /* first */, (void *)vm_veh_handler);
+        /* #573：**临时停用注册**（一行实验）。目的：验证"崩溃是否由我自己的 VEH 注册引起"。
+         * 若停用后产物能继续往下走 ⇒ 崩因就是这里 ⇒ 之后改为"仅在显式开关下注册"。
+         * 保留取址（vm_get_proc 本身也是被怀疑的一环），只停用调用。 */
+        (void)add;
+        (void)vm_veh_handler;
+        (void)vm_veh_hit;
+        /* if (add) add(1u, (void *)vm_veh_handler); */
     }
 }
 #ifndef VM_NO_DIAG
