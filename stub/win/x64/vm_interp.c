@@ -801,6 +801,43 @@ static void vm_desc_key(const vm_desc_t *d, const vm_dfields_t *f, const u8 mast
  *   1) 密钥从 **PEB 的环境块**直接读（纯内存读，零 API 调用）；
  *   2) 硬门用 **ntdll!NtTerminateProcess**（ntdll 的导出从不转发）。
  * 密钥形式：环境变量 VMPX_KEY = 64 个十六进制字符（32 字节原始密钥）。 */
+/* ==================== Linux 裸 syscall 原语（取钥 + 反调试共用） ====================
+ * **放在 VM_KEY_EXTERNAL 之外**：Linux 侧的反调试（/proc/self/status 的 TracerPid）也要读文件，
+ * 而反调试不该依赖"外置密钥"这个开关。定义本身与密钥无关，只是 open/read/close 的薄封装。
+ * blob 是 freestanding 的：不链接 libc，全部走 syscall(2)。本文件后面已定义 vm_syscall3
+ * （x86_64：rax=n, rdi/si/dx = a/b/c），这里只做前置声明。
+ * 系统调用号（x86_64）：read=0 open=2 close=3 readlink=89 exit_group=231。
+ * 与 Windows 侧的对应关系：PEB -> /proc/self/exe 与 /proc/self/environ；
+ * ntdll 文件读 -> open/read/close；NtTerminateProcess -> exit_group。
+ * 注意：POSIX 只暴露退出码的低 8 位，所以 Linux 上"硬门"可观测到的值是 0x07。 */
+#if defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64))
+/* 两个架构的系统调用号与封装不同：
+ *   x86_64：read=0 open=2 close=3 readlink=89 exit_group=231（3 参数够用）
+ *   aarch64：read=63 close=57 exit_group=94，但**没有 open/readlink**，
+ *            只有 openat=56 readlinkat=78（都要 AT_FDCWD 这个第 4 参数，用 vm_syscall4_a64） */
+#if defined(__x86_64__)
+static long vm_syscall3(long n, long a, long b, long c);
+#define VM_LX_READ 0
+#define VM_LX_CLOSE 3
+#define VM_LX_EXIT_GROUP 231
+#define VM_LX_OPEN_RO(path) vm_syscall3(2 /* open */, (long)(path), 0, 0)
+#define VM_LX_READLINK_EXE(buf, cap) vm_syscall3(89 /* readlink */, (long)"/proc/self/exe", (long)(buf), (long)(cap))
+static long vm_lx_sys3(long n, long a, long b, long c) { return vm_syscall3(n, a, b, c); }
+#else
+static long vm_syscall3_a64(long n, long a, long b, long c);
+static long vm_syscall4_a64(long n, long a, long b, long c, long d);
+#define VM_LX_READ 63
+#define VM_LX_CLOSE 57
+#define VM_LX_EXIT_GROUP 94
+#define VM_LX_AT_FDCWD (-100)
+#define VM_LX_OPEN_RO(path) vm_syscall4_a64(56 /* openat */, VM_LX_AT_FDCWD, (long)(path), 0, 0)
+#define VM_LX_READLINK_EXE(buf, cap) vm_syscall4_a64(78 /* readlinkat */, VM_LX_AT_FDCWD, (long)"/proc/self/exe", (long)(buf), (long)(cap))
+static long vm_lx_sys3(long n, long a, long b, long c) { return vm_syscall3_a64(n, a, b, c); }
+#endif
+
+static u8 vm_lx_a[400];       /* ASCII 路径/命令缓冲（.bss，别放帧上） */
+static u16 vm_lx_u16[400];    /* 上层要 u16 路径/值，这里做一次转换 */
+#endif
 #ifdef VM_KEY_EXTERNAL
 
 /* 已实现取钥的平台：Windows(x64 / arm64 / x86) 与 Linux(amd64 / arm64)。
@@ -1160,40 +1197,9 @@ static u32 vm_hexval(u16 c) {
 #define VM_PP_IMAGE_OFF    0x60u
 #define VM_PP_ENV_OFF      0x80u
 #endif
-/* ============================ Linux/amd64 取钥原语 ============================
- * blob 是 freestanding 的：不链接 libc，全部走 syscall(2)。本文件后面已定义 vm_syscall3
- * （x86_64：rax=n, rdi/si/dx = a/b/c），这里只做前置声明。
- * 系统调用号（x86_64）：read=0 open=2 close=3 readlink=89 exit_group=231。
- * 与 Windows 侧的对应关系：PEB -> /proc/self/exe 与 /proc/self/environ；
- * ntdll 文件读 -> open/read/close；NtTerminateProcess -> exit_group。
- * 注意：POSIX 只暴露退出码的低 8 位，所以 Linux 上"硬门"可观测到的值是 0x07。 */
+/* 裸 syscall 原语（VM_LX_*）的**定义**已挪到本文件靠前的公共段（Linux 侧反调试也要用，
+ * 而反调试不该依赖"外置密钥"开关）。下面这个 #if 只把**取钥实现**留在 Linux 目标里。 */
 #if defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64))
-/* 两个架构的系统调用号与封装不同：
- *   x86_64：read=0 open=2 close=3 readlink=89 exit_group=231（3 参数够用）
- *   aarch64：read=63 close=57 exit_group=94，但**没有 open/readlink**，
- *            只有 openat=56 readlinkat=78（都要 AT_FDCWD 这个第 4 参数，用 vm_syscall4_a64） */
-#if defined(__x86_64__)
-static long vm_syscall3(long n, long a, long b, long c);
-#define VM_LX_READ 0
-#define VM_LX_CLOSE 3
-#define VM_LX_EXIT_GROUP 231
-#define VM_LX_OPEN_RO(path) vm_syscall3(2 /* open */, (long)(path), 0, 0)
-#define VM_LX_READLINK_EXE(buf, cap) vm_syscall3(89 /* readlink */, (long)"/proc/self/exe", (long)(buf), (long)(cap))
-static long vm_lx_sys3(long n, long a, long b, long c) { return vm_syscall3(n, a, b, c); }
-#else
-static long vm_syscall3_a64(long n, long a, long b, long c);
-static long vm_syscall4_a64(long n, long a, long b, long c, long d);
-#define VM_LX_READ 63
-#define VM_LX_CLOSE 57
-#define VM_LX_EXIT_GROUP 94
-#define VM_LX_AT_FDCWD (-100)
-#define VM_LX_OPEN_RO(path) vm_syscall4_a64(56 /* openat */, VM_LX_AT_FDCWD, (long)(path), 0, 0)
-#define VM_LX_READLINK_EXE(buf, cap) vm_syscall4_a64(78 /* readlinkat */, VM_LX_AT_FDCWD, (long)"/proc/self/exe", (long)(buf), (long)(cap))
-static long vm_lx_sys3(long n, long a, long b, long c) { return vm_syscall3_a64(n, a, b, c); }
-#endif
-
-static u8 vm_lx_a[400];       /* ASCII 路径/命令缓冲（.bss，别放帧上） */
-static u16 vm_lx_u16[400];    /* 上层要 u16 路径/值，这里做一次转换 */
 
 /* 授权/狗/PEB 这些在 Linux 上还没实现（它们的实现整段在 Windows 分支里）。
  * 这里给**安全失败**的桩，让 stub 保持自包含，并且语义是"拿不到"：
@@ -1967,6 +1973,50 @@ static void vm_antidebug(void) {
     if (!vm_dbg_verdict && (vm_dbg_mask & (vm_dbg_mask - 1)) != 0) {
         vm_dbg_verdict = 1;
         vm_dbg_defer = VM_DBG_DEFER_CALLS; /* 静默延后：不 trap */
+    }
+}
+#elif defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64))
+/* Linux 侧反调试（#389 登记的最后一条缺口）：读 /proc/self/status 的 TracerPid。
+ *
+ * 判据与 Windows 侧的差别（有意为之）：Linux **一条路径就定性**。TracerPid != 0 意味着有 tracer
+ * 附着（gdb / strace / 任何 ptrace attach 都会把它写成 tracer 的 pid；实测 gdb 下 = 566/972），
+ * 正常进程恒为 0 ⇒ 误报率极低。Windows 那边要"≥2 条路径"是因为它的集合里含 rdtsc 这种弱信号。
+ * 想再加一条的话，候选是 ptrace(PTRACE_TRACEME) 返回 EPERM —— 但它会改变自身的 ptrace 状态，不划算。
+ *
+ * 读文件复用公共段里的裸 syscall 原语（VM_LX_OPEN_RO / VM_LX_READ / vm_lx_sys3）：不引 libc、
+ * 不新增依赖，x86-64 与 aarch64 走同一套宏。**读不到就不定性**（宁可漏报也绝不误报）。
+ * 定性后与 Windows 完全同款：置 vm_dbg_defer，接下来 VM_DBG_DEFER_CALLS 次 vm_run 返回错值，不 trap。 */
+static u32 vm_dbg_mask;
+static u32 vm_dbg_verdict;
+
+static int vm_tracer_pid(void) {
+    static char st[1024];
+    long fd = VM_LX_OPEN_RO("/proc/self/status");
+    if (fd < 0) return -1;
+    long n = vm_lx_sys3(VM_LX_READ, fd, (long)st, (long)sizeof(st) - 1);
+    vm_lx_sys3(VM_LX_CLOSE, fd, 0, 0);
+    if (n <= 0) return -1;
+    st[n] = 0;
+    static const char key[] = "TracerPid:";
+    for (long i = 0; i + 12 < n; i++) {
+        u32 k = 0;
+        while (k < 10 && st[i + k] == key[k]) k++;
+        if (k != 10) continue;
+        long j = i + 11; /* 跳过冒号后的制表符/空格 */
+        while (j < n && (st[j] == ' ' || st[j] == '\t')) j++;
+        int v = 0, digits = 0;
+        while (j < n && st[j] >= '0' && st[j] <= '9') { v = v * 10 + (st[j] - '0'); j++; digits++; }
+        return digits ? v : -1;
+    }
+    return -1;
+}
+
+static void vm_antidebug(void) {
+    if (vm_dbg_verdict) return;
+    if (vm_tracer_pid() > 0) {
+        vm_dbg_mask |= 1u;
+        vm_dbg_verdict = 1;
+        vm_dbg_defer = VM_DBG_DEFER_CALLS; /* 静默延后：与 Windows 同款，不给可定位的崩点 */
     }
 }
 #else

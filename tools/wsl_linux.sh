@@ -83,6 +83,26 @@ if [ "$ONLY" = "all" ] || [ "$ONLY" = "amd64" ]; then
   step "elf layout gate"      python3 tools/check_elf_layout.py \
     --packed build/linux_target.vmp --manifest build/vm_interp_linux.json \
     --blob build/vm_interp_linux.bin --report build/linux_vmp.json --selftest
+  # Linux 侧反调试（/proc/self/status 的 TracerPid，#389 登记的那条缺口）：两个方向都要验 ——
+  # 没有 tracer 时**行为必须完全不变**，有 tracer 时必须**静默延后**（给错值但正常退出，不 trap）。
+  # gdb 只是"制造一个 tracer"的手段（实测它会把 TracerPid 置成自己的 pid）。
+  antidebug_probe() {
+    local p="build/linux_target.vmp"
+    [ -x "$p" ] || { echo "no $p"; return 1; }
+    local plain traced
+    plain=$("./$p" check-key 10 2>/dev/null | head -1)
+    if [ "$plain" != "143" ]; then echo "no-tracer run returned '$plain' (expected 143) -> false positive?"; return 1; fi
+    traced=$(gdb -batch -ex run --args "./$p" check-key 10 2>/dev/null | grep -E '^[0-9]+$' | head -1)
+    if [ -z "$traced" ] || [ "$traced" = "143" ]; then
+      echo "under a tracer the result was '$traced' (expected != 143)"; return 1
+    fi
+    echo "no tracer -> 143 ; under gdb -> $traced (wrong value, normal exit: silent deferral)"
+  }
+  if command -v gdb >/dev/null 2>&1; then
+    step "linux anti-debug (TracerPid)" antidebug_probe
+  else
+    echo "[SKIP] linux anti-debug: no gdb on this machine to create a tracer"
+  fi
   step "elf image encryption" bash tools/e2e_elf_image.sh --strict
 fi
 

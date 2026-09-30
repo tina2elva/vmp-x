@@ -9970,4 +9970,40 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
 
 **未做项**
 - E5 目前只在 ET_DYN 上真正生效（`-enc-image-elf` 只支持 ET_EXEC）；ELF 的 `.rela.dyn/.rela.plt` "先减后加"应用器仍未写（`#390` 登记）。
-- Linux 反调试（`/proc/self/status` 的 `TracerPid`）仍未做 —— 待下一项。
+- Linux 反调试（`/proc/self/status` 的 `TracerPid`）：**已在 `#587` 落地**（含"无 tracer 不误报 / 有 tracer 静默延后"两端验证，
+  已接进 `tools/wsl_linux.sh` 成为一步）。
+
+### 587. Linux 侧反调试：`/proc/self/status` 的 `TracerPid`（`#389` 登记的最后一条缺口）
+
+**做了什么**
+- `stub/win/x64/vm_interp.c`：`vm_antidebug()` 增加 Linux 分支
+  （`#elif defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64))`）：
+  读 `/proc/self/status` 找 `TracerPid:`，非 0 ⇒ 判定被 tracer 附着（gdb / strace / 任何 ptrace attach）。
+  定性后与 Windows **完全同款**：置 `vm_dbg_defer = VM_DBG_DEFER_CALLS`，接下来 3 次 `vm_run` 返回错值 ——
+  **静默延后，不 trap**（攻击者看到的是"偶尔算错"，不是一个可定位的崩点）。
+- **判据差异（有意如此）**：Linux **一条路径就定性**。`TracerPid != 0` ⇒ 正常进程恒为 0（实测 gdb 下为 566/972），
+  误报率极低；Windows 那边要"≥2 条路径"是因为它的集合里含 rdtsc 这种弱信号（见 `#389` 的降级记录）。
+  读不到 `/proc/self/status` 就**不定性**（宁可漏报，绝不误报 —— 这条写在代码注释里）。
+- **结构性改动（上回没做成的关键）**：`VM_LX_*` 裸 syscall 原语原先关在 `#ifdef VM_KEY_EXTERNAL` 里，
+  而反调试不该依赖"外置密钥"这个开关 ⇒ 把原语的**定义**挪到公共段（自带 `#endif`），
+  原位置只留 `#if defined(VM_BLOB_TARGET_LINUX) && (x86_64 || VM_ARCH_AARCH64)` 这条守卫给取钥实现用。
+  现在**兼容模式与外置模式都带** Linux 反调试（预处理 `#if`/`#endif` 配平 81/81；两种构建均无新增告警）。
+  （上回失败的原因记录在此：只搬了块的一部分、漏掉它的外层 `#endif`，把守卫平衡搞坏 ⇒ 已回退重做。）
+
+**证据（本机 WSL）**
+- `tools/e2e.sh` → **17 passed / 0 failed**（含 1b 三形态）⇒ **"没有 tracer 时行为完全不变"**；
+  这同时是反方向的**校准**：若解析写错导致误报，这 17 条会立刻红。
+- 直接双端验证（兼容模式产物，**不需要密钥**）：
+  - 无 tracer：`check-key 10` → **143**、`sum-to 10` → **55**（与原生一致）；
+  - 在 `gdb` 下：同一产物 `check-key 10` → **10**（≠143）⇒ 检测生效；且
+    `[Inferior 1 exited normally]` + `$_exitcode = 0` ⇒ **不是崩溃**，正是设计要求的行为。
+- 盲验证：`strings build/vm_interp_linux.bin | grep -c TracerPid:` = **1** ⇒ 默认（兼容）blob 里确实编进了这段代码。
+- 已接进 `tools/wsl_linux.sh` 作为一步 `linux anti-debug (TracerPid)`：**两个方向都断言**
+  （无 tracer 必须 143；有 tracer 必须 ≠143），机器上没有 gdb 时**醒目 SKIP**；
+  `tools/wsl_linux.ps1 -Only amd64` → **7 步全 OK**。
+
+**未做项**
+- 这条用例目前只在**本机 WSL 门禁**里：CI 的两个 Linux 作业没有 gdb。要让 CI 也测，需要在作业里
+  `apt-get install gdb` 并把它加进 `tools/e2e.sh`；而 aarch64 那条跑在 qemu-user 下、语义不同（tracer 是 qemu 进程），
+  要单独设计 —— 一并留给下一轮。
+- 第二条 Linux 路径（`ptrace(PTRACE_TRACEME)` 返回 EPERM）**有意不做**：它会改变进程自身的 ptrace 状态。
