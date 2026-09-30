@@ -10045,3 +10045,35 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
 **未做项**
 - 让这条用例真正通过（先要判定：go-merge blob 的 `vm_entry` 能否直接当 payload 的 `StubEntry`；
   或让用例自己按生产配方建 payload）。在那之前它保持"显式指定才跑、否则 SKIP"。
+
+### 589. DLL + 外置密钥（`#385` 登记的那条缺口）：运行期按"包含自己代码的模块"定位密钥文件
+
+**问题（为什么以前不支持）**
+1b 的密钥文件路径是 `<产物路径>.vmpkey`，而那个路径取自 `PEB->ProcessParameters->ImagePathName`。
+**产物是 DLL 时该字段是宿主 EXE 的路径** ⇒ 密钥文件明明放在 DLL 旁边，也会去找 `<宿主>.vmpkey`，
+于是永远走硬门（`0xC0DE0007`）。这正是 `#385` 里"EXE 路径已验证、DLL 未做"的原因。
+
+**改法（只动运行期；打包端不用改，格式/密钥没变）**
+- `stub/win/x64/vm_interp.c` 新增 `vm_own_module_path(self, out, cap)`：走 `PEB->Ldr->InMemoryOrderModuleList`，
+  用 `DllBase + SizeOfImage` 判断**哪个已加载模块包含 `self`**，把它的 **`FullDllName`** 拷出来。
+  `self` 传 blob 里一个 .bss 对象的地址（`&vm_key_path_buf`）—— blob 被注入到产物映像里，
+  所以"包含它的模块"就是产物自己（DLL 就是那个 DLL，EXE 就是主镜像）。
+  （取静态对象地址是 `lea sym(%rip)`，**不产生绝对重定位**，合并器接受 —— 已用 blob 构建验证。）
+- `vm_key_path()` 先用它；拿不到就**回退**到原来的 `ImagePathName` 逻辑 ⇒ 拿不到时的行为与改动前完全一致。
+  对 EXE 两者指向同一个文件，所以这不是"特例分支"，是统一。
+- 新增按位宽的三个偏移：`SizeOfImage`（x64 +0x40 / i386 +0x20）、`FullDllName`（+0x48 / +0x24）、
+  `FullDllName.Buffer`（+0x50 / +0x28）。i386 的 `UNICODE_STRING` 只有 8 字节，Buffer 偏移与 x64 不同 ——
+  这里与 `BaseDllName` 那次是同一类坑，所以单独列了 `VM_FULLNAMEBUF_OFF`。
+
+**验收（本机端到端，含校准）**
+- `tools/e2e_dll.ps1` 新增 1b/DLL 四条。关键在于**宿主是 `dlhost.exe`**（不是 DLL 自己）：
+  只有"DLL 自己的模块"这条路才能找到密钥，用 `ImagePathName` 必然失败。
+  - 无密钥 ⇒ 硬门：**宿主进程** `rc=0xC0DE0007` 且无输出 ✓
+  - 密钥文件 `build/testlib_ext.dll.vmpkey` ⇒ 三个导出与原生逐字节一致 ✓
+- **校准（证明这条用例能失败）**：把 `vm_own_module_path(...)` 短路成 `0 && ...` 重新构建后再跑，
+  三条全红（`ext=` 为空 ⇒ 走了硬门）⇒ **修复就是让它通过的原因**，不是别的因素。
+- 结果：`dll e2e: 7 passed, 0 failed`（改动前是 3 条）。
+
+**未做项**
+- 硬件狗（Sentinel）与 DLL 的组合**没有**单独验证（同一条取钥接缝，理论上跟着受益）。
+- i386（win/x86）宿主下的 DLL 外置密钥只做了**代码级**偏移适配，**没有**实机验证（本机没有 32 位宿主环境）。

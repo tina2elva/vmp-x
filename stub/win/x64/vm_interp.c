@@ -1134,10 +1134,12 @@ static void vm_veh_install(void) {
 static u8 vm_master_buf[32];
 static u32 vm_master_ok; /* .bss：0 = 还没取，1 = 已取且 KCV 通过 */
 
-/* 这两个符号在本文件靠后的 Windows 段里定义 */
+/* 这几个符号在本文件靠后的 Windows 段里定义 */
 static u64 vm_peb_base(void);
 static u64 vm_find_module(const char *name);
 static void *vm_get_proc(u64 mod, const char *fn);
+/* 取"包含指定地址的那个已加载模块"的 FullDllName（DLL + 外置密钥要用，见函数定义处的注释）。 */
+static int vm_own_module_path(const void *self, u16 *out, u32 cap);
 
 /* 硬门：走 ntdll!NtTerminateProcess(-1, code) —— ntdll 的导出不转发，地址一定有效；
  * 万一取不到就 ud2（0xC000001D）。默认 code = 7 ⇒ 退出码 0xC0DE0007、无任何输出。 */
@@ -1339,6 +1341,23 @@ static const u16 *vm_key_path(void) {
         }
         for (u32 i = 0; ov[i] && n < 344; i++) b[n++] = ov[i];
         b[n] = 0;
+        return b;
+    }
+    /* 产物自己的路径：优先"包含我们自己代码的那个模块"的 FullDllName。
+     * DLL 场景**必须**这样（ImagePathName 是宿主 EXE 的路径，会去找 <宿主>.vmpkey）；
+     * 对 EXE，那个模块就是主镜像，FullDllName 与 ImagePathName 指向同一个文件 ⇒ 两条路统一。
+     * 拿不到就回退到下面的 ImagePathName 老逻辑（行为与改动前完全一致）。 */
+    if (vm_own_module_path(&vm_key_path_buf, b, 344)) {
+        u32 m = 0;
+        while (b[m]) m++;
+        if (!(m >= 4 && b[0] == '\\' && b[1] == '?' && b[2] == '?' && b[3] == '\\')) {
+            for (u32 k = m + 1; k-- > 0;) b[k + 4] = b[k]; /* 连 NUL 一起后移，腾出 "\??\" */
+            b[0] = '\\'; b[1] = '?'; b[2] = '?'; b[3] = '\\';
+            m += 4;
+        }
+        const char *suf = ".vmpkey";
+        for (u32 i = 0; i < 7; i++) b[m++] = (u16)(u8)suf[i];
+        b[m] = 0;
         return b;
     }
     u64 peb = vm_peb_base();
@@ -3299,6 +3318,9 @@ static int vm_name_eq(const char *a, const char *b) {
 #define VM_LDR_HEAD_OFF     0x14u
 #define VM_LINK_BACK_OFF    0x08u
 #define VM_DLLBASE_OFF      0x18u
+#define VM_SIZEIMG_OFF      0x20u  /* LDR_DATA_TABLE_ENTRY.SizeOfImage */
+#define VM_FULLNAME_OFF     0x24u  /* FullDllName（BaseDllName 在 +0x2C） */
+#define VM_FULLNAMEBUF_OFF  0x28u  /* FullDllName.Buffer（i386 的 UNICODE_STRING 只有 8 字节） */
 #define VM_NAMELEN_OFF      0x2Cu
 #define VM_NAMEBUF_OFF      0x30u
 #define vm_pread(p)         (*(const u32 *)(p))
@@ -3307,6 +3329,9 @@ static int vm_name_eq(const char *a, const char *b) {
 #define VM_LDR_HEAD_OFF     0x20u
 #define VM_LINK_BACK_OFF    0x10u
 #define VM_DLLBASE_OFF      0x30u
+#define VM_SIZEIMG_OFF      0x40u  /* LDR_DATA_TABLE_ENTRY.SizeOfImage */
+#define VM_FULLNAME_OFF     0x48u  /* FullDllName（BaseDllName 在 +0x58） */
+#define VM_FULLNAMEBUF_OFF  0x50u  /* FullDllName.Buffer */
 #define VM_NAMELEN_OFF      0x58u
 #define VM_NAMEBUF_OFF      0x60u
 #define vm_pread(p)         (*(const u64 *)(p))
@@ -3354,6 +3379,45 @@ static u64 vm_find_module(const char *name) {
         }
         tmp[n] = 0;
         if (base && vm_name_eq(tmp, name)) return base;
+        cur = vm_pread(cur);
+    }
+    return 0;
+}
+
+/* 找到"包含地址 self 的那个已加载模块"，把它的 **FullDllName** 拷进 out（u16，NUL 结尾）。
+ *
+ * 为什么需要它（STATUS #385 登记的那条缺口）：1b 的密钥路径原来用
+ * PEB->ProcessParameters->ImagePathName 拼 <产物>.vmpkey —— 那是**宿主 EXE** 的路径。
+ * 产物是 DLL 时我们要找的是 <DLL>.vmpkey，用宿主路径必然找错文件（表现为"密钥文件明明在，
+ * 却始终走硬门"）。改成"包含我们自己代码的那个模块"就同时覆盖两者：对 EXE，那个模块就是主镜像，
+ * FullDllName 与 ImagePathName 指向同一个文件 —— 所以这不是特例分支，是统一。
+ *
+ * self 由调用方传 blob 里一个 .bss 对象的地址（&vm_key_path_buf）：它在产物映像内，
+ * 而 blob 被注入到产物映像里，所以"包含 self 的模块"就是产物自己。
+ * 返回 1 成功；0 = 拿不到（调用方回退到 ImagePathName 的老逻辑，行为与改动前一致）。 */
+static int vm_own_module_path(const void *self, u16 *out, u32 cap) {
+    u64 addr = (u64)self;
+    if (!cap) return 0;
+    u64 peb = vm_peb_base();
+    if (!peb) return 0;
+    u64 ldr = vm_pread(peb + VM_PEB_LDR_OFF);
+    if (!ldr) return 0;
+    u64 head = ldr + VM_LDR_HEAD_OFF;
+    u64 cur = vm_pread(head);
+    for (int i = 0; i < 512 && cur && cur != head; i++) {
+        u64 ent = cur - VM_LINK_BACK_OFF;
+        u64 base = vm_pread(ent + VM_DLLBASE_OFF);
+        u32 size = *(const u32 *)(ent + VM_SIZEIMG_OFF);
+        if (base && size && addr >= base && addr < base + (u64)size) {
+            u16 len = *(const u16 *)(ent + VM_FULLNAME_OFF);
+            const u16 *buf = (const u16 *)(u64)vm_pread(ent + VM_FULLNAMEBUF_OFF);
+            u32 n = (u32)(len / 2);
+            if (!buf || n == 0) return 0;
+            if (n > cap - 1) n = cap - 1;
+            for (u32 k = 0; k < n; k++) out[k] = buf[k];
+            out[n] = 0;
+            return (n >= 3) ? 1 : 0; /* 太短的内容不像是路径，让调用方走更稳的回退 */
+        }
         cur = vm_pread(cur);
     }
     return 0;

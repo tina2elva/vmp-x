@@ -220,8 +220,8 @@
 ## 其他已登记（来源见括号，优先级低于上面 1–3）
 
 - [ ] ELF 侧 `.rela.dyn/.rela.plt` 的"先减后加"应用器（现状：ELF PIE 能用是因为测试目标落在加密节里的重定位项恰好没有）。(`STATUS #390`)
-- [ ] Linux 侧反调试：`/proc/self/status` 的 `TracerPid`（现在四条路径都是 Windows 目标）。(`STATUS #389`)
-- [ ] 外置密钥 + DLL 组合；Linux/arm64 的取钥路径。(`STATUS #385`)
+- [x] Linux 侧反调试：`/proc/self/status` 的 `TracerPid`（现在四条路径都是 Windows 目标）。**已落地，见 `STATUS #587`**（`STATUS #389`）
+- [x] 外置密钥 + DLL 组合（**已落地，见 `STATUS #589`**：运行期按"包含自己代码的模块"定位 `<DLL>.vmpkey`）；Linux/arm64 的取钥路径已在 `STATUS #388` 落地。(`STATUS #385`)
 - [ ] 1b 的其余取钥形态：授权回调、TPM/TEE 封印（接缝已是 `vm_key_from_file()` 一个函数）；本次对话拟定的过渡方案是 **DPAPI 包装的密钥文件**。(`STATUS #385/#393`)
 - [x] `-key-in` 的"密钥纪元"策略：`vmpepoch new` 建纪元、`which` 认领产物、按 `<产物>.vmpkey` 分发 —— 已在 `tools/acceptance_demo.ps1` 里端到端演示（`STATUS #395/#400`）。
 
