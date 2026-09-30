@@ -67,13 +67,9 @@ fi
 if [ "$ONLY" = "all" ] || [ "$ONLY" = "amd64" ]; then
   echo "=== linux/amd64 (CI job linux-amd64) ==="
   step "go build ./..."       go build ./...
-  # TestARM64PayloadUnderQEMU picks up ../../build/vm_interp_arm64.* + build/payload_probe_arm64
-  # and SKIPs only when they are absent. On a machine where e2e_arm64.sh has already run they DO
-  # exist, so the test runs against whatever blob happens to be there and can fail for reasons that
-  # have nothing to do with the tree (observed: "AArch64 branch out of +/-128MB"). CI's checkout is
-  # fresh, so CI always sees the skip. Reproduce CI here: drop those leftovers before go test.
-  # (Registered as a test-isolation trap in STATUS #584.)
-  rm -f build/vm_interp_arm64.bin build/vm_interp_arm64.json build/payload_probe_arm64
+  # TestARM64PayloadUnderQEMU 以前按"build/ 里恰好有什么"决定跑还是跳（残留产物会让它拿错配的
+  # blob/manifest）。STATUS #588 把它改成**只认 VMP_ARM64_DIR**：没给就确定性 SKIP。
+  # 所以这里不再需要"先删残留"那种补丁 —— 残留不会再影响它。
   step "go test ./..."        go test ./...
   step "payload probe"        bash tools/verify_linux_payload.sh
   step "elf end-to-end"       bash tools/e2e.sh

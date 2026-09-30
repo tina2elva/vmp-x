@@ -1050,7 +1050,12 @@ EOF
   两端都验过：无 tracer → `143`（且 `e2e.sh` 17/17 证明不误报）；gdb 下 → `10`（≠143）且 `exit code 0`。
   已接进 `tools/wsl_linux.sh` 作为一步（无 gdb 时醒目 SKIP）。
   **仍未做**：把它做成 CI 的 e2e 用例（CI 的 Linux 作业没有 gdb；aarch64 那条跑在 qemu-user 下、语义不同）。
-- `TestARM64PayloadUnderQEMU` 的**测试隔离**（它按 `build/` 里有没有残留决定跑还是跳）。
+- **✅ `TestARM64PayloadUnderQEMU` 的测试隔离**（`STATUS #588`）：三个输入改为**只认 `VMP_ARM64_DIR`**，
+  没给就确定性 SKIP（不再"看 `build/` 里恰好有什么"）；`tools/wsl_linux.sh` 里那条"先删残留"的临时补丁也撤了。
+  顺带查出这条用例**从来没在任何地方真正跑过**（CI 两个作业都必然 SKIP），并逐个修掉三个过期假设
+  （坐标系混用 / 探针 CLI 从 argv[6] 起 / 输出行格式）。**仍未通过**：修完后能执行到 qemu，但解释器返回 `0` 而非 6
+  （候选：go-merge blob 的 `vm_entry=0` 能否直接当 `StubEntry`）—— 在那之前它**不接进 CI**
+  （CI 的 `e2e_arm64.sh` 已端到端覆盖同一块）。
 - DLL + 外置密钥（`#385`）、DPAPI 包装的取钥形态（`#393`）。
 
 **还等拍板的**：把两个 arm64 CI 作业从 workflow 停掉（用户已说 arm64 暂停；它们只是复现器，

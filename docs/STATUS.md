@@ -10007,3 +10007,41 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
   `apt-get install gdb` 并把它加进 `tools/e2e.sh`；而 aarch64 那条跑在 qemu-user 下、语义不同（tracer 是 qemu 进程），
   要单独设计 —— 一并留给下一轮。
 - 第二条 Linux 路径（`ptrace(PTRACE_TRACEME)` 返回 EPERM）**有意不做**：它会改变进程自身的 ptrace 状态。
+
+### 588. `TestARM64PayloadUnderQEMU` 的测试隔离（`#584` 登记的那条）：改成"只认显式指定的成套产物"
+
+**做了什么**
+- `internal/inject/arm64_qemu_test.go`：三个输入（`vm_interp_arm64.bin` / `.json` / `payload_probe_arm64`）不再从 `build/` 的固定路径猜，
+  改为从 **`VMP_ARM64_DIR`** 取；没设或文件缺失就**确定性 SKIP**（SKIP 原因写清楚）。
+  动机（`#584` 实测）：`tools/e2e_elf_image.sh` 也用 `BLOB_SRC=stub/linux/arm64` 写 `build/vm_interp_arm64.bin`，
+  而 json 不是同一份 ⇒ 拿"别人的 blob + 这份 manifest"建载荷，报出与代码无关的
+  `BuildPayload 失败: f: AArch64 分支超出 ±128MB` ⇒ `go test ./...` 的结果取决于"这台机器之前跑过什么"。
+- `tools/wsl_linux.sh` 里那条"go test 之前先删 arm64 残留"的**临时补丁撤掉**了 —— 现在残留不再影响它。
+
+**顺带发现（重要）：这条用例从来没在任何地方真正跑过** —— 四个过期假设，逐个有据：
+
+| # | 过期假设 | 证据 / 修法 |
+|---|---|---|
+| 1 | 读 `build/` 的固定路径 | CI 的 `linux-amd64` 作业没有 aarch64 产物 ⇒ SKIP；`linux-arm64` 作业只跑 `e2e_arm64.sh`、不跑 `go test` ⇒ 也 SKIP。**所以它从未被执行**。已改为 `VMP_ARM64_DIR` 门控 |
+| 2 | 坐标系混用 | `BuildPayload(opt, baseRVA)` 与 `FuncSpec.RVA` 按契约**都是"相对镜像基址的地址"**（`payload.go` 字段注释；生产方 vmpack 两者都是镜像内 RVA）。测试把 `baseRVA` 当 VA（0x40000000）却把函数 RVA 写成 0x1000 ⇒ 分支距离 = 1GB ⇒ 就是那句 `±128MB`。已修（`RVA: va + 0x1000`） |
+| 3 | 探针 CLI 契约 | guest 参数从 **argv[6]** 开始（`<payload> <va> <thunkOff> <ring_off> <diag_off> <arg>...`），测试只给到 argv[4] ⇒ 那个 `"0"` 被当成 `ring_off`、参数循环一次都不执行、**一行结果都不打**。已修（补 `"0","0","0"`） |
+| 4 | 探针输出格式 | 探针把"映射信息"写在 stderr 且**不带换行**，结果行是 stdout 的 `  check_key(0) = <ret>`；测试拿整段输出和 `"6"` 比 ⇒ 永远不成立。已修（按 `check_key(` 定位、取 `=` 之后的值） |
+
+（另外核对过：手写字节码的 opcode 值 `0x21 = OP_ALU_RI`、`0x02 = OP_RET` **是对的**，不是过期假设。）
+
+**仍未通过（如实登记，留给下一轮）**
+修完上面四条后，用例能走到**真正的执行点**，但解释器返回 **0** 而不是 6（`check_key(0) = 0`）。候选原因：
+`StubEntry = man.Symbols["vm_entry"] = 0`（go-merge 的 blob 里入口确实在 0 偏移，但用例是直接 `br` 过去，
+可能跳过了 `stub/linux/arm64` 入口汇编的寄存器/栈约定），或 payload 里缺少入口蹦床需要的字段。
+**本轮不动它**，理由：CI 的 `e2e_arm64.sh` 已经**端到端**覆盖同一块（打包产物在 qemu 下与原生逐字节一致），
+这条 Go 用例是"更细的单元级"，不值得在没搞清语义前硬接进 CI。
+⇒ 因此**撤掉了** `e2e_arm64.sh` 里的接线（一条未通过的用例不该挂进 CI）。
+
+**证据**
+- 不给 `VMP_ARM64_DIR`：`go test ./...` 里 `TestARM64PayloadUnderQEMU` **SKIP**（原因可见），包 `ok`；本地门禁见下。
+- 给 `VMP_ARM64_DIR=$PWD/build`（`e2e_arm64.sh` 刚生成的成套产物）：用例**真的执行到 qemu**，
+  输出 `check_key(0) = 0` —— 比修之前的 `±128MB` 深入了一层。
+
+**未做项**
+- 让这条用例真正通过（先要判定：go-merge blob 的 `vm_entry` 能否直接当 payload 的 `StubEntry`；
+  或让用例自己按生产配方建 payload）。在那之前它保持"显式指定才跑、否则 SKIP"。
