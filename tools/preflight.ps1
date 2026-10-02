@@ -1,4 +1,4 @@
-# preflight.ps1 - fast sanity checks before any real work (AGENTS.md acceptance item 1).
+﻿# preflight.ps1 - fast sanity checks before any real work (AGENTS.md acceptance item 1).
 #
 # Contract: prints "[+] preflight: OK" and exits 0 when everything checks out;
 # otherwise prints one "[!] ..." line per problem and exits 1.
@@ -80,6 +80,25 @@ Step "blob builds (vmpbuild)" {
   if ($LASTEXITCODE -ne 0) { Write-Host ("    " + ($out -split "`r?`n" | Select-Object -First 3)); return $false }
   if (-not (Test-Path "build/preflight_blob.bin")) { Write-Host "    no blob produced"; return $false }
   Remove-Item build/preflight_blob.bin, build/preflight_blob.json -ErrorAction SilentlyContinue
+  return $true
+}
+
+# 5) 含非 ASCII 的 .ps1 必须带 UTF-8 BOM：PowerShell 5.1 在**没有 BOM** 时按 ANSI 读文件，
+#    中文注释/字符串会变成乱码，**而且可能直接造成语法错误**。本仓库真踩过：用编辑工具改 e2e.ps1 时
+#    把开头的 BOM 吃掉了，[]::ParseFile 当场报 10 个解析错误（错误位置还指向无关的行，很难查）。
+Step "ps1 encoding (BOM)" {
+  $bad = @()
+  foreach ($f in Get-ChildItem -Path tools -Filter *.ps1 -Recurse) {
+    $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    $nonAscii = $false
+    for ($i = 0; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -gt 0x7F) { $nonAscii = $true; break } }
+    if ($nonAscii -and -not $hasBom) { $bad += $f.Name }
+  }
+  if ($bad.Count -gt 0) {
+    Write-Host ("    no UTF-8 BOM (PowerShell 5.1 reads these as ANSI -> mojibake/syntax errors): " + ($bad -join ", "))
+    return $false
+  }
   return $true
 }
 

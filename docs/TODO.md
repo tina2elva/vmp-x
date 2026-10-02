@@ -222,7 +222,8 @@
 - [ ] ELF 侧 `.rela.dyn/.rela.plt` 的"先减后加"应用器（现状：ELF PIE 能用是因为测试目标落在加密节里的重定位项恰好没有）。(`STATUS #390`)
 - [x] Linux 侧反调试：`/proc/self/status` 的 `TracerPid`（现在四条路径都是 Windows 目标）。**已落地，见 `STATUS #587`**（`STATUS #389`）
 - [x] 外置密钥 + DLL 组合（**已落地，见 `STATUS #589`**：运行期按"包含自己代码的模块"定位 `<DLL>.vmpkey`）；Linux/arm64 的取钥路径已在 `STATUS #388` 落地。(`STATUS #385`)
-- [ ] 1b 的其余取钥形态：授权回调、TPM/TEE 封印（接缝已是 `vm_key_from_file()` 一个函数）；本次对话拟定的过渡方案是 **DPAPI 包装的密钥文件**。(`STATUS #385/#393`)
+- [~] 1b 的其余取钥形态：**DPAPI 包装的密钥文件已落地**（`<产物>.vmpkey.dpapi` + `cmd/vmpkeywrap`，见 `STATUS #590`）；
+  **仍未做**：授权回调形态、TPM/TEE 封印（`密钥永不出芯片`）。接缝仍是 `vm_key_from_file()` 一个函数。(`STATUS #385/#393`)
 - [x] `-key-in` 的"密钥纪元"策略：`vmpepoch new` 建纪元、`which` 认领产物、按 `<产物>.vmpkey` 分发 —— 已在 `tools/acceptance_demo.ps1` 里端到端演示（`STATUS #395/#400`）。
 
 ## 5. 授权层（License Layer）—— 设计基线与**剩余未做项**

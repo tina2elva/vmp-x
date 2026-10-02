@@ -322,7 +322,36 @@ if ($LASTEXITCODE -ne 0) {
         else { $fail++; $failLines += ("E2EFAIL ext-key/file: code=0x{0:X8} out=[{1}] (expect 143)" -f ($rf.Code -band 0xFFFFFFFF), $rf.Out.Trim()) }
         Remove-Item $extKeyBeside -ErrorAction SilentlyContinue
 
-        # 6) correct key via the VMPX_KEY environment variable (fallback form) => identical to native
+        # 6) 受保护形态 <产物>.vmpkey.dpapi（DPAPI 用户作用域，由 cmd/vmpkeywrap 生成）。
+        #    这里**故意**在旁边放一个错的明文文件：受保护形态必须优先，所以结果仍应是 143 ——
+        #    这条同时证明"优先读受保护文件"真的生效，而不只是"两种形态都能用"。
+        [System.IO.File]::WriteAllText((Join-Path (Get-Location) $extKeyBeside), ("11" * 32))
+        $dpPath = Join-Path (Get-Location) "$extExe.vmpkey.dpapi"
+        Remove-Item $dpPath -ErrorAction SilentlyContinue
+        & go build -o build/vmpkeywrap.exe ./cmd/vmpkeywrap 2>&1 | Out-Null
+        & .\build\vmpkeywrap.exe -key $extHex -out $dpPath 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            $fail++; $failLines += "E2EFAIL ext-key/dpapi: vmpkeywrap failed"
+        } else {
+            $rw = Get-ExitCode $extExe @("check_key", "10")
+            if (($rw.Code -eq 0) -and ($rw.Out.Trim() -eq "143")) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL ext-key/dpapi: code=0x{0:X8} out=[{1}] (expect 143; the plaintext beside it was deliberately WRONG, so this also proves the .dpapi is preferred)" -f ($rw.Code -band 0xFFFFFFFF), $rw.Out.Trim()) }
+            # 7) 受保护文件被改一个字节 => 解不开 => 硬门。先把错明文挪走，让这条**只**取决于篡改检测
+            #    （否则"回退到错明文"也能得到同样的硬门，这条断言就没有区分力）。
+            Remove-Item $extKeyBeside -ErrorAction SilentlyContinue
+            # 偏移必须落在**受完整性保护**的区域：实测 DPAPI 密文的第 4..19 字节是 provider GUID，
+            # 翻它 CryptUnprotectData 照样成功、解出同一把密钥（"改一字节"在那里没有任何效果）。
+            # 取末尾 4 字节（密文/MAC 区）—— 逐偏移量测过（方法见 STATUS #590）：除 4..19 外全部被检出。
+            $bad = [System.IO.File]::ReadAllBytes($dpPath)
+            $bad[$bad.Length - 4] = $bad[$bad.Length - 4] -bxor 0xFF
+            [System.IO.File]::WriteAllBytes($dpPath, $bad)
+            $rt = Get-ExitCode $extExe @("check_key", "10")
+            if ((('{0:X8}' -f ($rt.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($rt.Out -eq "")) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL ext-key/dpapi-tamper: code=0x{0:X8} out=[{1}] (expect 0xC0DE0007)" -f ($rt.Code -band 0xFFFFFFFF), $rt.Out.Trim()) }
+            Remove-Item $dpPath -ErrorAction SilentlyContinue
+        }
+
+        # 8) correct key via the VMPX_KEY environment variable (fallback form) => identical to native
         $env:VMPX_KEY = $extHex.ToUpper()
         $nOut = Run-File "build/target.exe" @("check_key", "10") 30
         $vOut = Run-File $extExe @("check_key", "10") 30

@@ -1720,9 +1720,84 @@ static int vm_key_from_sentinel(void) {
     return 0;
 }
 
+/* ---------------- DPAPI 保护的密钥文件（STATUS #590） ----------------
+ * 部署形态：<产物>.vmpkey 是明文（32 字节原始，或 64 位 hex）。受保护形态是
+ * <产物>.vmpkey.dpapi —— 由 cmd/vmpkeywrap 在**目标机器 + 目标用户**上生成
+ * （CryptProtectData，用户作用域，entropy = "vmpx-payload-key-v1"）。
+ * 拷到别的机器/别的用户解不开；被改动一个字节也解不开 —— 两条都已经在 e2e 里断言。
+ *
+ * 为什么 blob 自己解而不是让宿主解：blob 虽然 freestanding，但"按名字找导出"这条路仓库已经在用
+ * （vm_find_module + vm_get_proc，含转发导出处理）。crypt32 在多数进程里已加载；没加载就用
+ * **ntdll!LdrLoadDll** 主动加载 —— ntdll 的导出从不转发，与硬门用 NtTerminateProcess 同一个理由。 */
+typedef struct { u32 cbData; u8 *pbData; } vm_dblob_t;
+
+static const char vm_dpapi_entropy[] = "vmpx-payload-key-v1";
+
+/* ASCII -> u16（blob 里不用宽字符串字面量，少一层重定位/合并器的面）。 */
+static void vm_name_u16(u16 *dst, const char *src, u32 cap) {
+    u32 i = 0;
+    for (; src[i] && i + 1 < cap; i++) dst[i] = (u16)(u8)src[i];
+    dst[i] = 0;
+}
+
+/* 读 <path> 并解开 DPAPI 密文，成功则把 32 字节主密钥写进 vm_master_buf。
+ * 返回 1 = 成功；0 = 文件不在 / 解不开 / 长度不对（调用方回退明文形态）。 */
+static int vm_key_from_file_dpapi(const u16 *path) {
+    static u8 blob[512];
+    static u16 name[16];
+    u32 got = 0;
+    if (!vm_key_read_nt(path, blob, (u32)sizeof(blob), &got) || got < 16) return 0;
+    u64 c32 = vm_find_module("crypt32.dll");
+    if (!c32) {
+        typedef long (VM_WINAPI *ldrload_t)(u16 *, u32 *, vm_ustr_t *, void **);
+        ldrload_t ld = (ldrload_t)vm_get_proc(vm_find_module("ntdll.dll"), "LdrLoadDll");
+        if (!ld) return 0;
+        vm_name_u16(name, "crypt32.dll", 16);
+        vm_ustr_t us;
+        us.Length = 22;        /* "crypt32.dll" = 11 个字符 */
+        us.MaximumLength = 24;
+        us.Buffer = name;
+        void *h = 0;
+        if (ld(0, 0, &us, &h) < 0 || !h) return 0;
+        c32 = (u64)h;
+    }
+    typedef int (VM_WINAPI *unprot_t)(vm_dblob_t *, u16 **, vm_dblob_t *, void *, void *, u32, vm_dblob_t *);
+    unprot_t up = (unprot_t)vm_get_proc(c32, "CryptUnprotectData");
+    if (!up) return 0;
+    vm_dblob_t in, ent, out;
+    in.cbData = got;
+    in.pbData = blob;
+    ent.cbData = (u32)sizeof(vm_dpapi_entropy) - 1;
+    ent.pbData = (u8 *)vm_dpapi_entropy;
+    out.cbData = 0;
+    out.pbData = 0;
+    if (!up(&in, 0, &ent, 0, 0, 0x1u /* CRYPTPROTECT_UI_FORBIDDEN */, &out)) return 0;
+    int ok = 0;
+    if (out.pbData && out.cbData >= 32) {
+        u32 i;
+        for (i = 0; i < 32; i++) vm_master_buf[i] = out.pbData[i];
+        ok = 1;
+    }
+    if (out.pbData) { /* DPAPI 用 LocalAlloc 分配，必须还回去：不复用会被宿主进程记一笔泄漏 */
+        typedef void *(VM_WINAPI *free_t)(void *);
+        free_t lf = (free_t)vm_get_proc(vm_find_module("kernel32.dll"), "LocalFree");
+        if (lf) lf(out.pbData);
+    }
+    return ok;
+}
+
 static int vm_key_from_file(void) {
     const u16 *path = vm_key_path();
     if (!path || !*path) return 0;
+    /* **受保护形态优先**：同目录同前缀的 <产物>.vmpkey.dpapi。
+     * 解不开/不存在就回退明文 —— 于是"只分发受保护文件"是默认姿势，而已有部署（只有明文）逐字节不变。 */
+    static u16 dpath[400];
+    u32 n = 0;
+    while (path[n] && n < 391) { dpath[n] = path[n]; n++; }
+    const char *suf = ".dpapi";
+    for (u32 i = 0; i < 6; i++) dpath[n++] = (u16)(u8)suf[i];
+    dpath[n] = 0;
+    if (vm_key_from_file_dpapi(dpath)) return 1;
     u8 buf[128];
     u32 got = 0;
     if (!vm_key_read_nt(path, buf, (u32)sizeof(buf), &got)) return 0;

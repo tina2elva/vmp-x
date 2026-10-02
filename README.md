@@ -37,6 +37,16 @@ gcc -O2 -o build/target.exe testdata/target.c
 ./build/target_vmp.exe check_key 12345
 ```
 
+外置主密钥（1b）时，产物旁边的 `<产物>.vmpkey` 就是密钥。它默认是明文 hex；要让它**只在本机本用户**可用，
+在**目标机器**上再包一层 DPAPI（拷到别的机器/别的用户、或改一个字节都解不开）：
+
+```powershell
+go build -o build/vmpkeywrap.exe ./cmd/vmpkeywrap
+./build/vmpkeywrap.exe -in build/target_vmp.exe.vmpkey -out build/target_vmp.exe.vmpkey.dpapi
+```
+
+运行期**优先**读 `<产物>.vmpkey.dpapi`，解不开才回退明文 —— 所以分发时只放受保护文件即可。
+
 
 ## 一条命令跑完全部门禁（本机 Windows/amd64）
 

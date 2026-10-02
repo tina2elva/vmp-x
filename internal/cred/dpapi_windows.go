@@ -34,6 +34,10 @@ var (
 // 别的程序即使用同一个用户也解不出一份"通用"明文。
 var Entropy = []byte("vmpx-toolkey-v1")
 
+// EntropyPayload 是**产物主密钥**（<产物>.vmpkey.dpapi）用的固定混入串。
+// 与工具侧刻意分开：两处密文互不通用 —— 工具私钥的密文拿去当产物主密钥必然解不开，反之亦然。
+var EntropyPayload = []byte("vmpx-payload-key-v1")
+
 const cryptprotectUIFORBIDDEN = 0x1
 
 func blobOf(b []byte) (*dataBlob, error) {
@@ -54,12 +58,20 @@ func takeBlob(out dataBlob) []byte {
 }
 
 // Protect 用 DPAPI 加密（用户作用域）。
-func Protect(plain []byte) ([]byte, error) {
+func Protect(plain []byte) ([]byte, error) { return protectWith(plain, Entropy) }
+
+// ProtectPayload：给**产物主密钥**用（cmd/vmpkeywrap），entropy 与工具侧不同。
+func ProtectPayload(plain []byte) ([]byte, error) { return protectWith(plain, EntropyPayload) }
+
+// UnprotectPayload：解产物主密钥的密文（测试与工具侧自检用；blob 里有自己的 freestanding 实现）。
+func UnprotectPayload(blob []byte) ([]byte, error) { return unprotectWith(blob, EntropyPayload) }
+
+func protectWith(plain, entropy []byte) ([]byte, error) {
 	in, err := blobOf(plain)
 	if err != nil {
 		return nil, err
 	}
-	ent, _ := blobOf(Entropy)
+	ent, _ := blobOf(entropy)
 	var out dataBlob
 	r, _, lastErr := procProtect.Call(uintptr(unsafe.Pointer(in)), 0,
 		uintptr(unsafe.Pointer(ent)), 0, 0, cryptprotectUIFORBIDDEN, uintptr(unsafe.Pointer(&out)))
@@ -70,12 +82,14 @@ func Protect(plain []byte) ([]byte, error) {
 }
 
 // Unprotect 解密；换机器/换用户/被篡改都会失败。
-func Unprotect(blob []byte) ([]byte, error) {
+func Unprotect(blob []byte) ([]byte, error) { return unprotectWith(blob, Entropy) }
+
+func unprotectWith(blob, entropy []byte) ([]byte, error) {
 	in, err := blobOf(blob)
 	if err != nil {
 		return nil, err
 	}
-	ent, _ := blobOf(Entropy)
+	ent, _ := blobOf(entropy)
 	var out dataBlob
 	r, _, lastErr := procUnprot.Call(uintptr(unsafe.Pointer(in)), 0,
 		uintptr(unsafe.Pointer(ent)), 0, 0, cryptprotectUIFORBIDDEN, uintptr(unsafe.Pointer(&out)))

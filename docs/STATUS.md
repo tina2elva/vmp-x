@@ -10077,3 +10077,42 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
 **未做项**
 - 硬件狗（Sentinel）与 DLL 的组合**没有**单独验证（同一条取钥接缝，理论上跟着受益）。
 - i386（win/x86）宿主下的 DLL 外置密钥只做了**代码级**偏移适配，**没有**实机验证（本机没有 32 位宿主环境）。
+
+### 590. DPAPI 保护的 payload 主密钥形态（`#393`）：`<产物>.vmpkey.dpapi`
+
+**做了什么**
+- **运行期**（`stub/win/x64/vm_interp.c`）：`vm_key_from_file()` **优先**读同目录同前缀的
+  `<产物>.vmpkey.dpapi`，用 `CryptUnprotectData`（crypt32.dll，entropy = `vmpx-payload-key-v1`，
+  用户作用域，`CRYPTPROTECT_UI_FORBIDDEN`）解出 32 字节主密钥；解不开/不存在就**回退**明文
+  `<产物>.vmpkey`（既有部署逐字节不变）。crypt32 未加载时用 **ntdll!LdrLoadDll** 主动加载
+  （与硬门用 NtTerminateProcess 同一个理由：ntdll 的导出从不转发）；输出用 kernel32!`LocalFree` 还回去。
+- **工具侧**：`internal/cred` 增加 `EntropyPayload` / `ProtectPayload` / `UnprotectPayload`
+  （与工具私钥的 entropy **刻意分开**：两处密文互不通用）；非 Windows 明确报错，不静默退回明文。
+  新增 `cmd/vmpkeywrap`：`-key <64hex>` 或 `-in <vmpbuild -key-out 的产物>` → `-out <产物>.vmpkey.dpapi`，
+  写完**立刻自解一遍**核对（宁可在这里失败，也不要写出一个运行期必然解不开的文件）。
+- 已有明文形态、环境变量形态、DLL 形态都不受影响（下面 e2e 全绿）。
+
+**证据（本机端到端）**
+- `tools/e2e.ps1` 的 1b 段新增两条：
+  1. **优先级 + 真的能解**：旁边**故意**放一个**错的**明文 `<产物>.vmpkey`，同时放正确的 `.dpapi`
+     ⇒ 仍返回 `143`。这一条自带校准：运行期若**不支持** DPAPI，就会回退到那份错明文 ⇒ 必然硬门 ⇒ 用例红。
+     （同时证明 freestanding blob 自己找到并加载 crypt32、entropy 两边一致。）
+  2. **篡改**：把 `.dpapi` 末尾 4 字节翻一位、并把明文挪走 ⇒ `0xC0DE0007` 且无输出。
+- **量测出来的一个 DPAPI 事实**（`build/dpapi_probe.go` 逐偏移翻转 262 字节的密文）：
+  第 **4..19 字节是 provider GUID，不在完整性保护范围内** —— 翻它 `CryptUnprotectData` 照样成功、
+  解出同一把密钥；其余偏移全部被检出。所以"改一字节"的用例必须落在密文/MAC 区
+  （第一版我翻了第 16 字节，用例判红的是**我的期望**而不是实现）。这不构成绕过：改 GUID 只会得到
+  同一把密钥，拿不到别人机器上的密钥。
+- 本机验收：`preflight OK`（含新加的第 5 项门禁）、`gates total 15 gates, 0 failed`（e2e 见下）。
+
+**顺带修掉的一个真坑（并已变成门禁）**：`tools/e2e.ps1` 这类**含中文**的 `.ps1` 必须带 UTF-8 BOM ——
+PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接语法错误**。本轮编辑工具把开头的 BOM
+吃掉了，`Parser::ParseFile` 当场报 **10 个解析错误**（位置还指向无关的第 115 行，很难查）。
+- 已在 `tools/preflight.ps1` 增加第 5 项：**含非 ASCII 的 `tools/*.ps1` 必须带 UTF-8 BOM**（否则 preflight 红）。
+- 这条门禁第一次运行就抓出 HEAD 里**本来就坏**的两个文件：`tools/verify_linux_payload.ps1`、
+  `tools/_write_lift.ps1`（含中文、无 BOM）—— 一并补齐，现在 `tools/*.ps1` 全部可解析。
+
+**未做项**
+- TPM/TEE 封印（"密钥永不出芯片"）与"授权回调"形态仍未做；本轮只做了 `#393` 里那个**过渡方案**。
+- DPAPI 的边界照旧如实说明：只挡"拷走文件到别的机器/别的用户"，**不挡**同一用户在本机调用
+  `CryptUnprotectData`，也不防内存抓取。

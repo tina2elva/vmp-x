@@ -1,4 +1,4 @@
-# verify_linux_payload.ps1 - verify (on Windows) that the protected Linux/amd64 payload executes.
+﻿# verify_linux_payload.ps1 - verify (on Windows) that the protected Linux/amd64 payload executes.
 #
 # The injected machine code is position-independent x86-64 and independent of the host kernel.
 # Mapping it at the ELF's original VA and calling the thunk with the guest calling convention

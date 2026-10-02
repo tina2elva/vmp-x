@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location "D:\vmp-x"
 $content = @'
 // Package arm64 把 ARM64（A64）指令翻译成平台无关 IR。

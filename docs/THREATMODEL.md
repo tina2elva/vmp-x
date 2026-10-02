@@ -65,7 +65,10 @@
 
 ### G7 机器/狗绑定的其余形态未做
 - `docs/TODO.md:225`（TPM/TEE/授权回调封印）、`:599`（母狗私钥保护 + `vmpbuild --key-from-dongle`）。
-- 注：DPAPI **工具侧已有**（`cmd/vmpepoch/license.go:130` 给签名私钥用），但**payload 主密钥**还没有。
+- 注：DPAPI **工具侧已有**（`cmd/vmpepoch/license.go:130` 给签名私钥用）；**payload 主密钥**的受保护形态
+  已在 `STATUS #590` 落地 —— `<产物>.vmpkey.dpapi`（`cmd/vmpkeywrap` 生成，运行期优先读它，
+  用 crypt32 的 `CryptUnprotectData` 解）。要点：它挡的是"拷走密钥文件到别的机器/别的用户"，
+  **不挡**同一用户在本机解密，也不防内存抓取；要更强仍得上 TPM/TEE。
 
 ### G8 反调试只抬成本，不构成边界
 - 4 条路径 + 静默延后；对手有调试/内核权限时只是减速带。
