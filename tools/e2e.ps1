@@ -161,8 +161,11 @@ $cases = @(
     @{ f = "sub128";         args = @(0, 1, 7, 255, 12345, 1000000, 18446744073709551615) }
 )
 
-$pass = 0; $fail = 0
+$pass = 0; $fail = 0; $skip = 0
 $failLines = @()
+# 未验证项（例如"本机没有 TPM，TPM 那条路没法验"）**必须单独记账**：混进 passed 就是让"通过数"说谎。
+# 每条 skip 都要带可见原因，摘要里与 passed/failed 一起打印；skip 不会让退出码变红。
+$skipLines = @()
 Write-Output ("[*] differential test (native vs protected)... cases=" + $cases.Count + " 名称=" + (($cases | ForEach-Object { $_.f }) -join ","))
 if ((Get-Item build\target_vmp.exe).LastWriteTime -ne $packTime) { Write-Host "[FAIL] target_vmp.exe changed after packing"; exit 1 }
 foreach ($c in $cases) {
@@ -358,6 +361,9 @@ if ($LASTEXITCODE -ne 0) {
         Remove-Item $ncPath -ErrorAction SilentlyContinue
         $ncOut = (& .\build\vmpkeywrap.exe -key $extHex -out $ncPath 2>&1 | Out-String).Trim()
         $ncExit = $LASTEXITCODE
+        # 工具自己报出的字节数：后面篡改扫描的"期望长度"用它（不手工推算）。
+        $ncExpect = 0
+        if ($ncOut -match 'wrote .*\((\d+) bytes') { $ncExpect = [int]$Matches[1] }
         if (($ncExit -ne 0) -or (-not (Test-Path $ncPath))) {
             $fail++; $failLines += ("E2EFAIL ext-key/ncrypt: vmpkeywrap failed (exit={0}): {1}" -f $ncExit, $ncOut)
         } else {
@@ -392,24 +398,36 @@ if ($LASTEXITCODE -ne 0) {
             # 10) 篡改标定：**逐个偏移量**翻一个字节，每一个都必须被检出（硬门 0xC0DE0007 且无输出）。
             #     先把明文与 .dpapi 挪走，让这条**只**取决于 .ncrypt（否则"回退到别的形态"也能得到硬门，
             #     这条断言就没有区分力）。标定方式就是"量的不是某一个字节，而是整个文件的每一个偏移量"：
-            #     长度以文件实际大小为准（这里 16 字节头 + 密钥名 + 256 字节 RSA 密文），不再手工挑位置。
+            #     长度以文件实际大小为准（这里 16 字节头 + 密钥名 + 256 字节 RSA 密文），不再手工挑位置；
+            #     但"长度来自文件"本身有个真空通过的坑（0 字节文件 => 0 个偏移 => 全部通过），
+            #     所以下面先做**下限断言**：短于格式下限或与工具报出的字节数不符，直接判红。
             Remove-Item $extKeyBeside, $dpPath2 -ErrorAction SilentlyContinue
             $ncGood = [System.IO.File]::ReadAllBytes((Resolve-Path $ncPath).Path)
-            $ncBadOff = @()
-            $ncDet = 0
-            for ($i = 0; $i -lt $ncGood.Length; $i++) {
-                $mut = [byte[]]::new($ncGood.Length)
-                [Array]::Copy($ncGood, $mut, $ncGood.Length)
-                $mut[$i] = $mut[$i] -bxor 0xFF
-                [System.IO.File]::WriteAllBytes((Resolve-Path $ncPath).Path, $mut)
-                $rt2 = Get-ExitCode $extExe @("check_key", "10")
-                if ((('{0:X8}' -f ($rt2.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($rt2.Out -eq "")) { $ncDet++ }
-                elseif ($ncBadOff.Count -lt 6) { $ncBadOff += $i }
+            # 下限断言（防**真空通过**）：长度虽然取自文件，但不能只信文件 ——
+            # 0 字节（或短于格式下限）的文件会让"0 个偏移全部通过"。
+            # 下限 = 16 字节头 + 至少 1 字节密钥名 + 至少 32 字节密文 = 49；
+            # 另外再要求与 vmpkeywrap 自己报出的字节数**相等**（自洽断言，双重保险）。
+            $ncMinLen = 16 + 1 + 32
+            if (($ncGood.Length -lt $ncMinLen) -or ($ncGood.Length -ne $ncExpect)) {
+                $fail++
+                $failLines += ("E2EFAIL ext-key/ncrypt-tamper: refusing to sweep a {0}-byte file (format floor {1}, vmpkeywrap reported {2}) - a zero or short input would 'pass' 0/0 offsets vacuously" -f $ncGood.Length, $ncMinLen, $ncExpect)
+            } else {
+                $ncBadOff = @()
+                $ncDet = 0
+                for ($i = 0; $i -lt $ncGood.Length; $i++) {
+                    $mut = [byte[]]::new($ncGood.Length)
+                    [Array]::Copy($ncGood, $mut, $ncGood.Length)
+                    $mut[$i] = $mut[$i] -bxor 0xFF
+                    [System.IO.File]::WriteAllBytes((Resolve-Path $ncPath).Path, $mut)
+                    $rt2 = Get-ExitCode $extExe @("check_key", "10")
+                    if ((('{0:X8}' -f ($rt2.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($rt2.Out -eq "")) { $ncDet++ }
+                    elseif ($ncBadOff.Count -lt 6) { $ncBadOff += $i }
+                }
+                [System.IO.File]::WriteAllBytes((Resolve-Path $ncPath).Path, $ncGood)
+                Write-Output ("  [*] ncrypt tamper sweep: {0}/{1} offsets rejected (file {2} bytes)" -f $ncDet, $ncGood.Length, $ncGood.Length)
+                if ($ncBadOff.Count -eq 0) { $pass++ }
+                else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt-tamper: only {0}/{1} offsets rejected; first bad offsets: {2}" -f $ncDet, $ncGood.Length, ($ncBadOff -join ",")) }
             }
-            [System.IO.File]::WriteAllBytes((Resolve-Path $ncPath).Path, $ncGood)
-            Write-Output ("  [*] ncrypt tamper sweep: {0}/{1} offsets rejected (file {2} bytes)" -f $ncDet, $ncGood.Length, $ncGood.Length)
-            if ($ncBadOff.Count -eq 0) { $pass++ }
-            else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt-tamper: only {0}/{1} offsets rejected; first bad offsets: {2}" -f $ncDet, $ncGood.Length, ($ncBadOff -join ",")) }
             # 11) 软件 KSP 那条路：显式 -provider software —— 本机确定可复现，不依赖有没有 TPM。
             #     显式指定 + 断言用的是软件提供程序 ⇒ "软件 KSP 下端到端通过"这条有直接证据。
             Remove-Item $ncPath -ErrorAction SilentlyContinue
@@ -429,14 +447,26 @@ if ($LASTEXITCODE -ne 0) {
             # 判"成功"必须同时看到 exit=0 + 写出标记 + 提供程序就是 TPM：
             # 只看名字会被**失败信息里的提供程序名**骗过（那会让这条静默地变成假通过）。
             $tpmOk = ($LASTEXITCODE -eq 0) -and $tpmOut.Contains("[+] wrote") -and $tpmOut.Contains("provider: Microsoft Platform Crypto Provider")
+            # 记账：这一档"应不应该是 skip"由**观测**（$tpmOk）决定，而不是由计数器决定；
+            # 然后断言 skip 计数器确实按观测动了 —— 于是"把 skip 写成 pass"这种伪装会被抓红
+            # （观测是 skip，但 skip 计数器没动 ⇒ accounting 断言失败）。
+            $skipBeforeTpm = $skip
             if (-not $tpmOk) {
-                Write-Output "  [skip] -provider tpm unavailable on this machine => the TPM path is NOT verified here"
-                Write-Output ("         reason: " + $tpmOut)
-                $pass++
+                $tpmSkipReason = "-provider tpm unavailable on this machine (no usable TPM / Platform Crypto Provider): " + ($tpmOut -replace '\s+', ' ')
+                Write-Output ("  [SKIP] ext-key/ncrypt-tpm: " + $tpmSkipReason)
+                $skip++; $skipLines += ("ext-key/ncrypt-tpm: " + $tpmSkipReason)
             } else {
                 $rtpm = Get-ExitCode $extExe @("check_key", "10")
                 if (($rtpm.Code -eq 0) -and ($rtpm.Out.Trim() -eq $ncNative)) { $pass++ }
                 else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt-tpm: code=0x{0:X8} out=[{1}] (TPM-wrapped key must work end-to-end)" -f ($rtpm.Code -band 0xFFFFFFFF), $rtpm.Out.Trim()) }
+            }
+            # accounting 断言：观测到的"跳过"必须与 skip 计数一致（skip 绝不能记成 pass）。
+            $tpmSkipDelta = $skip - $skipBeforeTpm
+            if ((-not $tpmOk) -and ($tpmSkipDelta -ne 1)) {
+                $fail++; $failLines += ("E2EFAIL accounting/ncrypt-tpm: the TPM case WAS skipped (observed) but the skip counter moved by {0} - a skipped case must never be counted as passed" -f $tpmSkipDelta)
+            }
+            elseif ($tpmOk -and ($tpmSkipDelta -ne 0)) {
+                $fail++; $failLines += ("E2EFAIL accounting/ncrypt-tpm: the TPM case was NOT skipped but the skip counter moved by {0}" -f $tpmSkipDelta)
             }
             Remove-Item $ncPath, $extKeyBeside, $dpPath2 -ErrorAction SilentlyContinue
         }
@@ -568,9 +598,19 @@ if (($LASTEXITCODE -eq 0) -and (Test-Path $vvOut)) { $pass++ }
 else { $fail++; $failLines += ("E2EFAIL verify: -verify 正例未通过（exit={0} 产物存在={1}）" -f $LASTEXITCODE, (Test-Path $vvOut)) }
 
 Write-Output ""
+# 不变式：每记一次 skip 就必须有一条**可见原因**（不允许"无名跳过"）。
+if ($skip -ne $skipLines.Count) {
+    $fail++
+    $failLines += ("E2EFAIL accounting/skip: {0} skip(s) counted but {1} reason line(s) recorded (every skip must carry a visible reason)" -f $skip, $skipLines.Count)
+}
+if ($skipLines.Count -gt 0) {
+    Write-Output "--- skipped cases: NOT verified by this run, and NOT counted as passed ---"
+    foreach ($sl in $skipLines) { Write-Output ("SKIP " + $sl) }
+}
 if ($failLines.Count -gt 0) {
     Write-Output "--- failure summary (one line per case, for CI annotations) ---"
     foreach ($fl in $failLines) { Write-Output $fl }
 }
-Write-Output ("e2e: {0} passed, {1} failed" -f $pass, $fail)
+# 摘要三分：passed / skipped / failed。skip 单独打印，不计入 passed；skip 不会让退出码变红。
+Write-Output ("e2e: {0} passed, {1} skipped, {2} failed" -f $pass, $skip, $fail)
 if ($fail -ne 0) { exit 1 }
