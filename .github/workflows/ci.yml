@@ -205,6 +205,38 @@ jobs:
           set -o pipefail
           bash tools/e2e_elf_image.sh --strict 2>&1 | tee build/elf_image_e2e.log
 
+      # ET_DYN(PIE)：两个用例在 CI 里**长期缺失**（只有本地 tools/wsl_linux.sh 跑过），
+      # 于是"CI 五作业全绿"只能证明 ET_EXEC 没回归 —— 加密节内的相对重定位（运行期应用器）
+      # 从未被 CI 覆盖（t6 的 FINDING）。
+      #
+      # 顺序是硬要求：布局门禁必须**紧跟**产生它的那次 e2e。blob 构建带随机性，门禁与产物之间
+      # 只要又跑了一次 e2e（重建 blob），E3 就会报 "[FAIL] ... blob byte(s) differ"
+      # （wsl_linux.sh 里同一条纪律）。因此 PIE 与 PIE_RELOCS 各自"e2e → 门禁"成对出现。
+      - name: ELF PIE image encryption e2e (ET_DYN, entry self-decrypt)
+        run: |
+          set -o pipefail
+          env PIE=1 TAG=pie bash tools/e2e_elf_image.sh --strict 2>&1 | tee build/elf_image_e2e_pie.log
+      - name: ELF layout gate (PIE, self-calibrating)
+        run: |
+          set -o pipefail
+          python3 tools/check_elf_layout.py \
+            --packed build/elf_target_pie.enc \
+            --manifest build/vm_interp_elf.json \
+            --blob build/vm_interp_elf.bin \
+            --report build/elf_enc_pie.json --selftest 2>&1 | tee build/elf_layout_pie.log
+      - name: ELF PIE with in-range relocations e2e (runtime reloc applier)
+        run: |
+          set -o pipefail
+          env PIE_RELOCS=1 TAG=pierel bash tools/e2e_elf_image.sh --strict 2>&1 | tee build/elf_image_e2e_pierel.log
+      - name: ELF layout gate (PIE + relocations, self-calibrating)
+        run: |
+          set -o pipefail
+          python3 tools/check_elf_layout.py \
+            --packed build/elf_target_pierel_relocs.enc \
+            --manifest build/vm_interp_elf.json \
+            --blob build/vm_interp_elf.bin \
+            --report build/elf_enc_pierel_relocs.json --selftest 2>&1 | tee build/elf_layout_pierel.log
+
   # ---------------------------------------------------------------- Linux/arm64 (qemu-user)
   linux-arm64:
     runs-on: ubuntu-latest
