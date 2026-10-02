@@ -10,7 +10,7 @@
 | Windows/amd64 | **Windows PowerShell 5.1 或 PowerShell 7**（本机只有 5.1，所有脚本都兼容两者）+ msys2 UCRT64 的 `gcc``objdump``ld`（或等价的 MinGW-w64 工具链）+ PowerShell 7 |
 | Linux/amd64 | `gcc``binutils``readelf` |
 | Linux/arm64 | `aarch64-linux-gnu-gcc``aarch64-linux-gnu-objdump``qemu-user` |
-| Windows/arm64 | **已全绿**：CI 用 clang 的 `aarch64-w64-windows-gnu` 目标产出 arm64 COFF blob 并在 `windows-11-arm` 原生 arm64 Windows 上**真跑**（native 与打包后退出码一致）。本机只需 Go + clang（可选） |
+| Windows/arm64 | **已从 CI 移除**（2026-09-30，平台暂缓，见 `STATUS #593`）。恢复后仍可用 clang 的 `aarch64-w64-windows-gnu` 目标产出 arm64 COFF blob，并在 `windows-11-arm` 原生 arm64 Windows 上真跑 |
 
 ## 1. Windows / amd64（本机已验证）
 
@@ -53,13 +53,13 @@ qemu-user 走的是正常 `execve` 装载路径，所以**内核/加载器把控
 
 ## 4. Windows / arm64（CI 上已完成构建 + 真跑）
 
-本机没有 aarch64 的 Windows 工具链，所以这一段完全交给 CI（两个作业）：
+本机没有 aarch64 的 Windows 工具链。这一段原先由 CI 的两个作业承担，**两个作业已于 2026-09-30 从 `ci.yml` 移除**（见 `STATUS #593`；本地复现脚本 `tools/e2e_win_arm64.ps1` 保留）。当时的做法记录如下，恢复时可直接照用：
 
-- `windows-arm64-blob`（ubuntu-latest）：`sudo apt-get install -y llvm lld` 后，用
+- （已移除）`windows-arm64-blob`（ubuntu-latest）：`sudo apt-get install -y llvm lld` 后，用
   `clang --target=aarch64-w64-windows-gnu` 编 blob（合并走内置合并器 `-merge go`，不需要 ld），
   再用同一个 clang 编一个 **freestanding 的 arm64 PE 目标**并打包，校验入口补丁是 8 字节
   `mov x16,x30 ; b thunk`（报告 JSON 里 `F0 03 1E AA`）。
-- `windows-arm64-run`（`windows-11-arm`，GitHub 的原生 arm64 Windows）：编 blob → 编 PE 目标 → 打包 →
+- （已移除）`windows-arm64-run`（`windows-11-arm`，GitHub 的原生 arm64 Windows）：编 blob → 编 PE 目标 → 打包 →
   **native 与打包后各跑一次**，比对退出码（目标把被保护函数的返回值混合成一个 30 位退出码，
   任一项算错都会变）。最近一次结果：`native=654184885 protected=654184885`。
 
@@ -213,7 +213,7 @@ git push -u origin main
 1. `build/` 里既有产物也有 **AEAD 主密钥**（`build/vm_interp.json` 的 `key` 字段）——`.gitignore` 已把 `build/` 排除，
    推之前请再确认一次 `git status` 里没有 `build/`；
 2. CI 首次运行最可能在 `linux-amd64`（`tools/e2e.sh`）与 `linux-arm64`（qemu）两个作业上暴露问题 ——
-   这两个脚本从未在 Linux 上跑过；`windows-arm64-blob` 若镜像里没有 aarch64 COFF 编译器会**明确失败**（不会静默跳过）。
+   这两个脚本从未在 Linux 上跑过。（原先 `windows-arm64-blob` 若镜像里没有 aarch64 COFF 编译器会**明确失败**、不会静默跳过 —— 该作业已于 2026-09-30 移除。）
 ## 6. 本机 vs CI 的边界（收尾报告要用的两栏）
 
 | 项目 | 状态 |

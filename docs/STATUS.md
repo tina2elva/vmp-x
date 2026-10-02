@@ -10273,3 +10273,30 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
    本轮多次假红（`171/2`、`172/1`）都与并发有关（评审自己遗留在临时树里的陈旧 `.ncrypt` 也污染过一次现场），
    复核后均能干净重跑（gates `15/0`、e2e `173/0`）⇒ 记为"**宿主负载/并发导致的测试抖动，不归因被测代码**"，
    但**报告数字必须注明工作区状态**。
+
+### 593. 停掉两个 win/arm64 CI 作业：验收口径「五作业」→「三作业」
+
+**做了什么**
+- 用户决定（2026-09-30）**暂缓 win/arm64** ⇒ 从 `.github/workflows/ci.yml` 删除 `windows-arm64-blob` 与 `windows-arm64-run`。
+  两者本来都是 `continue-on-error: true` 的**复现器**（跑绿跑红都不影响结论），却每轮占几分钟。
+- 停后 CI 是**三个硬门作业**（`continue-on-error` 全为空）：`windows-amd64`（10 步）/ `linux-amd64`（11 步）/
+  `linux-arm64`（qemu-user **真执行** aarch64，5 步）⇒ **"run 绿"现在等于"三个作业都真的绿"**，不再有"看着绿其实没跑"的作业。
+  （注意 `linux-arm64` **不是** Windows 的、也不是被停的那个；Linux/arm64 覆盖全在它身上，没有被削弱。）
+- **口径同步（只改当前口径；历史 STATUS 条目一律不改写）**：`AGENTS.md`（验收第 2/3 条，顺带把过期的
+  `e2e 165/0、dll 3/3` 更正为 `173/0、7/0`）、`docs/HANDOFF.md`（作业列表 + 3 处「五作业」）、`README.md`（平台表 +
+  `continue-on-error` 提示）、`docs/RUNBOOK.md`（作业说明）、`docs/TODO.md`（「还等拍板」→ 已执行；win/arm64 暂缓节）、
+  `docs/THREATMODEL.md`（验收句）、`tools/wsl_linux.sh`（注释）。
+- 删除 `.github/actionlint.yaml`：它存在的**唯一**目的就是给 `windows-11-arm` 标签登记（该作业已删）⇒ 成了死配置。
+- **保留未动**：`stub/win/arm64`、`tools/e2e_win_arm64.ps1`（本地复现器），以及所有历史记录
+  （`#497`/`#505`–`#523`/`#581` 里的 win/arm64 证据与缺口描述**都还在**）。
+
+**证据**
+- `python tools/check_workflow.py .github/workflows/ci.yml` → **`workflow OK: jobs=3`**；
+  结构核对：`windows-amd64`(10 步) / `linux-amd64`(11 步) / `linux-arm64`(5 步)，三者的 `continue-on-error` 均为空。
+- 本机：`tools/preflight.ps1` → `[+] preflight: OK`；`tools/gates.ps1` → `total 15 gates, 0 failed`。
+- CI：run `<RUN>`（提交 `<SHA>`）→ **三个作业全绿**。
+
+**未做项 / 边界**
+- **恢复方法**：从 git 历史取回本次删除前的那两个 job 文本（见本条提交信息），或按 `docs/RUNBOOK.md` 第 5 节记录的原始做法重建。
+- 这**不是**"放弃在 Windows/arm64 上验证"的结论，只是**暂缓期间的 CI 成本决策**：win/arm64 的既有缺口
+  （ASLR + 目标无 `.reloc`，见 `#505`–`#523`；以及 `#581` 的暂缓登记）**都没有解决**，解禁时需连 CI 作业一起恢复。

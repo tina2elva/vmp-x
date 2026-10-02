@@ -84,10 +84,10 @@ powershell -NoProfile -File tools/gates.ps1
 | windows-amd64 | gofmt/vet/test + E2E（本机 `173 passed / 0 failed`；CI runner 无 TPM 时为 `172 passed, 1 skipped, 0 failed`，skip 带原因且不计为 passed）+ DLL 7 例 + arm64 客户机差分 | 绿（每次 push 都跑） |
 | linux-amd64 | **ELF 整体加密默认开**：打包 → 结构断言 → 文件级 0 残留 → 真跑与原生逐字节一致（`tools/e2e_elf_image.sh --strict`） | run **35482334570** 绿：`[OK  ] ELF 整体加密：输出一致` |
 | linux-arm64（qemu-user） | aarch64 的 ELF 整体加密 + 入口自解密（含补上的 `ORR Xd, XZR, #imm` 形式，两个被保护函数） | run **35481622554** 绿：`chunks=9217 NON-ZERO FOUND=0` + 运行期一致 |
-| windows-arm64（原生 arm64 Windows） | PE/arm64 三段：结构（补丁 `F0 03 1E AA …`）+ 文件级（`.text` 2.87→7.55、`.rdata` 0.20→7.62，0 命中）+ 运行期退出码一致 | run **35483191384** 绿：`native=… protected=…` |
+| ~~windows-arm64（原生 arm64 Windows）~~ | **已从 CI 移除**（2026-09-30，平台暂缓；历史结果：PE/arm64 三段结构+文件级+退出码一致，见 `STATUS #497`/`#593`） | — |
 
-> 注意：`windows-arm64-run` 在 `ci.yml` 里标了 `continue-on-error: true`（runner 标签可用性所限），
-> 所以它**红不会让整个 run 变红**——看结论时要单独看这个作业。
+> 注意：自 2026-09-30 起 `ci.yml` 只有**三个作业**（`windows-amd64` / `linux-amd64` / `linux-arm64`），
+> 且**都是硬门**（没有 `continue-on-error`）⇒ "run 绿"就是"三个作业都真的绿"。win/arm64 的两个复现器作业已移除。
 
 ### 仍未做（如实）
 

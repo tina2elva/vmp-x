@@ -13,9 +13,9 @@
 # KNOWN_FAIL below: steps that are known to fail on a *newer local toolchain* for a bug that is
 # registered separately (STATUS #584). Marking them is NOT loosening a check: they still run,
 # they still print every failing line, and the moment one of them PASSES this script says so
-# loudly ("remove the exemption") so an exemption cannot silently outlive its bug. This mirrors
-# how the two windows-arm64 CI jobs are continue-on-error while that platform is deferred
-# (STATUS #581).
+# loudly ("remove the exemption") so an exemption cannot silently outlive its bug. (Same family as
+# the win/arm64 deferral: those two CI jobs were continue-on-error while that platform was paused,
+# and on 2026-09-30 they were removed from ci.yml entirely -- see STATUS #581/#593.)
 #
 # Output is ASCII only (Windows runners are not UTF-8; see AGENTS.md).
 set -u

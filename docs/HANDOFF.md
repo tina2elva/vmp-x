@@ -8,7 +8,7 @@
 
 ## 1. 环境与工具
 - 工作区 `D:\vmp-x`；Go 1.24；Windows 10/11；本机有 msys2 gcc（`gcc`）与 Go 交叉编译（`GOOS=linux GOARCH=arm64` 可用）。
-- CI：GitHub Actions，仓库 `tina2elva/vmp-x`（public）。作业：`windows-amd64` / `linux-amd64` / `linux-arm64`(qemu) / `windows-arm64-blob` / `windows-arm64-run`。
+- CI：GitHub Actions，仓库 `tina2elva/vmp-x`（public）。作业：`windows-amd64` / `linux-amd64` / `linux-arm64`(qemu) —— **三个硬门作业**（2026-09-30 起 win/arm64 的两个复现器作业已从 `ci.yml` 移除，见 `STATUS #593`；本地脚本 `tools/e2e_win_arm64.ps1` 与 `stub/win/arm64` 保留未动）。
 - `gh` CLI 在 `"C:\Program Files\GitHub CLI\gh.exe"`（已登录 tina2elva，但不在 PATH，用绝对路径调）。
 - 本机没有 aarch64 工具链、没有 Linux/qemu：aarch64 与 Linux 侧的运行期验证**只能交给 CI**。
 
@@ -82,7 +82,7 @@
    改成"按该条目的 rva/salt 现推 `K_f`"。C 侧 salt 必须与 Go 的 `KDFSaltForPlacement` 一致
    （`vm_kdf_salt()` 已实现，KAT 已对齐，直接调用即可）。
 3. 验证顺序：重建 blob → `tools/gates.ps1`（要求 **15 gates / 0 failed**）→ 本机产品级回归
-   （见第 5 节 demo64 命令）→ push → 等 CI **五个作业全绿**。
+   （见第 5 节 demo64 命令）→ push → 等 CI **三个作业全绿**。
 4. 补一条单测："不同 RVA ⇒ 不同 salt ⇒ 不同 key"（`internal/inject/kdf_test.go` 已有 salt 用例，可扩展）。
 
 **T2 目标项 1b：主密钥外置 + 硬门**
@@ -111,7 +111,7 @@
 5. 工具输出**只用 ASCII**（Windows runner 的 python stdout 是 cp1252，中文会 `UnicodeEncodeError` 被误判成其它失败）。
 6. PowerShell 里**不要用 bash 的 heredoc**（`<<'MSG'`），提交信息写文件再 `git commit -F`；多行 `argparse`/`flag` 调用插入参数要插在**整个调用之后**。
 7. CI 日志：`gh run view <id> --job <jobid> --log`；有些步骤的输出被脚本重定向进 `build/ci_step.log`，job 日志只回显尾部，
-   必要时看注解 `::error title=...::` 里带的内容。注意 `windows-arm64-run` 在 `ci.yml` 里是 `continue-on-error: true`。
+   必要时看注解 `::error title=...::` 里带的内容。三个作业都是硬门（无 `continue-on-error`）：任何作业红 = 整体红，没有"看着绿其实没跑"的作业了。
 8. **不要在余量不足时动主干**：宁可只做零风险登记（这正是本次阻塞的原因）。
 9. 每轮把"做了什么、证据、未做项"写进 `docs/STATUS.md`（追加编号，不覆盖历史）。
 
@@ -138,7 +138,7 @@
 ## 7. 验收标准（每项都要给证据）
 1. `tools/gates.ps1` = **15 gates / 0 failed**；e2e **165 passed / 0 failed**；dll 3/3；arm64 客户机 OK；
 2. 本机产品级回归：demo64 三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 输出除 base 两行外一致；
-3. CI **五个作业全绿**（run 号写进 STATUS）；
+3. CI **三个作业全绿**（run 号写进 STATUS）；
 4. `docs/STATUS.md` 追加一条：做了什么、证据（含 run 号与命令）、**未做项**。
 
 
@@ -154,7 +154,7 @@
 1. `tools/preflight.ps1` → `[+] preflight: OK`；
 2. `tools/gates.ps1` → `total 15 gates, 0 failed`（e2e 165/0、dll 3/3、arm64 客户机 OK）；
 3. demo64：三节全加密、`.rdata` 熵 ≈7.99、**≥12 字节可读串 ≈0**、native/protected 仅 base/地址两行不同、退出码 0=0；
-4. CI 五个作业全绿，run 号写进 STATUS。
+4. CI 三个作业全绿，run 号写进 STATUS。
 
 ## 附录 C：并发协作约定
 - 工作区可能有两个会话同时改：**提交只用明确路径**（如 `git add cmd/vmpack/main.go`），**不要 `git add -A`**；动手前 `git status`/`git log` 看清现状。

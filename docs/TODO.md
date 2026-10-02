@@ -1061,7 +1061,7 @@ EOF
 | `linux-arm64`（`e2e_arm64.sh` + `e2e_elf_image.sh`，qemu） | **能**（工具链齐全） | 只缺 WSL 里的 **Go**（脚本里那三条 `go build`）：把 Windows 下载的 Go tarball 解到 `~` 即可（无需 sudo），或把三个工具用 `GOOS=linux GOARCH=arm64` 从 Windows 交叉编译好 |
 | `linux-amd64`（`verify_linux_payload.sh` / `e2e.sh` / `e2e_elf_image.sh`） | **基本能** | 缺宿主 x86-64 `gcc`（有 `clang` 可试，但与 CI 的 gcc 不同源） |
 | `windows-amd64` | 本机 `tools/gates.ps1` 已覆盖 | CI 的**额外**价值只剩"**另一套** Windows 工具链"（新装的 msys2 gcc） |
-| `windows-arm64-blob` / `windows-arm64-run` | 不能（要真 arm64 Windows） | 与本轮范围无关，且两者都是 `continue-on-error` |
+| ~~`windows-arm64-blob` / `windows-arm64-run`~~ | — | **已于 2026-09-30 从 `ci.yml` 移除**（用户决定停；两者本是 `continue-on-error` 的复现器）。恢复见 `STATUS #593` |
 
 **已落地（`STATUS #584`）**
 - 装齐（`sudo` 已可用）：`gcc 15` / `go`(1.26，另装了 1.24.5 备用) / `gdb` / `aarch64-linux-gnu-gcc` /
@@ -1103,10 +1103,11 @@ EOF
   （CI 的 `e2e_arm64.sh` 已端到端覆盖同一块）。
 - DLL + 外置密钥（`#385`）、DPAPI 包装的取钥形态（`#393`）。
 
-**还等拍板的**：把两个 arm64 CI 作业从 workflow 停掉（用户已说 arm64 暂停；它们只是复现器，
-`continue-on-error` 不影响结论，但每次跑都要几分钟；停了要把"五作业全绿"的验收口径改成"三作业"）。
+**✅ 已决定并执行（2026-09-30）**：两个 win/arm64 CI 作业（`windows-arm64-blob` / `windows-arm64-run`）已从 `ci.yml` **移除**；
+验收口径随之从"五作业全绿"改为"**三个作业全绿**"（`windows-amd64` / `linux-amd64` / `linux-arm64`，且三者都是硬门，不再有 `continue-on-error`）。
+详见 `STATUS #593`。
 ### win/arm64：**已暂缓**（cancelled / deferred，见 STATUS #581）
 
-- 现状：`cmd/vmpbuild` 白名单**关闭**（构建即拒绝，fail-fast）；CI 两个 arm64 作业带 `continue-on-error` ⇒ 整体保持绿。
+- 现状：`cmd/vmpbuild` 白名单**关闭**（构建即拒绝，fail-fast）；原先的两个 arm64 CI 作业已于 2026-09-30 从 `ci.yml` 移除（`STATUS #593`）。
 - 已交付（保留）：ARM64 `EntryHook`/TLS thunk、无 `.reloc` 建节、ARM64 I-cache 刷新改 `FlushInstructionCache`、测试假通过修复。
 - 重启入口：上文"最终操作卡（#581）"（蹦床记录 `x0`/`sp` + 按符号核对产物 RVA ↔ manifest 偏移）。
