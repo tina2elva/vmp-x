@@ -20,6 +20,7 @@ const (
 
 	PT_NULL      = 0
 	PT_LOAD      = 1
+	PT_DYNAMIC   = 2
 	PT_NOTE      = 4
 	PT_PHDR      = 6
 	PT_INTERP    = 3
@@ -33,6 +34,25 @@ const (
 
 	EM_X86_64  = 62
 	EM_AARCH64 = 183
+
+	// 动态表（PT_DYNAMIC）里本包用到的 d_tag。
+	DT_NULL    = 0
+	DT_RELA    = 7
+	DT_RELASZ  = 8
+	DT_RELAENT = 9
+	DT_REL     = 17
+	DT_RELSZ   = 18
+	DT_RELENT  = 19
+
+	// 相对重定位的类型号（本仓库支持的两种架构）。两者语义相同：
+	// 运行期槽位值 = 装载基址 + r_addend，所以运行期一套「先减 delta → 验签 → 解密 → 再加回 delta」
+	// 对两种架构都够用（见 internal/inject 的重定位应用表）。
+	R_X86_64_RELATIVE  = 8
+	R_AARCH64_RELATIVE = 1027
+
+	// Elf64_Rela = 24 字节（offset/info/addend）；Elf64_Rel = 16 字节（offset/info）。
+	RelaEntrySize = 24
+	RelEntrySize  = 16
 )
 
 // Program 一个程序头
@@ -498,4 +518,206 @@ func (f *File) Summary() string {
 			i, name, p.Off, p.Vaddr, p.Filesz, p.Memsz)
 	}
 	return s
+}
+
+// ---- 动态重定位（ET_DYN/PIE 的镜像整体加密要用） ----
+//
+// 为什么走 PT_DYNAMIC 而不是节头表：打包端会搬动文件里的段
+// （MakeBssFileBacked 把带 .bss 的段整段挪到文件尾、只改程序头不改 sh_offset），
+// 一旦 .rela.* 落在那样的段里，节头表读出来的就是**死副本**。而加载器（ld.so）与运行期
+// 应用器都只按 PT_DYNAMIC 看，所以这里必须用同一份信息。
+
+// DynEntry 一条动态表项（d_tag / d_val）
+type DynEntry struct {
+	Tag uint64
+	Val uint64
+}
+
+// Reloc 一条动态重定位。
+//
+// Offset 是 **r_offset（链接期 VA，不是 RVA）**：PIE 里它等于"首选基址 + 偏移"，
+// 而 r_addend/槽位值也都是链接期 VA（实测 Go 的 -buildmode=pie 产物 7175/7175 条如此）。
+// 运行期槽位值 = 装载基址 + Addend ⇒ delta = 装载基址 = 运行期基址 − 首选基址。
+type Reloc struct {
+	Offset uint64 // r_offset：链接期 VA
+	Type   uint32 // r_info 的低 32 位（ELF64：sym<<32 | type）
+	Sym    uint32 // r_info 的高 32 位
+	Addend int64  // r_addend（DT_REL 语义的目标没有这项，按 0 处理）
+}
+
+// DynamicEntries 读 PT_DYNAMIC（没有这个段就返回 nil，不报错）。
+func (f *File) DynamicEntries() ([]DynEntry, error) {
+	var out []DynEntry
+	for _, p := range f.Progs {
+		if p.Type != PT_DYNAMIC {
+			continue
+		}
+		if p.Filesz == 0 || p.Off+p.Filesz > uint64(len(f.Data)) {
+			return nil, fmt.Errorf("PT_DYNAMIC 越界（off=0x%X filesz=0x%X）", p.Off, p.Filesz)
+		}
+		for o := p.Off; o+16 <= p.Off+p.Filesz; o += 16 {
+			tag := binary.LittleEndian.Uint64(f.Data[o:])
+			val := binary.LittleEndian.Uint64(f.Data[o+8:])
+			if tag == DT_NULL {
+				return out, nil
+			}
+			out = append(out, DynEntry{Tag: tag, Val: val})
+		}
+		return out, nil
+	}
+	return nil, nil
+}
+
+// DynRelocs 读动态重定位表（DT_RELA/DT_RELASZ/DT_RELAENT，或 REL 语义的 DT_REL/…）。
+//
+// 表本身用 **VA** 寻址，走 VAtoOffset（也就是按程序头映射），因此对打包端搬动过的产物仍有效。
+// 读不出来（越界/条目尺寸不对）时返回错误，调用方必须 fail-closed —— 静默当成"没有重定位"
+// 会让加密范围里那些真存在的重定位在运行期被解出垃圾。
+func (f *File) DynRelocs() ([]Reloc, error) {
+	ents, err := f.DynamicEntries()
+	if err != nil {
+		return nil, err
+	}
+	if len(ents) == 0 {
+		return nil, nil
+	}
+	// DT_RELA 优先（x86-64/aarch64 都是 RELA）；没有再退回 DT_REL。
+	type table struct{ addr, size, ent uint64 }
+	var tbl, tblRel table
+	for _, e := range ents {
+		switch e.Tag {
+		case DT_RELA:
+			tbl.addr = e.Val
+		case DT_RELASZ:
+			tbl.size = e.Val
+		case DT_RELAENT:
+			tbl.ent = e.Val
+		case DT_REL:
+			tblRel.addr = e.Val
+		case DT_RELSZ:
+			tblRel.size = e.Val
+		case DT_RELENT:
+			tblRel.ent = e.Val
+		}
+	}
+	if tbl.size == 0 && tblRel.size == 0 {
+		return nil, nil
+	}
+	withAddend := tbl.size != 0
+	t := tbl
+	if !withAddend {
+		t = tblRel
+	}
+	if t.addr == 0 {
+		return nil, fmt.Errorf("动态表声明了重定位（size=0x%X）但没有地址", t.size)
+	}
+	entSize := t.ent
+	if entSize == 0 {
+		if withAddend {
+			entSize = RelaEntrySize
+		} else {
+			entSize = RelEntrySize
+		}
+	}
+	if withAddend && entSize != RelaEntrySize {
+		return nil, fmt.Errorf("DT_RELAENT=%d，本包只支持 %d", entSize, RelaEntrySize)
+	}
+	if !withAddend && entSize != RelEntrySize {
+		return nil, fmt.Errorf("DT_RELENT=%d，本包只支持 %d", entSize, RelEntrySize)
+	}
+	off, err := f.VAtoOffset(t.addr)
+	if err != nil {
+		return nil, fmt.Errorf("重定位表 VA 0x%X：%w", t.addr, err)
+	}
+	if uint64(off)+t.size > uint64(len(f.Data)) {
+		return nil, fmt.Errorf("重定位表 0x%X+0x%X 超出文件", off, t.size)
+	}
+	n := int(t.size / entSize)
+	out := make([]Reloc, 0, n)
+	for i := 0; i < n; i++ {
+		o := off + i*int(entSize)
+		info := binary.LittleEndian.Uint64(f.Data[o+8:])
+		r := Reloc{Offset: binary.LittleEndian.Uint64(f.Data[o:]), Type: uint32(info), Sym: uint32(info >> 32)}
+		if withAddend {
+			r.Addend = int64(binary.LittleEndian.Uint64(f.Data[o+16:]))
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// RelativeRelocs 只返回本架构的 R_*_RELATIVE 项（其它类型丢弃）。
+// ET_EXEC/静态链接的目标返回空切片 —— 它们没有动态重定位。类型号不认识的架构返回错误。
+func (f *File) RelativeRelocs() ([]Reloc, error) {
+	var want uint32
+	switch f.Machine {
+	case EM_X86_64:
+		want = R_X86_64_RELATIVE
+	case EM_AARCH64:
+		want = R_AARCH64_RELATIVE
+	default:
+		return nil, fmt.Errorf("架构 %d 没有登记相对重定位类型号", f.Machine)
+	}
+	all, err := f.DynRelocs()
+	if err != nil {
+		return nil, err
+	}
+	var out []Reloc
+	for _, r := range all {
+		if r.Type == want {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// RelocsInVA 返回 r_offset 落在 [lo, hi) 的项（顺序保持）。
+func RelocsInVA(rel []Reloc, lo, hi uint64) []Reloc {
+	var out []Reloc
+	for _, r := range rel {
+		if r.Offset >= lo && r.Offset < hi {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// SlotValue 读一个重定位槽位（8 字节，小端）。
+func (f *File) SlotValue(va uint64) (uint64, error) {
+	b, err := f.ReadVA(va, 8)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint64(b), nil
+}
+
+// NormalizeRelocSlots 把给定重定位的槽位值**归一成链接期（首选基址）形式**：slot := r_addend。
+//
+// 为什么必须在加密之前做（这就是"先减"那一步）：
+// 运行期应用器按「先减 delta → 验签 → 解密 → 再加回 delta」工作（delta = 运行期基址 − 首选基址，
+// 见 internal/inject 的重定位应用表）。它要求**密文解密出来的字节就是链接期形式的槽位值**：
+// 如果打包端加密的是"已经加过基址的值"，运行期先减 delta 再解密就还原不回去（多减/少减一次），
+// 而且 AEAD 的 tag 覆盖整个范围 —— 差一字节就是验签失败。
+//
+// 实测 RELA 目标（Go -buildmode=pie：7175/7175 条 R_X86_64_RELATIVE）的槽位本来就等于 r_addend，
+// 所以这一步通常是 no-op；但它是**校准点**：文件被预重定位过、或目标用 REL（addend 在槽位里）语义时，
+// 必须在这里先减回链接期形式。返回被改写的槽位数。
+func (f *File) NormalizeRelocSlots(rel []Reloc) (int, error) {
+	changed := 0
+	for _, r := range rel {
+		off, err := f.VAtoOffset(r.Offset)
+		if err != nil {
+			return changed, fmt.Errorf("重定位槽位 VA 0x%X：%w", r.Offset, err)
+		}
+		if off+8 > len(f.Data) {
+			return changed, fmt.Errorf("重定位槽位 VA 0x%X 越界", r.Offset)
+		}
+		want := uint64(r.Addend)
+		if binary.LittleEndian.Uint64(f.Data[off:]) == want {
+			continue
+		}
+		binary.LittleEndian.PutUint64(f.Data[off:], want)
+		changed++
+	}
+	return changed, nil
 }

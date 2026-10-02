@@ -67,6 +67,9 @@ fi
 if [ "$ONLY" = "all" ] || [ "$ONLY" = "amd64" ]; then
   echo "=== linux/amd64 (CI job linux-amd64) ==="
   step "go build ./..."       go build ./...
+  # 真实 PIE 夹具：internal/load/elf 的 TestRelativeRelocsRealPIE 拿它当输入（没有就 SKIP）。
+  # 它必须在 go test **之前**造出来，否则那条用例在 CI 上永远是"跳过的死代码"。
+  step "pie target fixture"   env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -buildmode=pie -o build/pie_target ./testdata/linux
   # TestARM64PayloadUnderQEMU 以前按"build/ 里恰好有什么"决定跑还是跳（残留产物会让它拿错配的
   # blob/manifest）。STATUS #588 把它改成**只认 VMP_ARM64_DIR**：没给就确定性 SKIP。
   # 所以这里不再需要"先删残留"那种补丁 —— 残留不会再影响它。
@@ -100,6 +103,22 @@ if [ "$ONLY" = "all" ] || [ "$ONLY" = "amd64" ]; then
     echo "[SKIP] linux anti-debug: no gdb on this machine to create a tracer"
   fi
   step "elf image encryption" bash tools/e2e_elf_image.sh --strict
+  # ET_DYN(PIE)：镜像加密 + **载荷里不能有未重定位的绝对 VA**（E5 对 ET_DYN 才是真检查；
+  # 对 ET_EXEC 它只是一条 INFO）。这里必须**紧挨着**跑布局门禁：e2e_elf_image.sh 会重建
+  # vm_interp_elf.bin/json，而 blob 构建带随机性，隔一次跑就对不上（E3 会红）。
+  # 校准：改动前 PIE 这条用例直接红（打包器跳过加密 → 原执行段 0 残留那条断言失败）。
+  step "elf pie image"        env PIE=1 TAG=pie bash tools/e2e_elf_image.sh --strict
+  step "elf layout gate (PIE)" python3 tools/check_elf_layout.py \
+    --packed build/elf_target_pie.enc --manifest build/vm_interp_elf.json \
+    --blob build/vm_interp_elf.bin --report build/elf_enc_pie.json --selftest
+  # 加密范围里**真的有**相对重定位的目标（gcc 的 PIE，.rodata 里两条 R_X86_64_RELATIVE）：
+  # 默认必须拒绝加密那个范围（fail-closed），产物照旧与原生一致。
+  step "elf pie relocs"       env PIE_RELOCS=1 TAG=pierel bash tools/e2e_elf_image.sh --strict
+  # 这一份的门禁验的是"账目"：声明的加密范围里那 2 条重定位必须被记录（imgRelocCount），
+  # 且 payload 里必须真有应用表（imgRelocTableRVA）。
+  step "elf layout gate (PIE + relocs)" python3 tools/check_elf_layout.py \
+    --packed build/elf_target_pierel_relocs.enc --manifest build/vm_interp_elf.json \
+    --blob build/vm_interp_elf.bin --report build/elf_enc_pierel_relocs.json --selftest
 fi
 
 if [ "$ONLY" = "all" ] || [ "$ONLY" = "arm64" ]; then

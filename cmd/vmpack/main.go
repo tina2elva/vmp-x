@@ -75,6 +75,8 @@ func main() {
 	stripRelocs := flag.Bool("strip-relocs", false, "退回旧行为：拆掉重定位表 + 清 DYNAMIC_BASE（放弃 ASLR）。默认**保留**，运行期按「先减回去→解密→再加回来」处理")
 	flag.BoolVar(&encImageELFData, "enc-image-elf-data", false, "ELF 侧把 .rodata/.gopclntab 也纳入整体加密（实验：CI 上 aarch64 会 SIGSEGV，默认关）")
 	noEncImageELF := flag.Bool("no-enc-image-elf", false, "对 ET_EXEC 的 ELF 关闭原镜像整体加密（默认开；探针已改为合成补丁字节，不再依赖明文）")
+	encImageELFPIEFlag := flag.Bool("enc-image-elf-pie", false, "对 ET_DYN(PIE) 也做原镜像整体加密（默认关；只加密**不含相对重定位**的范围，含重定位的范围会跳过并说明）")
+	encImageELFPIERelocsFlag := flag.Bool("enc-image-elf-pie-relocs", false, "允许加密**含相对重定位**的 PIE 范围（需要运行期应用器：把重定位表落进 payload/报告，见 internal/inject 的 RelocTableHeaderSize）")
 	credFlag := flag.String("cred", "", "构建凭据路径（默认 $VMPX_CRED 或工具同目录 vmpx.cred）；仅当工具烘焙了厂商根公钥时才校验")
 	vendorFlag := flag.String("vendor", "", "本次构建声明的 vendorID；工具授权开启时会强制与凭据里的一致")
 	verify := flag.Bool("verify", false, "自检：跑一遍原始与受保护产物并比对输出，不一致就**删除产物**并失败退出")
@@ -109,6 +111,10 @@ func main() {
 	encImageEnabled = !*noEncImage
 	encImageDLLEnabled = !*noEncImageDLL
 	encImageELFEnabled = !*noEncImageELF
+	encImageELFPIERelocs = *encImageELFPIERelocsFlag
+	// -enc-image-elf-pie-relocs 隐含 -enc-image-elf-pie：只给前者会让"含重定位的范围"这个开关
+	// 永远不生效（静默 no-op），那种沉默比多打一行更危险。
+	encImageELFPIE = *encImageELFPIEFlag || encImageELFPIERelocs
 	encImageSectionList = *encImageSections
 
 	if *exe == "" || len(funcs) == 0 {
@@ -829,15 +835,29 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 	if f.Entry > imageBase && f.Entry-imageBase <= 0xFFFFFFFF {
 		entryRVA = uint32(f.Entry - imageBase)
 	}
-	// ELF 整体加密（默认关）：只做 ET_EXEC —— PIE/ET_DYN 会被 ld.so 重定位写进密文，
-	// 解密出来就是垃圾（和 DLL 那边同一个道理），需要单独的方案。
+	// ELF 整体加密：ET_EXEC 默认开；**ET_DYN(PIE) 要显式 -enc-image-elf-pie**。
+	//
+	// 为什么 PIE 不能照搬 ET_EXEC：ld.so 在**入口点之前**就按动态重定位表把 .rela 槽位写成
+	// "运行期基址 + addend"，而密文的 AEAD tag 覆盖整个范围 —— 被加载器改写过的那几个字节
+	// 会让验签失败（-4），解密出来也是垃圾（#390 登记的那条）。所以含相对重定位的范围必须
+	// 由运行期应用器"先减 delta → 验签 → 解密 → 再加回 delta"（协议见 internal/inject 的
+	// RelocTableHeaderSize）。运行期那半还没落地时，本打包端**默认只加密不含相对重定位的范围**，
+	// 含重定位的范围要显式 -enc-image-elf-pie-relocs 才加密（并会在报告里留下重定位应用表）。
 	var imgSecs []inject.ImgSection
+	var imgRelocs []inject.ImgReloc // 落在加密范围内的相对重定位（RVA 形式，要交给 payload）
+	var imgRelocList []elfload.Reloc
 	if encImageELFEnabled {
 		switch {
 		case f.Machine != elfload.EM_X86_64 && f.Machine != elfload.EM_AARCH64:
 			fmt.Println("[*] ELF 整体加密：跳过（只支持 x86-64 与 aarch64）")
-		case f.EType != 2:
-			fmt.Println("[*] ELF 整体加密：跳过（只支持 ET_EXEC；PIE 会被重定位破坏密文）")
+		case f.EType != elfload.ET_EXEC && f.EType != elfload.ET_DYN:
+			fmt.Println("[*] ELF 整体加密：跳过（只支持 ET_EXEC / ET_DYN）")
+		case f.EType == elfload.ET_DYN && !encImageELFPIE:
+			fmt.Println("[*] ELF 整体加密：跳过（ET_DYN/PIE 需要显式 -enc-image-elf-pie）")
+		case f.EType == elfload.ET_DYN && !elfHasInterp(f):
+			// 静态 PIE 没有 PT_INTERP：自重定位代码在**入口点之后**才跑（我们解完密它还会写），
+			// 这条路径没有验过，默认不碰。
+			fmt.Println("[*] ELF 整体加密：跳过（静态 PIE 没有 PT_INTERP，自重定位发生在入口点之后）")
 		case imgMaster == nil:
 			fmt.Println("[*] ELF 整体加密：跳过（没有主密钥）")
 		default:
@@ -848,22 +868,29 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				// 第一个 LOAD 段往往**从文件偏移 0 开始**（Go 的 ET_EXEC 就是），
 				// 也就是说 ELF 头与程序头表都在这个段里 —— 加载器要从**文件**读它们，
 				// 绝不能加密（CI 第一次跑就抓到了：e_entry 被加密后读出来是垃圾）。
-				// 跳过 [0, align_up(程序头表末尾))，第 0 页保持明文。
+				// 头部是**文件**里的 [0, align_up(程序头表末尾))；折算到本段内部要减去段的文件起点：
+				// gcc 的 PIE 里可执行段从文件偏移 0x1000 开始（头那一页在只读段里），
+				// 原来一律按"段从 0 开始"跳过 ⇒ 要么整段被跳过、要么多跳 0x1000 字节。
+				// tools/image_residue_elf.py 一直用的是"减段起点"这套口径，两边必须一致。
 				skip := uint64(f.Phoff) + uint64(f.Phnum)*uint64(f.Phentsize)
 				skip = (skip + 0xFFF) &^ 0xFFF
 				if skip < 0x1000 {
 					skip = 0x1000
 				}
-				if p.Filesz <= skip {
+				inner := uint64(0)
+				if skip > p.Off {
+					inner = skip - p.Off
+				}
+				if p.Filesz <= inner {
 					fmt.Println("[*] ELF 整体加密：跳过（可执行段全落在文件头那一页里）")
 					break
 				}
 				imgSecs = append(imgSecs, inject.ImgSection{
-					RVA:   uint32(p.Vaddr - imageBase + skip),
-					Size:  uint32(p.Filesz - skip),
+					RVA:   uint32(p.Vaddr - imageBase + inner),
+					Size:  uint32(p.Filesz - inner),
 					Flags: 1,
 				})
-				fmt.Printf("[*] ELF 整体加密：PT_LOAD(X) va=0x%X 跳过头部 %d 字节，加密 %d 字节（入口自解密）", p.Vaddr, skip, p.Filesz-skip)
+				fmt.Printf("[*] ELF 整体加密：PT_LOAD(X) va=0x%X off=0x%X 跳过头部 %d 字节，加密 %d 字节（入口自解密）", p.Vaddr, p.Off, inner, p.Filesz-inner)
 				fmt.Println()
 				break
 			}
@@ -903,20 +930,70 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				fmt.Printf("[*] ELF 整体加密：%s RVA=0x%X size=0x%X（只读数据）", sc.name, sc.addr-imageBase, sc.size)
 				fmt.Println()
 			}
+			// PIE：把"范围内有相对重定位"的范围挑出来 —— 记录了才能让运行期应用器把它加减回去。
+			// 读不出来就 fatalf（fail-closed）：静默当成"没有重定位"会让运行期把密文解成垃圾。
+			if f.EType == elfload.ET_DYN && len(imgSecs) > 0 {
+				relocs, rerr := f.RelativeRelocs()
+				if rerr != nil {
+					fatalf("读不出 PIE 的动态重定位表：%v（不能当成没有重定位）", rerr)
+				}
+				fmt.Printf("[*] ELF 整体加密：PIE 的动态相对重定位共 %d 条（PT_DYNAMIC；装载器会在入口点前写它们）", len(relocs))
+				fmt.Println()
+				kept := make([]inject.ImgSection, 0, len(imgSecs))
+				for _, s := range imgSecs {
+					lo, hi := imageBase+uint64(s.RVA), imageBase+uint64(s.RVA+s.Size)
+					in := elfload.RelocsInVA(relocs, lo, hi)
+					if len(in) == 0 {
+						kept = append(kept, s)
+						continue
+					}
+					where := elfSectionName(elfRaw, lo)
+					if !encImageELFPIERelocs {
+						fmt.Printf("[*] ELF 整体加密：跳过 %s（RVA 0x%X size 0x%X 内有 %d 条相对重定位；加密它们需要运行期应用器，见 -enc-image-elf-pie-relocs）",
+							where, s.RVA, s.Size, len(in))
+						fmt.Println()
+						continue
+					}
+					for _, r := range in {
+						imgRelocs = append(imgRelocs, inject.ImgReloc{RVA: uint32(r.Offset - imageBase), Type: r.Type})
+						imgRelocList = append(imgRelocList, r)
+					}
+					fmt.Printf("[*] ELF 整体加密：%s 内有 %d 条相对重定位，已记入重定位应用表（运行期按 delta 加减）", where, len(in))
+					fmt.Println()
+					kept = append(kept, s)
+				}
+				imgSecs = kept
+			}
 			if len(imgSecs) == 0 {
-				fmt.Println("[*] ELF 整体加密：跳过（找不到可加密的可执行段）")
+				fmt.Println("[*] ELF 整体加密：跳过（找不到可安全加密的范围）")
 			}
 		}
 	}
+	// "先减"：把加密范围内的相对重定位槽位归一成**链接期形式**（slot := r_addend），
+	// 而且必须在加密之前做 —— 密文要能解密回链接期形式，运行期才靠 delta 加减还原。
+	// 实测 RELA 目标（Go PIE）的槽位本来就等于 r_addend，所以通常改写 0 个；这一步是校准点。
+	if len(imgRelocList) > 0 {
+		chg, nerr := f.NormalizeRelocSlots(imgRelocList)
+		must(nerr)
+		fmt.Printf("[*] ELF 整体加密：加密范围内 %d 个相对重定位槽位，先减回链接期形式（改写 %d 个）", len(imgRelocList), chg)
+		fmt.Println()
+	}
 	res, err := inject.ApplyELF(f, inject.Options{SectionName: ".vmp", Stub: stub, StubEntry: entryOff, Funcs: specs, Encrypt: enc, Arch: arch,
 		DescMagic: descMagic, PatchKey: patchKey, Master: master, FieldMaskSalt: fieldMaskSalt, Verbose: verbose, BSSOff: bssOff, BSSSize: bssSize,
-		ImgSections: imgSecs, ImageBase: 0, UnpackFn: unpackFn,
+		ImgSections: imgSecs, ImgRelocs: imgRelocs, ImageBase: 0, UnpackFn: unpackFn,
 		Wipe:          wipeEnabled,
 		EntryHook:     patchKey != ([8]byte{}) && verifyFn >= 0 && entryRVA != 0 && f.Machine == elfload.EM_X86_64,
 		EntryHookSysV: true,
 		VerifyFn:      verifyFn,
 		EntryRVA:      entryRVA})
 	must(err)
+	// 重定位应用表真的写进 payload 了吗？报告里给出位置/长度/条数与首选基址 ——
+	// 运行期应用器（与 ELF 布局门禁）就是按这几个字段对账的。
+	if res.ImgRelocCount > 0 || res.ImgRelocTableRVA != 0 {
+		fmt.Printf("[*] ELF 整体加密：重定位应用表 RVA=0x%X len=0x%X（%d 条；prefBase=0x%X，运行期 delta = 基址 - prefBase）",
+			res.ImgRelocTableRVA, res.ImgRelocLen, res.ImgRelocCount, res.ImgPrefBase)
+		fmt.Println()
+	}
 	if len(imgSecs) > 0 {
 		if err := encryptImageSectionsELF(f, imageBase, res, imgMaster, fieldMaskSalt); err != nil {
 			fatalf("ELF 原镜像加密失败: %v", err)
@@ -1001,6 +1078,19 @@ var encImageSectionList string
 // patch bytes=BD047B120F + 六处 missing/mismatch）。所以在"探针也改成不依赖明文"之前，
 // 保持 opt-in。
 var encImageELFEnabled bool
+
+// encImageELFPIE：是否对 ET_DYN(PIE) 也做原镜像整体加密（**默认关**，显式 opt-in）。
+//
+// 为什么默认关（与 -enc-image-elf-data 同一个理由，见 #374）：PIE 的加密范围里只要有一条
+// 相对重定位，就**必须**有运行期应用器"先减 delta → 验签 → 解密 → 再加回 delta"才能跑
+// （ld.so 在入口点之前会往那些槽位写值，密文的 AEAD tag 覆盖整个范围 ⇒ 不改回去就是验签失败）。
+// 运行期那半（vm_interp.c 的 Linux 区）还没落地时，本开关只加密**不含相对重定位**的范围，
+// 含重定位的范围要么跳过，要么用 -enc-image-elf-pie-relocs 显式打开（并落表给应用器）。
+var encImageELFPIE bool
+
+// encImageELFPIERelocs：允许加密**含相对重定位**的 PIE 范围。
+// 打开它就必须有运行期应用器；否则产物会以"AEAD 验签失败"硬崩（而不是静默跑错）。
+var encImageELFPIERelocs bool
 
 // encImageDLLEnabled：是否对 DLL 也加密（默认**开**；-no-enc-image-dll 关闭）。
 // DLL 只有在"落在首选基址"时才成立：打包端已拆掉重定位表，落不下会明确失败。
@@ -1566,6 +1656,30 @@ func setTLSCallbacks(f *pe.File, dirRVA uint32, va uint64) error {
 	}
 	binary.LittleEndian.PutUint64(f.Data[to+24:], va)
 	return nil
+}
+
+// elfHasInterp：目标有 PT_INTERP（动态链接 / 动态 PIE）。静态 PIE 的重定位由程序自己的
+// 启动代码在**入口点之后**做，我们解出来的明文会被它再写一遍 —— 那条路径没有验过，默认不碰。
+func elfHasInterp(f *elfload.File) bool {
+	for _, p := range f.Progs {
+		if p.Type == elfload.PT_INTERP {
+			return true
+		}
+	}
+	return false
+}
+
+// elfSectionName 按原始镜像的节头表反查一个 VA 落在哪个节里（找不到返回 "-"）。
+func elfSectionName(raw []byte, va uint64) string {
+	for _, s := range elfSections(raw) {
+		if s.size == 0 {
+			continue
+		}
+		if va >= s.addr && va < s.addr+s.size {
+			return s.name
+		}
+	}
+	return "-"
 }
 
 // elfRawBytes 读原始镜像文件：挑候选节要按**原始布局**，不能用注入流程里的缓冲区。

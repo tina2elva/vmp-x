@@ -20,9 +20,15 @@ Everything is derived from the PRODUCT FILE plus the same build's blob manifest 
         PAGEALIGN(max(vaddr+memsz))). A segment with memsz > filesz therefore keeps its bss only
         when its own PAGEALIGN(vaddr+filesz) IS that maximum; anything else loses its bss entirely
         and dies on the first global write ("error 6" = not present + write). Assert none exists.
-  E5 relocation coverage (ET_DYN only)
-        for a PIE, every preferred-base absolute VA in the payload must be covered by an
-        R_*_RELATIVE entry; for ET_EXEC (the supported case) nothing applies and it says so.
+  E5 relocation coverage (ET_DYN only, two assertions)
+        (a) every preferred-base absolute VA stored in the payload must be covered by an
+            R_*_RELATIVE entry (candidates are filtered by the plausible-VA window, not by
+            "value >> 32", which matches nearly every random word);
+        (b) every R_*_RELATIVE whose target sits inside a range the report declares as
+            image-encrypted must be recorded (report.imgRelocCount) and have an apply table
+            (report.imgRelocTableRVA) -- ld.so writes those slots before the entry hook, so a
+            missing record is either an AEAD verify failure or a silently corrupted slot.
+        ET_EXEC keeps its INFO line (the image never moves).
 
 --selftest mutates copies and requires every check to catch its own mutation.
 
@@ -50,6 +56,9 @@ PF_R = 4
 SHT_RELA = 4
 R_RELATIVE = {62: 8, 183: 1027}  # EM_X86_64 / EM_AARCH64
 ET_EXEC, ET_DYN = 2, 3
+PT_DYNAMIC = 2
+DT_NULL, DT_RELA, DT_RELASZ, DT_RELAENT = 0, 7, 8, 9
+DT_REL, DT_RELSZ, DT_RELENT = 17, 18, 19
 
 
 def align_up(v, a):
@@ -103,19 +112,52 @@ class ELF:
             return None
         return self.data[o:o + n]
 
-    def rela_entries(self):
-        """[(r_offset, type)] from every SHT_RELA section"""
+    def dyn_relocs(self):
+        """[(r_offset, type, addend)] from PT_DYNAMIC (DT_RELA/DT_REL), or None if there is none.
+
+        Read through PT_DYNAMIC on purpose: the packer MOVES segment payloads to the end of
+        the file (MakeBssFileBacked) without fixing sh_offset, so the section table can point
+        at dead copies -- and ld.so (the thing that actually applies these relocations) only
+        ever looks at PT_DYNAMIC.
+        """
+        dyn = [p for p in self.progs if p["type"] == PT_DYNAMIC]
+        if not dyn:
+            return None
+        tags = {}
+        p = dyn[0]
+        for o in range(p["off"], p["off"] + p["filesz"], 16):
+            if o + 16 > len(self.data):
+                break
+            tag, val = struct.unpack_from("<QQ", self.data, o)
+            if tag == DT_NULL:
+                break
+            tags.setdefault(tag, val)
+        with_addend = tags.get(DT_RELASZ, 0) != 0
+        addr = tags.get(DT_RELA, 0) if with_addend else tags.get(DT_REL, 0)
+        size = tags.get(DT_RELASZ, 0) if with_addend else tags.get(DT_RELSZ, 0)
+        ent = tags.get(DT_RELAENT, 0) if with_addend else tags.get(DT_RELENT, 0)
+        if size == 0:
+            return None
+        if ent == 0:
+            ent = 24 if with_addend else 16
+        off = self.va_to_off(addr)
+        if off is None or off + size > len(self.data):
+            return None
         out = []
-        for s in self.sections:
-            if s["type"] != SHT_RELA or s["ent"] == 0:
-                continue
-            for k in range(s["size"] // s["ent"]):
-                o = s["off"] + k * s["ent"]
-                if o + 24 > len(self.data):
-                    break
-                r_off, r_info = struct.unpack_from("<QQ", self.data, o)
-                out.append((r_off, r_info & 0xFFFFFFFF))
+        for k in range(size // ent):
+            o = off + k * ent
+            r_off, r_info = struct.unpack_from("<QQ", self.data, o)
+            add = struct.unpack_from("<q", self.data, o + 16)[0] if with_addend else 0
+            out.append((r_off, r_info & 0xFFFFFFFF, add))
         return out
+
+    def va_ceiling(self):
+        """Highest mapped VA (end of the last PT_LOAD) -- upper bound of a plausible absolute VA."""
+        return max((p["vaddr"] + p["memsz"] for p in self.loads), default=0)
+
+    # 注意：这里**没有**按节头表读 .rela.dyn 的版本。打包端会把某些段整段搬到文件尾
+    # （MakeBssFileBacked，只改程序头不改 sh_offset），节头表可能指向死副本；ld.so 与运行期
+    # 应用器都只认 PT_DYNAMIC，所以本门禁也只走 dyn_relocs()。
 
     def top_bss_edge(self):
         return max((align_up(p["vaddr"] + p["filesz"], 4096) for p in self.loads), default=0)
@@ -249,35 +291,88 @@ def check_bss(elf, rep):
 
 
 def check_relocs(elf, report, rep):
+    """E5 (ET_DYN/PIE only) -- two independent assertions:
+
+    (a) payload absolute-VA coverage: for a PIE the payload must be base-independent. Every
+        preferred-base VA stored in the payload segment needs an R_*_RELATIVE entry covering
+        it, otherwise the product breaks as soon as ASLR really moves the image. Candidates are
+        filtered by the "plausible VA" window [imageBase, end of last LOAD) -- the old
+        "value >> 32" heuristic matches essentially EVERY random 8-byte word (the encrypted
+        byte code and the AEAD tags are random), so it could never be a real gate.
+    (b) encrypted-range bookkeeping: every R_*_RELATIVE whose target lies inside a range the
+        report declares as image-encrypted must be recorded (report.imgRelocCount) and must
+        have an apply table in the payload. ld.so writes those slots BEFORE the entry hook runs,
+        so missing one = AEAD verify failure or a corrupted slot (STATUS #390 / the packer's
+        -enc-image-elf-pie[-relocs]).
+    """
     if elf.etype != ET_DYN:
-        rep.info("E5", "ET_EXEC: no relocations apply, the payload's VAs are link-time absolute")
+        rep.info("E5", "ET_EXEC: the image stays at its link-time base, no relocation applies")
         return
-    rel = elf.rela_entries()
+    rel = elf.dyn_relocs()
+    if rel is None:
+        rep.fail("E5", "ET_DYN product has no readable PT_DYNAMIC relocation table")
     kinds = R_RELATIVE.get(elf.machine, 8)
-    covered = set(r for r, t in rel if t == kinds)
-    sec_rva = elf.image_base + int(report["sectionRVA"])
-    cands = []
+    covered = set(off for off, ty, _a in rel if ty == kinds)
+    pref = elf.image_base
+    ceiling = elf.va_ceiling()
+
+    sec_rva = pref + int(report["sectionRVA"])
     p = None
     for q in elf.loads:
         if q["vaddr"] == sec_rva:
             p = q
     if p is None:
         rep.fail("E5", "payload LOAD missing (see E2)")
-    for rel_off in range(0, p["filesz"] - 7, 8):
-        raw = elf.read(sec_rva + rel_off, 8)
-        if raw is None:
-            continue
-        v = struct.unpack("<Q", raw)[0]
-        # for a PIE the stored value is the link-time (preferred) base + rva
-        if v and v >> 32:
-            cands.append((sec_rva + rel_off, v))
-    uncovered = [r for r, v in cands if r not in covered]
-    for r in uncovered[:8]:
-        rep.lines.append("[----] E5  vaddr 0x%X holds a VA but no RELATIVE entry covers it" % r)
-    if uncovered:
-        rep.fail("E5", "%d of %d absolute VA(s) in the payload have no RELATIVE relocation"
-                 % (len(uncovered), len(cands)))
-    rep.ok("E5", "%d absolute VA(s) covered by %d RELATIVE entries" % (len(cands), len(covered)))
+
+    # (a) payload absolute VAs
+    if pref == 0:
+        # RVA 与 VA 在基址 0 的 PIE 里无法区分（可执行段从 vaddr 0 开始），
+        # 载荷里的 RVA 字段会全部落进窗口 —— 这条检查对这种目标没有分辨力，如实说清楚。
+        rep.info("E5", "preferred base is 0: RVA and VA are indistinguishable, payload VA coverage check skipped")
+    else:
+        cands = []
+        for off in range(0, p["filesz"] - 7, 8):
+            raw = elf.read(sec_rva + off, 8)
+            if raw is None:
+                continue
+            v = struct.unpack("<Q", raw)[0]
+            if pref <= v < ceiling:
+                cands.append((sec_rva + off, v))
+        uncovered = [(r, v) for r, v in cands if r not in covered]
+        for r, v in uncovered[:8]:
+            rep.lines.append("[----] E5  vaddr 0x%X holds a preferred-base VA (0x%X) but no RELATIVE entry covers it" % (r, v))
+        if uncovered:
+            rep.fail("E5", "%d of %d payload absolute VA(s) have no RELATIVE relocation (first at 0x%X holding 0x%X)"
+                     % (len(uncovered), len(cands), uncovered[0][0], uncovered[0][1]))
+        rep.ok("E5", "payload: %d absolute VA(s), all covered by %d RELATIVE entries" % (len(cands), len(covered)))
+
+    # (b) encrypted ranges vs the recorded relocations
+    secs = report.get("imgSections")
+    if secs is None:
+        rep.info("E5", "report has no imgSections: cannot cross-check the relocation record")
+        return
+    found = 0
+    where = []
+    for s in secs:
+        lo = pref + int(s["rva"])
+        hi = lo + int(s["size"])
+        n = sum(1 for off, ty, _a in rel if ty == kinds and lo <= off < hi)
+        if n:
+            found += n
+            where.append("0x%X:%d" % (int(s["rva"]), n))
+    recorded = int(report.get("imgRelocCount") or 0)
+    if found != recorded:
+        rep.fail("E5", "report.imgRelocCount=%d but the product holds %d RELATIVE reloc(s) inside the "
+                       "declared encrypted ranges (%s); a missing record makes the runtime applier "
+                       "skip a slot ld.so already wrote" % (recorded, found, ",".join(where) or "-"))
+    if found > 0 and not int(report.get("imgRelocTableRVA") or 0):
+        rep.fail("E5", "%d in-range RELATIVE reloc(s) recorded but no apply table was emitted "
+                       "(imgRelocTableRVA=0)" % found)
+    if found == 0:
+        rep.ok("E5", "bookkeeping: %d encrypted range(s), none holds a relative relocation" % len(secs))
+    else:
+        rep.ok("E5", "bookkeeping: %d in-range RELATIVE reloc(s) recorded (%s), apply table at RVA 0x%X"
+               % (found, ",".join(where), int(report["imgRelocTableRVA"])))
 
 
 def run_checks(path, manifest, report, blob, quiet=False):
@@ -302,9 +397,15 @@ def failed_names(rep):
     return sorted({l.split()[1] for l in rep.lines if l.startswith("[FAIL]")})
 
 
-def _expect_fail(rep, check):
-    hit = check in failed_names(rep)
-    return (hit, "" if hit else "expected %s to fail, it passed" % check)
+def _expect_fail(rep, check, needle=None):
+    """Require the given check to fail -- and, when a needle is given, that its OWN failure line
+    carries it. Without the needle a mutation that trips several checks would prove the wrong one."""
+    fails = [l for l in rep.lines if l.startswith("[FAIL]") and l.split()[1] == check]
+    if not fails:
+        return (False, "expected %s to fail, it passed" % check)
+    if needle is not None and needle not in fails[0]:
+        return (False, "%s failed but not for the planted reason (want %r in %r)" % (check, needle, fails[0]))
+    return (True, fails[0])
 
 
 def mutate(src, patch, tmp, tag):
@@ -356,6 +457,52 @@ def selftest(path, manifest, report, blob):
             def m4(d, p=planted):
                 struct.pack_into("<Q", d, p["hdr"] + 32, p["filesz"] - 0x1000)  # shrink filesz
             results.append(("E4", *_expect_fail(run_checks(mutate(path, m4, tmp, "e4"), manifest, report, blob, True), "E4")))
+
+        # E5 is a PIE-only check (an ET_EXEC image never moves, so there is nothing to cover).
+        # Say that out loud instead of reporting a "not caught" calibration failure.
+        if elf.etype != ET_DYN:
+            print("[SKIP] CAL  E5-*: this product is ET_EXEC; E5 only applies to ET_DYN(PIE)")
+
+        # M5b (E5, encrypted-range bookkeeping): the report claims one more in-range reloc than
+        # the product actually holds. Report-side mutation on purpose: it is shape-independent
+        # (works whether the product has 0 or many in-range relocs) and ONLY E5 reads that field.
+        elif "imgSections" in report:
+            rep5 = dict(report)
+            rep5["imgRelocCount"] = int(report.get("imgRelocCount") or 0) + 1
+            results.append(("E5-bookkeeping", *_expect_fail(
+                run_checks(path, manifest, rep5, blob, True), "E5", "imgRelocCount=")))
+        else:
+            print("[SKIP] CAL  E5-bookkeeping: this product's report has no imgSections field")
+
+        # M6 (E5, payload absolute-VA coverage): plant a preferred-base VA inside the payload
+        # segment where no RELATIVE entry covers it. E3 also trips on this byte (the payload no
+        # longer matches the blob), so the calibration additionally requires E5''s own failure
+        # line to name the planted address -- otherwise E3 would be doing the work.
+        pref = elf.image_base
+        if elf.etype != ET_DYN:
+            pass  # 上面已经 SKIP 过了
+        elif pref == 0:
+            print("[SKIP] CAL  E5-payload: preferred base is 0, RVA and VA cannot be told apart")
+        else:
+            planted = None
+            for off in range(0, pl["filesz"] - 7, 8):
+                raw = elf.read(pref + int(report["sectionRVA"]) + off, 8)
+                if raw is None:
+                    continue
+                if pref <= struct.unpack("<Q", raw)[0] < elf.va_ceiling():
+                    continue
+                planted = (off, pref + 0x1000)
+                break
+            if planted is None:
+                print("[SKIP] CAL  E5-payload: no free 8-byte slot in the payload to plant a VA")
+            else:
+                off, va = planted
+
+                def m6(d, off=off, va=va):
+                    struct.pack_into("<Q", d, pl["off"] + off, va)
+                results.append(("E5-payload", *_expect_fail(
+                    run_checks(mutate(path, m6, tmp, "e5"), manifest, report, blob, True), "E5",
+                    "holding 0x%X" % va)))
 
         # M5 (E1, the ordering rule): list the RW overlay BEFORE the payload segment
         if int(manifest["bssSize"]) > 0:

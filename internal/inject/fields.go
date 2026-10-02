@@ -12,12 +12,18 @@ package inject
 //	m_desc   = KDFEntry(master, 0xC0DE0003, FieldMaskSalt)   // 描述符 8..32
 //	m_image  = KDFEntry(master, 0xC0DE0004, FieldMaskSalt)   // 解密表：表头 12..24、每条 0..12
 //	m_verify = KDFEntry(master, 0xC0DE0005, FieldMaskSalt)   // 校验表：每条 0..24
+//	m_reloc  = KDFEntry(master, 0xC0DE0006, FieldMaskSalt)   // 重定位应用表：表头 4..28、每条 0..8
 //
-// C 侧对应 stub/win/x64/vm_kdf.c 的 vm_field_mask()，两侧由 KAT 钉死。
+// C 侧对应 stub/win/x64/vm_kdf.c 的 vm_kdf_entry()（vm_interp.c 里直接调它 + 域常量），
+// 两侧由 KAT 钉死。运行期应用器要用 m_reloc 时，C 侧加一行：
+//
+//	vm_kdf_entry(master, 0xC0DE0006u /* VM_FIELD_MASK_RELOC */, VM_FIELD_MASK_SALT, m);
 const (
 	FieldMaskDomainDesc   = uint32(0xC0DE0003)
 	FieldMaskDomainImage  = uint32(0xC0DE0004)
 	FieldMaskDomainVerify = uint32(0xC0DE0005)
+	// FieldMaskDomainReloc：重定位应用表（见 RelocTableHeaderSize）。
+	FieldMaskDomainReloc = uint32(0xC0DE0006)
 )
 
 // FieldMask 派生某个域下的 32 字节掩码。

@@ -42,10 +42,56 @@ type EncryptFunc func(plain []byte, aad []byte, key [32]byte) (ct []byte, nonce 
 
 // ImgSection 一个需要入口自解密的原镜像节
 type ImgSection struct {
-	RVA   uint32
-	Size  uint32
-	Flags uint32 // bit0 = 可执行、bit1 = 可写（解密后按这两位恢复页保护）
+	RVA   uint32 `json:"rva"`
+	Size  uint32 `json:"size"`
+	Flags uint32 `json:"flags"` // bit0 = 可执行、bit1 = 可写（解密后按这两位恢复页保护）
 }
+
+// ---- 重定位应用表（ET_DYN/PIE 的"先减 delta → 验签 → 解密 → 再加回 delta"） ----
+//
+// 为什么需要它：Linux 的 ld.so 在**入口点之前**就按动态重定位表把槽位写成"运行期基址 + addend"，
+// 而我们的密文是在**文件字节**上做的、tag 又覆盖整个范围 —— 被加载器改写过的那几个字节会让
+// AEAD 验签直接失败，解密出来也是垃圾。所以运行期必须先把 delta 减回去（还原成链接期形式）、
+// 验签+解密、再把 delta 加回来。运行期要知道"哪些槽位"，就靠这张表。
+//
+// ImgReloc 一条这样的槽位。
+type ImgReloc struct {
+	// RVA：槽位相对**首选基址**（PrefBase / ImageBase）的偏移；运行期地址 = 运行期基址 + RVA。
+	RVA uint32 `json:"rva"`
+	// Type：ELF 重定位类型（x86-64：8 = R_X86_64_RELATIVE；aarch64：1027 = R_AARCH64_RELATIVE）。
+	// 运行期对不认识的类型必须走硬门（fail-closed），不要静默跳过。
+	Type uint32 `json:"type"`
+}
+
+// 重定位应用表的**线上格式**（payload 内，小端）：
+//
+//	偏移  大小  字段
+//	+0    4     magic = RelocTableMagic（0x52504D56 = "VMPR"）
+//	+4    4     count        条目数
+//	+8    4     selfRVA      本表的 RVA（运行期 base = 表地址 − selfRVA，与解密表同一招）
+//	+12   4     flags        见 RelocTableFlagDelta
+//	+16   8     prefBase     链接期（首选）基址；delta = base − prefBase
+//	+24   4     entrySize    每条字节数（= RelocEntrySize = 8）
+//	+28   4     reserved     0
+//	+32   ...   count × { u32 rva; u32 type }（语义见 ImgReloc）
+//
+// 掩码（静态可读性，与解密表同构）：表头 [4,28) 与 m_reloc[0:24] 异或，每条 8 字节与 m_reloc[24:32]
+// 异或。掩码在**写完之后**做；运行期先解掩码再读。m_reloc = FieldMask(master, FieldMaskDomainReloc, salt)，
+// 没有主密钥时用全零 master（与描述符/校验表的"无条件混淆"一致）。
+//
+// 运行期算法（三个步骤必须按这个顺序，且槽位语义是**就地加减**）：
+//
+//	delta = base − prefBase
+//	for e in entries: *(base + e.rva) -= delta   // 还原成链接期形式，让 AEAD 验签通过
+//	（验签 + 解密各个加密范围）
+//	for e in entries: *(base + e.rva) += delta   // 把运行期基址加回去
+const (
+	RelocTableMagic      = uint32(0x52504D56) // "VMPR"（小端字节序 56 4D 50 52）
+	RelocTableHeaderSize = 32
+	RelocEntrySize       = 8
+	// RelocTableFlagDelta：条目的语义是"就地加减 delta"（当前唯一取值；运行期不认识的 flags 必须硬门）。
+	RelocTableFlagDelta = uint32(1)
+)
 
 // buildImgHookARM64 生成 AArch64 的入口自解密蹦床（12 条指令 / 48 字节）：
 //
@@ -153,6 +199,13 @@ type Options struct {
 	EntryRVA uint32
 	// ImgSections：需要"入口自解密"的原镜像节（原镜像整体加密）。为空则不启用。
 	ImgSections []ImgSection
+	// ImgRelocs：落在 ImgSections 范围内的**相对重定位**槽位（ET_DYN/PIE 的常态；
+	// ET_EXEC 一般没有）。非空时 payload 里会生成"重定位应用表"（格式与运行期算法见
+	// RelocTableHeaderSize 的注释）。空 = 加密范围里没有相对重定位，运行期不需要应用器。
+	ImgRelocs []ImgReloc
+	// PrefBase：链接期（首选）镜像基址，写进重定位应用表头。
+	// 运行期 delta = 运行期基址 − PrefBase（ET_EXEC 上两者相等 ⇒ delta=0）。
+	PrefBase uint64
 	// ImageBase：目标的首选镜像基址（写进表头；运行期据此拒绝"被重定位"的情况）。
 	ImageBase uint64
 	// UnpackFn：vm_unpack_image 在 blob 内的偏移（manifest 的 symbols 里查）。
@@ -251,6 +304,9 @@ type Payload struct {
 	ImgTlsArrayRVA uint32
 	LoadCfgRVA     uint32
 	TlsDirRVA      uint32
+	// ImgRelocTableRVA/ImgRelocLen：重定位应用表（0 = 没有；格式见 RelocTableHeaderSize）。
+	ImgRelocTableRVA uint32
+	ImgRelocLen      int
 }
 
 // Result 注入结果
@@ -266,6 +322,18 @@ type Result struct {
 	ImgTlsArrayRVA uint32      `json:"imgTlsArrayRVA"`
 	LoadCfgRVA     uint32
 	TlsDirRVA      uint32 `json:"tlsDirRVA"`
+	// ImgSections：本次真正整体加密的范围（ELF 侧由 ApplyELF 填；供布局门禁核对
+	// "范围里没有没被记录的重定位"）。
+	ImgSections []ImgSection `json:"imgSections"`
+	// ImgRelocTableRVA/ImgRelocLen/ImgRelocCount：重定位应用表（见 RelocTableHeaderSize）。
+	// 0/0/0 表示加密范围里没有相对重定位（运行期不需要应用器）。
+	ImgRelocTableRVA uint32 `json:"imgRelocTableRVA"`
+	ImgRelocLen      int    `json:"imgRelocLen"`
+	ImgRelocCount    int    `json:"imgRelocCount"`
+	// ImgPrefBase：链接期（首选）基址；运行期 delta = 运行期基址 − ImgPrefBase。
+	ImgPrefBase uint64 `json:"imgPrefBase"`
+	// ImgEType：e_type（2=ET_EXEC、3=ET_DYN/PIE）。=3 时运行期**必须**做 delta 应用。
+	ImgEType uint16 `json:"imgEType"`
 }
 
 // BuildPayload 组装 payload；baseRVA 是 payload 将被放置的地址（相对镜像基址）
@@ -289,6 +357,21 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 	thunkSize, patchLen, err := opt.Arch.info()
 	if err != nil {
 		return nil, err
+	}
+	// 重定位应用表描述的是"落在**加密范围里**的槽位"：每个槽位必须完整落在一个 ImgSection 内。
+	// 不成立就报错 —— 表与加密范围不一致时，运行期会去加减一个没被加密的槽位（或者漏掉一个
+	// 真被加密的），两者都是静默的错误结果。
+	for i, r := range opt.ImgRelocs {
+		found := false
+		for _, s := range opt.ImgSections {
+			if uint64(r.RVA) >= uint64(s.RVA) && uint64(r.RVA)+8 <= uint64(s.RVA)+uint64(s.Size) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("重定位槽位 #%d RVA=0x%X 不在任何被加密的范围内", i, r.RVA)
+		}
 	}
 	data := make([]byte, 0, len(opt.Stub)+len(opt.Funcs)*(descSize+thunkSize)+4096)
 	data = append(data, opt.Stub...)
@@ -644,6 +727,48 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		}
 		data = append(data, t...)
 	}
+	// ---- 重定位应用表（只在该目录非空时生成；格式/运行期算法见 RelocTableHeaderSize） ----
+	// 放在 imgHook 之后：imgHook 里的 rel32 位移都是按绝对 RVA 算好的，追加在后面不会动到它们。
+	imgRelocTableRVA := uint32(0)
+	imgRelocLen := 0
+	if len(opt.ImgRelocs) > 0 {
+		align(16)
+		imgRelocTableRVA = baseRVA + uint32(len(data))
+		put32 := func(v uint32) {
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], v)
+			data = append(data, b[:]...)
+		}
+		put32(RelocTableMagic)
+		put32(uint32(len(opt.ImgRelocs)))
+		put32(imgRelocTableRVA) // selfRVA：运行期 base = 表地址 − selfRVA
+		put32(RelocTableFlagDelta)
+		var pb [8]byte
+		binary.LittleEndian.PutUint64(pb[:], opt.PrefBase)
+		data = append(data, pb[:]...)
+		put32(RelocEntrySize)
+		put32(0) // reserved
+		for _, r := range opt.ImgRelocs {
+			put32(r.RVA)
+			put32(r.Type)
+		}
+		imgRelocLen = len(data) - int(imgRelocTableRVA-baseRVA)
+		// 掩码：**无条件**做（没有主密钥时用全零 master），与描述符/校验表一致 ——
+		// 少掩一次运行期就解出垃圾，两边必须同一个算式。
+		{
+			m := opt.Master
+			if len(m) != 32 {
+				m = make([]byte, 32)
+			}
+			mr := FieldMask(m, FieldMaskDomainReloc, opt.FieldMaskSalt)
+			base := int(imgRelocTableRVA - baseRVA)
+			XorMask(data, base+4, 24, mr[0:24])
+			for i := range opt.ImgRelocs {
+				XorMask(data, base+RelocTableHeaderSize+i*RelocEntrySize, RelocEntrySize, mr[24:32])
+			}
+		}
+		align(16)
+	}
 	// ---- TLS 目录副本（当它落在被整体加密的节里时） ----
 	tlsDirRVA := uint32(0)
 	if len(opt.TlsDirCopy) > 0 {
@@ -714,7 +839,7 @@ func BuildPayload(opt Options, baseRVA uint32) (*Payload, error) {
 		}
 		data = append(data, make([]byte, 8)...) // 终止项
 	}
-	pl := &Payload{Data: data, Placements: placements, CodeSize: len(data) - opt.BSSSize, BSSOff: opt.BSSOff, BSSSize: opt.BSSSize, EntryHookRVA: entryHookRVA, EntryHookLen: entryHookLen, ImgTableRVA: imgTableRVA, ImgTableLen: imgTableLen, ImgHookRVA: imgHookRVA, ImgTlsArrayRVA: imgTlsArrayRVA, TlsDirRVA: tlsDirRVA, LoadCfgRVA: loadCfgRVA}
+	pl := &Payload{Data: data, Placements: placements, CodeSize: len(data) - opt.BSSSize, BSSOff: opt.BSSOff, BSSSize: opt.BSSSize, EntryHookRVA: entryHookRVA, EntryHookLen: entryHookLen, ImgTableRVA: imgTableRVA, ImgTableLen: imgTableLen, ImgHookRVA: imgHookRVA, ImgTlsArrayRVA: imgTlsArrayRVA, TlsDirRVA: tlsDirRVA, LoadCfgRVA: loadCfgRVA, ImgRelocTableRVA: imgRelocTableRVA, ImgRelocLen: imgRelocLen}
 	return pl, nil
 }
 

@@ -17,7 +17,10 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 	warnRWX := false
 	_ = warnRWX
 	imageBase := f.ImageBase()
-	if imageBase == 0 {
+	// ET_DYN(PIE) 的首选基址**可以就是 0**（gcc 默认布局：第一个 PT_LOAD 的 p_vaddr = 0，
+	// 内核把它映射到 load_bias）。此时 RVA == VA，本函数里所有 "imageBase + RVA" 的算术照样成立，
+	// 运行期也照旧用 "解密表地址 − selfRVA" 反推基址。只有 ET_EXEC 的基址为 0 才是解析失败。
+	if imageBase == 0 && f.EType != elf.ET_DYN {
 		return nil, fmt.Errorf("无法确定镜像基址")
 	}
 	baseVA := f.NextVA()
@@ -25,6 +28,11 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		return nil, fmt.Errorf("新段地址 0x%X 超出 32 位表示范围", baseVA)
 	}
 	baseRVA := uint32(baseVA - imageBase)
+
+	// 链接期（首选）基址要写进重定位应用表：运行期 delta = 运行期基址 − 首选基址。
+	// 注意与 opt.ImageBase（写进解密表头、运行期用来**强制**基址）不同：ELF 侧那里传 0
+	// （PIE 必然被搬走，不能强制）；这里必须是真实的链接期基址。
+	opt.PrefBase = imageBase
 
 	pl, err := BuildPayload(opt, baseRVA)
 	if err != nil {
@@ -119,13 +127,21 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		f.SwapPhdrs(oi, pi)
 	}
 
+	// 重定位应用表（运行期应用器的契约，见 RelocTableHeaderSize）连同"到底加密了哪些范围"
+	// 一起落进报告：布局门禁据此核对"范围里没有没被记录的重定位"。
 	return &Result{
-		SectionRVA:   baseRVA,
-		SectionSize:  len(pl.Data),
-		StubEntryRVA: baseRVA + uint32(opt.StubEntry),
-		Placements:   pl.Placements,
-		ImgTableRVA:  pl.ImgTableRVA,
-		ImgTableLen:  pl.ImgTableLen,
+		SectionRVA:       baseRVA,
+		SectionSize:      len(pl.Data),
+		StubEntryRVA:     baseRVA + uint32(opt.StubEntry),
+		Placements:       pl.Placements,
+		ImgTableRVA:      pl.ImgTableRVA,
+		ImgTableLen:      pl.ImgTableLen,
+		ImgSections:      opt.ImgSections,
+		ImgRelocTableRVA: pl.ImgRelocTableRVA,
+		ImgRelocLen:      pl.ImgRelocLen,
+		ImgRelocCount:    len(opt.ImgRelocs),
+		ImgPrefBase:      imageBase,
+		ImgEType:         f.EType,
 	}, nil
 }
 
