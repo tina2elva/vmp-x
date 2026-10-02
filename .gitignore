@@ -5,3 +5,6 @@
 
 # local diagnostics
 /interp_*.txt
+
+# 多智能体协作的临时状态（绝不提交；见 docs/HANDOFF.md 的并发协作约定）
+/.agent-teams/

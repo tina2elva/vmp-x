@@ -16,7 +16,7 @@
 > | **必做（技术正确性）** | ① `CDQ/CQO/IDIV/DIV` lift　② `/Od` 栈传参/varargs　③ `CVTDQ2PD`/double　④ **保护前逐函数差分自检（fail-closed）** | ①②③ 直接卡住客户 demo 里的 `Gcd`/`IsPrime`/`FormatReport`/`Mean`；④ 把"静默算错"变成"明确拒绝" |
 > | **建议做（产品化）** | ⑤ 母狗/工具私钥保护（DPAPI/TPM）+ `--key-from-dongle`　⑥ 接客户自己的 `verify.py`/`ground_truth`，产出**逐函数可保护性清单**　⑦ `export` 发版包 + CI 核对 `epochs.json` | ⑤ 现在私钥是明文文件，复制即绕过工具授权；⑥ 是给客户看的"自证材料"；⑦ 交付与防发错纪元 |
 > | **按需/待决策** | ⑧ Sentinel 接口层（要上狗才做）　⑨ 吊销/黑名单（离线怎么定义要先定）　⑩ `features`（并发/功能点/机器绑定 —— 客户模型里只有"产品+到期"，默认**不做**）　⑪ ELF `.rela` + Linux 反调试　⑫ 外置密钥+DLL / Linux/arm64 取钥　⑬ `vmpepoch which` 支持 ELF　⑭ **PE32（32 位）支持**（客户 `demo32.exe` 被拒：`不支持的 PE 机器类型 0x14C`，这是平台移植不是开关） | 取决于客户实际交付形态；PE32 若客户还有 32 位产品则是**硬门槛** |
-> | **可砍** | ⑮ 1b 的"授权回调"形态（与 ⑤ 的 DPAPI/TPM 路线重复，TPM 那半边并入 ⑤） | 避免两条并行路线 |
+> | **可砍** | ⑮ 1b 的"授权回调"形态（与 ⑤ 的 DPAPI/TPM 路线重复，TPM 那半边并入 ⑤） | 避免两条并行路线。**2026-09-30 用户已拍板：不做** —— 见下方「1b「授权回调」取钥形态：已评估，决定不做（2026-09-30）」一节 |
 >
 > **已完成**：工具授权（构建凭据）✅、委派签发（canIssue）✅、运行期强制 ✅、商业化闭环可复跑脚本 `tools/acceptance_demo.ps1`（23/23）✅
 > **已经过时/删掉**：授权层设计基线里"路线 B 未实现"的描述、运行期强制 WIP 段、Ed25519 描述（已换 ECDSA P-256）、密钥纪元分发策略（已落地）。
@@ -219,12 +219,20 @@
 
 ## 其他已登记（来源见括号，优先级低于上面 1–3）
 
-- [ ] ELF 侧 `.rela.dyn/.rela.plt` 的"先减后加"应用器（现状：ELF PIE 能用是因为测试目标落在加密节里的重定位项恰好没有）。(`STATUS #390`)
+- [x] ELF 侧 `.rela.dyn/.rela.plt` 的"先减后加"应用器（现状：ELF PIE 能用是因为测试目标落在加密节里的重定位项恰好没有）。(`STATUS #390`) → **已落地（`STATUS #592`；提交 `0aac4a3`/`098bd98`/`d5d038c`/`411b764`）**：语义也纠正了 —— ELF 的 `R_*_RELATIVE` 是**赋值**，所以**不是「先减后加」**，而是「验签前把槽位还原成 `r_addend ^ 密码流`、解密后再写 `r_addend + l_addr`」。默认**拒绝**加密含相对重定位的范围，`-enc-image-elf-pie-relocs` 才打开；静态 PIE（无 `PT_INTERP`）+ `-enc-image-elf-pie` 有 pre-existing 的 rc=139（见下面登记）。
 - [x] Linux 侧反调试：`/proc/self/status` 的 `TracerPid`（现在四条路径都是 Windows 目标）。**已落地，见 `STATUS #587`**（`STATUS #389`）
 - [x] 外置密钥 + DLL 组合（**已落地，见 `STATUS #589`**：运行期按"包含自己代码的模块"定位 `<DLL>.vmpkey`）；Linux/arm64 的取钥路径已在 `STATUS #388` 落地。(`STATUS #385`)
-- [~] 1b 的其余取钥形态：**DPAPI 包装的密钥文件已落地**（`<产物>.vmpkey.dpapi` + `cmd/vmpkeywrap`，见 `STATUS #590`）；
-  **仍未做**：授权回调形态、TPM/TEE 封印（`密钥永不出芯片`）。接缝仍是 `vm_key_from_file()` 一个函数。(`STATUS #385/#393`)
+- [~] 1b 的其余取钥形态：**DPAPI 包装的密钥文件已落地**（`<产物>.vmpkey.dpapi` + `cmd/vmpkeywrap`，见 `STATUS #590`）；**CNG/TPM 封印的密钥文件也已落地**（`<产物>.vmpkey.ncrypt`，优先 Microsoft Platform Crypto Provider/TPM，退软件 KSP，见 `STATUS #591`）；
+  **仍未做**：TEE/远程证明那一档 —— ".ncrypt" 已做到"私钥不出 CNG/TPM 边界"，但**硬件保证 / attestation 未验**（Platform Crypto Provider 拒答 Impl Type，`0x80090029`，见 `STATUS #591`）。
+  **授权回调形态：已拍板不做**（2026-09-30，见下面单独一节）。接缝仍是 `vm_key_from_file()` 一个函数。(`STATUS #385/#393/#591`)
 - [x] `-key-in` 的"密钥纪元"策略：`vmpepoch new` 建纪元、`which` 认领产物、按 `<产物>.vmpkey` 分发 —— 已在 `tools/acceptance_demo.ps1` 里端到端演示（`STATUS #395/#400`）。
+
+## 1b「授权回调」取钥形态：已评估，决定不做（2026-09-30）
+
+**1b「授权回调」取钥形态：已评估，决定不做**（2026-09-30；完整设计见 `docs/THREATMODEL.md` G7-1b）
+**这是什么**：产物运行时需要一个 32 字节主密钥才能解密自己的字节码。「授权回调」是第 4 种送达方式 —— 不放在任何文件里，而是由**宿主程序运行时现给**：客户要在自己的程序里写一个函数（`int vmpx_key_cb(unsigned char *out, unsigned int outLen)`，返回恰好 32 字节），产物启动时按 `"<模块名>!<导出名>"` 去宿主进程里找到并调用它；拿不到就直接**杀掉宿主进程**（fail-closed，不是报错退出）。
+**为什么不做的**：它把「密钥从哪来」外包给宿主 ⇒ **锁的强度等于宿主自己的强度**；已做好的两种形态（`.dpapi` 见 `#590`、`.ncrypt` 见 `#591`）至少保住「产物+密钥文件拷到别的机器就跑不起来」，而回调形态连密钥文件都没有、密钥就在宿主进程内存里；且主密钥必须每次运行都相同（密文与 KCV 都是构建期烘进去的），**吊销/轮换救不了它**。
+**什么情况下才回头做**（三条同时成立）：1) 产物是 **DLL**（住在客户程序里）；2) 客户回调背后有**比密钥文件更硬的锚**（狗/TPM/服务器）；3) 客户接受「**没有回调就杀掉宿主进程**」。届时实现估计约 150–250 行 / 4 文件 + 1 测试目录 / 1–1.5 人日。**本次不排实现任务**。
 
 ## 5. 授权层（License Layer）—— 设计基线与**剩余未做项**
 ### 417. Sentinel 接进 blob 的设计与执行清单（本轮完成设计，实现留下一轮）
@@ -741,6 +749,42 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       而非外置产物在同一 runner 上正常 ⇒ 崩在取钥之前/之中。白名单保持关闭；复现器 
       `tools/e2e_win_arm64.ps1` 已就绪（加回该作业即可复现，run 35951042779）。
       **另需更正**：此前"没有环境能执行 Windows/ARM64"的判断是错的 —— 该作业本来就是原生 ARM64。
+
+## 本轮（2026-09-30）新登记的未做项与「数字自我美化」类问题
+
+来源：`STATUS #591`/`#592` 的独立复核与收尾（t5/t6/t8/t9）。机制描述都带 file:line，便于直接动手。
+
+- [ ] **跳过的 step 会被 `gates.ps1` 汇总成 `[OK]` 并留在 15 里**（与已修的 A1「skip 计入 passed」同族，本轮**未修**）。
+      机制：`tools/gates.ps1:16-24` 的 `Step()` **只记 exit code**、无条件进 `$script:results`，最后汇总 `total N gates, M failed`
+      ⇒ 任何 **exit 0 的 skip** 都显示为 `[OK  ] <name> (exit 0)`。exit 0 的 skip 路径：
+      `tools/wsl_linux.ps1:29`（无 wsl.exe）、`:38`（WSL 在但不可用）、`tools/gates.ps1:41-44`（`-NoWsl`，且什么都不验）、
+      `tools/e2e_32bit.ps1:44-52`（缺 i686 工具链，打印两行 `[!] SKIPPED: … NOT being verified by this run.`）。
+      缓解（现成）：`VMP_REQUIRE_WSL=1` / `VMP_REQUIRE_I686=1` 把 skip 变硬失败（CI 的 32-bit 作业已设后者，见 `ci.yml:28`）。
+      修法方向：跳过的 step 在摘要里**单列**（如 `[SKIP] <name>`）且**不得计为 OK**；汇总行区分 ok/skip/fail。
+      同族但目前无害：`tools/wsl_linux.sh:30` 的 `KNOWN_FAIL=""`（清单为空，`:41` 会在豁免过期时提示）。
+      **边界**：@`9405987` 与 @`d5d038c` 两份本地 gates 日志里 `[SKIP]` 行数为 **0** ⇒ 那两次 `15/0` 是 15 步全真的；
+      只有缺 WSL/i686 的机器上才会出现"含未跑步骤的 15/0"。
+- [ ] **`tools/e2e.ps1:19-21` 按镜像名"全机器"杀残留进程**：同一台机器上并发跑 e2e/gates 会**互相杀**，
+      表现为 `E2EFAIL mt(0) … try1[rc=-1 out[]]` 或 `mt_many … lenP=0`。本轮多次假红（`171/2`、`172/1`）都与并发有关，
+      干净重跑即恢复（gates `15/0`、e2e `173/0`）⇒ 记为**测试抖动，不归因被测代码**。
+      修法方向：只杀自己派生的子进程（按 pid/job，而不是按镜像名），或给并发跑加锁。
+      附带：**陈旧产物也会污染现场**（评审临时树里遗留的 `.ncrypt` 让 ext-key 用例红过一次）⇒ 报告数字必须注明工作区状态。
+- [ ] **静态 PIE + `-enc-image-elf-pie` 只打印跳过，但产物 rc=139**（SIGSEGV）。**pre-existing**，本轮未修。
+      修法方向：`fatalf` 或醒目告警。
+- [ ] **aarch64 的"加密范围内重定位"路径没有可运行用例**（`#376` 禁掉 aarch64 只读数据节加密）⇒ 该分支只有代码级审查。
+- [ ] **fail-closed `code=8`（重定位表地址两个窗口都不在）构造不出来**（改 `DT_RELA` 会让 ld.so 先 SIGSEGV，rc=139）⇒ **未验证**；
+      其余分支（code=1/2/3/4 与打包端 DT_RELASZ 越界）已独立构造并实测为 rc=7 + stderr 诊断。
+- [ ] **E5 的"载荷绝对 VA 覆盖"在真实 Go PIE 上候选为 0**（`[OK] E5 payload: 0 absolute VA(s), all covered by 7175 RELATIVE entries`）
+      ⇒ 只对**植入**的 VA 有区分力；承重的是 E5-bookkeeping 与 t10 的运行期断言。
+- [ ] **t1 的两条工具 CLI 负例（`-provider bogus` / 非 ASCII `-keyname`）不在 committed e2e 里**（由评审独立复现：exit 2 且不落文件）
+      ⇒ 建议补进 `tools/e2e.ps1` 的 1b 段。
+- [ ] **工具"自检失败就拒绝写出"分支没有故障注入**：证据 = 代码路径（`wrapNCrypt` 里 `os.WriteFile` 唯一且在两道校验之后）
+      + 两条可达的 CNG 前负例 + `internal/cred/payloadwrap_test.go` 的坏输入用例。要更强需注入 CNG 故障。
+- [ ] **C/Go 密钥名校验不对称**：C 侧只拒 `0x00`/`>127`（`stub/win/x64/vm_interp.c:1819-1822`），Go 侧拒 `<0x20`。
+      属 fail-closed（名字对不上只是找不到密钥），未修。
+- [ ] **探针留下一把不可导出的 CNG 密钥（名字 `keys`）**：`certutil` 需管理员 ⇒ 清理失败，**无害遗留**
+      （管理员执行 `certutil -delkey -csp "Microsoft Platform Crypto Provider" keys` 可清掉）。
+- [ ] **t11 的 e2e accounting 断言是防回归护栏**（"skip 不能计成 passed"），不是"密钥形态/应用器正确"的独立证据。
 
 ## 8. 稳定性观察（追加）
 

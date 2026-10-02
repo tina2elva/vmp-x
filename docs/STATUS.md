@@ -10118,3 +10118,158 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
 - TPM/TEE 封印（"密钥永不出芯片"）与"授权回调"形态仍未做；本轮只做了 `#393` 里那个**过渡方案**。
 - DPAPI 的边界照旧如实说明：只挡"拷走文件到别的机器/别的用户"，**不挡**同一用户在本机调用
   `CryptUnprotectData`，也不防内存抓取。
+
+### 591. payload 主密钥的 CNG/TPM 封印形态（`<产物>.vmpkey.ncrypt`）＋「授权回调」形态已评估并决定不做
+
+**做了什么**
+- **运行期**（`stub/win/x64/vm_interp.c`，Windows 密钥路径）：`vm_key_from_file()` 的优先链变成
+  **`.ncrypt` > `.dpapi` > 明文`<产物>.vmpkey`**，任一步解不开/不存在就按序回退 ⇒ 既有部署逐字节不变。
+  文件格式（小端，与 Go 侧 `internal/cred/payloadwrap.go` **同一份常量**）：magic `"VMPXNCR1"`
+  + `u32 nameLen(1..64)` + `u32 blobLen(32..512)` + ASCII 密钥名 + RSA-2048/PKCS#1 v1.5 密文；
+  **两端都要求声明长度正好用完文件**（多一个尾巴也算"被动过"），所以头/名/密文里任意一字节翻转都是拒绝，
+  不会静默错位。`ncrypt.dll` 经 `ntdll!LdrLoadDll` 加载（blob 不引导入表），与 `crypt32`/`bcrypt` 两处同一做法。
+- **工具侧** `cmd/vmpkeywrap`：`-form auto|dpapi|ncrypt`（auto 按 `-out` 后缀判）、
+  `-provider auto|tpm|software`、`-keyname`。确保/新建一把**不可导出**的 RSA-2048（能力探针 = 加密→解密往返，
+  不能解密就换下一个提供程序），包裹之后**先把刚做出来的密文自解一遍、逐字节比对，再写文件**（不一致就 exit 1、不落盘）。
+- **e2e 新用例**（`tools/e2e.ps1` 9/9a/9b/10/11/12）：正确的 `.ncrypt` 与原生逐字节一致（旁边**故意**放一份错的明文 ⇒ 同时证明优先级）；
+  `.ncrypt` 胜过一个"包着另一把密钥"的 `.dpapi` 诱饵；**逐偏移篡改扫描**（文件 291 字节全翻一遍，都必须硬门 `0xC0DE0007` 且无输出）；
+  显式 `-provider software` 与显式 `-provider tpm` 各自端到端（无 TPM 的机器上**醒目跳过**）。
+- **1b「授权回调」取钥形态**：设计与威胁模型已冻结在 `docs/THREATMODEL.md` G7-1b（Q1 pull/否掉 push、Q2 ABI 与调用上下文、
+  Q3 打包端复用 `vm_key_src` 零格式变更、Q4 并入 `kind>=2` 严格族、Q5 威胁增量表，以及"否掉的备选方案"表）。
+  **用户已拍板：不做**（它是把"密钥从哪来"外包给宿主 ⇒ 锁的强度等于宿主自身的强度，相对已落地的 `.dpapi`/`.ncrypt` 是降级）。
+  收口文字已逐字写进 `docs/TODO.md`（不留悬空待办），`THREATMODEL` G7 加了一行指回该决定。
+
+**证据（本机与 CI，命令与 run 号）**
+- 独立 worktree（`9405987`）上：`tools/preflight.ps1` → `[+] preflight: OK`；
+  `tools/gates.ps1` → **`total 15 gates, 0 failed`**（其中 `e2e: 173 passed, 0 failed`、`dll e2e: 7 passed, 0 failed`）。
+- e2e 里的 ncrypt 关键行：`[*] ncrypt provider: TPM (Microsoft Platform Crypto Provider)`、
+  `[*] ncrypt tamper sweep: 291/291 offsets rejected (file 291 bytes)`。
+- **校准（人为破坏后必须真的红；记录命令与输出）**：在临时 worktree 里把 `.ncrypt` 探测挪到 `.dpapi` **之后**
+  ⇒ `E2EFAIL ext-key/ncrypt-vs-dpapi: code=0xC0DE0007 out=[] native=[143] (expect the .ncrypt answer)`；
+  删掉 8 字节 magic 比较 ⇒ `E2EFAIL ext-key/ncrypt-tamper: only 283/291 offsets rejected; first bad offsets: 0,1,2,3,4,5`
+  （那一次 `e2e: 171 passed, 2 failed`，其余 171 条仍全绿 ⇒ 失败是定点的）。
+- **既有形态无回归**（我自建外置密钥产物，原生基准 `check_key 10 → 143`）：明文 `.vmpkey` → `rc=0 out=[143]`；
+  环境变量 `VMPX_KEY` → `rc=0 out=[143]`；`.vmpkey.dpapi` → `rc=0 out=[143]`；`.vmpkey.ncrypt` → `rc=0 out=[143]`；
+  四种全删 → `rc=0xC0DE0007 out=[]`。DLL 形态由 `tools/e2e_dll.ps1` 覆盖（`dll e2e: 7 passed, 0 failed`，
+  含 `[OK] 1b/dll: no key -> rc=0xC0DE0007, no output`）。
+- **工具 CLI 负例（评审独立复现，不在 committed e2e 里）**：`-provider bogus` / 非 ASCII `-keyname` / `-form zzz`
+  三条都 exit 2 且**不落文件**；`-form auto` 按后缀正确选 dpapi/ncrypt。
+- **TPM 事实（更正）**：本机**确有** TPM 2.0（`tpmtool getdeviceinformation`：INTC、固件 700.19.18.2595、PPI 1.3；
+  `Get-Tpm` 返回空只是缺管理员权限）。auto 路径**真的走了 Microsoft Platform Crypto Provider**
+  （wrap 密钥落在 `%LOCALAPPDATA%\Microsoft\Crypto\PCPKSP\<guid>\*.PCPKEY`，而软件 KSP 在 `%APPDATA%\Microsoft\Crypto\Keys`）。
+  ⇒ 表述："**软件 KSP 端到端已验；TPM（Platform Crypto Provider）路径在一台确有 TPM 2.0 的机器上端到端已验；
+  硬件保证 / attestation 未验**"（Platform Crypto Provider 拒答 Impl Type，`0x80090029`）。
+- **CI**：`9405987` → **run `37001837353` 五作业全绿**（windows-amd64 上真跑了 `tools/e2e.ps1`，含新用例）；
+  纯文档的 G7-1b 设计提交 `8fd02b4` → **run `37002265597` 五作业全绿**。
+- **e2e 数字按平台分开写（t11 修前/修后）**：本机旧格式 `e2e: 173 passed, 0 failed`，且 TPM 用例**真的跑了**
+  （日志有 `[*] ncrypt provider: TPM (Microsoft Platform Crypto Provider)`、**无 `[skip]` 行**）⇒ 本机 173 = 173 条真验过；
+  CI 的 windows-amd64 runner **无 TPM**，同一行 `173 passed` 实为 **172 验过 + 1 个未验证 skip**
+  （当时 `[skip] -provider tpm unavailable … NOT verified here` 仍 `$pass++`）；t11（`13399c5`）修后同一 runner 是
+  `e2e: 172 passed, 1 skipped, 0 failed`（**run `37008085604`** 五绿），skip 带可见原因且仍 exit 0（CI 无 TPM 不能变红）。
+
+**未做项**
+- **硬件保证 / attestation 未验**（见上：`0x80090029`）。"私钥物理上出不了芯片"没有证据。
+- 工具"**自检失败就拒绝写出**"这条分支**没有做故障注入**：证据是代码路径（`wrapNCrypt` 里 `os.WriteFile` 只有一处，
+  且在两处校验之后）+ 两条可达的 CNG 前负例（`-provider bogus` / 非 ASCII `-keyname`，都 exit 2 且不落文件）
+  + `internal/cred/payloadwrap_test.go` 的坏输入用例。**不得**写成"已注入验证"。
+- **跨语言一致性**：单测只钉 Go 侧常量（`payloadwrap_test.go:96-98`），**不读** `vm_interp.c`；Go↔C 的一致性由
+  **端到端**证明（工具写出的 291 字节文件被 C 侧解析+解密，且 291/291 个偏移被拒）。
+- C/Go **密钥名校验不对称**：C 侧只拒 `0x00` 与 `>127`（`vm_interp.c:1819-1822`），Go 侧拒 `<0x20`。
+  属于 fail-closed（名字对不上只是找不到密钥），**未修**。
+- **探针留下一把不可导出的 CNG 密钥（名字 `keys`）**：评审复核时留下，`certutil` 需管理员 ⇒ 清理失败。
+  如实登记为"**无害遗留，未清理**"。
+- 1b 授权回调：**不做**（决定与"什么情况下才回头做"的三条见 `docs/TODO.md`）。
+- t1 的提交信息里 "the Linux key path is untouched" **不精确**：探针代码位于 `VM_KEY_EXTERNAL` 编译段，
+  linux/amd64、linux/arm64、win/x86 同样会编译进去，只是 Linux 的 `vm_find_module`/`vm_get_proc` 是返回 0 的桩
+  ⇒ **Linux 恒回退**，行为与改动前一致（不是"没改到"）。
+
+### 592. ELF PIE（ET_DYN）的 `.rela` 应用器 + 布局门禁 E5（含 CI 覆盖补齐）
+
+**做了什么**
+- **打包/载入端（Go）**：`internal/load/elf` 新增动态重定位读取（走目标自己的 `PT_DYNAMIC`：
+  DT_RELA/DT_RELASZ/DT_RELAENT，及 REL 退回）+ `NormalizeRelocSlots()`（把槽位归一成 `r_addend`；读不出来一律报错 = fail-closed）；
+  `internal/inject` 新增 payload 内的**重定位应用表**与 `FieldMaskDomainReloc=0xC0DE0006`；
+  `cmd/vmpack` 新增 `-enc-image-elf-pie`（ET_DYN 显式 opt-in）与 `-enc-image-elf-pie-relocs`
+  （允许加密含相对重定位的范围）。**默认拒绝**加密含相对重定位的范围并打印理由；静态 PIE（无 `PT_INTERP`）也拒绝。
+  顺带修掉两个"只有真 PIE 才暴露"的打包器缺陷：ET_DYN 首选基址为 0 被误判为"无法确定镜像基址"；头部跳过量没减段起点
+  （与 `tools/image_residue_elf.py` 一直用的口径对齐）。
+- **运行期**（`stub/win/x64/vm_interp.c` 的 Linux 区，x86-64 + aarch64 两条分支）。**关键结论（与 PE 侧 #390 的差异，必须记住）**：
+  PE 那套「先减 delta → 验签 → 解密 → 再加回 delta」**不能照搬 ELF** —— PE 的重定位是"就地加 l_addr"，
+  减 delta 能把原始文件字节拿回来；而 ELF 的 `R_*_RELATIVE` 是**赋值** `value = l_addr + r_addend`，
+  密文那几个字节已被**覆盖**，减 delta 只能得到"链接期明文"，而 **Poly1305 认证的是密文**。
+  正确做法：验签**之前**把槽位还原成**原始密文** = `r_addend ^ 密码流`（`r_addend` 来自目标自己的 DT_RELA；
+  密码流由本次解密已算出的 key/nonce 现场生成，消息从 counter=1 起，故第 k 字节属于块 `1 + k/64`）；
+  验签、解密（原有两句不动）之后再把槽位写成 `r_addend + l_addr`（`delta = base − prefBase`）。
+  重定位表读**目标自己的** `PT_DYNAMIC`（与 ld.so 同一份），运行期不依赖 payload 里那张账目表的位置；
+  glibc 会把 DT_RELA 这类"指针型"动态项**就地**加 l_addr，所以表地址按"运行期窗口/链接期窗口"判定一次，
+  两边都不在就硬门（code 8）。`mprotect` 从"验签之后"前移到"验签之前"。
+  **没有 `PT_DYNAMIC` 的静态目标（Go 的 ET_EXEC / 静态 PIE）是无条件 no-op** ⇒ 既有静态目标零回归。
+- **门禁**：`tools/check_elf_layout.py` 的 E5 对 ET_DYN 变成两条**真检查** ——（a）载荷里的首选基址绝对 VA 必须被
+  `R_*_RELATIVE` 覆盖（候选按 `[imageBase, 末段末)` 的"合理 VA 窗口"过滤；原来的 `v>>32` 判据几乎匹配任意随机 8 字节，等于没有检查）；
+  （b）账目：报告声明的加密范围里每条 `R_*_RELATIVE` 必须被记录（`imgRelocCount`）且有应用表（`imgRelocTableRVA`）。
+  校准新增 M5b（E5-bookkeeping）与 M6（E5-payload，要求 E5 **自己的**失败行指向植入的 VA，避免被 E3 顶替）；
+  ET_EXEC 保持 INFO + 校准 SKIP（不回归）。
+- **用例**：`tools/e2e_elf_image.sh` 新增 `PIE=1`（Go `-buildmode=pie`）与 `PIE_RELOCS=1`（gcc PIE，`.rodata` 里两条
+  `R_X86_64_RELATIVE`）两个模式；`tools/wsl_linux.sh` 在 `go test` 之前先造 PIE 夹具（否则真实 PIE 用例永远 SKIP）+ 4 个新步骤；
+  t10 把 t3 写的、已过期的"必须 fail-closed"期望换成**真检查**（`PIE_RELOCS` 产物必须与原生逐字节一致：143 / 5050 且 rc=0，
+  放过路径 grep 已清空）。
+- **CI 覆盖补齐（t12）**：`.github/workflows/ci.yml` 的 linux-amd64 作业新增 4 步（`PIE` e2e → PIE 门禁 → `PIE_RELOCS` e2e → PIE_RELOCS 门禁，
+  全部 `--strict` + `set -o pipefail`，且**门禁紧跟产生它的那次 e2e**）。
+
+**证据（独立复跑，命令与输出；被验提交 sha 逐条写明）**
+- **自建 PIE 夹具**（不是脚本里那份）：`.rodata` 里 6 个指向 6 个全局的指针槽 + 2 个字符串指针，运行期 `selfCheck()`
+  把每个重定位槽与 `&global` 比对（不一致返回 3/4/5）。用 `-enc-image-elf-pie -enc-image-elf-pie-relocs` 打包后
+  `imgEType=3 imgRelocCount=8 imgRelocTableRVA=0xE300`；**原生 vs 产物 stdout 与退出码逐条一致**：
+  `selfcheck -> [selfcheck ok] rc=0`、`check-key 10 -> [143] rc=0`、`sum-to 100 -> [5050] rc=0`、`reloc-probe -> [29377357731159] rc=0`；
+  `098bd98` 与 `d5d038c` 两个 sha 上结果相同（`git diff --stat 098bd98 d5d038c -- stub/ internal/ cmd/` **为空**）。
+  默认（只给 `-enc-image-elf-pie`）时打包器**明确拒绝**加密那段 `.rodata`：
+  `跳过 .rodata（RVA 0x2000 size 0x130 内有 8 条相对重定位；加密它们需要运行期应用器，见 -enc-image-elf-pie-relocs）`。
+- **校准（"改之前/改坏之后必须真的红"）**：三条独立破坏，且**默认产物始终绿**（失败是定点的）——
+  ① 短路 `vm_reloc_fix` ⇒ t10 的新断言红：`[MISMATCH] reloc-bearing product check-key: native=[143] (rc=0)
+  packed=[VMPELF verifyfail rva=8192 …] (rc=132)` + `[FAIL] reloc-bearing PIE product is not byte-identical to native (check-key)`（exit 1）；
+  ② 删掉写回 `*slot += delta` ⇒ **能跑但算错**：`packed=[ro slot 0 corrupted] rc=3`；
+  ③ 用 **PE 配方**（把槽位"减 delta"而不是按 `r_addend ^ 密码流` 重算密文）⇒ `packed=[VMPELF verifyfail rva=8192 …] rc=132`
+  —— **这一条自己证明了上面那条关键结论**，不是转述注释。
+- **`tools/check_elf_layout.py`**：契约命令
+  `python3 tools/check_elf_layout.py --packed build/linux_target.vmp --manifest build/vm_interp_linux.json --blob build/vm_interp_linux.bin --report build/linux_vmp.json --selftest`
+  → exit 0，**六项校准全过**（pristine/E1/E2/E3/E4/E1-order），ET_EXEC 下 E5 是 INFO + 按设计 SKIP；
+  PIE 产物门（紧跟其 e2e 跑）→ exit 0，**八项校准全过**（含 E5-bookkeeping/E5-payload）。
+  **自造 E5 缺陷**（在 payload 里植入 `0x401234`，落在 `[prefBase 0x400000, ceiling 0x5EF203)`）⇒ 门禁 exit 1，且是 **E5 自己的失败行**：
+  `[FAIL] E5 1 of 1 payload absolute VA(s) have no RELATIVE relocation (first at 0x5E6000 holding 0x401234)`。
+- **无回归**：`tools/wsl_linux.ps1` → exit 0，`[+] wsl_linux: every step passed`，**13/13 步 OK**
+  （含 ET_EXEC 的 elf end-to-end 与两条 arm64/qemu 步骤）；`tools/gates.ps1` @`d5d038c` → **`total 15 gates, 0 failed`**
+  （`e2e: 173 passed, 0 failed`）；gates 的 linux-payload 门还打印 `PIE payload: identical to native at BOTH load addresses`（0x5AD000 / 0x6AD000）。
+- **CI**：`0aac4a3` → run `37003069602`；`098bd98` → run `37004469592`；`d5d038c` → run `37005713743`；
+  `411b764` → run `37006677847` —— **四条全部五作业 success**。其中 `411b764` 的 linux-amd64 作业
+  **真的执行了**新增的 PIE 步骤：`[OK  ] 带重定位的 PIE 产物：check-key 10 -> 143 ; sum-to 100 -> 5050（与原生一致）`、
+  `[OK] E5  bookkeeping: 2 in-range RELATIVE reloc(s) recorded (0x2000:2), apply table at RVA 0xE210`。
+  ⇒ **`411b764` 之后"CI 五作业全绿"才真正覆盖运行期重定位应用器**；此前（`PIE=0`、且从不调 `check_elf_layout.py`）的绿只能写成"ET_EXEC 无回归"。
+
+**未做项（逐条登记，含"不可构造/未验证"的诚实标注）**
+- **O1（pre-existing，本轮未修）**：静态 PIE（无 `PT_INTERP`）+ `-enc-image-elf-pie` **只打印跳过，但产物 rc=139**
+  （SIGSEGV）—— 建议改成 `fatalf` 或醒目告警。
+- **O3**：aarch64 的"范围内重定位"路径**没有可运行用例**（`#376` 禁掉 aarch64 的只读数据节加密）。
+- **O4**：fail-closed 的 **code=8**（重定位表地址两个窗口都不在）**构造不出来** —— 改 DT_RELA 会让 ld.so 先 SIGSEGV（rc=139）
+  ⇒ 该分支**未验证**。其余分支（code=1 动态表越界、code=3 范围内非 `R_*_RELATIVE`、code=4 槽位跨范围末、
+  code=2 只有 DT_REL、打包端 DT_RELASZ 越界）由 t8 评审独立构造并实测为 rc=7 + stderr 诊断。
+- **O5/K2**：E5 的"载荷绝对 VA 覆盖"半条在**真实 Go PIE 上候选为 0**（`[OK] E5 payload: 0 absolute VA(s), all covered by 7175 RELATIVE entries`）
+  ⇒ 它只对**植入**的 VA 有区分力（脚本的 M6 与本人的自造缺陷）；承重的是 E5-bookkeeping + t10 的运行期断言。
+- **O6**：t11 的 accounting 断言是**防回归护栏**，不是"应用器正确"的独立证据。
+- 本轮 PIE 支持是 **opt-in**（`-enc-image-elf-pie`）；ET_EXEC 行为不变。
+
+**本轮暴露的两条"数字自我美化"与假红归因（如实，不归因被测代码）**
+1. **跳过的 step 会被汇总成 `[OK]` 并留在 15 里**（与 t11 修的 A1 是同一族）。机制与清单：
+   `tools/gates.ps1:16-24` 的 `Step()` **只记 exit code**、无条件进 `$script:results`，最后汇总 `total N gates, M failed` ⇒
+   任何 **exit 0 的 skip** 都变成 `[OK  ] <name> (exit 0)`。exit 0 的 skip 路径：
+   `tools/wsl_linux.ps1:29`（无 wsl.exe）、`:38`（WSL 在但不可用）、`tools/gates.ps1:41-44`（`-NoWsl`，且**什么都不验**）、
+   `tools/e2e_32bit.ps1:44-52`（缺 i686 工具链，打印两行 `[!] SKIPPED: … NOT being verified by this run.`）。
+   逃生门：`VMP_REQUIRE_WSL=1` / `VMP_REQUIRE_I686=1`（CI 的 32-bit 作业确实设了后者，见 `ci.yml:28`），
+   但 **CI 从不调用 `tools/gates.ps1`** ⇒ 这条美化只影响**本地**汇总。同族但目前无害：`tools/wsl_linux.sh:30` 的
+   `KNOWN_FAIL=""`（清单为空，且 `:41` 会在"豁免过期"时大声提示）。
+   **边界（别把话说大）**：被验的两份本地 gates 日志（@`9405987`、@`d5d038c`）里 **[SKIP] 行数为 0**
+   ⇒ 那两次 `total 15 gates, 0 failed` 是 15 步**全真**的；只有换到缺 WSL 或缺 i686 的机器上，同一个 `15/0` 才会含未跑步骤。
+2. **`tools/e2e.ps1:19-21` 按镜像名"全机器"杀残留进程** ⇒ 同一台机器上并发跑 e2e/gates 会**互相杀**，
+   表现是 `E2EFAIL mt(0) … try1[rc=-1 out[]] try2[rc=-1 out[]]` 或 `mt_many … lenP=0`。
+   本轮多次假红（`171/2`、`172/1`）都与并发有关（评审自己遗留在临时树里的陈旧 `.ncrypt` 也污染过一次现场），
+   复核后均能干净重跑（gates `15/0`、e2e `173/0`）⇒ 记为"**宿主负载/并发导致的测试抖动，不归因被测代码**"，
+   但**报告数字必须注明工作区状态**。

@@ -81,7 +81,7 @@ powershell -NoProfile -File tools/gates.ps1
 
 | 平台 | 验证内容 | 结果 |
 |---|---|---|
-| windows-amd64 | gofmt/vet/test + E2E 147 例 + DLL 3 例 + arm64 客户机差分 | 绿（每次 push 都跑） |
+| windows-amd64 | gofmt/vet/test + E2E（本机 `173 passed / 0 failed`；CI runner 无 TPM 时为 `172 passed, 1 skipped, 0 failed`，skip 带原因且不计为 passed）+ DLL 7 例 + arm64 客户机差分 | 绿（每次 push 都跑） |
 | linux-amd64 | **ELF 整体加密默认开**：打包 → 结构断言 → 文件级 0 残留 → 真跑与原生逐字节一致（`tools/e2e_elf_image.sh --strict`） | run **35482334570** 绿：`[OK  ] ELF 整体加密：输出一致` |
 | linux-arm64（qemu-user） | aarch64 的 ELF 整体加密 + 入口自解密（含补上的 `ORR Xd, XZR, #imm` 形式，两个被保护函数） | run **35481622554** 绿：`chunks=9217 NON-ZERO FOUND=0` + 运行期一致 |
 | windows-arm64（原生 arm64 Windows） | PE/arm64 三段：结构（补丁 `F0 03 1E AA …`）+ 文件级（`.text` 2.87→7.55、`.rdata` 0.20→7.62，0 命中）+ 运行期退出码一致 | run **35483191384** 绿：`native=… protected=…` |
@@ -92,12 +92,14 @@ powershell -NoProfile -File tools/gates.ps1
 ### 仍未做（如实）
 
 1. **镜像必须落在首选基址**：整体加密是在文件字节上做的，所以打包端会拆掉重定位表（`IMAGE_FILE_RELOCS_STRIPPED`）；基址被占则**明确失败**，不静默跑飞。代价是该模块失去 ASLR。
-2. **ELF 只支持 ET_EXEC**：PIE/ET_DYN 会被 `ld.so` 的重定位写进密文，当前明确跳过（要做得先解决重定位与加密的交互）。
-3. **ELF 侧只加密可执行段**：`.rodata`/`.data` 等其它段仍是明文（PE 侧已覆盖 `.rdata`/`.data`）。
+2. **ELF 的 PIE/ET_DYN 是显式 opt-in**：默认只对 ET_EXEC 加密；`-enc-image-elf-pie` 打开 PIE，`-enc-image-elf-pie-relocs` 才允许加密**含相对重定位**的范围（需要运行期应用器：`R_*_RELATIVE` 是赋值，验签前必须把槽位还原成 `r_addend ^ 密码流`）。默认**拒绝**含相对重定位的范围并打印理由。**已知 pre-existing 缺陷**：静态 PIE（无 `PT_INTERP`）只打印跳过，但产物 rc=139。
+3. **ELF 侧默认只加密可执行段**：`.rodata`/`.data` 等其它段仍是明文（PE 侧已覆盖 `.rdata`/`.data`）。ET_DYN 用 `-enc-image-elf-pie-relocs` 可以加密含相对重定位的只读数据段；**aarch64 的只读数据节加密仍然禁用**（见 `docs/STATUS.md` #376）。
 4. **arm64 的两个宿主 blob 只能由 CI 构建**：本机没有 `aarch64-w64-mingw32` / `aarch64-linux-gnu` 工具链，Windows/arm64 与 Linux/arm64 的 blob 由 CI 的 clang / 交叉 gcc 作业产出并验证。
 5. **解释器仍是 `-O1`**：`-O2` 下只要浮点函数里含整数↔浮点转换，整个解释器会被 gcc 编译错（见 `docs/STATUS.md` 第 71/72 轮）。
 6. **指令子集未覆盖** x87、AVX/VEX、AES-NI、REP 字符串、`SYSCALL`。
 7. **没有反调试/反 dump 纵深**（除入口补丁校验与自校验外），也没有 JIT。
+8. **主密钥的保护形态**：明文 `<产物>.vmpkey`、DPAPI（用户作用域，`#590`）、CNG/TPM 封印（`#591`，优先 Microsoft Platform Crypto Provider，退软件 KSP）三种已落地，运行期优先级 `.ncrypt` > `.dpapi` > 明文。**授权回调形态已拍板不做**（2026-09-30，见 `docs/TODO.md`）；**TEE/远程证明（硬件 attestation）未做** —— "私钥物理上不出芯片"没有证据。
+9. **ELF PIE 的加密范围**：默认拒绝加密含相对重定位的范围；`-enc-image-elf-pie-relocs` 打开后由运行期应用器负责（`STATUS #592`）。aarch64 的只读数据节加密仍禁用（`#376`）。
 
 ## 覆盖到的指令子集
 
