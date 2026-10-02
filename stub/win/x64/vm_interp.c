@@ -3227,6 +3227,222 @@ static void vm_keep_verify_ref(vm_ctx_t *vm) {
  * TLS 回调 -> 入口点）。放在 .bss（不能有初始化器，否则落进只读的 .data 段）。 */
 static u32 vm_img_done;
 
+#if defined(VM_BLOB_TARGET_LINUX)
+/* ---- ELF（ET_DYN/PIE）运行期相对重定位应用器 ----
+ *
+ * 为什么必须有它：镜像整体加密是在**文件字节**上做的，而 Linux 的 ld.so 在**入口点之前**就按
+ * 动态重定位表把相对重定位写进了内存。密文的 AEAD/Poly1305 tag 覆盖的是**密文**，被覆盖过的
+ * 那几个字节会让验签**必然**失败，解密出来也是垃圾。所以"含相对重定位的加密范围"要按下面三步走：
+ *
+ *   ① 还原密文（验签之前）：ELF 的 R_*_RELATIVE 语义是**赋值** value = l_addr + r_addend，
+ *      不是"给旧值加 l_addr" —— 原来那几个密文字节已经被覆盖、无法"减 delta 拿回来"（PE 侧
+ *      #390 那套「先减再加」在 PE 上成立是因为 PE 的重定位是"就地加 delta"）。密文可以**重算**：
+ *      打包端加密的明文就是链接期形式（= r_addend，打包端归一过），而密码流运行期手上就有
+ *      （key/nonce 都由解密表推出）⇒  密文 = r_addend ^ 密码流。
+ *   ② 验签 + 解密（原有的两句，不动）。
+ *   ③ 写回运行期值（解密之后）：此时槽位 = r_addend ⇒ 加上装载基址即 value = l_addr + r_addend。
+ *
+ *   delta          = base − prefBase（= 装载基址 l_addr）
+ *   base           = 表地址 − selfRVA（既有约定，见下面两个 vm_unpack_image）
+ *   prefBase       = 最小 PT_LOAD 的 p_vaddr 向下页对齐（= 打包端 ImageBase，Go 侧 elf.ImageBase()）
+ *   slot 运行期地址 = vm_elf_addr(base, prefBase, r_offset)
+ *
+ * 信息来自**目标自己的 PT_DYNAMIC**（DT_RELA/DT_RELASZ/DT_RELAENT）—— 与 ld.so 读的是同一份，
+ * 所以运行期不依赖 payload 里那张重定位应用表的位置（那张表是打包端/门禁的账目，见
+ * internal/inject.RelocTableHeaderSize）。注意 glibc 会把 DT_RELA 这类"指针型"动态项**就地**
+ * 加上 l_addr（ET_DYN；ET_EXEC 的 l_addr = 0），所以表地址要按"运行期地址/链接期地址"两个窗口
+ * 判定一次（见下面 vm_reloc_fix 里那段注释）。
+ *
+ * fail-closed（都走硬门，见各分支的 vm_reloc_fail）：
+ *   - 加密范围里出现**非 R_*_RELATIVE** 的重定位：ld.so 写进去的值我们无法还原；R_*_NONE 也一样
+ *     拒绝 —— 只承认自己确实理解的那一种（"不认识就拒跑"比"猜着跑"安全）；
+ *   - 只有 DT_REL（addend 在槽位里、已被覆盖）而拿不到 r_addend ⇒ 拒绝；
+ *   - 动态表/重定位表本身越界，或 DT_RELAENT/DT_RELENT 不是 64 位 ELF 的规格值，或表地址既不在
+ *     运行期窗口也不在链接期窗口，或槽位跨越加密范围边界（打包端保证不会，出现即说明产物被改过）。
+ * **没有 PT_DYNAMIC**（静态链接，例如 Go 的 ET_EXEC 与静态 PIE）不是错误：那时根本不存在动态
+ * 重定位，ld.so 也不会写任何槽位 —— 直接返回"无需处理"（这条保证了既有静态目标零回归）。
+ *
+ * 现场（失败时供 vm_reloc_fail 打印）：code 1=表越界 2=条目尺寸/REL 语义 3=非相对类型 4=槽位跨界
+ * 5=没有 PT_LOAD 6=架构不认识 7=程序头表畸形 8=重定位表地址既不在运行期窗口也不在链接期窗口。
+ * 放在 .bss（不能有初始化器）。
+ */
+static u32 vm_reloc_bad;
+static u32 vm_reloc_bad_type;
+static u32 vm_reloc_bad_rva;
+
+#if defined(VM_ARCH_AARCH64)
+#define VM_RT_RELATIVE 1027u /* R_AARCH64_RELATIVE */
+#else
+#define VM_RT_RELATIVE 8u /* R_X86_64_RELATIVE */
+#endif
+
+/* VA → 运行期地址（imageBase 的相对关系由 base/prefBase 决定） */
+static u64 vm_elf_addr(u64 base, u64 prefBase, u64 va) { return base + (va - prefBase); }
+
+/* [va, va+len) 是否完整落在某个 PT_LOAD 的 [p_vaddr, p_vaddr+p_memsz) 内 */
+static int vm_elf_range_ok(const u8 *eh, u64 phoff, u16 phnum, u64 va, u64 len)
+{
+    u32 i;
+    for (i = 0; i < phnum; i++) {
+        const u8 *p = eh + phoff + (u64)i * 56u;
+        u64 s, m;
+        if (*(const u32 *)(p + 0) != 1u) continue; /* PT_LOAD */
+        s = *(const u64 *)(p + 16);
+        m = *(const u64 *)(p + 40);
+        if (va >= s && va + len <= s + m) return 1;
+    }
+    return 0;
+}
+
+/* 一个加密范围里第 off 个字节的**密码流字节**（off 相对范围起点）。
+ * 与打包端逐字节一致：消息从 ChaCha20-Poly1305 的 counter = 1 开始（counter 0 是 Poly1305 的钥块），
+ * 所以第 k 字节属于块 1 + k/64、块内偏移 k%64。 */
+static u8 vm_reloc_ks(const u8 key[32], const u8 nonce[12], u32 off)
+{
+    u8 blk[64];
+    u32 i;
+    for (i = 0; i < 64u; i++) blk[i] = 0;
+    vm_chacha20_xor(key, 1u + off / 64u, nonce, blk, blk, 64u);
+    return blk[off % 64u];
+}
+
+/* 处理"落在 [prefBase+rva, prefBase+rva+size) 内的 R_*_RELATIVE 槽位"：
+ *
+ *   back = 0（验签**之前**）→ 槽位 := **原始密文** = r_addend ^ 密码流
+ *     为什么不是"减 delta"：ELF 的 ld.so 不是"给旧值加 l_addr"，而是**无条件赋值**
+ *     l_addr + r_addend —— 密文那几个字节已经被**覆盖**了，减 delta 只能得到"链接期明文"，
+ *     而 Poly1305 认证的是**密文**（实测：减 delta 后仍验签失败，报 verifyfail）。
+ *     密文可以重新算出来：打包端是把"链接期形式"的明文（= r_addend，打包端已归一）加密成密文，
+ *     所以 密文 = r_addend ^ 密码流。密码流运行期自己就能生成（key/nonce 都在手上）。
+ *   back = 1（解密**之后**）→ 槽位 += delta（此时槽位 = r_addend，加回装载基址就是运行期正确值）
+ *
+ * 调用者必须先把这段内存 mprotect 成可写。返回 0 = 成功（或不需要处理），负数 = 失败。 */
+static int vm_reloc_fix(u64 base, u32 rva, u32 size, const u8 key[32], const u8 nonce[12], int back)
+{
+    const u8 *eh = (const u8 *)base;
+    u64 phoff = *(const u64 *)(eh + 0x20);
+    u16 phentsize = *(const u16 *)(eh + 0x36);
+    u16 phnum = *(const u16 *)(eh + 0x38);
+    u16 machine = *(const u16 *)(eh + 0x12);
+    u64 prefBase = ~(u64)0;
+    u64 linkEnd = 0, linkLo, linkHi, rtLo, rtHi, delta;
+    u64 dynVA = 0, dynSz = 0;
+    u64 tabVA = 0, tabSz = 0, ent = 0, linkTab, rtTab;
+    u64 relaVA = 0, relaSz = 0, relaEnt = 0, relVA = 0, relSz = 0, relEnt = 0;
+    u64 lo, hi;
+    int haveDyn = 0, withAddend;
+    u32 i, j;
+
+    vm_reloc_bad = 0;
+    vm_reloc_bad_type = 0;
+    vm_reloc_bad_rva = 0;
+    if (machine != 62u && machine != 183u) { vm_reloc_bad = 6; return -6; }
+    if (phentsize != 56u || phnum == 0u || phnum > 1024u) { vm_reloc_bad = 7; return -7; }
+
+    for (i = 0; i < phnum; i++) {
+        const u8 *p = eh + phoff + (u64)i * 56u;
+        u32 type = *(const u32 *)(p + 0);
+        if (type == 1u) { /* PT_LOAD */
+            u64 v = *(const u64 *)(p + 16), m = *(const u64 *)(p + 40);
+            if (v < prefBase) prefBase = v;
+            if (v + m > linkEnd) linkEnd = v + m;
+        } else if (type == 2u) { /* PT_DYNAMIC */
+            dynVA = *(const u64 *)(p + 16);
+            dynSz = *(const u64 *)(p + 32);
+            haveDyn = 1;
+        }
+    }
+    if (!haveDyn) return 0; /* 静态链接：不存在动态重定位，ld.so 没写任何东西 */
+    if (prefBase == ~(u64)0 || linkEnd <= prefBase) { vm_reloc_bad = 5; return -5; }
+    prefBase &= ~(u64)0xFFFu; /* 与打包端的 elf.ImageBase() 同一口径 */
+    delta = base - prefBase;  /* 运行期基址 − 链接期基址 */
+    linkLo = prefBase;
+    linkHi = linkEnd;
+    rtLo = base;
+    rtHi = base + (linkEnd - prefBase);
+    lo = prefBase + rva;
+    hi = lo + size;
+    if (dynSz < 16u || dynSz > (1u << 20) || dynVA < linkLo || dynVA + dynSz > linkHi ||
+        !vm_elf_range_ok(eh, phoff, phnum, dynVA, dynSz)) {
+        vm_reloc_bad = 1;
+        return -1;
+    }
+
+    {
+        const u8 *d = (const u8 *)vm_elf_addr(base, prefBase, dynVA);
+        for (j = 0; j * 16u + 16u <= dynSz; j++) {
+            u64 tag = *(const u64 *)(d + j * 16u);
+            u64 val = *(const u64 *)(d + j * 16u + 8u);
+            if (tag == 0u) break; /* DT_NULL */
+            if (tag == 7u) relaVA = val;
+            else if (tag == 8u) relaSz = val;
+            else if (tag == 9u) relaEnt = val;
+            else if (tag == 17u) relVA = val;
+            else if (tag == 18u) relSz = val;
+            else if (tag == 19u) relEnt = val;
+        }
+    }
+    withAddend = relaSz != 0u;
+    tabVA = withAddend ? relaVA : relVA;
+    tabSz = withAddend ? relaSz : relSz;
+    ent = withAddend ? relaEnt : relEnt;
+    if (tabSz == 0u) return 0; /* 目标没有任何重定位项 */
+    if (ent == 0u) ent = withAddend ? 24u : 16u;
+    if (ent != (withAddend ? 24u : 16u)) { vm_reloc_bad = 2; return -2; }
+    if (tabSz > (1u << 24) || tabSz % ent != 0u) { vm_reloc_bad = 1; return -1; }
+    /* DT_RELA/DT_REL 的 d_ptr 在运行期**已经被 ld.so 就地改成了运行期地址**：glibc 的
+     * elf_get_dynamic_info 会给 ET_DYN 的"指针型"动态项（DT_RELA/DT_STRTAB/DT_SYMTAB/…）
+     * 就地加 l_addr（实测：本机 glibc 上 DT_RELA 的值 = 装载基址 + 链接期 VA）；ET_EXEC 的
+     * l_addr = 0，值本来就是运行期地址。所以先按运行期地址用；只有当它落在"链接期窗口"里
+     * （那个加载器没做这一步调整）才折算一次。两边都不在 ⇒ 硬门（产物被改过/搬到了别处）。
+     * 重定位**条目里的 r_offset 不受这步影响**，它始终是链接期 VA，所以槽位地址要折算。 */
+    if (tabVA >= rtLo && tabVA + tabSz <= rtHi) linkTab = tabVA - delta;
+    else if (tabVA >= linkLo && tabVA + tabSz <= linkHi) linkTab = tabVA;
+    else { vm_reloc_bad = 8; return -8; }
+    if (!vm_elf_range_ok(eh, phoff, phnum, linkTab, tabSz)) { vm_reloc_bad = 1; return -1; }
+    rtTab = vm_elf_addr(base, prefBase, linkTab);
+    for (j = 0; j < (u32)(tabSz / ent); j++) {
+        const u8 *r = (const u8 *)rtTab + (u64)j * ent;
+        u64 off = *(const u64 *)(r + 0);
+        u32 type = (u32)(*(const u64 *)(r + 8) & 0xFFFFFFFFu);
+        u64 *slot;
+        u64 plain;
+        u8 *pb = (u8 *)&plain;
+        u32 b;
+        if (off < lo || off >= hi) continue; /* 不在本次要处理的加密范围里 ⇒ ld.so 写的值我们不动它 */
+        if (off + 8u > hi) {
+            vm_reloc_bad = 4;
+            vm_reloc_bad_rva = (u32)(off - prefBase);
+            return -4;
+        }
+        if (type != VM_RT_RELATIVE) {
+            vm_reloc_bad = 3;
+            vm_reloc_bad_type = type;
+            vm_reloc_bad_rva = (u32)(off - prefBase);
+            return -3;
+        }
+        slot = (u64 *)vm_elf_addr(base, prefBase, off);
+        if (back) {
+            /* 解密后槽位 = r_addend；加回装载基址 = 运行期值 */
+            *slot += delta;
+            continue;
+        }
+        if (!withAddend) {
+            /* REL 语义的 addend 就在槽位里，而槽位已被 ld.so 覆盖 ⇒ 无法还原密文。硬门。 */
+            vm_reloc_bad = 2;
+            vm_reloc_bad_rva = (u32)(off - prefBase);
+            return -2;
+        }
+        plain = (u64)*(const i64 *)(r + 16); /* r_addend = 打包端加密前的链接期明文 */
+        for (b = 0; b < 8u; b++) {
+            pb[b] = (u8)(pb[b] ^ vm_reloc_ks(key, nonce, (u32)(off - lo) + b));
+        }
+        *slot = plain;
+    }
+    return 0;
+}
+#endif /* VM_BLOB_TARGET_LINUX */
+
 #if defined(VM_BLOB_TARGET_LINUX) && defined(VM_ARCH_AARCH64)
 /* ---- Linux/aarch64：与 x86-64 那条同构（只验签 + 原地解密），差别只在 syscall 约定：
  * 号放 x8、参数 x0..x2、svc #0；mprotect = 226、write = 64。基址同样用「表地址 - selfRVA」反推。 ---- */
@@ -3274,6 +3490,19 @@ static void vm_dbg_trace(const char *tag, long v) {
     vm_syscall3_a64(64 /* SYS_write */, 2 /* stderr */, (long)buf, (long)n);
 }
 
+/* 运行期重定位的硬门：**不返回**。退出码 0xC0DE0007（POSIX 只暴露低 8 位 = 7，与取钥硬门同码），
+ * 原因打到 stderr —— 静默跳过重定位等于带着错误的值继续跑，比崩更难查。 */
+static void vm_reloc_fail(void)
+{
+    vm_img_diag[0] = 0x100u + vm_reloc_bad;
+    vm_dbg_trace("VMPELF relocfail code=", (long)vm_reloc_bad);
+    vm_dbg_trace("VMPELF relocfail type=", (long)vm_reloc_bad_type);
+    vm_dbg_trace("VMPELF relocfail rva=", (long)vm_reloc_bad_rva);
+    vm_syscall3_a64(94 /* SYS_exit_group */, (long)0xC0DE0007u, 0, 0);
+    for (;;) {
+    }
+}
+
 int vm_unpack_image(const void *tblp) {
     if (vm_img_done) return 0;
     const u8 *t = (const u8 *)tblp;
@@ -3310,11 +3539,6 @@ int vm_unpack_image(const void *tblp) {
         u8 aad[8];
         *(u32 *)(aad + 0) = rva;
         *(u32 *)(aad + 4) = size;
-        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) {
-            vm_img_diag[0] = 4;
-            vm_dbg_trace("VMPELF verifyfail rva=", (long)rva);
-            return -4;
-        }
         u64 page = 0x1000;
         u64 pstart = (u64)dst & ~(page - 1);
         u64 pend = ((u64)dst + size + page - 1) & ~(page - 1);
@@ -3328,7 +3552,17 @@ int vm_unpack_image(const void *tblp) {
             vm_dbg_trace("VMPELF mprotect errno=", -mr);
             return -5;
         }
+        /* mprotect 提前到验签之前（原来是验签后）：先把本范围内**被 ld.so 覆盖过的**相对重定位
+         * 槽位还原成原始密文，否则 tag 覆盖的那几个字节已经变了 ⇒ 验签必然失败（见 vm_reloc_fix）。 */
+        if (vm_reloc_fix(base, rva, size, key, nonce, 0) != 0) vm_reloc_fail();
+        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) {
+            vm_img_diag[0] = 4;
+            vm_dbg_trace("VMPELF verifyfail rva=", (long)rva);
+            return -4;
+        }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        /* 解密后槽位 = r_addend；把装载基址加回去 = 运行期正确值（此刻仍是可写页） */
+        if (vm_reloc_fix(base, rva, size, key, nonce, 1) != 0) vm_reloc_fail();
         long prot = (flags & 1u) ? (1 | 4) : 1;
         if (flags & 2u) prot |= 2;
         vm_syscall3_a64(226, (long)pstart, (long)(pend - pstart), prot);
@@ -3372,6 +3606,19 @@ static void vm_dbg_trace(const char *tag, long v) {
     vm_syscall3(1 /* SYS_write */, 2 /* stderr */, (long)buf, (long)n);
 }
 
+/* 运行期重定位的硬门：**不返回**。退出码 0xC0DE0007（POSIX 只暴露低 8 位 = 7，与取钥硬门同码），
+ * 原因打到 stderr —— 静默跳过重定位等于带着错误的值继续跑，比崩更难查。 */
+static void vm_reloc_fail(void)
+{
+    vm_img_diag[0] = 0x100u + vm_reloc_bad;
+    vm_dbg_trace("VMPELF relocfail code=", (long)vm_reloc_bad);
+    vm_dbg_trace("VMPELF relocfail type=", (long)vm_reloc_bad_type);
+    vm_dbg_trace("VMPELF relocfail rva=", (long)vm_reloc_bad_rva);
+    vm_syscall3(231 /* SYS_exit_group */, (long)0xC0DE0007u, 0, 0);
+    for (;;) {
+    }
+}
+
 int vm_unpack_image(const void *tblp) {
     if (vm_img_done) return 0;
     const u8 *t = (const u8 *)tblp;
@@ -3408,7 +3655,6 @@ int vm_unpack_image(const void *tblp) {
         u8 aad[8];
         *(u32 *)(aad + 0) = rva;
         *(u32 *)(aad + 4) = size;
-        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_dbg_trace("VMPELF verifyfail rva=", (long)rva); vm_dbg_trace("VMPELF verifyfail size=", (long)size); return -4; }
         /* mprotect 按页：整页放宽再解，解完恢复（代码段 RWX 只是这一瞬间） */
         u64 page = 0x1000;
         u64 pstart = (u64)dst & ~(page - 1);
@@ -3423,7 +3669,13 @@ int vm_unpack_image(const void *tblp) {
             vm_dbg_trace("VMPELF mprotect len=", (long)(pend - pstart));
             return -5;
         }
+        /* mprotect 提前到验签之前（原来是验签后）：本范围内那些**被 ld.so 覆盖过的**相对重定位
+         * 槽位必须先还原成原始密文，否则 tag 覆盖的字节已经变了 ⇒ 验签必然失败（见 vm_reloc_fix）。 */
+        if (vm_reloc_fix(base, rva, size, key, nonce, 0) != 0) vm_reloc_fail();
+        if (!vm_aead_verify_aad(key, nonce, aad, 8, dst, size, tag)) { vm_img_diag[0] = 4; vm_dbg_trace("VMPELF verifyfail rva=", (long)rva); vm_dbg_trace("VMPELF verifyfail size=", (long)size); return -4; }
         vm_chacha20_xor(key, 1, nonce, dst, dst, size);
+        /* 解密后槽位 = r_addend；把装载基址加回去 = 运行期正确值（此刻仍是可写页） */
+        if (vm_reloc_fix(base, rva, size, key, nonce, 1) != 0) vm_reloc_fail();
         long prot = (flags & 1u) ? (1 | 4) : 1;
         if (flags & 2u) prot |= 2;
         vm_syscall3(10, (long)pstart, (long)(pend - pstart), prot);
