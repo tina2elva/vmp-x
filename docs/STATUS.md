@@ -10103,7 +10103,9 @@ Linux 反调试、ELF `.rela` 应用器、DLL+外置密钥），不是任务书�
   解出同一把密钥；其余偏移全部被检出。所以"改一字节"的用例必须落在密文/MAC 区
   （第一版我翻了第 16 字节，用例判红的是**我的期望**而不是实现）。这不构成绕过：改 GUID 只会得到
   同一把密钥，拿不到别人机器上的密钥。
-- 本机验收：`preflight OK`（含新加的第 5 项门禁）、`gates total 15 gates, 0 failed`（e2e 见下）。
+- 本机验收：`preflight OK`（含新加的第 5 项门禁）、`gates total 15 gates, 0 failed`（e2e **167/0**、dll 7/0）。
+- **CI：run `36998443987`（`ed6d3f1`）五作业全绿** —— 其中 `windows-amd64` 会在 GitHub runner 上真跑
+  `tools/e2e.ps1`（含这两条新用例）⇒ DPAPI 在 runner 上同样可用，用例**不是**本机环境依赖。
 
 **顺带修掉的一个真坑（并已变成门禁）**：`tools/e2e.ps1` 这类**含中文**的 `.ps1` 必须带 UTF-8 BOM ——
 PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接语法错误**。本轮编辑工具把开头的 BOM
