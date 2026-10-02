@@ -1786,9 +1786,92 @@ static int vm_key_from_file_dpapi(const u16 *path) {
     return ok;
 }
 
+/* ---------------- CNG/TPM 包裹的密钥文件（<产物>.vmpkey.ncrypt）----------------
+ * 形态（与 Go 侧 internal/cred/payloadwrap.go **同一份格式**，小端）：
+ *   0..7   magic "VMPXNCR1"
+ *   8..11  u32 nameLen  (1..64)
+ *   12..15 u32 blobLen  (32..512)
+ *   16..   密钥名（ASCII）+ RSA-2048/PKCS#1 密文
+ * 为什么它比 .dpapi 更强：密文是用**本机 CNG 持久化密钥的公钥**包的
+ * （优先 Microsoft Platform Crypto Provider = TPM，不可用则退软件 KSP），私钥永不以可用形式存在；
+ * 把文件拷到别的机器/别的用户，那边没有这把持久化密钥 ⇒ 解不开。
+ * 与 .dpapi 一样：解不开就**回退**到下一个形态（既有部署行为逐字节不变）。
+ *
+ * 为什么这个解密不能放到授权门禁那里去：这里只做一件事（拿主密钥），
+ * 门禁仍在入口跳床；与 .dpapi 一样处于同一个函数接缝里。
+ * ncrypt.dll 在简单进程里通常没有加载：用 ntdll!LdrLoadDll 自己加载
+ * （blob 不引入导入表；与 bcrypt/crypt32 那两处同一做法）。
+ * 密钥名只允许 ASCII（工具侧写文件时已校验）：非 ASCII 一律当"文件被动过"拒绝。 */
+static const char vm_ncrypt_magic[8] = {'V', 'M', 'P', 'X', 'N', 'C', 'R', '1'};
+
+static int vm_key_from_file_ncrypt(const u16 *path) {
+    static u8 blob[1024];
+    static u16 keyname[80];
+    static u8 plain[32];
+    u32 got = 0;
+    if (!vm_key_read_nt(path, blob, (u32)sizeof(blob), &got)) return 0;
+    if (got < 16u + 1u + 32u) return 0;
+    for (u32 i = 0; i < 8; i++) if (blob[i] != (u8)vm_ncrypt_magic[i]) return 0;
+    u32 nl = (u32)blob[8] | ((u32)blob[9] << 8) | ((u32)blob[10] << 16) | ((u32)blob[11] << 24);
+    u32 cl = (u32)blob[12] | ((u32)blob[13] << 8) | ((u32)blob[14] << 16) | ((u32)blob[15] << 24);
+    if (nl < 1u || nl > 64u || cl < 32u || cl > 512u) return 0;
+    /* 必须**整文对齐**：头里声明的长度加不回来就说明文件被动过（多一个字节也算）。 */
+    if (16u + nl + cl != got) return 0;
+    for (u32 i = 0; i < nl; i++) {
+        u8 c = blob[16 + i];
+        if (c == 0 || c > 127) return 0;
+        keyname[i] = (u16)c;
+    }
+    keyname[nl] = 0;
+    u64 nc = vm_find_module("ncrypt.dll");
+    if (!nc) {
+        static const u16 ncName[] = {'n','c','r','y','p','t','.','d','l','l',0};
+        nc = vm_load_lib(ncName);
+    }
+    if (!nc) return 0;
+    typedef long (VM_WINAPI *openprov_t)(void **, const u16 *, u32);
+    typedef long (VM_WINAPI *openkey_t)(void *, void **, const u16 *, u32, u32);
+    typedef long (VM_WINAPI *decrypt_t)(void *, u8 *, u32, void *, u8 *, u32, u32 *, u32);
+    typedef long (VM_WINAPI *free_t)(void *);
+    openprov_t op = (openprov_t)vm_get_proc(nc, "NCryptOpenStorageProvider");
+    openkey_t ok = (openkey_t)vm_get_proc(nc, "NCryptOpenKey");
+    decrypt_t dec = (decrypt_t)vm_get_proc(nc, "NCryptDecrypt");
+    free_t fr = (free_t)vm_get_proc(nc, "NCryptFreeObject");
+    if (!op || !ok || !dec || !fr) return 0;
+    /* 提供程序顺序与工具侧（cred.CNGProviders）一致：TPM 优先。 */
+    u16 provs[2][40];
+    vm_name_u16(provs[0], "Microsoft Platform Crypto Provider", 40);
+    vm_name_u16(provs[1], "Microsoft Software Key Storage Provider", 40);
+    for (u32 p = 0; p < 2; p++) {
+        void *hp = 0;
+        if (op(&hp, provs[p], 0) != 0 || !hp) continue;
+        void *hk = 0;
+        if (ok(hp, &hk, keyname, 0, 0) != 0 || !hk) { fr(hp); continue; }
+        u32 out = 0;
+        long st = dec(hk, blob + 16 + nl, cl, 0, plain, (u32)sizeof(plain), &out,
+                      0x40u /* NCRYPT_SILENT_FLAG */ | 0x2u /* NCRYPT_PAD_PKCS1 */);
+        fr(hk);
+        fr(hp);
+        /* 长度必须正好 32：PKCS#1 填充被动过、密钥不对、不是同一台机器 ⇒ 这里都过不去。 */
+        if (st != 0 || out != 32u) continue;
+        for (u32 i = 0; i < 32; i++) vm_master_buf[i] = plain[i];
+        return 1;
+    }
+    return 0;
+}
+
 static int vm_key_from_file(void) {
     const u16 *path = vm_key_path();
     if (!path || !*path) return 0;
+    /* **最强形态优先**：同目录同前缀的 <产物>.vmpkey.ncrypt（私钥不出 CNG/TPM 边界）。
+     * 解不开/不存在就回退下一形态 —— 于是"只分发受保护文件"是默认姿势，而已有部署逐字节不变。 */
+    static u16 npath[400];
+    u32 m = 0;
+    while (path[m] && m < 391) { npath[m] = path[m]; m++; }
+    const char *nsuf = ".ncrypt";
+    for (u32 i = 0; i < 7; i++) npath[m++] = (u16)(u8)nsuf[i];
+    npath[m] = 0;
+    if (vm_key_from_file_ncrypt(npath)) return 1;
     /* **受保护形态优先**：同目录同前缀的 <产物>.vmpkey.dpapi。
      * 解不开/不存在就回退明文 —— 于是"只分发受保护文件"是默认姿势，而已有部署（只有明文）逐字节不变。 */
     static u16 dpath[400];

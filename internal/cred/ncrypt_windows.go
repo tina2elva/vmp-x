@@ -32,10 +32,14 @@ var (
 	procExport   = ncryptDLL.NewProc("NCryptExportKey")
 	procSign     = ncryptDLL.NewProc("NCryptSignHash")
 	procFree     = ncryptDLL.NewProc("NCryptFreeObject")
+	// 产物主密钥包裹（<产物>.vmpkey.ncrypt）用的三个：
+	procSetProp = ncryptDLL.NewProc("NCryptSetProperty")
+	procEncrypt = ncryptDLL.NewProc("NCryptEncrypt")
+	procDecrypt = ncryptDLL.NewProc("NCryptDecrypt")
 )
 
 const (
-	provTPM         = "Microsoft Platform Crypto Provider"
+	provTPM         = CNGTPMProviderName
 	provSoftware    = "Microsoft Software Key Storage Provider"
 	algECDSA256     = "ECDSA_P256"
 	blobECCPub      = "ECCPUBLICBLOB"
@@ -216,4 +220,254 @@ func hexOf(b []byte) string {
 		sb.WriteByte(tab[c&0xF])
 	}
 	return sb.String()
+}
+
+// ---------------- 产物主密钥的 CNG/TPM 包裉（<产物>.vmpkey.ncrypt）----------------
+//
+// 这就是「私钥永不出安全边界」的那一档：
+//   - 包裹用的是持久化 RSA-2048 密钥的**公钥**，私钥在 CNG 安全边界里
+//     （优先 Microsoft Platform Crypto Provider = TPM，不可用则退软件 KSP）；
+//   - 文件里只有 RSA 密文 + 密钥名，拷到别的机器/别的用户都解不开；
+//   - 运行期由 blob 自己调 NCryptOpenKey + NCryptDecrypt（见 stub/win/x64/vm_interp.c）。
+//
+// 算法与填充：RSA-2048 + PKCS#1 v1.5（NCRYPT_PAD_PKCS1）。
+// 选 PKCS#1 而不是 OAEP 是为了兼容性：TPM 那一档（Platform Crypto Provider）
+// 对 PKCS#1 解密的支持在各个 Windows 版本上最稳。
+//
+// 诚实说明：软件 KSP 只能说“私钥不出 CNG 边界”（我们的 API 导不出来），
+// 不能说“私钥不出芯片”——后者要硬件 TPM。
+const (
+	// rsaAlgorithm：包裹密钥的算法名（NCryptCreatePersistedKey 用的是算法标识字符串）。
+	rsaAlgorithm = "RSA"
+	// wrapKeyBits：包裹密钥长度。
+	wrapKeyBits = 2048
+	// ncryptPadPKCS1 = NCRYPT_PAD_PKCS1；NCRYPT_SILENT_FLAG 用已有的 ncryptSilent。
+	ncryptPadPKCS1 = 0x00000002
+	// ncryptLengthProp = NCRYPT_LENGTH_PROPERTY 的属性名（必须在 Finalize 之前设）。
+	ncryptLengthProp = "Length"
+	// wrapPlainLen：包裹的明文总是 32 字节（解密缓冲区也就是这么大，与运行期一致）。
+	wrapPlainLen = 32
+)
+
+func ncryptStatus(op string, r uintptr) error {
+	return fmt.Errorf("%s failed: 0x%X", op, uint32(r))
+}
+
+// ncryptEncrypt 用已打开的密钥（只需公钥部分）做 RSA/PKCS#1 加密。
+func ncryptEncrypt(hk uintptr, plain []byte) ([]byte, error) {
+	if len(plain) == 0 {
+		return nil, fmt.Errorf("ncryptEncrypt: 明文为空")
+	}
+	buf := make([]byte, 512)
+	var need uint32
+	r, _, _ := procEncrypt.Call(hk, uintptr(unsafe.Pointer(&plain[0])), uintptr(len(plain)), 0,
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), uintptr(unsafe.Pointer(&need)),
+		ncryptSilent|ncryptPadPKCS1)
+	if r != 0 {
+		return nil, ncryptStatus("NCryptEncrypt(PKCS1)", r)
+	}
+	if need < 32 || int(need) > len(buf) {
+		return nil, fmt.Errorf("NCryptEncrypt 返回的密文长度异常: %d", need)
+	}
+	out := make([]byte, need)
+	copy(out, buf[:need])
+	return out, nil
+}
+
+// ncryptDecrypt 用已打开的密钥做 RSA/PKCS#1 解密，输出必须正好 32 字节。
+// 填充被动过、密钥不对、不是同一台机器 —— 都会在这里失败。
+func ncryptDecrypt(hk uintptr, ct []byte) ([]byte, error) {
+	if len(ct) == 0 {
+		return nil, fmt.Errorf("ncryptDecrypt: 密文为空")
+	}
+	buf := make([]byte, wrapPlainLen)
+	var need uint32
+	r, _, _ := procDecrypt.Call(hk, uintptr(unsafe.Pointer(&ct[0])), uintptr(len(ct)), 0,
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), uintptr(unsafe.Pointer(&need)),
+		ncryptSilent|ncryptPadPKCS1)
+	if r != 0 {
+		return nil, ncryptStatus("NCryptDecrypt(PKCS1)", r)
+	}
+	if need != wrapPlainLen {
+		return nil, fmt.Errorf("解出来的明文长度不是 %d（实得 %d）", wrapPlainLen, need)
+	}
+	out := make([]byte, wrapPlainLen)
+	copy(out, buf[:need])
+	return out, nil
+}
+
+// ncryptRoundTrip：用同一把密钥做一次 加密→解密，答案必须逐字节相等。
+// 这是在「这台机器上这把密钥到底能不能做 RSA 解密」上的唯一可信证据：
+// TPM 那一档既可能“能建但不能解”（用途策略不对），也可能“能解但解错”。
+func ncryptRoundTrip(hk uintptr) error {
+	probe := make([]byte, wrapPlainLen)
+	copy(probe, "vmpx-wrap-selftest-v1")
+	ct, err := ncryptEncrypt(hk, probe)
+	if err != nil {
+		return err
+	}
+	back, err := ncryptDecrypt(hk, ct)
+	if err != nil {
+		return err
+	}
+	if string(back) != string(probe) {
+		return fmt.Errorf("加密→解密的往返结果与输入不一致")
+	}
+	return nil
+}
+
+// CNGProviderSelection：把 -provider 选项译成供应程序队列。
+//
+//	auto（空串）= TPM 优先，不可用则退软件 KSP（运行期的顺序也是这个）；
+//	tpm / software = 只用指定的那一个（验收用来把两条路径分开测）。
+func CNGProviderSelection(sel string) ([]string, error) {
+	switch strings.ToLower(strings.TrimSpace(sel)) {
+	case "", "auto":
+		return CNGProviders(), nil
+	case "tpm":
+		return []string{provTPM}, nil
+	case "software", "ksp":
+		return []string{provSoftware}, nil
+	}
+	return nil, fmt.Errorf("-provider 只能是 auto/tpm/software（实得 %q）", sel)
+}
+
+// CNGFindPayloadKey 在给定供应程序队列里找到能用的包裉密钥，并**实测**一次往返。
+func CNGFindPayloadKey(sel, name string) (provider string, err error) {
+	if err := ValidWrapKeyName(name); err != nil {
+		return "", err
+	}
+	provs, serr := CNGProviderSelection(sel)
+	if serr != nil {
+		return "", serr
+	}
+	var lastErr error
+	for _, prov := range provs {
+		hp, hk, oerr := cngOpenKey(prov, name)
+		if oerr != nil {
+			lastErr = oerr
+			continue
+		}
+		perr := ncryptRoundTrip(hk)
+		procFree.Call(hk)
+		procFree.Call(hp)
+		if perr != nil {
+			lastErr = fmt.Errorf("%s 下的密钥 %q 不能做 RSA 解密: %v", prov, name, perr)
+			continue
+		}
+		return prov, nil
+	}
+	return "", fmt.Errorf("找不到可用的包裹密钥 %q（TPM 与软件 KSP 都没成功）: %v", name, lastErr)
+}
+
+// CNGEnsurePayloadKey：找得到就直接用；找不到就在给定的供应程序队列（默认 TPM → 软件 KSP）里
+// 建一把不可导出的 RSA-2048（建完立刻做一次加解密往返，不行就换下一个提供程序）。
+func CNGEnsurePayloadKey(sel, name string) (provider string, created bool, err error) {
+	if prov, ferr := CNGFindPayloadKey(sel, name); ferr == nil {
+		return prov, false, nil
+	}
+	if err := ValidWrapKeyName(name); err != nil {
+		return "", false, err
+	}
+	provs, serr := CNGProviderSelection(sel)
+	if serr != nil {
+		return "", false, serr
+	}
+	var lastErr error
+	for _, prov := range provs {
+		hp, oerr := openProvider(prov)
+		if oerr != nil {
+			lastErr = oerr
+			continue
+		}
+		var h uintptr
+		r, _, _ := procCreate.Call(hp, uintptr(unsafe.Pointer(&h)),
+			uintptr(unsafe.Pointer(mustUTF16(rsaAlgorithm))), uintptr(unsafe.Pointer(mustUTF16(name))), 0, 0)
+		if r != 0 {
+			procFree.Call(hp)
+			lastErr = fmt.Errorf("NCryptCreatePersistedKey(RSA @ %s) 失败: 0x%X", prov, uint32(r))
+			continue
+		}
+		bits := make([]byte, 4)
+		binary.LittleEndian.PutUint32(bits, uint32(wrapKeyBits))
+		if sr, _, _ := procSetProp.Call(h, uintptr(unsafe.Pointer(mustUTF16(ncryptLengthProp))),
+			uintptr(unsafe.Pointer(&bits[0])), uintptr(len(bits)), ncryptSilent); sr != 0 {
+			// 设不上不算失败（默认就是 2048）：真正的判定是下面的往返测试。
+			lastErr = fmt.Errorf("NCryptSetProperty(Length @ %s) 失败: 0x%X", prov, uint32(sr))
+		}
+		if fr, _, _ := procFinalize.Call(h, ncryptSilent); fr != 0 {
+			procFree.Call(h)
+			procFree.Call(hp)
+			lastErr = fmt.Errorf("NCryptFinalizeKey(RSA @ %s) 失败: 0x%X", prov, uint32(fr))
+			continue
+		}
+		perr := ncryptRoundTrip(h)
+		procFree.Call(h)
+		procFree.Call(hp)
+		if perr != nil {
+			lastErr = fmt.Errorf("在 %s 下建的包裹密钥不能做 RSA 解密: %v", prov, perr)
+			continue
+		}
+		return prov, true, nil
+	}
+	return "", false, fmt.Errorf("没有可用的 CNG 提供程序来建包裹密钥（TPM 与软件 KSP 都失败）: %v", lastErr)
+}
+
+// CNGWrapPayload 用持久化密钥的公钥把 32 字节主密钥包成 .ncrypt 文件内容。
+func CNGWrapPayload(sel, name string, master []byte) (blob []byte, provider string, err error) {
+	if len(master) != wrapPlainLen {
+		return nil, "", fmt.Errorf("主密钥必须是 %d 字节（实得 %d）", wrapPlainLen, len(master))
+	}
+	provs, serr := CNGProviderSelection(sel)
+	if serr != nil {
+		return nil, "", serr
+	}
+	var lastErr error
+	for _, prov := range provs {
+		hp, hk, oerr := cngOpenKey(prov, name)
+		if oerr != nil {
+			lastErr = oerr
+			continue
+		}
+		ct, eerr := ncryptEncrypt(hk, master)
+		procFree.Call(hk)
+		procFree.Call(hp)
+		if eerr != nil {
+			lastErr = eerr
+			continue
+		}
+		b, merr := MarshalPayloadNCrypt(name, ct)
+		if merr != nil {
+			return nil, "", merr
+		}
+		return b, prov, nil
+	}
+	return nil, "", fmt.Errorf("用 %q 包裹失败（TPM 与软件 KSP 都没成功）: %v", name, lastErr)
+}
+
+// CNGUnwrapPayloadBlob 解开 .ncrypt 内容，返回 32 字节主密钥。
+// 工具侧自检用的就是这个：它与运行期 blob 的解析/解密逐条对应
+// （同一份格式、同一个提供程序顺序、同一个填充标志），自检不过就不写文件。
+func CNGUnwrapPayloadBlob(blob []byte) ([]byte, error) {
+	name, ct, err := ParsePayloadNCrypt(blob)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, prov := range CNGProviders() {
+		hp, hk, oerr := cngOpenKey(prov, name)
+		if oerr != nil {
+			lastErr = oerr
+			continue
+		}
+		pt, derr := ncryptDecrypt(hk, ct)
+		procFree.Call(hk)
+		procFree.Call(hp)
+		if derr != nil {
+			lastErr = fmt.Errorf("%s: %v", prov, derr)
+			continue
+		}
+		return pt, nil
+	}
+	return nil, fmt.Errorf("解不开密钥名 %q 的密文（本机没有这把持久化密钥，或密文被改过/来自别的机器）: %v", name, lastErr)
 }

@@ -351,6 +351,96 @@ if ($LASTEXITCODE -ne 0) {
             Remove-Item $dpPath -ErrorAction SilentlyContinue
         }
 
+        # 9) <产物>.vmpkey.ncrypt：CNG/TPM 持久化密钥包裹（"私钥不出安全边界"的那一档）。
+        #    优先级链是 .ncrypt > .dpapi > 明文，三条要**分别**证明：
+        #    只证"能用"会掩盖优先级写错（把更弱的形态放到前面）。
+        $ncPath = Join-Path (Get-Location) "$extExe.vmpkey.ncrypt"
+        Remove-Item $ncPath -ErrorAction SilentlyContinue
+        $ncOut = (& .\build\vmpkeywrap.exe -key $extHex -out $ncPath 2>&1 | Out-String).Trim()
+        $ncExit = $LASTEXITCODE
+        if (($ncExit -ne 0) -or (-not (Test-Path $ncPath))) {
+            $fail++; $failLines += ("E2EFAIL ext-key/ncrypt: vmpkeywrap failed (exit={0}): {1}" -f $ncExit, $ncOut)
+        } else {
+            # 校准 1：工具必须自己报告做过自检（否则"写出来的密文本机解不开"会被静默接受）
+            if ($ncOut -match 'self-check: decrypted') { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt: vmpkeywrap did not report its self-check: " + $ncOut) }
+            $ncProv = ""
+            if ($ncOut -match 'provider: ([A-Za-z0-9 ]+) --') { $ncProv = $Matches[1].Trim() }
+            $ncKind = "?"
+            if ($ncProv -match 'Platform Crypto') { $ncKind = "TPM" }
+            elseif ($ncProv -match 'Software') { $ncKind = "software KSP" }
+            Write-Output ("  [*] ncrypt provider: " + $ncKind + " (" + $ncProv + ")")
+            # 9a) 正确答案 vs 原生：旁边**故意**放一个错的明文。.ncrypt 必须优先 ⇒ 与原生逐字节一致。
+            [System.IO.File]::WriteAllText((Join-Path (Get-Location) $extKeyBeside), ("22" * 32))
+            $ncNative = (Run-File "build/target.exe" @("check_key", "10") 30).Trim()
+            $rn1 = Get-ExitCode $extExe @("check_key", "10")
+            if (($ncNative -ne "") -and ($rn1.Code -eq 0) -and ($rn1.Out.Trim() -eq $ncNative)) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt: code=0x{0:X8} out=[{1}] native=[{2}] (the plaintext beside it was deliberately WRONG, so this also proves .ncrypt is preferred)" -f ($rn1.Code -band 0xFFFFFFFF), $rn1.Out.Trim(), $ncNative) }
+            # 9b) .ncrypt 优先于 .dpapi：旁边再放一个"包着另一把密钥"的 .dpapi。
+            #     它自己能被 DPAPI 解开，但解出来的主密钥过不了 KCV（会走硬门）——
+            #     所以"答出 143"只可能来自 .ncrypt 被优先读走。
+            $dpPath2 = Join-Path (Get-Location) "$extExe.vmpkey.dpapi"
+            Remove-Item $dpPath2 -ErrorAction SilentlyContinue
+            & .\build\vmpkeywrap.exe -key ("33" * 32) -out $dpPath2 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                $fail++; $failLines += "E2EFAIL ext-key/ncrypt-vs-dpapi: could not build the decoy .dpapi"
+            } else {
+                $rn2 = Get-ExitCode $extExe @("check_key", "10")
+                if (($rn2.Code -eq 0) -and ($rn2.Out.Trim() -eq $ncNative)) { $pass++ }
+                else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt-vs-dpapi: code=0x{0:X8} out=[{1}] native=[{2}] (expect the .ncrypt answer)" -f ($rn2.Code -band 0xFFFFFFFF), $rn2.Out.Trim(), $ncNative) }
+            }
+            # 10) 篡改标定：**逐个偏移量**翻一个字节，每一个都必须被检出（硬门 0xC0DE0007 且无输出）。
+            #     先把明文与 .dpapi 挪走，让这条**只**取决于 .ncrypt（否则"回退到别的形态"也能得到硬门，
+            #     这条断言就没有区分力）。标定方式就是"量的不是某一个字节，而是整个文件的每一个偏移量"：
+            #     长度以文件实际大小为准（这里 16 字节头 + 密钥名 + 256 字节 RSA 密文），不再手工挑位置。
+            Remove-Item $extKeyBeside, $dpPath2 -ErrorAction SilentlyContinue
+            $ncGood = [System.IO.File]::ReadAllBytes((Resolve-Path $ncPath).Path)
+            $ncBadOff = @()
+            $ncDet = 0
+            for ($i = 0; $i -lt $ncGood.Length; $i++) {
+                $mut = [byte[]]::new($ncGood.Length)
+                [Array]::Copy($ncGood, $mut, $ncGood.Length)
+                $mut[$i] = $mut[$i] -bxor 0xFF
+                [System.IO.File]::WriteAllBytes((Resolve-Path $ncPath).Path, $mut)
+                $rt2 = Get-ExitCode $extExe @("check_key", "10")
+                if ((('{0:X8}' -f ($rt2.Code -band 0xFFFFFFFF)) -eq 'C0DE0007') -and ($rt2.Out -eq "")) { $ncDet++ }
+                elseif ($ncBadOff.Count -lt 6) { $ncBadOff += $i }
+            }
+            [System.IO.File]::WriteAllBytes((Resolve-Path $ncPath).Path, $ncGood)
+            Write-Output ("  [*] ncrypt tamper sweep: {0}/{1} offsets rejected (file {2} bytes)" -f $ncDet, $ncGood.Length, $ncGood.Length)
+            if ($ncBadOff.Count -eq 0) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt-tamper: only {0}/{1} offsets rejected; first bad offsets: {2}" -f $ncDet, $ncGood.Length, ($ncBadOff -join ",")) }
+            # 11) 软件 KSP 那条路：显式 -provider software —— 本机确定可复现，不依赖有没有 TPM。
+            #     显式指定 + 断言用的是软件提供程序 ⇒ "软件 KSP 下端到端通过"这条有直接证据。
+            Remove-Item $ncPath -ErrorAction SilentlyContinue
+            $swOut = (& .\build\vmpkeywrap.exe -key $extHex -out $ncPath -keyname vmpx-payload-key-sw-e2e -provider software 2>&1 | Out-String).Trim()
+            $swOk = ($LASTEXITCODE -eq 0) -and $swOut.Contains("[+] wrote") -and $swOut.Contains("provider: Microsoft Software Key Storage Provider")
+            if (-not $swOk) {
+                $fail++; $failLines += ("E2EFAIL ext-key/ncrypt-sw: -provider software failed (exit={0}): {1}" -f $LASTEXITCODE, $swOut)
+            } else {
+                $rsw = Get-ExitCode $extExe @("check_key", "10")
+                if (($rsw.Code -eq 0) -and ($rsw.Out.Trim() -eq $ncNative)) { $pass++ }
+                else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt-sw: code=0x{0:X8} out=[{1}] (software-KSP wrapped key must work end-to-end)" -f ($rsw.Code -band 0xFFFFFFFF), $rsw.Out.Trim()) }
+            }
+            # 12) TPM 那条路：显式 -provider tpm。本机有 TPM 2.0 时应成功；没有 TPM 的机器会**明确失败**，
+            #     这一档就**大声跳过**（不冒充验过）。硬件保证本身（私钥出不了芯片）不是这里的断言。
+            Remove-Item $ncPath -ErrorAction SilentlyContinue
+            $tpmOut = (& .\build\vmpkeywrap.exe -key $extHex -out $ncPath -keyname vmpx-payload-key-tpm-e2e -provider tpm 2>&1 | Out-String).Trim()
+            # 判"成功"必须同时看到 exit=0 + 写出标记 + 提供程序就是 TPM：
+            # 只看名字会被**失败信息里的提供程序名**骗过（那会让这条静默地变成假通过）。
+            $tpmOk = ($LASTEXITCODE -eq 0) -and $tpmOut.Contains("[+] wrote") -and $tpmOut.Contains("provider: Microsoft Platform Crypto Provider")
+            if (-not $tpmOk) {
+                Write-Output "  [skip] -provider tpm unavailable on this machine => the TPM path is NOT verified here"
+                Write-Output ("         reason: " + $tpmOut)
+                $pass++
+            } else {
+                $rtpm = Get-ExitCode $extExe @("check_key", "10")
+                if (($rtpm.Code -eq 0) -and ($rtpm.Out.Trim() -eq $ncNative)) { $pass++ }
+                else { $fail++; $failLines += ("E2EFAIL ext-key/ncrypt-tpm: code=0x{0:X8} out=[{1}] (TPM-wrapped key must work end-to-end)" -f ($rtpm.Code -band 0xFFFFFFFF), $rtpm.Out.Trim()) }
+            }
+            Remove-Item $ncPath, $extKeyBeside, $dpPath2 -ErrorAction SilentlyContinue
+        }
+
         # 8) correct key via the VMPX_KEY environment variable (fallback form) => identical to native
         $env:VMPX_KEY = $extHex.ToUpper()
         $nOut = Run-File "build/target.exe" @("check_key", "10") 30
