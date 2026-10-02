@@ -112,7 +112,9 @@ if [ "$ONLY" = "all" ] || [ "$ONLY" = "amd64" ]; then
     --packed build/elf_target_pie.enc --manifest build/vm_interp_elf.json \
     --blob build/vm_interp_elf.bin --report build/elf_enc_pie.json --selftest
   # 加密范围里**真的有**相对重定位的目标（gcc 的 PIE，.rodata 里两条 R_X86_64_RELATIVE）：
-  # 默认必须拒绝加密那个范围（fail-closed），产物照旧与原生一致。
+  # 默认必须拒绝加密那个范围（fail-closed）且产物与原生一致；打开 -enc-image-elf-pie-relocs 之后
+  # 那一份也必须与原生**逐字节一致**（check-key 10 → 143、sum-to 100 → 5050）—— 它是运行期
+  # 重定位应用器（vm_interp.c 的 vm_reloc_fix）唯一的端到端验收点，校准命令见 e2e 脚本头部。
   step "elf pie relocs"       env PIE_RELOCS=1 TAG=pierel bash tools/e2e_elf_image.sh --strict
   # 这一份的门禁验的是"账目"：声明的加密范围里那 2 条重定位必须被记录（imgRelocCount），
   # 且 payload 里必须真有应用表（imgRelocTableRVA）。

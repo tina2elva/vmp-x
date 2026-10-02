@@ -11,11 +11,12 @@
 #                   （ld.so 在入口点之前会写那些槽位，密文的 AEAD tag 覆盖整个范围）。
 #                   这个目标加密范围里**没有**重定位，所以现在就能跑通，且必须与原生一致。
 #   PIE_RELOCS=1    ET_DYN(PIE) 的 **C** 目标（gcc -fPIE），.rodata 里故意放两条
-#                   R_X86_64_RELATIVE：默认必须**拒绝**加密那个范围（fail-closed），
-#                   产物照旧跑通；打开 -enc-image-elf-pie-relocs 才加密它并把重定位应用表
-#                   落进 payload/报告（运行期应用器是另一个任务 ⇒ 那一份只做结构断言、不运行）。
+#                   R_X86_64_RELATIVE：默认必须**拒绝**加密那个范围（fail-closed），产物照旧跑通；
+#                   打开 -enc-image-elf-pie-relocs 才加密它并把重定位应用表落进 payload/报告。
+#                   这一份**必须与原生逐字节一致**（check-key 10 → 143、sum-to 100 → 5050）：
+#                   它是运行期应用器（vm_reloc_fix）唯一的端到端验收点。
 #
-# 校准（改之前必须能红）：PIE 模式下"原执行段 0 残留"这条断言在改动前直接失败 ——
+# 校准 1（改之前必须能红）：PIE 模式下"原执行段 0 残留"这条断言在 t3 之前直接失败 ——
 # 打包器会打印 "跳过（只支持 ET_EXEC；PIE 会被重定位破坏密文）"，密文根本没做，
 # 于是 image_residue_elf.py 报 NON-ZERO FOUND=10121；输出比对却仍然通过（没加密 != 跑不对），
 # 所以**必须**有这条结构断言才抓得住。任何 reviewer 都能复现这条校准：
@@ -25,6 +26,24 @@
 #       -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
 #       -enc-image-elf-pie -no-enc-image-elf -out build/cal_pie.enc -report build/cal_pie.json
 #   python3 tools/image_residue_elf.py build/elf_target_pie build/cal_pie.enc   # NON-ZERO FOUND=10121, rc=2
+#
+# 校准 2（PIE_RELOCS=1 的"与原生一致"断言必须能红）：把运行期应用器短路掉再跑同一个用例。
+# **只在本地做，不要提交 stub/**（本任务的 in-scope 只有 tools/）：
+#
+#   python3 - <<'PY'
+#   p = "stub/win/x64/vm_interp.c"
+#   s = open(p).read()
+#   s = s.replace("    const u8 *eh = (const u8 *)base;\n    u64 phoff",
+#                 "    return 0; /* CAL: short-circuit the applier */\n    const u8 *eh = (const u8 *)base;\n    u64 phoff", 1)
+#   open(p, "w").write(s)
+#   PY
+#   PIE_RELOCS=1 TAG=cal bash tools/e2e_elf_image.sh --strict   # 必须 [MISMATCH] + exit 1
+#   git checkout -- stub/win/x64/vm_interp.c                     # 恢复（git status 必须干净）
+#   # 实测输出（t10，短路后跑 --strict）：
+#   #   [*] PIE: the reloc-bearing product must answer exactly what native answers
+#   #   [MISMATCH] reloc-bearing product check-key: native=[143] (rc=0) packed=[VMPELF verifyfail rva=8192
+#   #   VMPELF verifyfail size=128] (rc=132)
+#   #   [FAIL] reloc-bearing PIE product is not byte-identical to native (check-key)   -> exit 1
 set -u
 cd "$(dirname "$0")/.."
 
@@ -217,20 +236,24 @@ assert int(rep["imgRelocTableRVA"]) != 0, "a relocation table must be emitted in
 assert int(rep["imgRelocLen"]) == 32 + 2 * 8, "table length must be header(32) + 2*8, got %s" % rep["imgRelocLen"]
 print("    imgRelocTableRVA=0x%X imgRelocLen=%d imgRelocCount=%d" % (int(rep["imgRelocTableRVA"]), int(rep["imgRelocLen"]), int(rep["imgRelocCount"])))
 PY
-    # 这一份**现在只能失败**：运行期应用器（先减 delta / 验签 / 解密 / 再加回 delta）是下一个任务。
-    # 但它必须**fail-closed**（ld.so 已经写过那两个槽位 ⇒ AEAD 验签失败 ⇒ ud2），
-    # 而不是带着错的重定位值往下跑 —— 后者才是真正危险的那种"能跑但算错"。
-    echo "[*] PIE: the relocs product must fail CLOSED until the runtime applier lands"
+    # 这一份必须**与原生逐字节一致**：含相对重定位的加密范围要靠运行期应用器
+    # （stub/win/x64/vm_interp.c 的 vm_reloc_fix：先按 r_addend ^ 密码流还原密文 → 验签 → 解密
+    #  → 再把槽位写成 l_addr + r_addend）才能跑起来。应用器缺失/被短路/写错，这里就红。
+    # 原来这里是一条"必须 fail-closed"的期望（应用器未落地时的占位），t10 起换成真检查。
+    echo "[*] PIE: the reloc-bearing product must answer exactly what native answers"
     OPT_RC=0
     OPT_OUT="$(./build/elf_target_${TAG}_relocs.enc check-key 10 2>&1)" || OPT_RC=$?
-    if [ "$OPT_RC" -eq 0 ] && [ "$OPT_OUT" = "$NATIVE_OUT" ]; then
-        echo "[NOTE] the relocs product now runs correctly -- the runtime applier has landed;"
-        echo "       replace this fail-closed expectation with a plain native-vs-packed check."
-    elif printf '%s' "$OPT_OUT" | grep -q "verifyfail"; then
-        echo "[OK  ] fail-closed as expected: rc=$OPT_RC, out=[$OPT_OUT]"
-    else
-        fail "relocs product neither ran correctly nor failed closed (rc=$OPT_RC, out=[$OPT_OUT])"
+    if [ "$OPT_RC" -ne 0 ] || [ "$OPT_OUT" != "$NATIVE_OUT" ]; then
+        echo "[MISMATCH] reloc-bearing product check-key: native=[$NATIVE_OUT] (rc=0) packed=[$OPT_OUT] (rc=$OPT_RC)"
+        fail "reloc-bearing PIE product is not byte-identical to native (check-key)"
     fi
+    OPT_SUM_RC=0
+    OPT_SUM="$(./build/elf_target_${TAG}_relocs.enc sum-to 100 2>&1)" || OPT_SUM_RC=$?
+    if [ "$OPT_SUM_RC" -ne 0 ] || [ "$OPT_SUM" != "$NATIVE_SUM" ]; then
+        echo "[MISMATCH] reloc-bearing product sum-to: native=[$NATIVE_SUM] (rc=0) packed=[$OPT_SUM] (rc=$OPT_SUM_RC)"
+        fail "reloc-bearing PIE product is not byte-identical to native (sum-to)"
+    fi
+    echo "[OK  ] 带重定位的 PIE 产物：check-key 10 -> $OPT_OUT ; sum-to 100 -> $OPT_SUM（与原生一致）"
 fi
 
 echo "[+] e2e_elf_image: OK"
