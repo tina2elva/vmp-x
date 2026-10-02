@@ -10294,7 +10294,8 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
 - `python tools/check_workflow.py .github/workflows/ci.yml` → **`workflow OK: jobs=3`**；
   结构核对：`windows-amd64`(10 步) / `linux-amd64`(11 步) / `linux-arm64`(5 步)，三者的 `continue-on-error` 均为空。
 - 本机：`tools/preflight.ps1` → `[+] preflight: OK`；`tools/gates.ps1` → `total 15 gates, 0 failed`。
-- CI：run `<RUN>`（提交 `<SHA>`）→ **三个作业全绿**。
+- CI：run **`37011535364`**（提交 `72b05c0`）→ **三个作业全绿**（`windows-amd64` / `linux-amd64` / `linux-arm64`），
+  且 `jobs=3` —— 即工作流没有因为删作业而启动失败（这是本轮最容易踩的坑）。
 
 **未做项 / 边界**
 - **恢复方法**：从 git 历史取回本次删除前的那两个 job 文本（见本条提交信息），或按 `docs/RUNBOOK.md` 第 5 节记录的原始做法重建。
