@@ -202,11 +202,19 @@ function Get-PEAslrInfo([string]$path) {
 $ti = Get-PEAslrInfo "build/target.exe"
 $vi = Get-PEAslrInfo "build\target_vmp.exe"
 Write-Output ("[*] ASLR facts: target DYNAMIC_BASE=" + $ti.DynBase + " reloc=" + ("0x{0:X}+0x{1:X}" -f $ti.RelocRva, $ti.RelocSize) + " | product DYNAMIC_BASE=" + $vi.DynBase + " reloc=" + ("0x{0:X}+0x{1:X}" -f $vi.RelocRva, $vi.RelocSize))
+# "产物是否**多出**重定位条目"**故意不断言**：payload 里绝对 VA 站点的条数由**工具链代码生成**决定
+# （本机 msys2 gcc 是 7 个，CI runner 上是 0 个）—— 把它当不变量就是**形状依赖断言**，
+# 2026-10-03 被 CI 抓过一次（旧写法报 "did not gain relocation entries (target=68 product=68)"）。
+# ASLR 覆盖**不依赖**它：只要目标自己 DYNAMIC_BASE + 非空 .reloc，加载器就会挑随机基址并搬移
+# **镜像自身**的重定位，运行期"先减 delta → 验签 → 解密 → 加回 delta"因此仍然被跑到。故只作信息输出。
+$appended = 0
+if ($packLog -match "补了 (\d+) 个重定位项") { $appended = [int]$Matches[1] }
+Write-Output ("[*] ASLR: packer appended " + $appended + " payload relocation item(s) (codegen-dependent, NOT asserted)")
 $aslrBad = @()
 if (-not $ti.DynBase) { $aslrBad += "the fixture has no DYNAMIC_BASE (ASLR coverage would be vacuous)" }
 if ($ti.RelocSize -eq 0) { $aslrBad += "the fixture has an empty .reloc directory" }
 if (-not $vi.DynBase) { $aslrBad += "the packed product lost DYNAMIC_BASE" }
-if ($vi.RelocSize -le $ti.RelocSize) { $aslrBad += ("the packed product did not gain relocation entries (target=" + $ti.RelocSize + " product=" + $vi.RelocSize + ")") }
+if ($vi.RelocSize -eq 0) { $aslrBad += "the packed product has an empty .reloc directory" }
 if ($aslrBad.Count -gt 0) {
     $fail++
     foreach ($m in $aslrBad) { Write-Host ("  [FAIL] ASLR: " + $m) }

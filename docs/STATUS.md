@@ -10346,3 +10346,15 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
 - 静态 PIE 走的是**醒目告警**而不是构建期硬拒绝（产物本身可用）；要改成硬拒绝需另行决定。
 - `tools/wsl_linux.sh` 的 `KNOWN_FAIL`（现为空）仍是"整步豁免"机制 —— 本轮**未动**，它的过期自报（`:41`）继续保留。
 - 并发互杀只是**收窄**：同仓库内的同名进程仍会被杀（那是本意）；跨仓库/跨用户不再互相影响。
+
+**补记（同日）｜CI 抓到我自己的"形状依赖断言"**
+- 首次推送 `90cd977` 的 CI **红了**：run `37121832822`，`windows-amd64` 的 `E2E x86-64` 步报
+  `[FAIL] ASLR: the packed product did not gain relocation entries (target=68 product=68)`。
+  原因是那条断言把"payload 里绝对 VA 站点的条数"当成了不变量，而它由**工具链代码生成**决定：
+  本机 msys2 gcc 产出 7 个，**CI runner 上是 0 个** ⇒ 目录没长大。**这正是本仓库反复踩的"形状依赖断言"**
+  （与此前 PE 侧 C4、ELF 侧 E5 同款）。
+- 修法：删掉该断言、改成**信息输出**（`[*] ASLR: packer appended N payload relocation item(s) (codegen-dependent, NOT asserted)`），
+  只保留**形状无关**的三条 —— 夹具可重定位（DYNAMIC_BASE + 非空 `.reloc`）、产物保留 DYNAMIC_BASE 且目录非空、
+  CreateProcess 下与原生一致。ASLR 覆盖**不依赖** payload 站点数：镜像**自身**的重定位照样被加载器搬移，
+  运行期的 delta 处理因此仍被真实跑到。
+- 本机复验：`e2e: 174 passed, 0 skipped, 0 failed`，并打印 `[*] ASLR: packer appended 7 … (NOT asserted)`。
