@@ -97,3 +97,53 @@ func TestPayloadNCryptRejectsBadInput(t *testing.T) {
 		t.Errorf("格式常量被改动：运行期 vm_interp.c 里是同一份，两边必须一起改")
 	}
 }
+
+// A1 的 Go 侧那一半：密钥名的字节域必须是**可打印 ASCII**（0x20..0x7e），不许"只拒 0x00 和 >127"。
+//
+// 为什么单列一条：运行期（stub/win/x64/vm_interp.c）此前只拒 0x00/>127，
+// 于是 0x01..0x1f 与 0x7f 在两边被判成不同的东西 —— 而工具侧永远不会写出这种名字，
+// 分叉是**静默**的（fail-closed：找不到这样的密钥 → 走硬门）。这条把 Go 的端点逐个钉死，
+// C 侧是逐字节同一个区间，由 stub/win/x64/keyname_probe.c（e2e 里编译并运行）钉死。
+// 改坏任一侧：这里红（Go 侧）或 keyname_probe 红（C 侧）。
+func TestValidWrapKeyNameBoundaries(t *testing.T) {
+	// 标定：两端点必须**接受**（能失败的前提是"接受"这件事本身被断言过）
+	for _, ok := range []string{" ", "~", "k", "A", "vmpx-payload-key-v1", string([]byte{0x20, 0x7e})} {
+		if err := ValidWrapKeyName(ok); err != nil {
+			t.Errorf("ValidWrapKeyName(%q) 应接受，实得 %v", ok, err)
+		}
+	}
+	// 每一步都要**拒绝**：0x1f/0x20 与 0x7e/0x7f 是这条规则的两条边界
+	for _, bad := range []string{
+		"",             // 长度下界
+		"\x00",         // NUL（旧规则拒过它，但新规则拒的是整段 <0x20）
+		"\x01", "\x09", // TAB 与更低的控制字符：旧 C 规则会**放行**
+		"\x1f",                                     // 紧邻 0x20 的下方
+		"\x7f",                                     // DEL：紧邻 0x7e 的上方
+		"\x80",                                     // 非 ASCII 的最高位
+		"k\x00y", "k\x1fy", "k\x7fy", "k\xc3\xa9y", // 夹在名字中间（é 的 UTF-8 两字节）
+		"k\xffy",
+	} {
+		if err := ValidWrapKeyName(bad); err == nil {
+			t.Errorf("ValidWrapKeyName(%q) 应拒绝（规则是 0x20..0x7e 的可打印 ASCII）", bad)
+		}
+	}
+	// 整个字节域逐字节断言：接受的**恰好**是 0x20..0x7e，不多不少。
+	for c := 0; c < 256; c++ {
+		name := "k" + string(rune(byte(c))) + "y"
+		err := ValidWrapKeyName(name)
+		want := (c >= 0x20 && c <= 0x7e)
+		if want && err != nil {
+			t.Errorf("字节 0x%02x 应被接受，实得 %v", c, err)
+		}
+		if !want && err == nil {
+			t.Errorf("字节 0x%02x 应被拒绝（运行期 keyname_probe 断言的是同一个区间）", c)
+		}
+	}
+	// 长度：1..64 的边界（与运行期的 nl<1||nl>64 同一对常量）
+	if err := ValidWrapKeyName(string(bytes.Repeat([]byte{'x'}, PayloadWrapNameMax))); err != nil {
+		t.Errorf("恰好 %d 字节的名字应被接受，实得 %v", PayloadWrapNameMax, err)
+	}
+	if err := ValidWrapKeyName(string(bytes.Repeat([]byte{'x'}, PayloadWrapNameMax+1))); err == nil {
+		t.Errorf("超过 %d 字节的名字应被拒绝", PayloadWrapNameMax)
+	}
+}

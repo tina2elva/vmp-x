@@ -45,7 +45,16 @@ func main() {
 	form := flag.String("form", "auto", "输出形态：auto（按 -out 后缀判）/ dpapi / ncrypt")
 	keyName := flag.String("keyname", cred.PayloadWrapKeyName, "ncrypt 形态用的 CNG 持久化密钥名")
 	provider := flag.String("provider", "auto", "ncrypt 形态用哪个 CNG 供应程序：auto（TPM 优先）/ tpm / software")
+	// 运维子开关（A4）：删掉本工具/探针在这台机器上留下的**持久化**密钥。
+	// 必须显式给 -cleanup 才动手：删除是不可逆的，绝不能让它成为默认行为。
+	cleanup := flag.Bool("cleanup", false, "运维：删掉 -keyname 指定的持久化 CNG 密钥（本工具自己创建的；不写任何文件）")
+	listKeys := flag.Bool("list", false, "运维：列出本机当前可用的持久化 CNG 密钥名（配合 -cleanup 只看不删）")
 	flag.Parse()
+
+	if *cleanup {
+		cleanupKeys(*provider, *keyName, *listKeys)
+		return
+	}
 
 	if (*key == "") == (*in == "") {
 		fmt.Fprintln(os.Stderr, "[!] 必须且只能给一个：-key <hex> 或 -in <file>")
@@ -93,6 +102,90 @@ func main() {
 		return
 	}
 	wrapDPAPI(raw, *out)
+}
+
+// cleanupKeys：运维子命令（A4）。删掉 -keyname 指定的持久化 CNG 密钥。
+//
+// 为什么要有它：工具与探针会在这台机器上建**持久化**密钥，它们不随进程退出消失，
+// 而 certutil 那条路要管理员（本机实测不行）⇒ 残留只能靠 NCryptDeleteKey 清。
+// 输出三件事，缺一不可：真的删了哪些（逐 store）、每个 store 在文件系统的哪里、
+// 删不掉的**实际错误码**。删不掉就**明确说没删掉**，绝不写成"已清理"。
+//
+// -list：先列出当前存在的持久化密钥名（只看不删），用于"这台机器上还有什么是我们建的"。
+func cleanupKeys(sel, keyName string, list bool) {
+	if err := cred.ValidWrapKeyName(keyName); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] -keyname 不合法: %v\n", err)
+		os.Exit(2)
+	}
+	if list {
+		names, notes, lerr := cred.CNGEnumPersisted(sel)
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "[!] 列密钥失败: %v\n", lerr)
+			os.Exit(1)
+		}
+		fmt.Printf("[*] persisted CNG keys visible to the current user (%d)\n", len(names))
+		// 注意是 range 的**键**（密钥名），值是供应程序名 —— 写成 range names 的
+		// 第二个返回值就会把 32 把密钥打印成 32 行"Microsoft Software Key Storage Provider"
+		// （冒烟测试时真踩到过）。所以这里用 for n := range names。
+		for n := range names {
+			mark := ""
+			if n == keyName {
+				mark = "   <-- this is -keyname"
+			}
+			fmt.Printf("    %s%s\n", n, mark)
+		}
+		for _, note := range notes {
+			fmt.Printf("    [note] %s\n", note)
+		}
+		if len(names) == 0 {
+			fmt.Println("[!] 没看到任何持久化密钥 —— 空结果要先怀疑枚举/权限，别当成机器很干净")
+		}
+		// -list 只看不删：显式结束，避免"带了 -list 却把密钥删了"。
+		fmt.Println("[*] -list only: nothing was deleted")
+		return
+	}
+	deleted, tried, err := cred.CNGDeletePersisted(sel, keyName)
+	fmt.Printf("[*] -cleanup -keyname %q (-provider %s)\n", keyName, showSel(sel))
+	if len(deleted) > 0 {
+		fmt.Printf("[+] deleted from %d store(s):\n", len(deleted))
+		for _, p := range deleted {
+			fmt.Printf("    %s  (store: %s)\n", p, storeDir(p))
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] NOT deleted: %v\n", err)
+		for _, t := range tried {
+			fmt.Fprintf(os.Stderr, "    tried: %s\n", t)
+		}
+		fmt.Fprintln(os.Stderr, "    (0x80090016 = NTE_BAD_KEYSET: 这个 store 下没有这把密钥)")
+		if len(deleted) == 0 {
+			os.Exit(1)
+		}
+	}
+	if len(deleted) == 0 {
+		fmt.Println("[+] nothing left to delete")
+	}
+}
+
+// storeDir：持久化密钥在文件系统里的位置。两者都落在当前用户的 profile 下
+// （软件 KSP 与 Platform Crypto Provider 的**密钥文件**都在这里；TPM 那把的实际私钥在芯片里）。
+func storeDir(provider string) string {
+	base := os.Getenv("USERPROFILE")
+	if base == "" {
+		base = "%USERPROFILE%"
+	}
+	if strings.Contains(provider, "Platform Crypto") {
+		return base + "\\AppData\\Microsoft\\Crypto\\Keys (TPM-backed: the private key itself never leaves the chip)"
+	}
+	return base + "\\AppData\\Microsoft\\Crypto\\Keys"
+}
+
+func showSel(sel string) string {
+	s := strings.ToLower(strings.TrimSpace(sel))
+	if s == "" {
+		return "auto"
+	}
+	return s
 }
 
 // wrapDPAPI：<产物>.vmpkey.dpapi（用户作用域；与 STATUS #590 的行为完全一致）。
@@ -144,13 +237,10 @@ func wrapNCrypt(sel, keyName string, raw []byte, out string) {
 	}
 	// 自检（**写文件之前**）：解回来的必须与输入逐字节一致。
 	// 这一步走的是与运行期 blob 逐条对应的解析+解密路径，所以它过了，产物侧才会过。
-	back, err := cred.CNGUnwrapPayloadBlob(blob)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] 自检失败（刚做出的密文本机解不开，拒绝写出）: %v\n", err)
-		os.Exit(1)
-	}
-	if len(back) != 32 || string(back) != string(raw) {
-		fmt.Fprintln(os.Stderr, "[!] 自检失败：解回来的主密钥与输入不一致，拒绝写出")
+	// 判据只有一份、在 internal/cred（VerifyWrappedPayload）：写在这里会分叉，
+	// 而且包外那条路没法用故障注入证明"A3 自检失败即拒绝写出"。
+	if err := cred.VerifyWrappedPayload(blob, raw); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] 自检失败（拒绝写出）: %v\n", err)
 		os.Exit(1)
 	}
 	if err := os.WriteFile(out, blob, 0o600); err != nil {

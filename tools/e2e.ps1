@@ -178,6 +178,11 @@ $failLines = @()
 # 未验证项（例如"本机没有 TPM，TPM 那条路没法验"）**必须单独记账**：混进 passed 就是让"通过数"说谎。
 # 每条 skip 都要带可见原因，摘要里与 passed/failed 一起打印；skip 不会让退出码变红。
 $skipLines = @()
+$skipLines = @()
+# 用例执行的**可见**证据：新增用例默认静默（只在失败时打印一行），跑完摘要看不出
+# 它到底跑没跑。这里给每条新用例印一行 ASCII 的 [*] 行（与 e2e 现有风格一致）。
+$script:caseLog = New-Object System.Collections.ArrayList
+function CaseBanner([string]$caseId) { [void]$script:caseLog.Add($caseId) }
 
 # ---- ASLR 启动验收（CreateProcess 路径 = 走加载器的重定位） ----
 # 为什么单列一条：win/arm64 那个 0xC0DE0002 的 bug（STATUS #507/#510）正是"ASLR 生效时缺重定位"这一类，
@@ -536,6 +541,86 @@ if ($LASTEXITCODE -ne 0) {
             Remove-Item $ncPath, $extKeyBeside, $dpPath2 -ErrorAction SilentlyContinue
         }
 
+            # 13) CLI 负例（committed）：工具必须在**参数层**就拒绝，且**不落任何文件**。
+            #     为什么是 exit 2：与工具里其它用法错误同码（-key/-out/-form 都是 2），
+            #     而 1 留给"做了事但失败"（读不到密钥、CNG 不可用、自检不过）。
+            #     为什么还要断言"不落文件"：只看退出码的话，一个"先写文件再报错"的实现
+            #     会照样通过 —— 而那种实现会把一个**解不开的** .ncrypt 留在部署目录里。
+            $badOut = Join-Path (Get-Location) "build\e2e_keywrap_negative.ncrypt"
+            Remove-Item $badOut -ErrorAction SilentlyContinue
+            function Test-KeywrapNegative([string]$label, [string[]]$kvArgs) {
+                # 调用方用 $script:rc / $script:so / $script:se 取结果（PowerShell 函数没有多返回值）
+                Remove-Item $badOut -ErrorAction SilentlyContinue
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.FileName = (Resolve-Path "build\vmpkeywrap.exe").Path
+                $psi.Arguments = ($kvArgs -join ' ')
+                $psi.UseShellExecute = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $pr = [System.Diagnostics.Process]::Start($psi)
+                $script:so = $pr.StandardOutput.ReadToEnd()
+                $script:se = $pr.StandardError.ReadToEnd()
+                $pr.WaitForExit()
+                $script:rc = $pr.ExitCode
+            }
+            CaseBanner "ext-key/neg-provider"
+            # 13a) -provider bogus：提供程序名不认识 ⇒ 参数错误（exit 2），且不落文件
+            Test-KeywrapNegative "provider-bogus" @("-key", $extHex, "-out", $badOut, "-provider", "bogus")
+            $negProviderOk = ($rc -eq 2) -and (-not (Test-Path $badOut)) -and ($so.Trim() -eq "") -and ($se.Trim() -ne "")
+            if ($negProviderOk) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL ext-key/neg-provider: -provider bogus must exit 2 with no file (rc={0} file={1} stdout=[{2}] stderr=[{3}])" -f $rc, (Test-Path $badOut), ($so -replace '\s+', ' ').Trim(), ($se -replace '\s+', ' ').Trim()) }
+            CaseBanner "ext-key/neg-keyname"
+            # 13b) 非 ASCII -keyname：密钥名规则是**可打印 ASCII**（0x20..0x7e），与运行期
+            #      vm_interp.c 的 vm_ncrypt_keyname_ok 同一条规则（C 侧由 stub/win/x64/keyname_probe.c
+            #      逐字节钉死）。这里用 U+00E9，它经 UTF-8 是两字节 0xC3 0xA9 ⇒ 必须被拒。
+            #      同样必须 exit 2 且不落文件：工具永远不该写出一个"运行期按别的规则读"的名字。
+            $nonAsciiName = "vmpx-" + [string][char]0x00E9 + "-e2e"
+            Test-KeywrapNegative "keyname-nonascii" @("-key", $extHex, "-out", $badOut, "-keyname", $nonAsciiName)
+            $negNameOk = ($rc -eq 2) -and (-not (Test-Path $badOut)) -and ($so.Trim() -eq "") -and ($se.Trim() -ne "")
+            if ($negNameOk) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL ext-key/neg-keyname: a non-ASCII -keyname must exit 2 with no file (rc={0} file={1} stdout=[{2}] stderr=[{3}])" -f $rc, (Test-Path $badOut), ($so -replace '\s+', ' ').Trim(), ($se -replace '\s+', ' ').Trim()) }
+            CaseBanner "ext-key/cleanup-roundtrip"
+            # 13c) -cleanup 往返（A4）：用工具建一把**测试用**持久化密钥，再用 -cleanup 删掉它。
+            #      两个证据缺一不可：① 工具自己报"deleted from N store(s)"且 exit=0；
+            #      ② 用 .NET CngKey 这个**第三方口径**再问一次"这把密钥还在吗"（-1 = 有、0 = 没有）。
+            #      只信工具自己的输出，等于让被验对象给自己打分。
+            $cleanupName = "vmpx-e2e-cleanup-roundtrip"
+            $cleanupOut = Join-Path (Get-Location) "build\e2e_keywrap_cleanup.ncrypt"
+            Remove-Item $cleanupOut -ErrorAction SilentlyContinue
+            $cu = (& .\build\vmpkeywrap.exe -key $extHex -out $cleanupOut -keyname $cleanupName -provider software 2>&1 | Out-String).Trim()
+            if (($LASTEXITCODE -ne 0) -or (-not (Test-Path $cleanupOut))) {
+                $fail++; $failLines += ("E2EFAIL ext-key/cleanup: could not create the round-trip key (exit={0}): {1}" -f $LASTEXITCODE, ($cu -replace '\s+', ' '))
+            } else {
+                Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+                $existsBefore = try { [int]([System.Security.Cryptography.CngKey]::Exists($cleanupName, [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider)) } catch { -1 }
+                # 标定：刚建出来的密钥必须"看得到"（否则 -1 这种异常返回值会被当成通过）
+                if ($existsBefore -ne 1) {
+                    $fail++; $failLines += ("E2EFAIL ext-key/cleanup: the freshly created key is not visible to CngKey.Exists (got {0}) - the probe itself is broken" -f $existsBefore)
+                }
+                $cd = (& .\build\vmpkeywrap.exe -cleanup -keyname $cleanupName -provider software 2>&1 | Out-String).Trim()
+                $cdRc = $LASTEXITCODE
+                $existsAfter = try { [int]([System.Security.Cryptography.CngKey]::Exists($cleanupName, [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider)) } catch { -1 }
+                if (($cdRc -eq 0) -and ($cd -match 'deleted from 1 store') -and ($existsAfter -eq 0)) { $pass++ }
+                else { $fail++; $failLines += ("E2EFAIL ext-key/cleanup: -cleanup did not delete the key (exit={0} existsAfter={1}): {2}" -f $cdRc, $existsAfter, ($cd -replace '\s+', ' ')) }
+                Remove-Item $cleanupOut, $badOut -ErrorAction SilentlyContinue
+            }
+            CaseBanner "keyname-rule/c-probe"
+            # 14) C 侧的密钥名规则（A1）：编译**真的** stub/win/x64/vm_interp.c 并调用它的
+            #     vm_ncrypt_keyname_ok()。keyname_probe.c include 的是那份源文件本体（不是副本），
+            #     所以改坏 vm_interp.c 里那条规则会让这个探针红；Go 侧的镜像断言在
+            #     internal/cred 的 TestValidWrapKeyNameBoundaries。两边都拒 0x01..0x1f 与 0x7f。
+            #     为什么探针要带 -DVM_KEY_EXTERNAL/-DVM_BLOB_USES_WIN64：vm_interp.c 是 blob 源，
+            #     规格是 vmpbuild 用这两组宏编的；不给它们，探针看到的是 Windows 取钥那一段的
+            #     空实现（探针会干脆编不过 —— 这是刻意的，免得静默地什么都没测）。
+            & gcc -O1 -Wno-unused -DVM_KEY_EXTERNAL=1 -DVM_BLOB_USES_WIN64=1 -I stub/win/x64 -o build/keyname_probe.exe stub/win/x64/keyname_probe.c stub/win/x64/vm_crypto.c stub/win/x64/vm_kdf.c stub/win/x64/vm_entry_asm.S 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                $fail++; $failLines += "E2EFAIL keyname-rule/c: the C probe does not build (vm_interp.c changed shape?)"
+            } else {
+                $kpOut = (& .\build\keyname_probe.exe 2>&1 | Out-String).Trim()
+                if (($LASTEXITCODE -eq 0) -and ($kpOut -match 'keyname_probe: OK')) { $pass++ }
+                else { $fail++; $failLines += ("E2EFAIL keyname-rule/c: the runtime key-name rule is not 0x20..0x7e (exit={0}): {1}" -f $LASTEXITCODE, ($kpOut -replace '\s+', ' ')) }
+            }
+
         # 8) correct key via the VMPX_KEY environment variable (fallback form) => identical to native
         $env:VMPX_KEY = $extHex.ToUpper()
         $nOut = Run-File "build/target.exe" @("check_key", "10") 30
@@ -663,6 +748,10 @@ if (($LASTEXITCODE -eq 0) -and (Test-Path $vvOut)) { $pass++ }
 else { $fail++; $failLines += ("E2EFAIL verify: -verify 正例未通过（exit={0} 产物存在={1}）" -f $LASTEXITCODE, (Test-Path $vvOut)) }
 
 Write-Output ""
+if ($script:caseLog.Count -gt 0) {
+    Write-Output "[*] cases exercised in this run (each carries a visible pass/fail line above):"
+    foreach ($cid in $script:caseLog) { Write-Output ("  [CASE] " + $cid) }
+}
 # 不变式：每记一次 skip 就必须有一条**可见原因**（不允许"无名跳过"）。
 if ($skip -ne $skipLines.Count) {
     $fail++

@@ -36,7 +36,26 @@ var (
 	procSetProp = ncryptDLL.NewProc("NCryptSetProperty")
 	procEncrypt = ncryptDLL.NewProc("NCryptEncrypt")
 	procDecrypt = ncryptDLL.NewProc("NCryptDecrypt")
+	// 运维（A4）：删掉自己留在这台机器上的持久化密钥。
+	procDelete   = ncryptDLL.NewProc("NCryptDeleteKey")
+	procEnumKeys = ncryptDLL.NewProc("NCryptEnumKeys")
 )
+
+// cngKeyName 是 NCryptEnumKeys 返回的 NCryptKeyName 结构（ncrypt.h）：
+//
+//	LPWSTR pszName; LPWSTR pszAlgid; DWORD dwLegacyKeySpec; DWORD dwFlags;
+//
+// x64 下两个指针各 8 字节、两个 DWORD 各 4 字节。**不手写偏移**：用结构体让编译器
+// 按真实布局取字段。
+type ncryptKeyNameRec struct {
+	pszName         *uint16
+	pszAlgid        *uint16
+	dwLegacyKeySpec uint32
+	dwFlags         uint32
+}
+
+// ncryptNoMoreItems = NTE_NO_MORE_ITEMS：NCryptEnumKeys 枚举结束的**正常**返回码。
+const ncryptNoMoreItems = 0x8009002A
 
 const (
 	provTPM         = CNGTPMProviderName
@@ -246,7 +265,9 @@ const (
 	// ncryptLengthProp = NCRYPT_LENGTH_PROPERTY 的属性名（必须在 Finalize 之前设）。
 	ncryptLengthProp = "Length"
 	// wrapPlainLen：包裹的明文总是 32 字节（解密缓冲区也就是这么大，与运行期一致）。
-	wrapPlainLen = 32
+	// 真身是 payloadwrap.go 的 cred.PayloadPlainLen —— 自检那半（无 build tag）也要用它，
+	// 定义在这里会让 GOOS=linux 的构建直接编译不过（已踩过一次）。
+	wrapPlainLen = PayloadPlainLen
 )
 
 func ncryptStatus(op string, r uintptr) error {
@@ -330,6 +351,114 @@ func CNGProviderSelection(sel string) ([]string, error) {
 		return []string{provSoftware}, nil
 	}
 	return nil, fmt.Errorf("-provider 只能是 auto/tpm/software（实得 %q）", sel)
+}
+
+// ---------------- 运维：清掉自己留在这台机器上的持久化密钥（A4）----------------
+//
+// 为什么需要它：工具（vmpkeywrap / 探针）会在这台机器上建**持久化** CNG 密钥，它们是
+// 机器级资源，不会随进程退出而消失。certutil 那条路需要管理员（本机实测不行），
+// 于是残留密钥一直留在用户存储里 —— 这既是卫生问题，也是"这台机器上到底有哪些
+// 我们建的密钥"的可知性问题。这里走 NCryptDeleteKey（当前用户对**自己创建**的密钥
+// 有删除权限，不需要管理员）。
+
+// CNGDeletePersisted 用给定的供应程序队列删掉名为 name 的持久化密钥。
+//
+// 返回值：providers 是**真的找到了**这把密钥的供应程序名（可能多把同名、不同 store）；
+// tried 是实际尝试过的供应程序与各自的错误码（没找到的写 0x80090016 = NTE_BAD_KEYSET，
+// 找不到这件事本身也是证据，所以不能只报"失败"）。返回 nil 表示至少删掉了一份。
+func CNGDeletePersisted(sel, name string) (deleted []string, tried []string, err error) {
+	if verr := ValidWrapKeyName(name); verr != nil {
+		return nil, nil, verr
+	}
+	provs, serr := CNGProviderSelection(sel)
+	if serr != nil {
+		return nil, nil, serr
+	}
+	var found bool
+	for _, prov := range provs {
+		hp, oerr := openProvider(prov)
+		if oerr != nil {
+			tried = append(tried, fmt.Sprintf("%s: %v", prov, oerr))
+			continue
+		}
+		var hk uintptr
+		// NCryptOpenKey + NCRYPT_SILENT_FLAG：与工具其它地方同一姿势（不要 UI）。
+		r, _, _ := procOpenKey.Call(hp, uintptr(unsafe.Pointer(&hk)), uintptr(unsafe.Pointer(mustUTF16(name))), 0, ncryptSilent)
+		if r != 0 || hk == 0 {
+			procFree.Call(hp)
+			tried = append(tried, fmt.Sprintf("%s: NCryptOpenKey 0x%X", prov, uint32(r)))
+			continue
+		}
+		found = true
+		// NCryptDeleteKey 会**顺带释放**这把密钥的句柄（文档要求），所以之后不要再 Free 它。
+		// dwFlags 必须是 0：传 NCRYPT_SILENT_FLAG 会当场拿到 0x80090009（NTE_INVALID_PARAMETER）——
+		// 本机在 Platform Crypto Provider 上删那把残留密钥时实测到的就是它。
+		dr, _, _ := procDelete.Call(hk, 0)
+		procFree.Call(hp)
+		if dr != 0 {
+			tried = append(tried, fmt.Sprintf("%s: NCryptDeleteKey 0x%X", prov, uint32(dr)))
+			continue
+		}
+		deleted = append(deleted, prov)
+	}
+	if len(deleted) > 0 {
+		return deleted, tried, nil
+	}
+	if !found {
+		return nil, tried, fmt.Errorf("在这些供应程序下都找不到名为 %q 的持久化密钥（它有可能是别的用户/别的 store 的）", name)
+	}
+	return nil, tried, fmt.Errorf("找到了 %q 但删除失败", name)
+}
+
+// CNGEnumPersisted 列出给定供应程序队列里**当前用户可见**的全部持久化密钥名（运维审计用）。
+// 返回 (name -> 供应程序) 与逐供应程序的说明（枚举以 NTE_NO_MORE_ITEMS 结束，不算错误）。
+func CNGEnumPersisted(sel string) (map[string]string, []string, error) {
+	provs, serr := CNGProviderSelection(sel)
+	if serr != nil {
+		return nil, nil, serr
+	}
+	out := map[string]string{}
+	var notes []string
+	for _, prov := range provs {
+		hp, oerr := openProvider(prov)
+		if oerr != nil {
+			notes = append(notes, fmt.Sprintf("%s: %v", prov, oerr))
+			continue
+		}
+		// 枚举状态由 CNG 持有，长度/内容对它不透明 —— 给一块足够大的内存即可。
+		// 关键是这块内存必须**不受 Go GC 管**：最初写成 Go 的 byte slice 并把 &slice
+		// 交给 NCryptEnumKeys，调用一回来运行时立刻
+		//   "fatal error: checkptr: pointer arithmetic result points to invalid allocation"
+		// （同样的代码在非 -race/非 checkptr 下会静默 —— 更糟）。那是 Go 对
+		// "把 Go 堆对象地址交给外部代码"的**正确拒绝**，不是 CNG 的错。
+		// 结论：外部 API 的状态缓冲区用 LocalAlloc（Windows 自己的堆），用完 LocalFree。
+		stateRaw, _, _ := procLocalAlloc.Call(0x0040 /* LPTR = LMEM_FIXED|LMEM_ZEROINIT */, 4096)
+		if stateRaw == 0 {
+			procFree.Call(hp)
+			notes = append(notes, fmt.Sprintf("%s: LocalAlloc 失败（枚举状态）", prov))
+			continue
+		}
+		for k := 0; k < 512; k++ {
+			var pk unsafe.Pointer
+			r, _, _ := procEnumKeys.Call(hp, 0, uintptr(unsafe.Pointer(&pk)), stateRaw, 0)
+			if r != 0 {
+				if uint32(r) != ncryptNoMoreItems {
+					notes = append(notes, fmt.Sprintf("%s: NCryptEnumKeys 结束于 0x%X", prov, uint32(r)))
+				}
+				break
+			}
+			if pk == nil {
+				break
+			}
+			kn := (*ncryptKeyNameRec)(pk)
+			// 名字是 CNG 分配的 NUL 结尾宽字符串；上限 512 个宽字符只是防御性边界。
+			out[syscall.UTF16ToString(unsafe.Slice(kn.pszName, 512))] = prov
+			procFree.Call(uintptr(pk)) /* NCryptFreeBuffer：NCryptKeyName 由 CNG 分配 */
+		}
+		procLocalFree.Call(stateRaw)
+		procFree.Call(hp)
+	}
+	return out, notes, nil
 }
 
 // CNGFindPayloadKey 在给定供应程序队列里找到能用的包裉密钥，并**实测**一次往返。

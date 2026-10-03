@@ -28,6 +28,9 @@ var (
 	procUnprot    = crypt32DLL.NewProc("CryptUnprotectData")
 	kernel32DLL   = syscall.NewLazyDLL("kernel32.dll")
 	procLocalFree = kernel32DLL.NewProc("LocalFree")
+	// A4 的枚举要一块**不受 Go GC 管**的缓冲区给 NCryptEnumKeys：
+	// 用 Windows 自己的堆（LocalAlloc/LocalFree），与这里已有的 LocalFree 同一套语义。
+	procLocalAlloc = kernel32DLL.NewProc("LocalAlloc")
 )
 
 // Entropy 是额外混入的固定串：让这份密文只对"本工具的密钥保护"有意义，

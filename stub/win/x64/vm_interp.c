@@ -1804,6 +1804,17 @@ static int vm_key_from_file_dpapi(const u16 *path) {
  * 密钥名只允许 ASCII（工具侧写文件时已校验）：非 ASCII 一律当"文件被动过"拒绝。 */
 static const char vm_ncrypt_magic[8] = {'V', 'M', 'P', 'X', 'N', 'C', 'R', '1'};
 
+/* 包裹密钥名的**单字节**谓词：可打印 ASCII（0x20..0x7e）。
+ * 与 Go 侧 internal/cred/payloadwrap.go 的 ValidWrapKeyName 是**同一条规则**：
+ * 那边拒 name[i] < 0x20 || name[i] > 0x7e，这里逐字节同一个区间；
+ * 少拒 0x01..0x1f / 0x7f 就等于放行工具侧永远不会产生的"坏名字"（见 A1 的登记）。
+ * 提起成函数是为了让 stub/win/x64/keyname_probe.c 能直接调用它做边界断言
+ * （此前这条规则只写在循环体里，没有可失败的验证）。 */
+static int vm_ncrypt_keyname_ok(u8 c) { return c >= 0x20u && c <= 0x7eu; }
+/* 编译期钉死两个端点（与 Go 侧 0x20/0x7e 同一对常量）：改端点会在这里编不过，
+ * 而"只改实现不改常量"会被 keyname_probe.c 的逐字节断言抓住。 */
+VM_STATIC_ASSERT(0x20u < 0x7eu, ncrypt_keyname_span_ordered);
+
 static int vm_key_from_file_ncrypt(const u16 *path) {
     static u8 blob[1024];
     static u16 keyname[80];
@@ -1819,7 +1830,11 @@ static int vm_key_from_file_ncrypt(const u16 *path) {
     if (16u + nl + cl != got) return 0;
     for (u32 i = 0; i < nl; i++) {
         u8 c = blob[16 + i];
-        if (c == 0 || c > 127) return 0;
+        /* 规则必须与工具侧 cred.ValidWrapKeyName 的 0x20..0x7e（可打印 ASCII）**逐条一致**：
+         * 只拒 0x00/>127 会让 0x01..0x1f、0x7f 在这里被当成"好名字"，
+         * 而工具侧根本不会（也不该）写出这种文件 ⇒ 两边对"文件被动过"的判定就会分叉。
+         * 这里用同一个谓词函数，只留**一处**实现（探针 keyname_probe.c 直接调用它）。 */
+        if (!vm_ncrypt_keyname_ok(c)) return 0;
         keyname[i] = (u16)c;
     }
     keyname[nl] = 0;

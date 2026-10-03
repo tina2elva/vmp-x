@@ -38,6 +38,14 @@ const (
 	// PayloadWrapNameMax / PayloadWrapBlobMax：运行期缓冲区就按这两个上限定义。
 	PayloadWrapNameMax = 64
 	PayloadWrapBlobMax = 512
+	// PayloadPlainLen：被包裹的产物主密钥长度（恒定 32 字节）。
+	//
+	// 为什么它放在这个**无 build tag** 的文件里：payloadwrap.go 的 VerifyWrappedPayload
+	// （写文件前的自检，平台无关的那半）要用它。原先这个常量定义在 ncrypt_windows.go
+	// （//go:build windows）里 —— 于是 GOOS=linux 的 go build ./... 直接报
+	// "undefined: wrapPlainLen"，整条 Linux 半场（tools/wsl_linux.ps1）红。
+	// 常量属于**格式**，不是平台能力，所以归到这里。
+	PayloadPlainLen = 32
 )
 
 // CNGTPMProviderName：硬件（TPM）提供程序的名字。
@@ -58,6 +66,45 @@ func ValidWrapKeyName(name string) error {
 		}
 	}
 	return nil
+}
+
+// payloadUnwrap 是**自检**要用的解包裹实现。生产里它永远是 CNGUnwrapPayloadBlob，
+// 只有 internal/cred 包内的测试会临时换掉它 —— 存在的唯一理由见
+// internal/cred/selfcheck_test.go 的长注释：自检失败必须"拒绝写出"，
+// 而这条路径在生产里**不可达**（刚做出来的 blob 必然解回原值），
+// 于是没有接缝就只剩"读代码"这一种证据。
+//
+// 刻意的取舍（不引入任何生产开关）：
+//   - 它是**包内变量**，不是导出 API，也不是命令行/环境变量开关 —— 部署里没有任何东西能改它；
+//   - 唯一的调用点在 VerifyWrappedPayload 里，默认值与生产路径逐字节相同；
+//   - 代价是每次调用多一次间接跳转（一次 RSA-2048 解密的噪声量级）；
+//   - 收益是"自检不过 ⇒ 拒绝写出"这条规则第一次有了**能失败**的证明。
+var payloadUnwrap = CNGUnwrapPayloadBlob
+
+// payloadSelfCheckError 判定"刚做出来的 .ncrypt 内容"能不能通过自检：
+//   - 解不开（blob 结构不对/本机没有那把密钥/填充被改）→ 拒绝；
+//   - 解得开但长度不是 32 或与输入不逐字节相等 → 拒绝。
+//
+// 返回 nil 才允许写出。与 cmd/vmpkeywrap 的 wrapNCrypt 是同一套判据
+// （那边照抄这段就会分叉，所以判据只留在这里一份）。
+func payloadSelfCheckError(blob []byte, want []byte) error {
+	back, err := payloadUnwrap(blob)
+	if err != nil {
+		return fmt.Errorf("刚做出的密文本机解不开: %w", err)
+	}
+	if len(back) != len(want) || string(back) != string(want) {
+		return fmt.Errorf("解回来的主密钥与输入不一致（%d 字节 vs %d 字节）", len(back), len(want))
+	}
+	return nil
+}
+
+// VerifyWrappedPayload：写文件**之前**的自检。cmd/vmpkeywrap 在写出前必须先过这一关；
+// 不过就拒绝写出（宁可这里失败，也不要让产物在部署后才炸）。
+func VerifyWrappedPayload(blob []byte, want []byte) error {
+	if len(want) != PayloadPlainLen {
+		return fmt.Errorf("输入主密钥必须是 %d 字节（实得 %d）", PayloadPlainLen, len(want))
+	}
+	return payloadSelfCheckError(blob, want)
 }
 
 // MarshalPayloadNCrypt 把密钥名 + RSA 密文装成 .ncrypt 文件内容。

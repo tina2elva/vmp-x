@@ -43,3 +43,14 @@ func CNGWrapPayload(sel, name string, master []byte) ([]byte, string, error) {
 func CNGUnwrapPayloadBlob(blob []byte) ([]byte, error) {
 	return nil, fmt.Errorf("CNG/TPM 密钥只在 Windows 可用")
 }
+
+// A4 的运维入口只在 Windows 上有意义（别的平台连 CNG 都没有）。
+// **必须有这两个桩**：cmd/vmpkeywrap 是无 build tag 的 main 包，Linux 上的
+// "go build ./..." 会把它一起编 —— 少了它们整条 Linux 半场会红（已踩过）。
+func CNGDeletePersisted(sel, name string) ([]string, []string, error) {
+	return nil, nil, fmt.Errorf("CNG/TPM 密钥只在 Windows 可用（-cleanup 也一样）")
+}
+
+func CNGEnumPersisted(sel string) (map[string]string, []string, error) {
+	return nil, nil, fmt.Errorf("CNG/TPM 密钥只在 Windows 可用（-list 也一样）")
+}
