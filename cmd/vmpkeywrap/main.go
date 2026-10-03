@@ -167,15 +167,16 @@ func cleanupKeys(sel, keyName string, list bool) {
 	}
 }
 
-// storeDir：持久化密钥在文件系统里的位置。两者都落在当前用户的 profile 下
-// （软件 KSP 与 Platform Crypto Provider 的**密钥文件**都在这里；TPM 那把的实际私钥在芯片里）。
+// storeDir：这个 store 的用户可见落点在文件系统里的位置（当前用户的 profile 下）。
+// 如实说：软件 KSP 的密钥文件确实在这里；Platform Crypto Provider 那把的**私钥材料在 TPM 芯片里**，
+// 这里只报告它归属的那个 store 目录（删除是否成功与这个目录无关，只认 NCryptDeleteKey 的返回码）。
 func storeDir(provider string) string {
 	base := os.Getenv("USERPROFILE")
 	if base == "" {
 		base = "%USERPROFILE%"
 	}
 	if strings.Contains(provider, "Platform Crypto") {
-		return base + "\\AppData\\Microsoft\\Crypto\\Keys (TPM-backed: the private key itself never leaves the chip)"
+		return base + "\\AppData\\Microsoft\\Crypto\\Keys (TPM-backed: the key material itself lives in the chip)"
 	}
 	return base + "\\AppData\\Microsoft\\Crypto\\Keys"
 }
