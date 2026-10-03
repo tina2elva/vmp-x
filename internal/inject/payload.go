@@ -79,12 +79,21 @@ type ImgReloc struct {
 // 异或。掩码在**写完之后**做；运行期先解掩码再读。m_reloc = FieldMask(master, FieldMaskDomainReloc, salt)，
 // 没有主密钥时用全零 master（与描述符/校验表的"无条件混淆"一致）。
 //
-// 运行期算法（三个步骤必须按这个顺序，且槽位语义是**就地加减**）：
+// **这张表不是运行期的输入**：stub 里对 RelocTableMagic 的引用只有一条注释，vm_reloc_fix 自己解析
+// 目标 PT_DYNAMIC 的 DT_RELA/DT_RELASZ（或 DT_REL/DT_RELSZ），只按"表地址落在运行期窗口
+// [base, base+linkSize) 还是链接期窗口 [prefBase, linkEnd)"折算一次；两个窗口都不在 ⇒ 硬门
+// code=8（exit 7）。所以它是打包端/门禁的账目（"哪些槽位要被就地还原"的声明），把它整张清零
+// 产物行为不变 —— 实测见 tools/e2e_elf_image.sh 头部"校准 3"（code=8 的构造点只能在动态段）。
+//
+// 运行期算法（三个步骤必须按这个顺序）：
 //
 //	delta = base − prefBase
-//	for e in entries: *(base + e.rva) -= delta   // 还原成链接期形式，让 AEAD 验签通过
+//	for e in entries: *(base + e.rva) = r_addend ^ 密码流字节
+//	    // 还原成**原始密文**：ld.so 对相对重定位是**无条件赋值** l_addr + r_addend（不是"加 delta"），
+//	    // 密文那几个字节已被覆盖，而密文 = r_addend ^ 密码流；减 delta 只会得到链接期明文，
+//	    // 验签仍然不过（实测：报 verifyfail）。
 //	（验签 + 解密各个加密范围）
-//	for e in entries: *(base + e.rva) += delta   // 把运行期基址加回去
+//	for e in entries: *(base + e.rva) += delta   // 解密后槽位 = r_addend，加回运行期基址即正确值
 const (
 	RelocTableMagic      = uint32(0x52504D56) // "VMPR"（小端字节序 56 4D 50 52）
 	RelocTableHeaderSize = 32
