@@ -330,22 +330,28 @@ if ((link_end + PAGE - 1) & ~(PAGE - 1)) - link_end < 32:
 target = ((link_end + PAGE - 1) & ~(PAGE - 1)) - 32
 dynoff = va2off(dynamic[0])
 assert dynoff is not None, "PT_DYNAMIC is not covered by any PT_LOAD"
-want = {7: ("DT_RELA", target), 8: ("DT_RELASZ", 24), 0x6FFFFFF9: ("DT_RELACOUNT", 0)}
+# DT_RELA/DT_RELASZ are required for this construction; DT_RELACOUNT is only glibc's RELATIVE
+# fast-path hint and NOT every linker emits it -- requiring it would false-red on those toolchains
+# (the construction still works without it: glibc then takes the generic relocation path).
+required = {7: ("DT_RELA", target), 8: ("DT_RELASZ", 24)}
+optional = {0x6FFFFFF9: ("DT_RELACOUNT", 0)}
 hit = []
 for j in range(dynamic[1] // 16):
     o = dynoff + j * 16
     tag = u64(o)
     if tag == 0:
         break
-    if tag in want:
-        struct.pack_into("<Q", d, o + 8, want[tag][1])
-        hit.append(want[tag][0])
-assert sorted(hit) == sorted(["DT_RELA", "DT_RELASZ", "DT_RELACOUNT"]), \
-    "dynamic section lacks the expected tags (hit=%r)" % (hit,)
+    src = required if tag in required else (optional if tag in optional else None)
+    if src is not None:
+        struct.pack_into("<Q", d, o + 8, src[tag][1])
+        hit.append(src[tag][0])
+missing = sorted(v[0] for v in required.values() if v[0] not in hit)
+assert not missing, "dynamic section lacks %r (hit=%r)" % (missing, hit)
 open(dst, "wb").write(d)
 os.chmod(dst, 0o755)
-print("    dynamic @file 0x%X ; linkEnd=0x%X ; out-of-window table VA=0x%X ; patched=%s"
-      % (dynoff, link_end, target, ",".join(sorted(hit))))
+print("    dynamic @file 0x%X ; linkEnd=0x%X ; out-of-window table VA=0x%X ; patched=%s%s"
+      % (dynoff, link_end, target, ",".join(sorted(hit)),
+         "" if "DT_RELACOUNT" in hit else " (no DT_RELACOUNT on this toolchain: glibc takes the generic path)"))
 PY
     c8_run() {  # $1 = binary -> C8_RC / C8_OUT / C8_ERR
         local errf
@@ -458,9 +464,53 @@ EOF
         -enc-image-elf-pie -enc-image-elf-pie-relocs \
         -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
         -out build/elf_target_a64reloc.enc -report build/elf_enc_a64reloc.json || fail "pack aarch64 reloc case"
+    # 先钉住"这条用例不是空转"：夹具必须真的把相对重定位放进了加密范围，且打包端真的记了账、
+    # 真的落了应用表。门禁的 E5(b) 会把 recorded 与产物自己 DT_DYNAMIC 里的条数对一遍，但如果两边
+    # 都是 0，那条等式会平凡成立 —— 所以这里单独断言 >= 1。
+    a64_reloc_bookkeeping() {  # $1 = report path
+        ELF_REPORT="$1" python3 - <<'PY' || fail "aarch64 reloc bookkeeping is vacuous ($1)"
+import json, os
+rep = json.load(open(os.environ["ELF_REPORT"]))
+n = int(rep.get("imgRelocCount") or 0)
+assert n >= 1, "the fixture put NO relative relocation inside the encrypted range: imgRelocCount=%s" % rep.get("imgRelocCount")
+assert int(rep.get("imgRelocTableRVA") or 0) != 0, "a relocation apply table must be emitted (imgRelocTableRVA=0)"
+print("    imgRelocCount=%d in-range RELATIVE reloc(s) recorded, apply table RVA=0x%X" % (n, int(rep["imgRelocTableRVA"])))
+PY
+    }
+    a64_reloc_bookkeeping build/elf_enc_a64reloc.json
     python3 tools/check_elf_layout.py --packed build/elf_target_a64reloc.enc \
         --manifest build/vm_interp_elf.json --blob build/vm_interp_elf.bin \
         --report build/elf_enc_a64reloc.json --selftest || fail "aarch64 layout gate (packing half of the reloc contract)"
+    # 第二种**合法**形状：注入器拿不到第二个可复用的 PT_NOTE 槽位时，payload 段整段退回 RWX
+    # （internal/inject/elf.go 会醒目告警），bss 由 payload 段自己的文件镜像承载 —— 此时"没有 RW 覆盖段"
+    # 是正确的。CI 的 gcc/ld 13 夹具只有 1 个 PT_NOTE，于是 CI 走的正是这条路；本机 ld 15 的夹具有 2 个，
+    # 一直走"RX + RW 覆盖段"，所以 2026-10-03 的 CI run 37128895442 在本机复现不出来。这里把多余的
+    # PT_NOTE 抹掉，把 CI 那种形状**在本机也造出来**：告警必须醒目，且门禁必须接受它。
+    python3 - build/elf_target_a64reloc build/elf_target_a64reloc_rwx <<'PY' || fail "build the one-NOTE (RWX fallback) fixture"
+import os, struct, sys
+src, dst = sys.argv[1], sys.argv[2]
+d = bytearray(open(src, "rb").read())
+phoff, phentsize, phnum = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+notes = [i for i in range(phnum) if struct.unpack_from("<I", d, phoff + i * phentsize)[0] == 4]
+for i in notes[1:]:
+    struct.pack_into("<I", d, phoff + i * phentsize, 0)   # p_type = PT_NULL: leave exactly one NOTE slot
+open(dst, "wb").write(d)
+os.chmod(dst, 0o755)
+print("    fixture has %d PT_NOTE; kept 1 so the injector cannot place the RW overlay" % len(notes))
+PY
+    RWX_OUT="$(./build/vmpack -exe build/elf_target_a64reloc_rwx -func checkKey -func sumTo \
+        -enc-image-elf-pie -enc-image-elf-pie-relocs \
+        -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
+        -out build/elf_target_a64reloc_rwx.enc -report build/elf_enc_a64reloc_rwx.json 2>&1)" || fail "pack the one-RWX-segment aarch64 case"
+    if ! printf '%s' "$RWX_OUT" | grep -q '退回 RWX'; then
+        printf '%s\n' "$RWX_OUT" | tail -n 5
+        fail "the injector must say LOUDLY when it falls back to one RWX payload segment"
+    fi
+    a64_reloc_bookkeeping build/elf_enc_a64reloc_rwx.json
+    python3 tools/check_elf_layout.py --packed build/elf_target_a64reloc_rwx.enc \
+        --manifest build/vm_interp_elf.json --blob build/vm_interp_elf.bin \
+        --report build/elf_enc_a64reloc_rwx.json --selftest || fail "aarch64 layout gate (one-RWX-segment shape)"
+    echo "[OK  ] aarch64: both legal payload shapes accepted (RX+RW overlay and the one-RWX-segment fallback)"
     # qemu 的 -L 是**前缀**：guest 里的 /lib/ld-linux-aarch64.so.1 会被解析成 <前缀>/lib/... ，
     # 所以前缀要取"loader 所在目录的上一级"（例如 /usr/aarch64-linux-gnu/lib -> /usr/aarch64-linux-gnu）。
     A64_LDFILE="$("$A64_CC" -print-file-name=ld-linux-aarch64.so.1 2>/dev/null)"

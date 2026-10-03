@@ -11,8 +11,19 @@ Everything is derived from the PRODUCT FILE plus the same build's blob manifest 
         table order and later mappings win, so inverting that order silently kills the
         interpreter's writable window (internal/inject/elf.go documents the measured failure).
   E2 payload segments vs the report
-        one PT_LOAD at exactly report.sectionRVA carrying the payload, plus (when bssSize > 0) an
-        RW PT_LOAD at sectionRVA + bssOff of exactly bssSize.
+        one PT_LOAD at exactly report.sectionRVA carrying the payload (executable, filesz ==
+        report.sectionSize). The interpreter's writable window (manifest bssOff/bssSize) must be
+        MAPPED and WRITABLE, and two implementations are legal:
+          (a) a dedicated RW PT_LOAD at sectionRVA + bssOff, filesz == memsz == bssSize -- what the
+              injector produces when it can split the payload (RX code + RW bss); or
+          (b) the payload LOAD itself is writable (PF_W) and its FILE IMAGE carries the bss bytes
+              (the range is inside p_filesz and inside the file) -- this is internal/inject/elf.go's
+              documented fallback to ONE RWX segment when no second PT_NOTE slot can be reused
+              (it prints a loud "[warn] ... 退回 RWX" when it does).
+        Requiring (a) unconditionally was an amd64-only assumption: the aarch64 fixture built by the
+        CI toolchain has a single PT_NOTE, so CI takes route (b) -- CI run 37128895442 went red here
+        and the same shape is reproducible locally by blanking one PT_NOTE (see the arm64 case in
+        tools/e2e_elf_image.sh).
   E3 payload byte identity
         file bytes at (sectionRVA + o) == blob[o] for every o in [0, blobSize).
   E4 bss mapping invariant (STATUS #585)
@@ -261,20 +272,60 @@ def check_payload(elf, manifest, report, rep):
     if p["flags"] & PF_W:
         rep.info("E2", "payload LOAD is RWX (the injector fell back to one segment: no W+X-free split)")
     bss_off, bss_size = int(manifest["bssOff"]), int(manifest["bssSize"])
+    shape = "no bss in the payload"
     if bss_size > 0:
-        want = sec_va + bss_off
-        w = None
+        bss_va = sec_va + bss_off
+        bss_end = bss_va + bss_size
+        # The interpreter's writable window (bss) must be MAPPED and WRITABLE. Two implementations
+        # are legal, and both are shape-independent statements about fields the product carries:
+        #   (a) a dedicated RW overlay PT_LOAD at sectionRVA+bssOff, filesz == memsz == bssSize
+        #       (what the injector produces when it can split the payload: RX code + RW bss);
+        #   (b) the payload LOAD itself is writable AND its FILE IMAGE carries the bss bytes
+        #       ([bss_va, bss_end) inside p_filesz and inside the file). This is the injector's
+        #       documented fallback to ONE RWX segment when there is no second reusable PT_NOTE
+        #       slot (internal/inject/elf.go prints a loud "[warn] ... 退回 RWX" there).
+        # Requiring (a) unconditionally was an amd64-only assumption: the aarch64 fixture built by
+        # the CI toolchain has a single PT_NOTE, so CI takes route (b) -- run 37128895442 went red
+        # here and the same shape is reproducible locally by blanking one PT_NOTE.
+        overlay = None
         for q in elf.loads:
-            if q["vaddr"] == want:
-                w = q
-        if w is None:
-            rep.fail("E2", "no RW overlay PT_LOAD at sectionRVA+bssOff = 0x%X" % want)
-        if not (w["flags"] & PF_W):
-            rep.fail("E2", "overlay LOAD at 0x%X is not writable (flags=0x%X)" % (want, w["flags"]))
-        if w["filesz"] != bss_size or w["memsz"] != bss_size:
-            rep.fail("E2", "overlay LOAD at 0x%X is 0x%X/0x%X, expected 0x%X" % (want, w["filesz"], w["memsz"], bss_size))
-    rep.ok("E2", "payload @0x%X (RVA 0x%X, 0x%X bytes) + overlay @0x%X (0x%X)"
-           % (sec_va, sec_rva, sec_size, sec_va + bss_off, bss_size))
+            if q["vaddr"] == bss_va:
+                overlay = q
+        if overlay is not None:
+            if not (overlay["flags"] & PF_W):
+                rep.fail("E2", "overlay LOAD at 0x%X is not writable (flags=0x%X)" % (bss_va, overlay["flags"]))
+            if overlay["filesz"] != bss_size or overlay["memsz"] != bss_size:
+                rep.fail("E2", "overlay LOAD at 0x%X is 0x%X/0x%X, expected 0x%X"
+                         % (bss_va, overlay["filesz"], overlay["memsz"], bss_size))
+            shape = "overlay @0x%X (0x%X)" % (bss_va, bss_size)
+        else:
+            # (b) Which segment actually backs bss_va: the LAST matching LOAD in program-header
+            # order (the kernel maps in table order, so a later segment wins).
+            cover = None
+            for q in elf.loads:
+                if q["vaddr"] <= bss_va < q["vaddr"] + q["memsz"]:
+                    cover = q
+            if cover is None:
+                rep.fail("E2", "bss [0x%X,0x%X) is mapped by NO PT_LOAD and there is no RW overlay "
+                               "(manifest bssOff=0x%X bssSize=0x%X) -- the interpreter would fault on its "
+                               "first write" % (bss_va, bss_end, bss_off, bss_size))
+            if not (cover["flags"] & PF_W):
+                rep.fail("E2", "bss [0x%X,0x%X) is mapped by a NON-writable LOAD (vaddr=0x%X flags=0x%X) and "
+                               "there is no RW overlay: the interpreter's writable window would fault"
+                         % (bss_va, bss_end, cover["vaddr"], cover["flags"]))
+            if bss_end > cover["vaddr"] + cover["memsz"]:
+                rep.fail("E2", "bss [0x%X,0x%X) is only partly mapped: the writable LOAD at 0x%X ends at 0x%X"
+                         % (bss_va, bss_end, cover["vaddr"], cover["vaddr"] + cover["memsz"]))
+            d = bss_va - cover["vaddr"]
+            if d + bss_size > cover["filesz"]:
+                rep.fail("E2", "bss [0x%X,0x%X) is neither overlaid nor file-backed: the writable LOAD at "
+                               "0x%X has p_filesz=0x%X, whose image stops at 0x%X"
+                         % (bss_va, bss_end, cover["vaddr"], cover["filesz"], cover["vaddr"] + cover["filesz"]))
+            if cover["off"] + d + bss_size > len(elf.data):
+                rep.fail("E2", "bss [0x%X,0x%X) file image runs past EOF (file is 0x%X bytes)"
+                         % (bss_va, bss_end, len(elf.data)))
+            shape = "bss file-backed inside the writable payload LOAD @0x%X (0x%X)" % (cover["vaddr"], bss_size)
+    rep.ok("E2", "payload @0x%X (RVA 0x%X, 0x%X bytes) + %s" % (sec_va, sec_rva, sec_size, shape))
 
 
 def check_identity(elf, manifest, report, blob, rep):
@@ -600,10 +651,41 @@ def selftest(path, manifest, report, blob):
                 run_checks(mutate(path, m7, tmp, "e5t"), manifest, report, blob, True), "E5",
                 "wantBase=0x%X" % planted_slot)))
 
-        # M5 (E1, the ordering rule): list the RW overlay BEFORE the payload segment
+        # E2's two legal shapes also change which calibrations are possible: the overlay ones need
+        # an overlay segment. Resolve it once, shape-independently.
+        ov = None
         if int(manifest["bssSize"]) > 0:
-            ov = [p for p in elf.loads
-                  if p["vaddr"] == elf.image_base + int(report["sectionRVA"]) + int(manifest["bssOff"])][0]
+            want_ov = elf.image_base + int(report["sectionRVA"]) + int(manifest["bssOff"])
+            for q in elf.loads:
+                if q["vaddr"] == want_ov:
+                    ov = q
+
+        # M8 (E2 route (a)): delete the RW overlay, so the bss is neither overlaid nor inside a
+        # writable segment. On amd64 the payload LOAD is RX, so route (b) cannot rescue it and E2
+        # itself must fail.
+        if ov is None:
+            print("[SKIP] CAL  E2-overlay: this product has no RW overlay segment to remove "
+                  "(the injector took the one-RWX-segment route)")
+        else:
+            def m8(d, ho=ov["hdr"]):
+                struct.pack_into("<I", d, ho, 0)  # p_type = PT_NULL
+            results.append(("E2-overlay", *_expect_fail(
+                run_checks(mutate(path, m8, tmp, "e2o"), manifest, report, blob, True), "E2",
+                "no RW overlay")))
+
+        # M9 (E2 route (b)): only meaningful on a product that really uses route (b). Declare a
+        # bigger writable window than the payload LOAD's file image carries; E2 must catch it with
+        # one of its own bss lines (all of them start with "bss [").
+        if ov is not None or int(manifest["bssSize"]) <= 0:
+            print("[SKIP] CAL  E2-filebacked: this product uses the RW-overlay shape (nothing to shrink)")
+        else:
+            man9 = dict(manifest)
+            man9["bssSize"] = int(manifest["bssSize"]) + 0x2000
+            results.append(("E2-filebacked", *_expect_fail(
+                run_checks(path, man9, report, blob, True), "E2", "bss [")))
+
+        # M5 (E1, the ordering rule): list the RW overlay BEFORE the payload segment
+        if ov is not None:
             a, b = pl["hdr"], ov["hdr"]
 
             def m5(d):
