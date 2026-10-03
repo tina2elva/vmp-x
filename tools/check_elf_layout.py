@@ -20,15 +20,42 @@ Everything is derived from the PRODUCT FILE plus the same build's blob manifest 
         PAGEALIGN(max(vaddr+memsz))). A segment with memsz > filesz therefore keeps its bss only
         when its own PAGEALIGN(vaddr+filesz) IS that maximum; anything else loses its bss entirely
         and dies on the first global write ("error 6" = not present + write). Assert none exists.
-  E5 relocation coverage (ET_DYN only, two assertions)
+  E5 relocation coverage (ET_DYN only)
         (a) every preferred-base absolute VA stored in the payload must be covered by an
             R_*_RELATIVE entry (candidates are filtered by the plausible-VA window, not by
-            "value >> 32", which matches nearly every random word);
+            "value >> 32", which matches nearly every random word). When the scan finds no
+            candidate at all the gate says so with an explicit INFO (plus a full unaligned
+            sweep as evidence) instead of reporting a pass it did not earn: for products this
+            packer generates the payload genuinely holds no preferred-base VA, so the
+            load-bearing checks are E3 (payload == blob), (a2) and (b) below, plus the e2e PIE
+            run that really lets ld.so relocate the image.
+        (a2) the payload's image-decryption table must not declare a preferred base
+            (report.imgTableRVA + 0 = wantBase). That is the one slot where the ELF payload
+            could carry an absolute VA; vm_unpack_image fails ("basemismatch") on a nonzero
+            value the moment ld.so relocates the image, so this is a real ASLR assertion and
+            not a blind word scan (it reads the product's own declared field).
         (b) every R_*_RELATIVE whose target sits inside a range the report declares as
             image-encrypted must be recorded (report.imgRelocCount) and have an apply table
             (report.imgRelocTableRVA) -- ld.so writes those slots before the entry hook, so a
             missing record is either an AEAD verify failure or a silently corrupted slot.
         ET_EXEC keeps its INFO line (the image never moves).
+
+  E5 coverage gap on aarch64 (REGISTERED, not fixed): the runtime applier's aarch64 branch
+  (VM_RT_RELATIVE = 1027) has no runnable acceptance case.
+    * What forbids it: docs/STATUS.md #376/#377 keep ELF read-only-data-section encryption off
+      on aarch64 (the SIGSEGV root cause is still unknown) and AGENTS.md forbids turning it on;
+      the only range type left that aarch64 can encrypt is the executable one, and a reloc slot
+      inside an encrypted *executable* range makes the product SIGSEGV on amd64 as well
+      (measured with DT_TEXTREL-style fixtures, plain pack included). A small aarch64 PIE is
+      refused a third time: its executable segment lies entirely inside the 64 KiB file-header
+      page ("跳过（可执行段全落在文件头那一页里）").
+    * Which bytes stay unverifiable: every R_AARCH64_RELATIVE target inside a range the packer
+      would have to encrypt (i.e. exactly the slots the runtime applier would rewrite).
+    * What covers it instead: tools/e2e_elf_image.sh's x86-64 PIE_RELOCS case is the applier's
+      only end-to-end acceptance point -- vm_reloc_fix is ONE arch-independent function and the
+      packer copies the target's own reloc type into the table -- while this gate re-derives the
+      recorded count/targets from an aarch64 product's own PT_DYNAMIC, so the packing half of
+      the contract stays checked from the artifact even where the runtime half cannot run.
 
 --selftest mutates copies and requires every check to catch its own mutation.
 
@@ -344,7 +371,44 @@ def check_relocs(elf, report, rep):
         if uncovered:
             rep.fail("E5", "%d of %d payload absolute VA(s) have no RELATIVE relocation (first at 0x%X holding 0x%X)"
                      % (len(uncovered), len(cands), uncovered[0][0], uncovered[0][1]))
-        rep.ok("E5", "payload: %d absolute VA(s), all covered by %d RELATIVE entries" % (len(cands), len(covered)))
+        if cands:
+            rep.ok("E5", "payload: %d absolute VA(s), all covered by %d RELATIVE entries" % (len(cands), len(covered)))
+        else:
+            # No candidate = this half of E5 had no input. Saying "OK" here would claim a pass the
+            # check did not earn, so report the downgrade explicitly and back it with a sweep at
+            # EVERY byte offset (not just the 8-byte stride) -- otherwise the emptiness could be
+            # an artefact of where the scan looks.
+            any_off = 0
+            for off in range(0, p["filesz"] - 7):
+                raw = elf.read(sec_rva + off, 8)
+                if raw is None:
+                    break
+                v = struct.unpack("<Q", raw)[0]
+                if pref <= v < ceiling:
+                    any_off += 1
+            rep.info("E5", "payload carries no preferred-base VA in [0x%X,0x%X): 0 candidate(s) at the 8-byte "
+                           "stride, %d at every byte offset -> the \"VA must be covered\" half of E5 has no "
+                           "input on this product (base-independence there is carried by E3 payload==blob, "
+                           "E5(a2) below and the e2e run that really relocates the image), NOT by this scan"
+                     % (pref, ceiling, any_off))
+
+    # (a2) the payload's own declared VA slot: the image table's wantBase field. It is the one place
+    # the ELF payload could hold an absolute preferred-base VA, and it is read from the PRODUCT (not
+    # from a magic value), so this half keeps its discriminating power on real PIE products.
+    img_tbl = int(report.get("imgTableRVA") or 0)
+    if img_tbl == 0:
+        rep.info("E5", "no image table in this product (report.imgTableRVA=0): no declared VA slot to check")
+    else:
+        want = elf.read(pref + img_tbl, 8)
+        if want is None:
+            rep.fail("E5", "report.imgTableRVA=0x%X is not file-backed in the product" % img_tbl)
+        wantbase = struct.unpack("<Q", want)[0]
+        if wantbase != 0:
+            rep.fail("E5", "payload image table at RVA 0x%X declares wantBase=0x%X; an ET_DYN image is loaded "
+                           "at an ASLR-chosen base, so a nonzero wantBase makes vm_unpack_image fail "
+                           "(VMPELF basemismatch) as soon as the image actually moves"
+                     % (img_tbl, wantbase))
+        rep.ok("E5", "payload image table wantBase=0: the payload relies on no absolute preferred-base VA")
 
     # (b) encrypted ranges vs the recorded relocations
     secs = report.get("imgSections")
@@ -373,6 +437,16 @@ def check_relocs(elf, report, rep):
     else:
         rep.ok("E5", "bookkeeping: %d in-range RELATIVE reloc(s) recorded (%s), apply table at RVA 0x%X"
                % (found, ",".join(where), int(report["imgRelocTableRVA"])))
+    # aarch64: say out loud that only the PACKING half of this contract is verified here. The runtime
+    # half (vm_reloc_fix with VM_RT_RELATIVE = 1027) has no runnable case today; see the docstring
+    # section "E5 coverage gap on aarch64".  A NOTE, not an assertion: the gap is architectural
+    # (#376/#377 + relocs inside an encrypted executable range), not a property of this product, and
+    # the task contract forbids shape-dependent assertions.
+    if elf.machine == 183:  # EM_AARCH64
+        rep.info("E5", "aarch64: ONLY the packing half above is verified -- the runtime applier branch "
+                       "(VM_RT_RELATIVE=1027) has no runnable acceptance case (#376/#377 keep read-only-data "
+                       "encryption off on aarch64, and a reloc slot inside an encrypted executable range "
+                       "SIGSEGVs on amd64 too); it is covered by the x86-64 PIE_RELOCS e2e plus code review")
 
 
 def run_checks(path, manifest, report, blob, quiet=False):
@@ -503,6 +577,28 @@ def selftest(path, manifest, report, blob):
                 results.append(("E5-payload", *_expect_fail(
                     run_checks(mutate(path, m6, tmp, "e5"), manifest, report, blob, True), "E5",
                     "holding 0x%X" % va)))
+
+        # M7 (E5, the payload's declared VA slot): make the payload's own image table claim a
+        # preferred base. Report-independent -- it is a plain field inside the product's payload table
+        # (report.imgTableRVA + 0), and only E5(a2) reads it. E3 also trips (the payload no longer
+        # matches the blob), so the calibration additionally requires E5's OWN line to name the value.
+        img_tbl = int(report.get("imgTableRVA") or 0)
+        if elf.etype != ET_DYN or img_tbl == 0:
+            print("[SKIP] CAL  E5-imgtable: this product has no image table (or is not ET_DYN)")
+        else:
+            t_off = elf.va_to_off(elf.image_base + img_tbl)
+            # Plant a base that is deliberately OUTSIDE the plausible-VA window: E5(a) must stay
+            # silent so the calibration can only be caught by E5(a2)'s own line. (Planting the link
+            # base would make both halves fail and the needle would prove the wrong one -- that is
+            # exactly the mistake the first version of this calibration made on the Go PIE, whose
+            # image base 0x400000 lies inside its own VA window.)
+            planted_slot = 0x7F0000000000
+
+            def m7(d, off=t_off, va=planted_slot):
+                struct.pack_into("<Q", d, off, va)
+            results.append(("E5-imgtable", *_expect_fail(
+                run_checks(mutate(path, m7, tmp, "e5t"), manifest, report, blob, True), "E5",
+                "wantBase=0x%X" % planted_slot)))
 
         # M5 (E1, the ordering rule): list the RW overlay BEFORE the payload segment
         if int(manifest["bssSize"]) > 0:

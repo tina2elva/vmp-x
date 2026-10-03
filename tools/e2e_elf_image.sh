@@ -419,4 +419,60 @@ EOF
     echo "[OK  ] 静态 PIE：打包端醒目告警且产物与原生一致（check-key 10 -> $SP_PACKED）"
 fi
 
+# ---- aarch64：加密范围内重定位 —— 打包侧可断言，运行期侧如实登记为"无可跑用例" ----
+# #376/#377 把 aarch64 的只读数据节加密默认关掉（根因未定，AGENTS.md 禁止打开），所以
+# "加密范围里带 R_AARCH64_RELATIVE" 这条运行期路径一直没有可跑用例。本块做两件**能跑**的事，
+# 并把跑不了的那半用实测数字打进日志（不做断言）：
+#   ① 打包侧契约：造一个 aarch64 PIE 夹具（.rodata 里两条相对重定位），用
+#      -enc-image-elf-pie -enc-image-elf-pie-relocs 打包，然后让**布局门禁**从产物自己的
+#      PT_DYNAMIC 重新推导"范围内重定位条数/应用表 RVA/类型"（E5(b)），并顺带把 E1..E4 与
+#      全部校准跑在**aarch64 产物**上（此前门禁只吃过 amd64 产物）。
+#   ② 运行期侧：今天不可达 —— 数据节加密被 #376/#377 禁；把重定位放进**可执行**范围则产物在
+#      amd64 上也会 SIGSEGV（DT_TEXTREL 类夹具，plain 打包同样崩）。所以这里只**记录**实测
+#      运行结果，不写成断言：把一个"当前崩"的状态钉成期望值，等于给未来的修复埋一颗假红，
+#      而这部分的结论写在 tools/check_elf_layout.py 的 "E5 coverage gap on aarch64" 一节里。
+if [ "${GOARCH_TARGET}" = "arm64" ] && [ -n "${BLOB_CC}" ]; then
+    echo "[*] aarch64: reloc-in-encrypted-range -- packing half asserted, runtime half registered as unverified (#376/#377)"
+    A64_CC=${A64_CC:-aarch64-linux-gnu-gcc}
+    cat > build/a64_pie_reloc.c <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int g_a = 7;
+static int g_b = 9;
+__attribute__((used, section(".rodata"))) const int *const tbl[2] = {&g_a, &g_b};
+__attribute__((noinline)) unsigned long checkKey(unsigned long x) { return ((x * 7) + 42) ^ 0xFF; }
+__attribute__((noinline)) long sumTo(long n) { long s = 0; for (long i = 1; i <= n; i++) s += i; return s; }
+int main(int argc, char **argv) {
+    if (argc < 3) { return 2; }
+    if (tbl[0] != &g_a || tbl[1] != &g_b) { fprintf(stderr, "reloc slots corrupted\n"); return 3; }
+    unsigned long v = strtoul(argv[2], 0, 0);
+    if (strcmp(argv[1], "check-key") == 0) printf("%lu\n", checkKey(v));
+    else if (strcmp(argv[1], "sum-to") == 0) printf("%ld\n", sumTo((long)v));
+    else return 2;
+    return 0;
+}
+EOF
+    "$A64_CC" -fPIE -pie -O1 -o build/elf_target_a64reloc build/a64_pie_reloc.c || fail "build aarch64 PIE fixture"
+    ./build/vmpack -exe build/elf_target_a64reloc -func checkKey -func sumTo \
+        -enc-image-elf-pie -enc-image-elf-pie-relocs \
+        -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
+        -out build/elf_target_a64reloc.enc -report build/elf_enc_a64reloc.json || fail "pack aarch64 reloc case"
+    python3 tools/check_elf_layout.py --packed build/elf_target_a64reloc.enc \
+        --manifest build/vm_interp_elf.json --blob build/vm_interp_elf.bin \
+        --report build/elf_enc_a64reloc.json --selftest || fail "aarch64 layout gate (packing half of the reloc contract)"
+    # qemu 的 -L 是**前缀**：guest 里的 /lib/ld-linux-aarch64.so.1 会被解析成 <前缀>/lib/... ，
+    # 所以前缀要取"loader 所在目录的上一级"（例如 /usr/aarch64-linux-gnu/lib -> /usr/aarch64-linux-gnu）。
+    A64_LDFILE="$("$A64_CC" -print-file-name=ld-linux-aarch64.so.1 2>/dev/null)"
+    A64_LD="$(dirname "$(dirname "$A64_LDFILE")")"
+    if [ -f "$A64_LDFILE" ]; then
+        A64_NAT_RC=0; A64_NAT="$($QEMU -L "$A64_LD" ./build/elf_target_a64reloc check-key 10 2>&1)" || A64_NAT_RC=$?
+        A64_RC=0; A64_OUT="$($QEMU -L "$A64_LD" ./build/elf_target_a64reloc.enc check-key 10 2>&1)" || A64_RC=$?
+        echo "[INFO] aarch64 reloc product runtime (NOT asserted): native rc=$A64_NAT_RC -> [$A64_NAT] ; packed rc=$A64_RC -> [$(printf '%s' "$A64_OUT" | head -n 2 | tr '\n' ' ')]"
+        echo "[INFO]   today the packed one cannot answer like native: read-only-data encryption is off on aarch64 (#376/#377) and a reloc slot inside an encrypted executable range SIGSEGVs on amd64 too"
+    else
+        echo "[INFO] aarch64 reloc product runtime: no aarch64 loader next to $A64_CC (looked for [$A64_LDFILE]) -- runtime half left unverified (#376/#377)"
+    fi
+fi
+
 echo "[+] e2e_elf_image: OK"
