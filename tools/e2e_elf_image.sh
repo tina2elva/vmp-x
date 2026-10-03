@@ -44,6 +44,24 @@
 #   #   [MISMATCH] reloc-bearing product check-key: native=[143] (rc=0) packed=[VMPELF verifyfail rva=8192
 #   #   VMPELF verifyfail size=128] (rc=132)
 #   #   [FAIL] reloc-bearing PIE product is not byte-identical to native (check-key)   -> exit 1
+#
+# 校准 3（fail-closed `code=8`：重定位表地址既不在运行期窗口、也不在链接期窗口）：运行期应用器
+# 读的是**目标自己的** PT_DYNAMIC（DT_RELA/DT_RELASZ），**不是** payload 里那张 VMPR 应用表 ——
+# 把那张表整张清零，产物照样与原生一致（实测，本用例构造时顺手验过）。所以想构造 code=8 只能改动态段，
+# 而"直接改坏动态段"会被 ld.so 先拦。本轮实测的四条死路（都在 PIE_RELOCS=1 的产物上）：
+#   * DT_RELA -> 未映射地址(0x900000)：ld.so 读表即 SIGSEGV，rc=139，根本进不到入口蹦床；
+#   * DT_RELAENT = 16：ld.so 断言 get-dynamic-info.h:123（DT_RELAENT == sizeof(Rela)）失败，rc=127；
+#   * DT_RELA -> 窗口外但已映射的零页、RELASZ=24、**RELACOUNT 保持 5**：glibc 走"前 RELACOUNT 条
+#     都是 RELATIVE"的快路径，断言 dl-machine.h:498（r_info == R_X86_64_RELATIVE）失败，rc=127；
+#   * payload 里那张 VMPR 表（selfRVA/flags/条目）怎么改都没用：运行期不读它。
+# 可构造的一版（本脚本末尾那段）：DT_RELA 指向"镜像窗口之外、但仍在最后一个 PT_LOAD 映射页里的
+# 零字节尾巴"，RELASZ=24，并把 RELACOUNT 改成 0 —— 于是 ld.so 读到的那一条是全零
+# （R_X86_64_NONE，无操作），它照常把控制权交给入口蹦床，应用器这才按"两个窗口都不含该地址"判硬门。
+# 实测：exit 7 + stderr "VMPELF relocfail code=8"（未构造的同一份产物：exit 0 / 143 / 无 relocfail）。
+# 顺带登记一条**文档**缺陷（本轮只读核对，未改该文件）：internal/inject/payload.go 的
+# RelocTableHeaderSize 注释把运行期算法写成"每个条目就地 -= delta"，而 vm_reloc_fix 实际是
+# "槽位 := r_addend ^ 密码流字节（还原原始密文）→ 验签/解密 → += delta" —— 减 delta 会得到链接期
+# 明文、验签仍然不过（这正是"直接改动态表会被 ld.so 先拦"之外的另一个误读来源）。
 set -u
 cd "$(dirname "$0")/.."
 
@@ -254,6 +272,102 @@ PY
         fail "reloc-bearing PIE product is not byte-identical to native (sum-to)"
     fi
     echo "[OK  ] 带重定位的 PIE 产物：check-key 10 -> $OPT_OUT ; sum-to 100 -> $OPT_SUM（与原生一致）"
+
+    # ---- fail-closed code=8：重定位表地址**既不在运行期窗口、也不在链接期窗口** ----
+    # 运行期应用器（vm_interp.c 的 vm_reloc_fix）读的是**目标自己的** PT_DYNAMIC：DT_RELA/DT_RELASZ
+    # 在运行期已经被 ld.so 就地改成运行期地址，应用器必须在"运行期窗口 [base, base+imgSize)"和
+    # "链接期窗口 [prefBase, linkEnd)"里认出它；两边都不在就走硬门（code=8，exit 7）。
+    # payload 里那张 VMPR 应用表**运行期不被读**，所以构造点只能在动态段（改那张表 = 无效，实测见头部校准 3）。
+    #
+    # 构造（对产物**副本**做字节级改写；运行期一行不动、格式也不变）：
+    #   DT_RELA      := 镜像窗口之外、但仍在最后一个 PT_LOAD 映射页里的零字节尾巴
+    #                   （= page_up(linkEnd) - 32：读它得到全零，不会 SIGSEGV）
+    #   DT_RELASZ    := 24（正好一条）
+    #   DT_RELACOUNT := 0（否则 glibc 按"前 RELACOUNT 条都是 RELATIVE"的快路径读那张表，
+    #                     会在 ld.so 里先断言死掉 —— 这就是"直接改动态表会被 ld.so 先拦"的真身）
+    # 于是 ld.so 从那张"表"里读到的唯一一条是全零 ⇒ R_X86_64_NONE（无操作），它照常跳入口蹦床；
+    # 蹦床里的应用器按"两个窗口都不含该地址"判定 ⇒ 硬门 code=8 ⇒ exit 7。
+    #
+    # 校准（本块自带两条断言，防止"空转"）：
+    #   ① 未构造的同一份产物：exit 0、输出与原生一致、stderr 里没有 relocfail；
+    #   ② 构造后：exit 7 且 stderr 含 "relocfail code=8"。
+    echo "[*] PIE: fail-closed code=8 (reloc table address in NEITHER window) must be constructible"
+    C8_PRISTINE="build/elf_target_${TAG}_relocs.enc"
+    C8_COPY="build/elf_target_${TAG}_c8.enc"
+    rm -f "$C8_COPY"
+    python3 - "$C8_PRISTINE" "$C8_COPY" <<'PY' || fail "construct the code=8 artifact"
+import os, struct, sys
+src, dst = sys.argv[1], sys.argv[2]
+d = bytearray(open(src, "rb").read())
+def u16(o): return struct.unpack_from("<H", d, o)[0]
+def u32(o): return struct.unpack_from("<I", d, o)[0]
+def u64(o): return struct.unpack_from("<Q", d, o)[0]
+phoff, phentsize, phnum = u64(0x20), u16(0x36), u16(0x38)
+loads, dynamic = [], None
+for i in range(phnum):
+    o = phoff + i * phentsize
+    t = u32(o)
+    if t == 1:
+        loads.append((u64(o + 16), u64(o + 40), u64(o + 8), o))  # p_vaddr, p_memsz, p_offset, phdr off
+    elif t == 2:
+        dynamic = (u64(o + 16), u64(o + 32))  # p_vaddr, p_filesz
+assert loads and dynamic, "packed product has no PT_LOAD/PT_DYNAMIC"
+def va2off(va):
+    for (va0, msz, off0, _pho) in loads:
+        if va0 <= va < va0 + msz:
+            return off0 + (va - va0)
+    return None
+PAGE = 0x1000
+va0, msz, off0, pho = max(loads, key=lambda l: l[0] + l[1])
+link_end = va0 + msz
+# The table must live in a mapped page but outside [prefBase, linkEnd).  Keep >=32 bytes of
+# zero tail in that last page; if the segment ends too close to the page boundary, grow its
+# p_memsz by 64 bytes (plain .bss semantics -- nobody uses those bytes).
+if ((link_end + PAGE - 1) & ~(PAGE - 1)) - link_end < 32:
+    msz += 64
+    struct.pack_into("<Q", d, pho + 40, msz)
+    link_end = va0 + msz
+target = ((link_end + PAGE - 1) & ~(PAGE - 1)) - 32
+dynoff = va2off(dynamic[0])
+assert dynoff is not None, "PT_DYNAMIC is not covered by any PT_LOAD"
+want = {7: ("DT_RELA", target), 8: ("DT_RELASZ", 24), 0x6FFFFFF9: ("DT_RELACOUNT", 0)}
+hit = []
+for j in range(dynamic[1] // 16):
+    o = dynoff + j * 16
+    tag = u64(o)
+    if tag == 0:
+        break
+    if tag in want:
+        struct.pack_into("<Q", d, o + 8, want[tag][1])
+        hit.append(want[tag][0])
+assert sorted(hit) == sorted(["DT_RELA", "DT_RELASZ", "DT_RELACOUNT"]), \
+    "dynamic section lacks the expected tags (hit=%r)" % (hit,)
+open(dst, "wb").write(d)
+os.chmod(dst, 0o755)
+print("    dynamic @file 0x%X ; linkEnd=0x%X ; out-of-window table VA=0x%X ; patched=%s"
+      % (dynoff, link_end, target, ",".join(sorted(hit))))
+PY
+    c8_run() {  # $1 = binary -> C8_RC / C8_OUT / C8_ERR
+        local errf
+        errf="$(mktemp)"
+        C8_OUT="$("$1" check-key 10 2>"$errf")"
+        C8_RC=$?
+        C8_ERR="$(cat "$errf")"
+        rm -f "$errf"
+    }
+    c8_run "./$C8_PRISTINE"
+    if [ "$C8_RC" -ne 0 ] || [ "$C8_OUT" != "$NATIVE_OUT" ] || printf '%s' "$C8_ERR" | grep -q relocfail; then
+        echo "[MISMATCH] calibration (unpatched): rc=$C8_RC out=[$C8_OUT] err=[$C8_ERR]"
+        fail "code=8 case would be spinning: the unpatched product must not report relocfail"
+    fi
+    C8_BASE_OUT="$C8_OUT"
+    c8_run "./$C8_COPY"
+    if [ "$C8_RC" -ne 7 ] || ! printf '%s' "$C8_ERR" | grep -q 'relocfail code=8'; then
+        echo "[MISMATCH] code=8 artifact: rc=$C8_RC out=[$C8_OUT]"
+        printf '%s\n' "$C8_ERR" | head -n 5 | sed 's/^/    /'
+        fail "the patched product must exit 7 with 'relocfail code=8' on stderr"
+    fi
+    echo "[OK  ] code=8: unpatched -> $C8_BASE_OUT (rc=0, no relocfail) ; patched -> rc=7 + $(printf '%s' "$C8_ERR" | head -n 1)"
 fi
 
 # ---- 静态 PIE：显式请求 -enc-image-elf-pie 但打包端拒绝加密时，必须**醒目告警**，且产物仍可用 ----
