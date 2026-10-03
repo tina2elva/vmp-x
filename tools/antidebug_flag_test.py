@@ -16,6 +16,7 @@ import argparse
 import ctypes
 import ctypes.wintypes as wt
 import os
+import re
 import sys
 
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -99,18 +100,61 @@ def run(exe, args, set_flag):
     return text, c.value
 
 
+# Lines whose content is a wall-clock measurement -- NOT an invariant of the program.
+# Found the hard way (task C2): this case printed one "flake" where the ONLY difference between the
+# plain and the flagged run was "ticks=0" vs "ticks=1". The target's bench line is
+# "acc=%llu ticks=%lld iters=%llu" (testdata/target.c) and ticks is clock() difference in ms;
+# four iterations of this loop round to 0 almost always, but once in a while the clock ticks over
+# mid-run and the field becomes 1. Comparing it byte-for-byte turns an ordinary scheduling hiccup
+# into "a single BeingDebugged signal already changed the result" -- a false accusation against the
+# product. Measured on the real artifact: 8/8 plain runs said ticks=0, the flagged run that made
+# this case red said ticks=1 (acc=782 in both, i.e. the deferral never fired).
+#
+# Refill is the opposite case and stays strict: "acc=%llu" is the deterministic answer, and a
+# silent deferral changes it (verified: with the threshold forced to 1 the flagged run answers
+# acc=185 instead of 782). So the fix is to drop measurement-only fields, not to loosen the check.
+NONDET_KEYS = ("ticks=",)
+
+
+def stable_lines(text):
+    """Drop the measurement-only FIELDS (not whole lines!); keep the deterministic output.
+
+    Dropping the whole line would turn this calibration into a check that can never fail: with the
+    threshold forced to 1 the flagged run prints acc=185 -- but the same line also carries ticks=,
+    so "skip the whole line" leaves both sides empty and the case reports OK (observed once while
+    developing this very fix, which is exactly why it is spelled out here).
+    """
+    out = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        for tok in NONDET_KEYS:
+            line = re.sub(r"\s*" + re.escape(tok) + r"\S*", "", line)
+        out.append(line.strip())
+    return [x for x in out if x]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
     ap.add_argument("--args", default="bench check_key 4")
     ap.add_argument("--expect-unchanged", action="store_true",
                     help="production rule (>=2 signals): a single flag must change NOTHING")
+    ap.add_argument("--strict", action="store_true",
+                    help="compare the raw output including measurement-only fields (diagnostic)")
     a = ap.parse_args()
     plain, pc = run(a.exe, a.args, False)
     flagged, fc = run(a.exe, a.args, True)
     print("[*] plain   : rc=%s out=%r" % (pc, plain.strip()[:70]))
     print("[*] flagged : rc=%s out=%r" % (fc, flagged.strip()[:70]))
-    same = plain.strip() == flagged.strip()
+    if a.strict:
+        same = plain.strip() == flagged.strip()
+    else:
+        same = stable_lines(plain) == stable_lines(flagged)
+    if not same:
+        # make the difference itself part of the record (the old script showed only the verdict)
+        print("[*] comparison: plain=%r" % (stable_lines(plain),))
+        print("[*]             flagged=%r" % (stable_lines(flagged),))
+        print("[*] note: 'ticks=' fields are excluded -- they are wall-clock, not program output")
     if a.expect_unchanged:
         if same:
             print("[OK  ] one signal does not flip the verdict (as designed)")

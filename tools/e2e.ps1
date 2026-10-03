@@ -680,6 +680,67 @@ if ($LASTEXITCODE -ne 0) {
     if ((($rf2.Code -band 0xFFFFFFFF) -eq 0xC0DE0007) -and ($rf2.Out -eq "")) { $pass++ }
     else { $fail++; $failLines += ("E2EFAIL runtime-license/forge: code=0x{0:X8} out=[{1}]" -f ($rf2.Code -band 0xFFFFFFFF), $rf2.Out.Trim()) }
 }
+# Per-run suffix for playwright-free scratch artifacts (see the refill case): two e2e runs on
+# two checkouts used to share build\target_neimg_refill.exe.
+$runTag = [guid]::NewGuid().ToString("N").Substring(0, 8)
+
+# ---- flake-attribution helpers (task C: the two one-off flakes, refill + antidebug) ----
+# Both of those cases used to end in a bare 'python <tool> failed' line: the tool printed the
+# real evidence (exit code, which placement was missing, plain-vs-flagged output) and the script
+# threw it away with '| Out-Null'. A red run therefore could not say whether it was a product
+# defect, an environmental interference, or a collision with a concurrent run.
+#
+# Run-PyCaptured: run a python tool and return rc / stdout / stderr AND the exact command line,
+# so every failure line below can be replayed verbatim.
+function Run-PyCaptured([string[]]$pyArgs, [int]$sec) {
+    $py = (Get-Command python -ErrorAction SilentlyContinue)
+    if (-not $py) { return @{ Rc = 127; Out = ""; Err = "python not found on PATH"; Cmd = ("python " + ($pyArgs -join ' ')) } }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $py.Source
+    # Each argument must be re-quoted: ProcessStartInfo.Arguments is a RAW command line, so
+    # joining with plain spaces hands python two arguments and argparse dies with
+    # "unrecognized arguments: 10" (observed: the e2e case went red on a probe-usage error, not
+    # on the product). PowerShell 5.1's Start-Process did this quoting for us; here we only need
+    # the simple form -- none of the callers pass embedded quotes or backslashes.
+    $quoted = $pyArgs | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }
+    $psi.Arguments = ($quoted -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $o = $proc.StandardOutput.ReadToEnd()
+    $e = $proc.StandardError.ReadToEnd()
+    if (-not $proc.WaitForExit($sec * 1000)) { try { $proc.Kill() } catch {} ; return @{ Rc = -99; Out = $o; Err = ("TIMEOUT after " + $sec + "s"); Cmd = ("python " + ($pyArgs -join ' ')) } }
+    return @{ Rc = $proc.ExitCode; Out = $o; Err = $e; Cmd = ($py.Source + " " + ($pyArgs -join ' ')) }
+}
+
+# One-line forensic digest: exit code + the tail of stdout AND stderr (never just one of them).
+function Get-PyDiag($r) {
+    $o = ($r.Out -replace '\s+', ' ').Trim()
+    $e = ($r.Err -replace '\s+', ' ').Trim()
+    if ($o.Length -gt 300) { $o = $o.Substring($o.Length - 300) }
+    if ($e.Length -gt 300) { $e = $e.Substring($e.Length - 300) }
+    return ("rc={0} stdout=[{1}] stderr=[{2}]" -f $r.Rc, $o, $e)
+}
+
+# Count the placements vmpack recorded. patch_refill.py exits 2 ('nothing refilled') only when
+# this is 0 -- i.e. ONLY when the packer produced no placement at all. Recording that number next
+# to the tool's exit code separates 'the report was empty (packer/tool-chain problem)' from 'the
+# report had entries but the patcher quietly matched none (script bug)'. Without it, both look
+# identical: 'tools/patch_refill.py failed'.
+function Get-ReportPlacements([string]$path) {
+    if (-not (Test-Path $path)) { return -1 }
+    try {
+        $j = Get-Content $path -Raw | ConvertFrom-Json
+        if ($j.PSObject.Properties.Name -contains 'placements') { return @($j.placements).Count }
+        return -2
+    } catch { return -3 }
+}
+
+# A failing case may leave its scratch artifacts on disk for a re-run; a passing case must not.
+function Clear-CaseTemp([string[]]$paths, [bool]$ok) {
+    if ($ok) { foreach ($t in $paths) { Remove-Item $t -Force -ErrorAction SilentlyContinue } }
+}
 # ---- (2) keyed-MAC integrity: the "refill" bypass must be refused ----
 # Put the native entry bytes back (the bypass the static-analysis report describes). We use an
 # artifact packed with -no-enc-image on purpose: with image encryption on, the entry patch lives
@@ -687,8 +748,13 @@ if ($LASTEXITCODE -ne 0) {
 # would never be exercised. With plaintext entry patches, only the keyed MAC can catch it.
 $neExe = "build\target_neimg.exe"
 $neMan = "build\target_neimg.json"
-$neRefill = "build\target_neimg_refill.exe"
-Remove-Item $neExe, $neRefill -ErrorAction SilentlyContinue
+Remove-Item $neExe -ErrorAction SilentlyContinue
+# Per-run refill output: two e2e runs from two checkouts (or a manual probe) used to share
+# build\target_neimg_refill.exe -- a collision there looks like a flake, not like a bug.
+# (Only OUR per-run name is cleaned here: a wildcard delete would remove another concurrent run's
+#  file, i.e. it would create the very interference it is meant to prevent.)
+$neRefill = "build\target_neimg_refill_" + $runTag + ".exe"
+Remove-Item $neRefill -ErrorAction SilentlyContinue
 & .\build\vmpack.exe -exe build\target.exe -func check_key -func sum_to -out $neExe -report $neMan -no-enc-image 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     $fail++
@@ -697,14 +763,22 @@ if ($LASTEXITCODE -ne 0) {
     $c0 = Run-File $neExe @("check_key", "10") 30
     if ($c0.Trim() -eq "143") { $pass++ }
     else { $fail++; $failLines += ("E2EFAIL refill/control: untouched artifact should answer 143, got [{0}]" -f $c0.Trim()) }
-    python tools/patch_refill.py --orig build/target.exe --packed $neExe --report $neMan --out $neRefill 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $neRefillPath = "build\target_neimg_refill_" + $runTag + ".exe"
+    $neRefillCmd = ("python tools/patch_refill.py --orig build/target.exe --packed " + $neExe + " --report " + $neMan + " --out build/target_neimg_refill_<run>.exe")
+    $rf = Run-PyCaptured @("tools/patch_refill.py", "--orig", "build/target.exe", "--packed", $neExe, "--report", $neMan, "--out", $neRefillPath) 60
+    $placements = Get-ReportPlacements $neMan
+    if ($rf.Rc -ne 0) {
         $fail++
-        $failLines += "E2EFAIL refill: tools/patch_refill.py failed"
+        $failLines += "E2EFAIL refill: tools/patch_refill.py failed: " + (Get-PyDiag $rf) + " | placements-in-report=" + $placements + " | repro: " + $neRefillCmd
     } else {
-        $rr = Get-ExitCode $neRefill @("check_key", "10")
+        $rr = Get-ExitCode $neRefillPath @("check_key", "10")
+        $refillRefused = ($rr.Code -ne 0) -and ($rr.Out -eq "")
         if (($rr.Code -ne 0) -and ($rr.Out -eq "")) { $pass++ }
-        else { $fail++; $failLines += ("E2EFAIL refill: refilled image was NOT refused (code=0x{0:X8} out=[{1}])" -f ($rr.Code -band 0xFFFFFFFF), $rr.Out.Trim()) }
+        else { $fail++; $failLines += "E2EFAIL refill: refilled image was NOT refused: rc=0x" + ("{0:X8}" -f ($rr.Code -band 0xFFFFFFFF)) + " out=[" + $rr.Out.Trim() + "] placements=" + $placements + " refilled=" + $neRefillPath + " | repro: " + $neRefillCmd }
+    }
+    if ($rf.Rc -eq 0 -and $refillRefused) {
+        # 'refused' is the expected verdict -> the scratch artifacts have served their purpose
+        Clear-CaseTemp @($neExe, $neMan, $neRefillPath) $true
     }
 }
 
@@ -720,9 +794,29 @@ else { $fail++; $failLines += "E2EFAIL aslr: packed image is not relocated (relo
 # Start the artifact suspended, set PEB.BeingDebugged (exactly what a debugger does), resume, and
 # compare with a plain run. The rule is ">= 2 different paths" so a single flag must change NOTHING
 # (that is the calibration: no single point can silently corrupt results in production).
-python tools/antidebug_flag_test.py --exe build/target_vmp.exe --args "bench check_key 4" --expect-unchanged 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) { $pass++ }
-else { $fail++; $failLines += "E2EFAIL antidebug: a single BeingDebugged signal flipped the verdict" }
+# The argument is "check_key 10" ON PURPOSE, not "bench ...": the bench line is
+# "acc=.. ticks=.. iters=.." and ticks is a clock() delta -- a wall-clock measurement, not program
+# output. The one "flake" this case produced was exactly that (task C2: flagged run printed
+# ticks=1 while acc was unchanged 782 => nothing had actually flipped). check_key always prints one
+# deterministic number, and a silent deferral changes it (threshold-1 calibration: 143 -> 0).
+# Attribution (task C2): the tool prints plain-vs-flagged rc and output, which is exactly what a
+# future red run needs -- it used to be discarded by "| Out-Null", leaving only a bare verdict line.
+# The "one signal must not flip it" rule needs >= 2 DISTINCT anti-debug paths; if this ever goes red,
+# the captured lines below say what the flagged run actually did, and the repro command re-runs it.
+# Known environmental interference for this case: another debugger/profiler attached to THIS process
+# (sets ProcessDebugPort/DebugObjectHandle, i.e. path 2) on top of the BeingDebugged front-end the
+# test writes -- that is probe/environment, not a product defect (the timing path was already
+# demoted to diagnostics-only in stub/win/x64/vm_interp.c, see the comment there).
+$adArgs = @("tools/antidebug_flag_test.py", "--exe", "build/target_vmp.exe", "--args", "check_key 10", "--expect-unchanged")
+$ad = Run-PyCaptured $adArgs 180
+$adCmd = "python " + ($adArgs -join " ")
+if ($ad.Rc -eq 0) { $pass++ }
+else {
+    $fail++
+    $failLines += "E2EFAIL antidebug: a single BeingDebugged signal flipped the verdict: " + (Get-PyDiag $ad) + " | repro: " + $adCmd
+}
+# the probe writes build\_adbg_out.txt (two runs, same name -- fine within one run); clean it up
+Clear-CaseTemp @((Join-Path (Get-Location) "build\_adbg_out.txt")) $true
 
 # ---- (3) container/record scalars must not be readable in the artifact ----
 # The report's P1.1-5: magic / RVA / length / flags sitting in plaintext. See tools/field_mask_check.py
