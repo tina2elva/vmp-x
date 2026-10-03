@@ -10340,7 +10340,9 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
 - 本机：`tools/preflight.ps1` → `[+] preflight: OK`；`tools/gates.ps1` → `total 15 gates, 0 failed, 0 skipped`
   （e2e **174/0**、dll 7/0、WSL every step passed）。
 - 校准（两条，都可失败）：ASLR 那条（`e2e: 172 passed, 2 failed`、rc=1）；跳过记账那条（`-NoWsl` ⇒ 1 skipped、rc=0；无 wsl ⇒ exit 77）。
-- CI：run `<RUN>`（提交 `<SHA>`）→ 三个作业全绿。
+- CI：**run `37122220215`（提交 `0bc75eb`）→ 三个作业全绿**（`windows-amd64` / `linux-amd64` / `linux-arm64`，`jobs=3`）。
+  过程中有一次**我自己造成的红**：首推 `90cd977` 的 run `37121832822` 在 `windows-amd64` 的 `E2E x86-64` 步失败
+  （形状依赖断言，见上面"补记"）→ 修在 `0bc75eb`。
 
 **未做项 / 边界**
 - 静态 PIE 走的是**醒目告警**而不是构建期硬拒绝（产物本身可用）；要改成硬拒绝需另行决定。
