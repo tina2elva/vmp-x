@@ -10301,3 +10301,48 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
 - **恢复方法**：从 git 历史取回本次删除前的那两个 job 文本（见本条提交信息），或按 `docs/RUNBOOK.md` 第 5 节记录的原始做法重建。
 - 这**不是**"放弃在 Windows/arm64 上验证"的结论，只是**暂缓期间的 CI 成本决策**：win/arm64 的既有缺口
   （ASLR + 目标无 `.reloc`，见 `#505`–`#523`；以及 `#581` 的暂缓登记）**都没有解决**，解禁时需连 CI 作业一起恢复。
+
+### 594. 四项收尾加固：静态 PIE 告警 / ASLR 启动验收 / gates 跳过记账 / 并发互杀
+
+**做了什么（逐项）**
+1. **静态 PIE + `-enc-image-elf-pie`：把"静默跳过"改成醒目告警**（TODO #772）
+   - 先纠正了登记：**"产物 rc=139" 在 amd64 路径上复现不出来** —— 跳过分支产出的产物与原生逐字节一致（143、rc=0），
+     带 `-enc-image-elf-pie-relocs` 的变体同样正常；动态 PIE 对照则真的加密（721 字节）。
+   - 那条历史记录的**真身本轮查清了：是"架构不匹配"的伪缺陷** —— 本用例第一版没加宿主架构守卫，
+     在 a64 调用里把"x86-64 夹具 + arm64 blob"打在一起，产物正是 rc=139（见下面"自我踩坑"）。
+   - 改法：`cmd/vmpack` 在"显式要了 `-enc-image-elf-pie`、但目标是静态 PIE"时打**醒目 `[!]`**，
+     并明说"本产物**不含**原镜像加密"；**不**改成 fail-fast（跳过是合法结果、产物可用）。
+2. **ASLR 启动验收**（TODO 833）
+   - `tools/e2e.ps1` 新增 `[OK  ] ASLR launch (CreateProcess)`，钉三件事：① 夹具必须仍可重定位
+     （DYNAMIC_BASE + 非空 `.reloc` 目录）；② 产物必须保留 DYNAMIC_BASE；③ ASLR 下 native/packed 的 rc 与输出一致。
+   - 实证：夹具 `DllCharacteristics=0x160`（含 DYNAMIC_BASE）、目录 `0xE000+0x60`；打包后仍是真、目录 **0x76**（+7 个站点）
+     ⇒ 每次运行加载器都挑不同基址，运行期"先减 delta → 验签 → 解密 → 加回 delta"真的被跑到。
+   - **校准**：夹具加 `-Wl,--disable-dynamicbase` ⇒ `[FAIL] ASLR: the fixture has no DYNAMIC_BASE (ASLR coverage would be vacuous)`
+     + 产物那条 ⇒ `e2e: 172 passed, 2 failed`、rc=1（证明不是空断言）。
+   - 同时把 TODO 里整段过期的 arm64/ASLR 条目**据实收口**（建节已实现、清 DYNAMIC_BASE 已否、`rc=-998` 与
+     "为何清 DYNAMIC_BASE 改语义"关闭、两条随作业移除而失效的标注出来）。
+3. **gates 跳过记账（退出码 77 约定）**（TODO 757）
+   - `e2e_32bit.ps1` / `wsl_linux.ps1` 的跳过路径改为 `exit 77`；`gates.ps1` 的 `Step()` 把 77 **单独记账**，
+     摘要变 `total N gates, M failed, K skipped` 并额外打印一行醒目提示；跳过**不再**显示 `[OK]`、也不算失败。
+   - 校准：`gates.ps1 -NoWsl` ⇒ `total 15 gates, 0 failed, 1 skipped` + `[SKIP] … NOT verified by this run`，rc=0；
+     另实测"无 wsl.exe 时 `wsl_linux.ps1` 退出 **77**"。
+4. **并发互杀**（TODO 767）
+   - `tools/e2e.ps1` 的清场**只杀镜像路径在本仓库内**的同名进程；别人的同名进程只打印一行提示（把干扰源变成可见信息）。
+
+**自我踩坑（如实记录，正是这条解释了历史）**
+- 新用例第一版没守宿主架构：arm64 那次调用同样满足 `PIE=0`，于是把 x86-64 夹具与 arm64 blob 打在一起
+  ⇒ `[MISMATCH] static PIE product: native=[143] (rc=0) packed=[] (rc=139)`。加 `-z "$QEMU"` + `GOARCH_TARGET=amd64`
+  守卫后：amd64 里跑（`[OK  ] 静态 PIE … 143`）、a64 里跳过（0 次出现）。
+- 工具坑：在 `wsl.exe -e bash -c "…"` 里写 `echo rc=$?`，`$?` 会被 **PowerShell 先替换**成 `True/False`，
+  读数会骗人（本次据此误判过一次 rc）。要么写成脚本文件，要么转义。
+
+**证据**
+- 本机：`tools/preflight.ps1` → `[+] preflight: OK`；`tools/gates.ps1` → `total 15 gates, 0 failed, 0 skipped`
+  （e2e **174/0**、dll 7/0、WSL every step passed）。
+- 校准（两条，都可失败）：ASLR 那条（`e2e: 172 passed, 2 failed`、rc=1）；跳过记账那条（`-NoWsl` ⇒ 1 skipped、rc=0；无 wsl ⇒ exit 77）。
+- CI：run `<RUN>`（提交 `<SHA>`）→ 三个作业全绿。
+
+**未做项 / 边界**
+- 静态 PIE 走的是**醒目告警**而不是构建期硬拒绝（产物本身可用）；要改成硬拒绝需另行决定。
+- `tools/wsl_linux.sh` 的 `KNOWN_FAIL`（现为空）仍是"整步豁免"机制 —— 本轮**未动**，它的过期自报（`:41`）继续保留。
+- 并发互杀只是**收窄**：同仓库内的同名进程仍会被杀（那是本意）；跨仓库/跨用户不再互相影响。

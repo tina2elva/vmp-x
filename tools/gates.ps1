@@ -1,4 +1,4 @@
-# gates.ps1 - run every local (Windows/amd64) gate in one shot.
+﻿# gates.ps1 - run every local (Windows/amd64) gate in one shot.
 #
 #   powershell -NoProfile -File tools/gates.ps1
 #
@@ -13,14 +13,20 @@ param(
 Set-Location (Join-Path $PSScriptRoot "..")
 $script:results = @()
 
+# 步骤的三种结局：通过(0) / 失败(非0) / **跳过(77)**。77 是约定值：e2e_32bit.ps1 与 wsl_linux.ps1
+# 在缺工具链/缺 WSL 时用它，gates 于是能**单独记账**。以前它们 exit 0，gates 就报成 "[OK  ]" 并把
+# 未跑的步骤留在 "15" 里 —— 换台机器同一个 "15/0" 就含未验证项（与已修的"skip 计入 passed"同族）。
 function Step {
     param([string]$Name, [scriptblock]$Body)
     Write-Host "[*] $Name"
     $script:stepCode = 0
     & $Body
     if ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) { $script:stepCode = $LASTEXITCODE }
-    $script:results += [pscustomobject]@{ Name = $Name; Exit = $script:stepCode }
-    if ($script:stepCode -ne 0) { Write-Host "[!] $Name FAILED (exit $script:stepCode)" }
+    $skipped = ($script:stepCode -eq 77)
+    if ($skipped) { $script:stepCode = 0 }
+    $script:results += [pscustomobject]@{ Name = $Name; Exit = $script:stepCode; Skipped = $skipped }
+    if ($skipped) { Write-Host "[SKIP] $Name -- NOT verified by this run" }
+    elseif ($script:stepCode -ne 0) { Write-Host "[!] $Name FAILED (exit $script:stepCode)" }
     $global:LASTEXITCODE = 0
 }
 
@@ -39,7 +45,7 @@ Step "32-bit payload (i686 blob + PE32 pack vs native)" { & powershell -NoProfil
 # into the WSL filesystem first, so the Linux build/ cannot collide with the Windows one.
 # SKIPs loudly (exit 0) when WSL is absent -- set VMP_REQUIRE_WSL=1 to make that a hard failure.
 Step "linux payloads via WSL (CI's linux-amd64/arm64 command set)" {
-    if ($NoWsl) { Write-Host "[SKIP] skipped with -NoWsl" }
+    if ($NoWsl) { Write-Host "[SKIP] skipped with -NoWsl"; $script:stepCode = 77 }
     else { & powershell -NoProfile -File (Join-Path $PSScriptRoot "wsl_linux.ps1") }
 }
 Step "go test ./..."     { go test ./... }
@@ -127,10 +133,12 @@ Step "linux payload (executed on Windows)" { & powershell -NoProfile -File (Join
 Write-Host ""
 Write-Host "==== local gates ===="
 foreach ($r in $script:results) {
-    $tag = if ($r.Exit -eq 0) { "[OK  ]" } else { "[FAIL]" }
+    $tag = if ($r.Skipped) { "[SKIP]" } elseif ($r.Exit -eq 0) { "[OK  ]" } else { "[FAIL]" }
     Write-Host ("{0} {1} (exit {2})" -f $tag, $r.Name, $r.Exit)
 }
 $bad = @($script:results | Where-Object { $_.Exit -ne 0 }).Count
-Write-Host ("total {0} gates, {1} failed" -f $script:results.Count, $bad)
+$skipN = @($script:results | Where-Object { $_.Skipped }).Count
+Write-Host ("total {0} gates, {1} failed, {2} skipped" -f $script:results.Count, $bad, $skipN)
+if ($skipN -gt 0) { Write-Host ("[!] " + $skipN + " gate(s) were SKIPPED: those steps were NOT verified by this run (see the [SKIP] lines above)") }
 if ($bad -gt 0) { exit 1 }
 exit 0

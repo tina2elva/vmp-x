@@ -856,8 +856,12 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 			fmt.Println("[*] ELF 整体加密：跳过（ET_DYN/PIE 需要显式 -enc-image-elf-pie）")
 		case f.EType == elfload.ET_DYN && !elfHasInterp(f):
 			// 静态 PIE 没有 PT_INTERP：自重定位代码在**入口点之后**才跑（我们解完密它还会写），
-			// 这条路径没有验过，默认不碰。
-			fmt.Println("[*] ELF 整体加密：跳过（静态 PIE 没有 PT_INTERP，自重定位发生在入口点之后）")
+			// 这条路径没有验过，默认不碰。**但能走到这里说明用户显式要了 -enc-image-elf-pie**
+			// （没要开关的情况被上面那个 case 拦住）⇒ 必须**醒目**说明"这个产物不含这层保护"，
+			// 否则会造成"以为加了密、其实没有"的错觉（STATUS #594，TODO #772）。
+			// 这里**不** fail-fast：跳过是合法结果，且产物必须与原生一致（已由 tools/e2e_elf_image.sh 钉住）。
+			fmt.Println("[!] ELF 整体加密：跳过（静态 PIE 没有 PT_INTERP，自重定位发生在入口点之后）")
+			fmt.Println("[!]   你显式请求了 -enc-image-elf-pie，但本产物**不含**原镜像加密；要用它请改用动态 PIE（有 PT_INTERP），或去掉该开关以消除本告警")
 		case imgMaster == nil:
 			fmt.Println("[*] ELF 整体加密：跳过（没有主密钥）")
 		default:

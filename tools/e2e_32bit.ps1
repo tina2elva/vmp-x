@@ -1,4 +1,4 @@
-# e2e_32bit.ps1 - gate for the 32-bit (i686/PE32) path.
+﻿# e2e_32bit.ps1 - gate for the 32-bit (i686/PE32) path.
 #
 #   powershell -NoProfile -File tools/e2e_32bit.ps1
 #
@@ -48,7 +48,9 @@ if (-not $cc) {
         Write-Host "[!] VMP_REQUIRE_I686=1 was set, so this skip is a failure."
         exit 1
     }
-    exit 0
+    # 77 = "skipped" 约定（gates.ps1 会**单独记账**）：以前这里 exit 0，于是 gates 把整步报成
+    # [OK  ] 并留在 "15 里" —— 换一台没有 i686 工具链的机器，同一个 "15/0" 就含未跑的步骤。
+    exit 77
 }
 Write-Host ("[*] i686 toolchain: " + $cc)
 

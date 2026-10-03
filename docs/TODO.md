@@ -754,7 +754,10 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
 
 来源：`STATUS #591`/`#592` 的独立复核与收尾（t5/t6/t8/t9）。机制描述都带 file:line，便于直接动手。
 
-- [ ] **跳过的 step 会被 `gates.ps1` 汇总成 `[OK]` 并留在 15 里**（与已修的 A1「skip 计入 passed」同族，本轮**未修**）。
+- [x] **跳过的 step 会被 `gates.ps1` 汇总成 `[OK]`**｜2026-10-02 已修（`STATUS #594`）：引入**退出码 77 = skipped** 约定
+      （`e2e_32bit.ps1` / `wsl_linux.ps1` 的跳过路径改用它），`gates.ps1` 的 `Step()` 把 77 单独记账，摘要变成
+      `total N gates, M failed, K skipped` 并额外打印一行醒目提示；跳过**不再**显示为 `[OK]`，也不算失败。
+      校准：`gates.ps1 -NoWsl` ⇒ `total 15 gates, 0 failed, 1 skipped` + `[SKIP] … NOT verified by this run`，rc=0。
       机制：`tools/gates.ps1:16-24` 的 `Step()` **只记 exit code**、无条件进 `$script:results`，最后汇总 `total N gates, M failed`
       ⇒ 任何 **exit 0 的 skip** 都显示为 `[OK  ] <name> (exit 0)`。exit 0 的 skip 路径：
       `tools/wsl_linux.ps1:29`（无 wsl.exe）、`:38`（WSL 在但不可用）、`tools/gates.ps1:41-44`（`-NoWsl`，且什么都不验）、
@@ -764,13 +767,17 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       同族但目前无害：`tools/wsl_linux.sh:30` 的 `KNOWN_FAIL=""`（清单为空，`:41` 会在豁免过期时提示）。
       **边界**：@`9405987` 与 @`d5d038c` 两份本地 gates 日志里 `[SKIP]` 行数为 **0** ⇒ 那两次 `15/0` 是 15 步全真的；
       只有缺 WSL/i686 的机器上才会出现"含未跑步骤的 15/0"。
-- [ ] **`tools/e2e.ps1:19-21` 按镜像名"全机器"杀残留进程**：同一台机器上并发跑 e2e/gates 会**互相杀**，
+- [x] **`tools/e2e.ps1` 按镜像名"全机器"杀残留进程**｜2026-10-02 已修（`STATUS #594`）：现在**只杀镜像路径在本仓库内**的同名进程，
+      别人的只打印一行提示（顺带把干扰源变成可见信息）。原先同机并发跑 e2e/gates 会**互相杀**，
       表现为 `E2EFAIL mt(0) … try1[rc=-1 out[]]` 或 `mt_many … lenP=0`。本轮多次假红（`171/2`、`172/1`）都与并发有关，
       干净重跑即恢复（gates `15/0`、e2e `173/0`）⇒ 记为**测试抖动，不归因被测代码**。
       修法方向：只杀自己派生的子进程（按 pid/job，而不是按镜像名），或给并发跑加锁。
       附带：**陈旧产物也会污染现场**（评审临时树里遗留的 `.ncrypt` 让 ext-key 用例红过一次）⇒ 报告数字必须注明工作区状态。
-- [ ] **静态 PIE + `-enc-image-elf-pie` 只打印跳过，但产物 rc=139**（SIGSEGV）。**pre-existing**，本轮未修。
-      修法方向：`fatalf` 或醒目告警。
+- [x] **静态 PIE + `-enc-image-elf-pie`｜2026-10-02 实测"产物 rc=139"复现不出来**（`STATUS #594`）：
+      跳过分支产出的产物与原生**逐字节一致**（`check-key 10 -> 143`、`rc=0`），带 `-enc-image-elf-pie-relocs` 的变体同样正常；
+      动态 PIE 对照则真的加密（721 字节）。所以真问题不是"崩"，而是**"以为加了密、其实没有"**：跳过原本只打 `[*]`。
+      现改为**醒目 `[!]` 告警 + 明说本产物不含该保护**（不改 fail-fast：跳过是合法结果、产物可用），
+      并在 `tools/e2e_elf_image.sh` 增加一条**先红后绿**的用例钉住"告警必须显眼 + 产物必须与原生一致"。
 - [ ] **aarch64 的"加密范围内重定位"路径没有可运行用例**（`#376` 禁掉 aarch64 只读数据节加密）⇒ 该分支只有代码级审查。
 - [ ] **fail-closed `code=8`（重定位表地址两个窗口都不在）构造不出来**（改 `DT_RELA` 会让 ld.so 先 SIGSEGV，rc=139）⇒ **未验证**；
       其余分支（code=1/2/3/4 与打包端 DT_RELASZ 越界）已独立构造并实测为 rc=7 + stderr 诊断。
@@ -823,46 +830,25 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       「启动方式 ⇒ ASLR ⇒ 缺少重定位表」，随后去 `cmd/vmpack` 查 win/arm64 的重定位表生成/保留；
       再据此修好，让三形态全绿并放开白名单。证据基础见 STATUS #506。
 
-- [ ] **win/arm64 真 bug（与取钥无关）**：产物在 **ASLR 生效**时缺重定位表 ⇒ `0xC0DE0002` 退出。
-      铁证见 STATUS #507（同一文件同一步骤，裸调用成功 / Start-Process 失败）。下一步：
-      ① 用 `-strip-relocs` 产物在 Start-Process 下试跑；② 对比 win/arm64 与 win/x64 的 `.reloc` 数据目录；
-      ③ 修 `vmpack` 并**给所有平台加"Start-Process（ASLR 生效）启动"的验收**。
-
-- [ ] **修 `cmd/vmpack`（下一轮）**：保留重定位那条路里检测"目标无重定位目录"⇒ **强制清 `DYNAMIC_BASE`**
-      并打印说明（否则 ASLR 生效时产物必崩，STATUS #508 已确认根因）。对**所有平台**都是保护。
-- [ ] **补"ASLR 启动"验收**：现有验收都走裸调用/探针映射，覆盖不到 ASLR —— 至少给 win/x64 与 win/arm64
-      加一条用 `Start-Process` 启动的用例（这正是本 bug 长期未被发现的原因）。
-
-- [ ] 查清 `strip-relocs via Start-Process: rc=-998` 的异常文本。
-
-- [ ] **win/arm64 续（下一步）**：① 查 `Start-Process` 报 `%1 is not a valid Win32 application` 的原因
-      （清 DYNAMIC_BASE 后裸调用可跑、ShellExecute 拒绝；检查 `clearDynamicBase` 改了哪些字段、
-      以及镜像是否仍满足 ShellExecute 的要求）；② 查 native `testdata/arm64/target_win.c` 的退出码语义
-      （654184885 = 0x26FE11B5 是否为设计值），再判断产物 rc=0 是否算错；
-      ③ 两者清楚后让三形态全绿，再放开白名单并补"ASLR 启动"验收。
-
-- [ ] **win/arm64 正解（下一轮）**：让产物**真正支持 ASLR** —— A) `vmpack` 在目标无 `.reloc` 节时
-      **新建该节**并把 blob 的绝对 VA 站点写成重定位项（`appendRelocs` 已有"追加"能力，缺"建节"）；
-      或 B) 把"目标无重定位表"变成**构建期 fail-fast 错误**（明确拒绝，而非产出必崩/行为不同的产物）。
-      已排除的错误做法：清 `DYNAMIC_BASE` 绕过（会改变语义路径、使产物退出码 ≠ native，见 STATUS #510）。
-
-- [ ] **win/arm64 正解（下一轮）**：**无重定位表时不要把 delta 应用于/逆应用于密文**（视 delta=0），
-      因为加载器无法搬动没有表的镜像 —— 这与"清 DYNAMIC_BASE"不同：只改我们对密文的处理，不改加载行为。
-      备选：由 `vmpack` 新建真正的 `.reloc` 节。两次错误尝试已回滚：#510(清 DYNAMIC_BASE⇒语义变)、
-      #511(放行⇒真崩 0xC0000005)。
-
-- [ ] **win/arm64（下一轮，只能从打包端解）**：① `vmpack` 在目标无 `.reloc` 时**新建真正的节**并把
-      **镜像自身**的绝对引用站点写成重定位项（本次诊断显示 blob 的 items 为空）；或 ② 构建期 fail-fast
-      拒绝无重定位表的目标。运行期三条路已全部实测否掉（#510/#511/#512），保护性拒绝已恢复。
-- [ ] 未解点：**为什么"清 DYNAMIC_BASE（delta=0）"会让产物退出码 ≠ native**（#510）—— 若要走近似解，
-      必须先答这一条。
-
-- [ ] **【重大】修 win/arm64 的假通过测试**：`windows-arm64-run` 的 "run native vs protected" 用 `& *.vmp`
-      调用 —— Windows/PowerShell **不会**启动该扩展名，于是 `$LASTEXITCODE` 保留上一次的值（native 的），
-      比对**必然通过**、其实从未跑过被保护产物（STATUS #517）。修法：先显式重置 `$LASTEXITCODE`、
-      用可执行扩展名（复制成 `.exe`）或 `Start-Process` 启动，并**断言退出码确实变化过**。
-      ⚠️ 修好后该步骤会真的失败（因为 (a) 未修）⇒ 应与 (a) 的修复同轮做。
-- [ ] **修 (a)**：`vmpack` 为无 `.reloc` 的目标**新建节并写入需要的条目**（或构建期 fail-fast 拒绝）。
+- [x] **ASLR 与重定位（原"win/arm64 真 bug"一族）—— 2026-10-02 重新核实并收口**（`STATUS #594`）：
+      · **打包端已经会新建 `.reloc` 节**：`cmd/vmpack/main.go` 的 `appendRelocs` 对"目标没有重定位目录"的情形会
+        `f.AddSection(".reloc", …)` 并把 payload 的绝对 VA 站点写进去 ⇒ 上面那些"新建节"的条目**已经落地**；
+        "强制清 `DYNAMIC_BASE`"那条路已被 `#510` 证否，现在只由 `-strip-relocs` 显式选择。
+      · **实证（本机）**：夹具 `build/target.exe` 的 `DllCharacteristics=0x160`（**含 DYNAMIC_BASE**）、
+        重定位目录 `0xE000+0x60`；打包后 DynBase 仍为真、目录**长到 `0x76`**（补了 7 个 payload 站点）
+        ⇒ 每次运行加载器都挑不同基址，运行期"先减 delta → 验签 → 解密 → 加回 delta"**真的被跑到**。
+      · **原「补 ASLR 启动验收」已落地**：`tools/e2e.ps1` 新增 `[OK  ] ASLR launch (CreateProcess)`，钉住三件事：
+        ① 夹具必须仍可重定位（DYNAMIC_BASE + 非空 `.reloc` 目录）；② 产物必须保留 DYNAMIC_BASE；
+        ③ ASLR 下 native 与 packed 的 rc/输出一致。**校准实测**：夹具加 `-Wl,--disable-dynamicbase` ⇒
+        `[FAIL] ASLR: the fixture has no DYNAMIC_BASE (ASLR coverage would be vacuous)` + 产物那条
+        ⇒ `e2e: 172 passed, 2 failed`、`rc=1`（证明它不是空断言）。
+      · **已关闭**：`rc=-998` 异常文本（随 `-strip-relocs` 路径归档）、"清 DYNAMIC_BASE 为何改语义"（默认路径已不清它）、
+        "无重定位表时视 delta=0"（已被"建节"方案取代）。
+      · **仍开放（属 win/arm64 暂缓）**：`Start-Process` 报 `%1 is not a valid Win32 application` 的原因、native
+        `testdata/arm64/target_win.c` 的退出码语义、以及"无重定位表是否还要再加一道构建期 fail-fast"（现按建节处理）。
+        这些都要在有 arm64 环境时才能验。
+      · **两条随作业移除而失效**：原「修 `windows-arm64-run` 的假通过比对」与「修 (a)」指的是那个已从 `ci.yml`
+        移除的作业（`STATUS #593`）；本地复现器 `tools/e2e_win_arm64.ps1` 保留，恢复该作业时这两条要一并重做。
 
 ## win/arm64 未完成项（#537-#549 汇总，接手指南）
 

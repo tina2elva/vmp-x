@@ -256,4 +256,53 @@ PY
     echo "[OK  ] 带重定位的 PIE 产物：check-key 10 -> $OPT_OUT ; sum-to 100 -> $OPT_SUM（与原生一致）"
 fi
 
+# ---- 静态 PIE：显式请求 -enc-image-elf-pie 但打包端拒绝加密时，必须**醒目告警**，且产物仍可用 ----
+# 背景（TODO #772）：曾登记"静态 PIE + 该开关 ⇒ 产物 rc=139(SIGSEGV)"。2026-10-02 实测**复现不出来**：
+# 跳过分支产出的产物与原生逐字节一致。所以这条用例钉住的是两件**真的**要求：
+#   ① 告警必须显眼（[!]，不是 [*]）—— 否则会造成"以为加了密、其实没有"；
+#   ② 既然只是跳过（没加密），产物就必须**可用**（与原生一致），不能借跳过之名产出坏产物。
+# 只在**本机架构**（无 QEMU 的 x86-64 宿主）跑：夹具是 `gcc -static-pie` 出来的**宿主**可执行文件，
+# 而 arm64 那次调用同样满足 PIE=0 —— 若不守这一条，就会把"x86-64 夹具"和"arm64 blob"打在一起，
+# 产物必然 SIGSEGV(rc=139)。**这正是历史上"静态 PIE ⇒ rc=139"那条记录的真身：架构不匹配的伪缺陷**
+# （2026-10-02 实测：同一块在 amd64 调用里通过、在 a64 调用里 rc=139）。
+if [ "$PIE" = "0" ] && [ "$PIE_RELOCS" = "0" ] && [ -z "$QEMU" ] && [ "$GOARCH_TARGET" = "amd64" ]; then
+    echo "[*] static-PIE: -enc-image-elf-pie must be refused LOUDLY (and the product must still work)"
+    cat > build/static_pie_target.c <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int g_a = 7; static int g_b = 9;
+__attribute__((used, section(".rodata"))) const int *const tbl[2] = {&g_a, &g_b};
+__attribute__((noinline)) unsigned long checkKey(unsigned long x) { return ((x * 7) + 42) ^ 0xFF; }
+__attribute__((noinline)) long sumTo(long n) { long s = 0; for (long i = 1; i <= n; i++) s += i; return s; }
+int main(int argc, char **argv) {
+    if (argc < 3) { return 2; }
+    unsigned long v = strtoul(argv[2], 0, 0);
+    if (strcmp(argv[1], "check-key") == 0) printf("%lu\n", checkKey(v));
+    else if (strcmp(argv[1], "sum-to") == 0) printf("%ld\n", sumTo((long)v));
+    else return 2;
+    return 0;
+}
+EOF
+    gcc -static-pie -O1 -o build/elf_target_staticpie build/static_pie_target.c || fail "build static-PIE fixture"
+    # 校准之一：夹具必须**真的**没有 PT_INTERP，否则本条根本没走到目标分支。
+    if readelf -lW build/elf_target_staticpie | grep -q INTERP; then
+        fail "static-PIE fixture has PT_INTERP; this case would not exercise the skip branch"
+    fi
+    SP_OUT="$(./build/vmpack -exe build/elf_target_staticpie -func checkKey -func sumTo -enc-image-elf-pie \
+        -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
+        -out build/elf_target_staticpie.enc -report build/elf_enc_staticpie.json 2>&1)" || fail "pack static PIE"
+    if ! printf '%s' "$SP_OUT" | grep -q '^\[!\] ELF 整体加密：跳过'; then
+        printf '%s\n' "$SP_OUT" | tail -n 4
+        fail "static PIE skip must be a LOUD [!] warning (no such line) -- see TODO #772"
+    fi
+    SP_NATIVE_RC=0; SP_NATIVE="$(./build/elf_target_staticpie check-key 10 2>&1)" || SP_NATIVE_RC=$?
+    SP_PACKED_RC=0; SP_PACKED="$(./build/elf_target_staticpie.enc check-key 10 2>&1)" || SP_PACKED_RC=$?
+    if [ "$SP_PACKED_RC" -ne 0 ] || [ "$SP_PACKED" != "$SP_NATIVE" ]; then
+        echo "[MISMATCH] static PIE product: native=[$SP_NATIVE] (rc=$SP_NATIVE_RC) packed=[$SP_PACKED] (rc=$SP_PACKED_RC)"
+        fail "a skipped-over static PIE product must still behave like native"
+    fi
+    echo "[OK  ] 静态 PIE：打包端醒目告警且产物与原生一致（check-key 10 -> $SP_PACKED）"
+fi
+
 echo "[+] e2e_elf_image: OK"

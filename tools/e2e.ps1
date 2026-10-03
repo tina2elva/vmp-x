@@ -15,9 +15,21 @@
 # 会**锁住产物文件**，导致下一次打包直接失败：
 #   [!] open build\target_vmp.exe: The process cannot access the file because it is being used by another process.
 # 这个症状曾经被误判成"lifter 无法翻译"（STATUS #429/#430）。真正的修复就是这里先清干净。
+# **只杀本仓库里的同名进程**：原来按镜像名"全机器"杀，于是同一台机器上两个 e2e/gates 并发会
+# **互相杀**（STATUS #594；现场是 mt/mt_many 的 try1/try2 都 rc=-1 或 lenP=0）。别人的同名进程
+# 只提示、不动手 —— 顺便把"干扰源"变成可见信息。
 $ErrorActionPreference = "Continue"
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 foreach ($pn in @("target_vmp", "target")) {
-    Get-Process -Name $pn -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch {} }
+    Get-Process -Name $pn -ErrorAction SilentlyContinue | ForEach-Object {
+        $imgPath = $null
+        try { $imgPath = $_.Path } catch { }
+        if ($imgPath -and $imgPath.StartsWith($repoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            try { $_.Kill() } catch {}
+        } elseif ($imgPath) {
+            Write-Host ("[*] not killing pid=" + $_.Id + " (" + $pn + "): its image is outside this repo: " + $imgPath)
+        }
+    }
 }
 Start-Sleep -Milliseconds 300
 if ($PSScriptRoot) { Set-Location (Join-Path $PSScriptRoot "..") }
@@ -166,6 +178,51 @@ $failLines = @()
 # 未验证项（例如"本机没有 TPM，TPM 那条路没法验"）**必须单独记账**：混进 passed 就是让"通过数"说谎。
 # 每条 skip 都要带可见原因，摘要里与 passed/failed 一起打印；skip 不会让退出码变红。
 $skipLines = @()
+
+# ---- ASLR 启动验收（CreateProcess 路径 = 走加载器的重定位） ----
+# 为什么单列一条：win/arm64 那个 0xC0DE0002 的 bug（STATUS #507/#510）正是"ASLR 生效时缺重定位"这一类，
+# 而它长期没被发现。本机实测（2026-10-02）：夹具 build/target.exe 的 DllCharacteristics=0x160 **含
+# DYNAMIC_BASE(0x40)**、且有非空 .reloc 目录；打包后重定位目录从 0x60 长到 0x76（补了 7 个 payload 站点）
+# ⇒ 每次运行加载器都挑**不同基址**，运行期"先减 delta → 验签 → 解密 → 加回 delta"因此真的被跑到。
+# 这条用例钉住三件事（缺一件覆盖就会**静默消失**，这正是空断言最爱藏的地方）：
+#   ① 夹具必须仍然可重定位（DYNAMIC_BASE + 非空 .reloc 目录）；
+#   ② 产物必须保留 DYNAMIC_BASE（用 -strip-relocs 打包就会失去它）；
+#   ③ ASLR 下 native 与 packed 的 rc/输出仍然一致。
+function Get-PEAslrInfo([string]$path) {
+    $b = [System.IO.File]::ReadAllBytes((Resolve-Path $path).Path)
+    $pe = [BitConverter]::ToInt32($b, 0x3C)
+    $opt = $pe + 24
+    $magic = [BitConverter]::ToUInt16($b, $opt)
+    $dd = if ($magic -eq 0x20B) { $opt + 0x70 } else { $opt + 0x60 }
+    $dllChar = [BitConverter]::ToUInt16($b, $opt + 0x46)
+    $relocRva = [BitConverter]::ToUInt32($b, $dd + 5 * 8)
+    $relocSize = [BitConverter]::ToUInt32($b, $dd + 5 * 8 + 4)
+    return [pscustomobject]@{ Magic = $magic; DynBase = (($dllChar -band 0x40) -ne 0); RelocRva = $relocRva; RelocSize = $relocSize }
+}
+$ti = Get-PEAslrInfo "build/target.exe"
+$vi = Get-PEAslrInfo "build\target_vmp.exe"
+Write-Output ("[*] ASLR facts: target DYNAMIC_BASE=" + $ti.DynBase + " reloc=" + ("0x{0:X}+0x{1:X}" -f $ti.RelocRva, $ti.RelocSize) + " | product DYNAMIC_BASE=" + $vi.DynBase + " reloc=" + ("0x{0:X}+0x{1:X}" -f $vi.RelocRva, $vi.RelocSize))
+$aslrBad = @()
+if (-not $ti.DynBase) { $aslrBad += "the fixture has no DYNAMIC_BASE (ASLR coverage would be vacuous)" }
+if ($ti.RelocSize -eq 0) { $aslrBad += "the fixture has an empty .reloc directory" }
+if (-not $vi.DynBase) { $aslrBad += "the packed product lost DYNAMIC_BASE" }
+if ($vi.RelocSize -le $ti.RelocSize) { $aslrBad += ("the packed product did not gain relocation entries (target=" + $ti.RelocSize + " product=" + $vi.RelocSize + ")") }
+if ($aslrBad.Count -gt 0) {
+    $fail++
+    foreach ($m in $aslrBad) { Write-Host ("  [FAIL] ASLR: " + $m) }
+    $failLines += ("E2EFAIL aslr: " + ($aslrBad -join "; "))
+} else {
+    $aslrN = Run-File "build/target.exe" @("check_key", "10") 30
+    $aslrV = Run-File "build/target_vmp.exe" @("check_key", "10") 30
+    if (($aslrN -notmatch "TIMEOUT|STARTFAIL") -and ($aslrN -ne "") -and ($aslrN -eq $aslrV)) {
+        $pass++
+        Write-Host ("  [OK  ] ASLR launch (CreateProcess): native=" + $aslrN + " packed=" + $aslrV)
+    } else {
+        $fail++
+        Write-Host ("  [FAIL] ASLR launch: native=[" + $aslrN + "] packed=[" + $aslrV + "]")
+        $failLines += ("E2EFAIL aslr-launch: native=[" + $aslrN + "] packed=[" + $aslrV + "]")
+    }
+}
 Write-Output ("[*] differential test (native vs protected)... cases=" + $cases.Count + " 名称=" + (($cases | ForEach-Object { $_.f }) -join ","))
 if ((Get-Item build\target_vmp.exe).LastWriteTime -ne $packTime) { Write-Host "[FAIL] target_vmp.exe changed after packing"; exit 1 }
 foreach ($c in $cases) {

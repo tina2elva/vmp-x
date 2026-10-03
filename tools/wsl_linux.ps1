@@ -1,4 +1,4 @@
-# wsl_linux.ps1 - run CI's Linux jobs LOCALLY, through WSL.
+﻿# wsl_linux.ps1 - run CI's Linux jobs LOCALLY, through WSL.
 #
 #   powershell -NoProfile -File tools/wsl_linux.ps1            # all steps
 #   powershell -NoProfile -File tools/wsl_linux.ps1 -Only arm64
@@ -27,7 +27,7 @@ $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
 if (-not $wsl) {
     if ($requireWsl) { Write-Host "[!] wsl_linux: WSL is required (VMP_REQUIRE_WSL=1) but wsl.exe was not found"; exit 1 }
     Write-Host "[SKIP] wsl_linux: no WSL on this machine (set VMP_REQUIRE_WSL=1 to make this a hard failure)"
-    exit 0
+    exit 77   # 77 = skipped：gates.ps1 会单独记账，不再把它报成 [OK]
 }
 
 # A broken/stopped distro must be a loud SKIP too, not a confusing failure later on.
@@ -36,7 +36,7 @@ if ($probe -notmatch "WSL_OK") {
     $why = ($probe -replace "\s+", " ").Trim()
     if ($requireWsl) { Write-Host ("[!] wsl_linux: WSL is present but not usable: " + $why); exit 1 }
     Write-Host ("[SKIP] wsl_linux: WSL is present but not usable: " + $why)
-    exit 0
+    exit 77   # 77 = skipped（同上）
 }
 
 # Windows repo path -> WSL mount path (D:\vmp-x -> /mnt/d/vmp-x)
