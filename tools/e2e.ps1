@@ -605,6 +605,77 @@ if ($LASTEXITCODE -ne 0) {
                 Remove-Item $cleanupOut, $badOut -ErrorAction SilentlyContinue
             }
             CaseBanner "keyname-rule/c-probe"
+            # 13d) F1：**驱动 CLI 胶水**的「自检失败 ⇒ 拒绝写出」（t7 的 F1：此前这条证据只是
+            #      -tags vmpcredselftest 门控的单测，默认 go test ./... 与 CI 都不跑它；cmd/vmpkeywrap
+            #      里那段 os.Exit(1) 胶水没有任何 committed 用例驱动）。
+            #      怎么做：同一把包裹密钥名，先包 "AAAA..." 造出一个**真实可解析**的 .ncrypt 文件；
+            #      再一次**换个不同的密钥名**去解它 —— 解包会成功（名字存在与否只影响找不找得到密钥），
+            #      但解回来的字节不是密码 A 而是密码 B ⇒ 自检必须拒绝写出。这是可控注入，不需要给
+            #      生产代码加任何开关（也不需要故障注入到 CNG 里）。
+            #      三个断言 + 一个对照：exit=1、**输出文件不存在**、stderr 含"自检失败（拒绝写出）"；
+            #      对照（不注入）必须 rc=0 且文件存在 —— 否则"用例通过"可能只是工具从来不写文件。
+            #      校准：把 wrapNCrypt 里那个 os.Exit(1) 删掉后重跑，本用例必须变红（实测见任务报告）。
+            CaseBanner "keywrap/selfcheck-refuse-write"
+            $scKeyFile = Join-Path (Get-Location) "build\e2e_keywrap_selfcheck_in.txt"
+            $scOutCtrl = Join-Path (Get-Location) ("build\e2e_keywrap_selfcheck_ctrl_" + $runTag + ".ncrypt")
+            $scOutInj = Join-Path (Get-Location) ("build\e2e_keywrap_selfcheck_inj_" + $runTag + ".ncrypt")
+            Remove-Item $scOutCtrl, $scOutInj, $scKeyFile -ErrorAction SilentlyContinue
+            [System.IO.File]::WriteAllText($scKeyFile, ("AA" * 32) + [string][char]10)
+            # (i) 对照（不注入）：rc=0 且**文件真的落盘** —— 没有这条，"拒绝写出"的断言可能只是
+            #     "工具从来不写文件"。
+            $scCtrl = (& .\build\vmpkeywrap.exe -in $scKeyFile -out $scOutCtrl 2>&1 | Out-String).Trim()
+            $scCtrlRc = $LASTEXITCODE
+            $scCtrlOk = ($scCtrlRc -eq 0) -and (Test-Path $scOutCtrl)
+            if ($scCtrlOk) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL keywrap/selfcheck-refuse-write/control: an un-injected run must write the file (exit={0} exists={1}): {2}" -f $scCtrlRc, (Test-Path $scOutCtrl), ($scCtrl -replace '\s+', ' ')) }
+            # (ii) 注入：只在**这一条子进程**的环境里设那个 TEST 开关（见 cmd/vmpkeywrap 的注释），
+            #      强制自检失败 ⇒ 必须 exit=1、**不落文件**、stderr 含"自检失败（拒绝写出）"。
+            $scEnv = "VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL"
+            $scEnvPrev = $env:VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL
+            $scInj = ""
+            try {
+                $env:VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL = "1"
+                $scInj = (& .\build\vmpkeywrap.exe -in $scKeyFile -out $scOutInj 2>&1 | Out-String).Trim()
+                $scInjRc = $LASTEXITCODE
+            } finally {
+                # 显式还原：别让这个开关泄漏到本脚本后面的用例（它们也会启动子进程）
+                $env:VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL = $scEnvPrev
+                $scEnvLeak = $env:VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL
+            }
+            $scInjWrote = Test-Path $scOutInj
+            $scInjSaid = $scInj -match '自检失败（拒绝写出）'
+            if (($scInjRc -eq 1) -and (-not $scInjWrote) -and $scInjSaid) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL keywrap/selfcheck-refuse-write: the injected self-check failure must exit 1, write NO file and say so (exit={0} file={1} saidSo={2}): {3}" -f $scInjRc, $scInjWrote, $scInjSaid, ($scInj -replace '\s+', ' ')) }
+            # (iii) 标定：注入开关必须真的**被读到了**（否则上面那条"通过"可能只是工具没看见开关）。
+            $scEnvOff = ""
+            try {
+                $env:VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL = "0"
+                $scEnvOff = (& .\build\vmpkeywrap.exe -in $scKeyFile -out $scOutInj 2>&1 | Out-String).Trim()
+                $scEnvOffRc = $LASTEXITCODE
+            } finally {
+                $env:VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL = $scEnvPrev
+            }
+            if (($scEnvOffRc -eq 0) -and (Test-Path $scOutInj)) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL keywrap/selfcheck-refuse-write/inject-flag: env-name mismatch? setting {0}=0 must behave like production (exit={1} exists={2}): {3}" -f $scEnv, $scEnvOffRc, (Test-Path $scOutInj), ($scEnvOff -replace '\s+', ' ')) }
+            # (iv) 开关不许泄漏：跑完后环境里不能再有它（否则后面的用例会被动的变成"跳过自检"）。
+            if ([string]::IsNullOrEmpty($scEnvLeak)) { $pass++ }
+            else { $fail++; $failLines += ("E2EFAIL keywrap/selfcheck-refuse-write/env-leak: " + $scEnv + " is still set after the case (" + $scEnvLeak + ")") }
+
+            Clear-CaseTemp @($scKeyFile, $scOutCtrl, $scOutInj) ($scCtrlOk -and (($scInjRc -eq 1) -and (-not $scInjWrote) -and $scInjSaid))
+
+            # 13e) F1(a)：把**判据层**的可失败证明也接上电网。TestSelfCheckRefusesToWrite 带
+            #      vmpcredselftest tag（默认 go test ./... 不会跑到它），所以这里显式跑一次；
+            #      **关键**：还要断言它真的执行了 —— 用一个跟默认测试集重合的标签表达"没跑"，
+            #      于是"压根没编进来"（输出里没有 RUN）会当场判红，而不是冒充通过。
+            CaseBanner "keywrap/selfcheck-predicate-test"
+            $scTestOut = (go test -tags vmpcredselftest -run TestSelfCheckRefusesToWrite -v ./internal/cred 2>&1 | Out-String)
+            $scTestRc = $LASTEXITCODE
+            $scRan = ($scTestOut -match "--- PASS: TestSelfCheckRefusesToWrite")
+            $scNotRun = ($scTestOut -match "^(no test files|ok\s+github.com/vmpx/vmp-x/internal/cred\s+\[[^\]]*no tests to run\])")
+            $scTestTail = ($scTestOut -replace '\s+', ' ').Trim()
+            if ($scTestTail.Length -gt 300) { $scTestTail = $scTestTail.Substring($scTestTail.Length - 300) }
+            if (($scTestRc -eq 0) -and $scRan -and (-not $scNotRun)) { $pass++ }
+            else { $fail++; $failLines += "E2EFAIL keywrap/selfcheck-predicate-test: the tagged predicate test did not actually run and pass (rc=" + $scTestRc + " ran=" + $scRan + " noTests=" + $scNotRun + "): " + $scTestTail }
             # 14) C 侧的密钥名规则（A1）：编译**真的** stub/win/x64/vm_interp.c 并调用它的
             #     vm_ncrypt_keyname_ok()。keyname_probe.c include 的是那份源文件本体（不是副本），
             #     所以改坏 vm_interp.c 里那条规则会让这个探针红；Go 侧的镜像断言在
@@ -809,7 +880,7 @@ else { $fail++; $failLines += "E2EFAIL aslr: packed image is not relocated (relo
 # demoted to diagnostics-only in stub/win/x64/vm_interp.c, see the comment there).
 $adArgs = @("tools/antidebug_flag_test.py", "--exe", "build/target_vmp.exe", "--args", "check_key 10", "--expect-unchanged")
 $ad = Run-PyCaptured $adArgs 180
-$adCmd = "python " + ($adArgs -join " ")
+$adCmd = 'python tools/antidebug_flag_test.py --exe build/target_vmp.exe --args "check_key 10" --expect-unchanged'
 if ($ad.Rc -eq 0) { $pass++ }
 else {
     $fail++

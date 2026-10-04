@@ -167,6 +167,11 @@ func cleanupKeys(sel, keyName string, list bool) {
 	}
 }
 
+// selfCheckInjectEnv 是**测试专用**的注入开关名（见 wrapNCrypt 里的注释）：
+// 设为 "1" 会强制让写文件之前的自检失败，用来验证"拒绝写出"这条胶水。
+// 它是环境变量而不是命令行开关：故意让它**不出现在 --help 里**，也不被任何部署脚本引用。
+const selfCheckInjectEnv = "VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL"
+
 // storeDir：这个 store 的用户可见落点在文件系统里的位置（当前用户的 profile 下）。
 // 如实说：软件 KSP 的密钥文件确实在这里；Platform Crypto Provider 那把的**私钥材料在 TPM 芯片里**，
 // 这里只报告它归属的那个 store 目录（删除是否成功与这个目录无关，只认 NCryptDeleteKey 的返回码）。
@@ -238,10 +243,18 @@ func wrapNCrypt(sel, keyName string, raw []byte, out string) {
 	}
 	// 自检（**写文件之前**）：解回来的必须与输入逐字节一致。
 	// 这一步走的是与运行期 blob 逐条对应的解析+解密路径，所以它过了，产物侧才会过。
-	// 判据只有一份、在 internal/cred（VerifyWrappedPayload）：写在这里会分叉，
-	// 而且包外那条路没法用故障注入证明"A3 自检失败即拒绝写出"。
-	if err := cred.VerifyWrappedPayload(blob, raw); err != nil {
-		fmt.Fprintf(os.Stderr, "[!] 自检失败（拒绝写出）: %v\n", err)
+	// 判据只有一份、在 internal/cred（VerifyWrappedPayload）：写在这里会分叉。
+	//
+	// 这里有一个**测试专用**注入点（t7 的 F1：这段胶水此前没有任何 committed 用例驱动）。
+	// 契约：默认空；**只有**显式设了下面那个环境变量的进程会跳过自检 —— 生产里没有任何东西会设它
+	// （名字自带 TEST 前缀，且工具本身不读任何配置）。tools/e2e.ps1 的
+	// keywrap/selfcheck-refuse-write 用它注入一次自检失败，断言 exit=1 + 不落文件 + stderr 文案。
+	selfCheck := cred.VerifyWrappedPayload(blob, raw)
+	if os.Getenv(selfCheckInjectEnv) == "1" {
+		selfCheck = fmt.Errorf("injected self-check failure (%s=1; test-only, never set in production)", selfCheckInjectEnv)
+	}
+	if selfCheck != nil {
+		fmt.Fprintf(os.Stderr, "[!] 自检失败（拒绝写出）: %v\n", selfCheck)
 		os.Exit(1)
 	}
 	if err := os.WriteFile(out, blob, 0o600); err != nil {

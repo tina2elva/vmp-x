@@ -2,27 +2,30 @@
 
 package cred
 
-// A3：「自检失败就拒绝写出」的**可失败证明**。
+// A3：「自检失败就拒绝写出」的**可失败证明**（判据层）。
 //
-// 问题：cmd/vmpkeywrap 里那条规则（刚做出来的 .ncrypt 内容解回来必须与输入逐字节一致，
-// 否则拒绝写出）在生产里**不可达** —— 工具自己加密、自己解，除非 CNG 坏了，否则永远一致。
-// 于是它长期只有"读代码"这一种证据，没有故障注入。
+// 这条规则在生产里天然不可达：工具自己加密、自己解，没有故障就永远一致（见 payloadwrap.go 的
+// payloadUnwrap 注释）。所以证据只能靠**测试专用接缝**：本文件用包内的 payloadUnwrap 换掉解包裹
+// 实现，再喂一个「能解析、但解回来不一致/解不开/长度不对」的 blob，断言 VerifyWrappedPayload 拒绝。
 //
-// 干净做法（不引入生产开关）：给包内那条判据加一个**测试专用接缝**
-// （payloadwrap.go 的 payloadUnwrap：默认就是生产的 CNGUnwrapPayloadBlob），
-// 再用一个**能解析、但解回来不一致/解不开**的 blob 去喂 VerifyWrappedPayload。
-//
-// 为什么整条测试用 build tag 关起来：普通构建（go test ./...）里这个文件根本不参与编译，
-// 换接缝的代码不会在任何常规测试里被执行；只有本任务验收时显式带上
-// -tags vmpcredselftest 跑一次。生产二进制里没有任何开关能改接缝（见 payloadwrap.go 的注释）。
+// 事实澄清（此前这里写过两处不成立的话，t7 的 F2 指出，逐条改掉）：
+//   1) 本条测试**不是**默认测试集的一部分：它带 `//go:build vmpcredselftest`，所以 `go test ./...`
+//      与 CI 都不会跑到它。它要显式带 tag 才跑（命令见下）。**CLI 那条胶水**（cmd/vmpkeywrap 里
+//      「自检失败就 os.Exit(1)」）的证据不在这里，而在 `tools/e2e.ps1` 的用例
+//      `keywrap/selfcheck-refuse-write`（默认门禁/CI 会跑到它，断言 exit=1 + 输出文件不存在 +
+//      stderr 含「自检失败（拒绝写出）」，并配一个未注入的对照 rc=0 + 文件存在）。
+//   2) 「cred 依赖 cmd/vmpkeywrap」这种说法是错的：Go 里 main 包不能作为库被 import，
+//      而且 cred **根本不 import cmd**。依赖方向本身有一条**可执行**断言：
+//      payloadwrap_test.go 的 TestCredDoesNotDependOnCmd（go list -deps，默认 go test 就会跑）。
 //
 // 用法（在仓库根）：
 //
 //	go test -tags vmpcredselftest -run TestSelfCheckRefusesToWrite -v ./internal/cred
 //
-// 校准（证明这条测试能红）：把 cmd/vmpkeywrap 的 wrapNCrypt 里
-// "if err := cred.VerifyWrappedPayload(...)" 换成不检查，
-// 或把 payloadSelfCheckError 的比较去掉，再按上面的命令跑 —— 测试必须失败。
+// 校准（证明这条测试**能红**，实测过）：把 payloadSelfCheckError 里那段
+// `len(back) != len(want) || string(back) != string(want)` 判据删掉 ⇒ 本测试立刻红在
+// 「解回来的主密钥与输入不一致，自检却放行了」。注意：**不能**用「删掉 cmd/vmpkeywrap 的
+// os.Exit(1)」来校准这一条 —— 本测试不经过那一层（那一层由 e2e 的用例和它的校准覆盖）。
 
 import (
 	"bytes"

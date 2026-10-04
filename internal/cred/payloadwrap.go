@@ -68,17 +68,17 @@ func ValidWrapKeyName(name string) error {
 	return nil
 }
 
-// payloadUnwrap 是**自检**要用的解包裹实现。生产里它永远是 CNGUnwrapPayloadBlob，
-// 只有 internal/cred 包内的测试会临时换掉它 —— 存在的唯一理由见
-// internal/cred/selfcheck_test.go 的长注释：自检失败必须"拒绝写出"，
-// 而这条路径在生产里**不可达**（刚做出来的 blob 必然解回原值），
-// 于是没有接缝就只剩"读代码"这一种证据。
+// payloadUnwrap 是**自检**要用的解包裹实现。生产里它永远是 CNGUnwrapPayloadBlob；
+// 只有 internal/cred 包内的测试会临时换掉它（测试文件还带 vmpcredselftest tag，默认不参与编译）。
+// 它存在的理由：自检失败必须"拒绝写出"，而这条路径在生产里**不可达**（刚做出来的 blob 必然解回
+// 原值），没有这个接缝就只剩"读代码"这一种证据。
 //
-// 刻意的取舍（不引入任何生产开关）：
+// 刻意的取舍（**本包**不引入任何开关；CLI 那边的注入点见 cmd/vmpkeywrap 的注释）：
 //   - 它是**包内变量**，不是导出 API，也不是命令行/环境变量开关 —— 部署里没有任何东西能改它；
 //   - 唯一的调用点在 VerifyWrappedPayload 里，默认值与生产路径逐字节相同；
 //   - 代价是每次调用多一次间接跳转（一次 RSA-2048 解密的噪声量级）；
-//   - 收益是"自检不过 ⇒ 拒绝写出"这条规则第一次有了**能失败**的证明。
+//   - 收益：包内判据有了能失败的证明（`go test -tags vmpcredselftest ./internal/cred` 会跑它；
+//     CLI 那一层的等价证据在 tools/e2e.ps1 的 keywrap/selfcheck-refuse-write 用例，门禁默认会跑到）。
 var payloadUnwrap = CNGUnwrapPayloadBlob
 
 // payloadSelfCheckError 判定"刚做出来的 .ncrypt 内容"能不能通过自检：

@@ -10,6 +10,8 @@ package cred
 
 import (
 	"bytes"
+	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -145,5 +147,22 @@ func TestValidWrapKeyNameBoundaries(t *testing.T) {
 	}
 	if err := ValidWrapKeyName(string(bytes.Repeat([]byte{'x'}, PayloadWrapNameMax+1))); err == nil {
 		t.Errorf("超过 %d 字节的名字应被拒绝", PayloadWrapNameMax)
+	}
+}
+
+// F4(b2)：把"internal/cred **不依赖** cmd/vmpkeywrap（依赖方向是单向的）"这句话变成**可执行**的。
+// 为什么值得钉：包装/自检的判据在这里，而 CLI 只是它的调用方 —— 一旦 cred 反过来 import cmd，
+// 就会形成 main 包与库的循环依赖（Go 会直接拒绝编译），也会把"判据只有一份"这件事说反。
+// 这里用 go list 的依赖图断言，而不是靠注释里的说法。
+func TestCredDoesNotDependOnCmd(t *testing.T) {
+	cmd := exec.Command("go", "list", "-deps", "github.com/vmpx/vmp-x/internal/cred")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Skipf("go list 不可用（跳过依赖方向断言）: %v", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "vmp-x/cmd/") {
+			t.Errorf("internal/cred 依赖了 cmd 包（依赖方向被反转）：%s", strings.TrimSpace(line))
+		}
 	}
 }

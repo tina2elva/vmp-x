@@ -1804,16 +1804,20 @@ static int vm_key_from_file_dpapi(const u16 *path) {
  * 密钥名只允许 ASCII（工具侧写文件时已校验）：非 ASCII 一律当"文件被动过"拒绝。 */
 static const char vm_ncrypt_magic[8] = {'V', 'M', 'P', 'X', 'N', 'C', 'R', '1'};
 
-/* 包裹密钥名的**单字节**谓词：可打印 ASCII（0x20..0x7e）。
+/* 包裹密钥名的**单字节**谓词：可打印 ASCII，区间由下面两个**具名宏**给出。
  * 与 Go 侧 internal/cred/payloadwrap.go 的 ValidWrapKeyName 是**同一条规则**：
  * 那边拒 name[i] < 0x20 || name[i] > 0x7e，这里逐字节同一个区间；
  * 少拒 0x01..0x1f / 0x7f 就等于放行工具侧永远不会产生的"坏名字"（见 A1 的登记）。
- * 提起成函数是为了让 stub/win/x64/keyname_probe.c 能直接调用它做边界断言
- * （此前这条规则只写在循环体里，没有可失败的验证）。 */
-static int vm_ncrypt_keyname_ok(u8 c) { return c >= 0x20u && c <= 0x7eu; }
-/* 编译期钉死两个端点（与 Go 侧 0x20/0x7e 同一对常量）：改端点会在这里编不过，
- * 而"只改实现不改常量"会被 keyname_probe.c 的逐字节断言抓住。 */
-VM_STATIC_ASSERT(0x20u < 0x7eu, ncrypt_keyname_span_ordered);
+ * 提起成函数是为了让 stub/win/x64/keyname_probe.c 能直接调用它做边界断言。 */
+#define VM_NCRYPT_NAME_MIN 0x20u /* 可打印 ASCII 下界（= ' '） */
+#define VM_NCRYPT_NAME_MAX 0x7eu /* 可打印 ASCII 上界（= '~'） */
+static int vm_ncrypt_keyname_ok(u8 c) { return c >= VM_NCRYPT_NAME_MIN && c <= VM_NCRYPT_NAME_MAX; }
+/* 两个端点必须**有序**。诚实说明：这条断言与谓词用的是同一对宏，所以它只在"宏本身被改成
+ * 相等/倒序"时才会响 —— 把它当成"改端点就编不过"是**错的**（端点改成 0x1f/0x7f 时它照样成立，
+ * 这正是此前那条 `0x20u < 0x7eu` 字面量断言的毛病：它恒真，什么都不查）。
+ * 真正拦住"端点被改"的网是 stub/win/x64/keyname_probe.c 的**逐字节域断言**（它 include 本文件，
+ * 把 256 个字节在每个边界上的判定与 Go 规则逐一对齐；改端点会让它直接红）。 */
+VM_STATIC_ASSERT(VM_NCRYPT_NAME_MIN < VM_NCRYPT_NAME_MAX, ncrypt_keyname_span_ordered);
 
 static int vm_key_from_file_ncrypt(const u16 *path) {
     static u8 blob[1024];
