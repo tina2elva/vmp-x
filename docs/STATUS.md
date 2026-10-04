@@ -10403,3 +10403,112 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
   只有将来 `cmd/` 下出现可导入包、且 cred 依赖了它，它才会如实报出来。
 - `tools/e2e_elf_image.sh` 的分类器在**外层与内层循环**里各维护一次"最后一个覆盖者"，两处轻微不一致
   （不影响当前产物，属 tidy-up）：留给 ELF 侧后续处理。
+
+### 596. 「小而真」那一栏收尾：A1–A4 / B1–B3 / C1–C2 全部闭环（含独立验证、形状依赖修复与 CI 记录）
+
+**做了什么 + 证据（逐条）**
+
+**A（取钥侧四件；功能 `56e289f` + 注释 `d3965d0`）**
+- **A1 C/Go 密钥名校验对齐**：C 侧 `vm_ncrypt_keyname_ok` 拒 `<0x20`/`>0x7e`，新增 `stub/win/x64/keyname_probe.c`（include
+  **真** `vm_interp.c`，逐字节断言 256 个字节）由 e2e 编译运行；Go 侧 `TestValidWrapKeyNameBoundaries`。
+  证据：C 回旧规则 ⇒ 探针 `FAIL/exit=1`（**34 字节偏离** = 32 个域字节 + 2 条边界断言）；Go 回旧规则 ⇒ 单测红
+  （逐字节列出 `0x01..0x1f` 与 `0x7f`）；运行时把 `.ncrypt` 名字首字节改成 `0x1f` ⇒ 硬门 `0xC0DE0007`（`t5` 独立复算）。
+- **A2 两条 CLI 负例进 committed e2e**（`tools/e2e.ps1` 第 13 步）：`-provider bogus` 与非 ASCII `-keyname` 都
+  `exit=2` + **不落文件** + stdout 空 + stderr 非空。校准：把期望改成 0 ⇒ `E2EFAIL ext-key/neg-provider` 变红。
+- **A3 「自检失败 ⇒ 拒绝写出」的证据接上电网**（细节见 **#595**）：判据单源化到 `internal/cred.VerifyWrappedPayload`；
+  包内接缝 `payloadUnwrap`；CLI 胶水由 e2e 的两条用例驱动。独立复算（`t5`）：带 tag 的判据测试 PASS；删掉一致性判据 ⇒ FAIL；
+  CLI 级注入 ⇒ `rc=1` + **不落文件** + stderr「自检失败（拒绝写出）」；正例 `rc=0` + 落盘。
+  **口径更正**：A3 早期交付的「**没有任何生产开关**」只对 `internal/cred` 的包内接缝成立；为了让 committed 用例能驱动 CLI 胶水，
+  #595 在生产代码里加了**测试专用**环境变量 `VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL`（默认空、不进 `--help`、fail-closed only、
+  有泄漏检查）—— 该取舍与边界登记在 **#595**，本条不重复。
+- **A4 残留 CNG 密钥清理**：新增 `-cleanup -keyname <name>` 与 `-list`（走 `NCryptDeleteKey`）。注册的那把 `keys` **已删除**
+  （`CngKey.Exists` 1→0，第三方口径复核）；缺键时打印**实际错误码** `NCryptOpenKey 0x80090016 (NTE_BAD_KEYSET)`（`t5` 独立复算）。
+
+**B1 fail-closed `code=8` 可知可测（`t2=9199ac0`）**
+- **关键更正**：`code=8` 判的是**目标自己的** `DT_RELA/DT_RELASZ`，**不是** payload 里那张 `VMPR` 应用表 —— 把整张 VMPR 表清零，
+  产物照样 `rc=0/143`（`t2` 实测，`t6` 我独立复核）。构造点只能在**动态段**。
+- 构造与实测（e2e 的 PIE_RELOCS 分支，对产物副本做字节级改写）：`DT_RELA := page_up(linkEnd)-32`、`DT_RELASZ := 24`、
+  `DT_RELACOUNT := 0` ⇒ **`exit=7`** + stderr `VMPELF relocfail code=8` / `type=0` / `rva=0`；未构造 ⇒ `rc=0/143/无 relocfail`。
+- 独立复算（`t6`）：自造夹具（3 条重定位）+ 自造补丁器（`DT_RELA=page_up(linkEnd)-24`）同样 `rc=7 + code=8`；
+  `vm_reloc_bad = 8` 全树唯一赋值点 = 「两个窗口都不在」分支。`t14=198f0f8` 起补丁器**不再硬依赖 `DT_RELACOUNT`**
+  （我把标签换成未使用值 `0x6000DEAD` 后跑：打印 `no DT_RELACOUNT … glibc takes the generic path`，用例仍 `rc=7 + code=8`；`t12` 复核）。
+
+**B2 E5 在真实 PIE 上的判别力（`t3=ec9b738`）**
+- 真实 Go PIE 上「候选 = 0」不再报「赚到的 OK」，改**显式 INFO** 并说清谁承重（E3 blob 逐字节 / E5(a2) / e2e 真重定位运行），
+  并用**逐字节复扫**证明「0」不是 8 字节跨步的假象。
+- 新增 **E5(a2)**：读**产物自己**镜像表的 `wantBase`（ELF 载荷里唯一可能承载 preferred-base 绝对 VA 的声明槽位）⇒ ET_DYN 必须为 0；
+  构造缺陷 ⇒ `[FAIL] E5 payload image table at RVA 0x1EF160 declares wantBase=0x7F0000000000; … vm_unpack_image fail (VMPELF basemismatch)`
+  + `rc=1`；`--selftest` 增 `[OK] CAL mutation caught by E5-imgtable`。独立复算（`t6`）：植入 `wantBase=0xDEADBEEF0000` ⇒ 门禁红；
+  未植入 ⇒ 绿；把植入值留在产物里运行 ⇒ `VMPELF basemismatch` + **SIGILL** ⇒ 该断言**真承重**（不是理论）。
+
+**B3 aarch64 缺口登记 + 两形状覆盖（`t3`、`t11=9f74e86`、`t14=198f0f8`）**
+- 书面结论在 `tools/check_elf_layout.py` docstring 的 **`E5 coverage gap on aarch64`** 一节（禁止来源 #376/#377 + AGENTS.md；
+  不可加密的是**任何带 `R_AARCH64_RELATIVE` 的槽位**）；运行期那半**如实标注未验证且故意不断言**（INFO 行）。
+- **CI 红与修复**：`run 37128895442`（`a6bc4ea`，`linux-arm64`）红在 `[FAIL] E2 no RW overlay PT_LOAD at sectionRVA+bssOff = 0x27000`。
+  根因 = **夹具的 `PT_NOTE` 数量**：CI 的 gcc/ld 13 只有 1 个 ⇒ 注入器醒目告警并**退回单 RWX 段** ⇒ 产物 2 个 PT_LOAD；
+  本机 gcc/ld 15 有 2 个 ⇒ RX + RW 覆盖段 ⇒ 3 个 PT_LOAD ⇒ 绿。`t11` 把 E2 改成**形状无关**（(a) RW 覆盖段 **或**
+  (b) payload LOAD 可写且 bss 落在 `p_filesz`/文件内），并把 `M5/E1-order` 自检也改成形状无关；修后 `run 37129830934` 三作业全绿。
+- **本批第二例「说的比做的多」**：`both legal payload shapes accepted` 那行原先**无条件打印**，而 CI 侧两个产物都走 fallback
+  ⇒ **CI 只验了一个形状却宣称两个都接受**。`t14` 起该行**按实测形状**生成（CI 日志里能看到形状 (b) 的
+  `[SKIP] CAL E2-overlay` + `[OK] CAL E2-filebacked`，形状 (a) 则相反）。（第一例是 #595 里 t7-F1 的「证据没上电网」。）
+- 独立复算（`t12`）：两种形状我自己各造一遍 —— 形状 (a) 我的 amd64 C PIE ⇒ `[OK] E2 … + overlay @0xD000 (0x1000)`；
+  形状 (b) 我抹掉多余 `PT_NOTE` 逼出注入器的醒目 `[warn] … 退回 RWX` ⇒ `[OK] E2 … bss file-backed inside the writable payload LOAD`
+  且 `M5/E1-order` 只 `[SKIP]` 不崩（0 traceback）；**两个方向都能打破**（去掉覆盖段 ⇒ `mapped by a NON-writable LOAD`；
+  manifest 的 `bssSize` 放大 ⇒ `only partly mapped`）。**F2 空转复现**：去掉夹具范围内重定位 ⇒ `imgRelocCount=0` ⇒
+  用例 `rc=1` + `[FAIL] aarch64 reloc bookkeeping is vacuous`（证明它不是只打印）。
+
+**C（两处 flaky；`t4=b54d1cd`）**
+- **C2 antidebug = 测试代码缺陷，已修**：根因是逐字节比较整段 stdout，而 `ticks=` 是 `clock()` 墙钟差（实测 plain `acc=782 ticks=0` /
+  flagged `acc=782 ticks=1`，`acc` 相同 ⇒ 判定位根本没触发，却报「a single BeingDebugged signal flipped the verdict」）。
+  修法：**字段级**剔除 `ticks=`（不丢整行）+ e2e 改确定性 `--args "check_key 10"`。独立复算（`t5`，自写探针）三档：
+  ticks 单差 ⇒ `rc=0`、`acc` 真差 ⇒ `rc=1`、`--strict` 下 ticks 单差 ⇒ `rc=1`。
+- **C1 refill = 无根因，做成可归因**：e2e 现在捕获 `patch_refill.py` 的 rc/stdout/stderr，失败行带 `placements-in-report`、
+  stderr 尾段与可复制 repro；输出名**每轮唯一**（只删自己那个文件）。独立复算（`t5`）：注入报告截断 ⇒ 失败行含
+  `rc=1` + `json.decoder.JSONDecodeError` + `placements-in-report=-3` + repro；三结局可区分（rc=0/placements=2、
+  rc=1/JSONDecodeError/-3、rc=2/「nothing refilled」/placements=0）。`tools/patch_refill.py` **未改**。
+
+**独立验证与评审链**
+- `t5`（A+C）completed；`t6`（B round 1）needs_revision（唯一阻塞 = E2 形状依赖，已由 `t11` 修）；`t12`（B round 2）**pass**；
+  评审 `t7`/`t8`/`t15`/`t17` 均 pass：`t8` 的 R1/R2 由 `t14` 修、R4 只登记；`t17` 的两条 low 残留里 P2 由 `t18` 修、P3 登记。
+
+**CI 记录（三作业 = windows-amd64 / linux-amd64 / linux-arm64；均 `gh run view` 亲核）**
+| 提交 | run | 结论 | 说明 |
+|---|---|---|---|
+| `d3965d0` | `37126232727` | success | t1 链（`56e289f` 本身**没有 run**；`d3965d0` 是它之上仅注释的提交） |
+| `b54d1cd` | `37128791800` | success | A+C |
+| `a6bc4ea` | `37128895442` | **failure** | 仅 `linux-arm64` 红（E2 形状依赖），另两作业 success —— 本批唯一一次真红，已由 t11 修并复绿 |
+| `9f74e86` | `37129830934` | success | t11（E2 形状无关化） |
+| `198f0f8` | `37168111979` | success | t14（「both shapes」按实测形状） |
+| `8bb18a8` | `37181558583` | success | t16 |
+| `6c422f6` | `37182530845` | success | t18（**哨兵 127 + try/catch**：命令没启动 ⇒ `rc=1` + `[FAIL] gcc build failed`；t17 建议的“只加 `$LASTEXITCODE = 0`”实测**修不掉行为**（不抛错但也不打 FAIL、rc 仍 0）；P1 陈旧注释） |
+
+终局**被验 sha = `6c422f6`**（本机 preflight/gates 跑在该 sha 上）；本条 `docs/` 提交是**纯文档改动**（不改被验代码），其 CI run 由队长复核时以 gh 为准（不写进正文以免自引用）。
+
+**本轮终局本机门禁**（在被记录的干净 sha 上跑，`git status --short` 为空）
+- `tools/preflight.ps1` ⇒ `[+] preflight: OK`（exit 0）
+- `tools/gates.ps1` ⇒ `total 15 gates, 0 failed, 0 skipped`（exit 0），`e2e: 183 passed, 0 skipped, 0 failed`、`dll e2e: 7 passed, 0 failed`；
+  WSL 半场 `wsl_linux: every step passed`（14 步全 `[OK]`）
+
+**未做项 / 如实降级**
+- **M5（升级为「已有 amd64 复现证据」）**：加密**可执行**范围里含重定位 ⇒ 产物 `rc=139`（native 143），**amd64 也崩**。
+  两个独立来源：`t3` 实测 + `t12` 我用 DT_TEXTREL 夹具独立复现（`.text` 内一个指针 + `-Wl,-z,notext`；readelf 有 TEXTREL，
+  `R_X86_64_RELATIVE` r_offset `0x1288` 落在被加密的 X 范围内；plain 与 `-pie-relocs` 两种打包都 `rc=139`）⇒ 与架构无关、
+  与是否 opt-in 无关。**另立独立待查项**（是否应打包端 fail-closed 拒绝，或运行期应用器要能处理可执行段内槽位）。
+- **K5（单一来源）**：产物 `PT_DYNAMIC.p_offset` 仍是 `0x3DB0`（该段已被挪到 `p_offset 0x5000`）⇒ 运行时 `.dynamic` 实际在文件
+  **`0x6DB0`**；`0x3DB0` 处留**陈旧副本**，**节头表 `sh_offset` 也未同步**。对 ld.so 无害，但按 `p_offset` 定位动态段的工具会读到陈旧副本。
+- **R4**：`check_elf_layout.py` 的 route(a) 把任何 `vaddr == bss_va` 的 LOAD 当覆盖段 ⇒ `bssOff == 0` 的布局会**假红**（现不可达）。
+- **N5**：`tools/e2e_elf_image.sh` 的分类器内外层各维护一次「最后一个覆盖者」，两处轻微不一致（不影响当前产物，tidy-up）。
+- **P2/P3**：`tools/e2e.ps1` 在 `Set-StrictMode` 下的失败分支 —— **P2 已由 `t18=6c422f6` 修**（哨兵 `127` + `try/catch`：命令没启动 ⇒ `rc=1` + `[FAIL] gcc build failed`；工具链齐备无回归；**t17 建议的“只加 `$LASTEXITCODE = 0`”实测修不掉行为**）；**P3** 仍登记：StrictMode 作用于绿跑覆盖不到的失败分支，最坏只少一行诊断，**不假绿/假红**。
+- **L2**：e2e 仍留 `vmpx-payload-key-v1` / `-sw-e2e` / `-tpm-e2e` 三把；历史探针 `vmpx-t7-selfcheck-probe` / `vmpx-cng-ACME` /
+  `t-sw-1` / `t-tpm-1` / `t-auto-1` 未清理。逐把命令：`build\vmpkeywrap.exe -cleanup -list` 先看，再
+  `build\vmpkeywrap.exe -cleanup -keyname <name> -provider <tpm|software|auto>`。
+- **L3（教训）**：`NCryptDeleteKey` 传 `NCRYPT_SILENT_FLAG` ⇒ `0x80090009 (NTE_INVALID_PARAMETER)`，必须 `dwFlags=0`。
+- **环境假红（非产品缺陷）**：共享工作区并发跑时 e2e 曾出现 `171/2`、`172/1`、`181/2` 这类计数（干净重跑即恢复）；
+  `t12` 另遇一次 aarch64 **默认**（Go 目标）用例的 `[MISMATCH]` + qemu SIGSEGV（跑在**私有**树、无并发，同树 3 次未复现；当时 WSL 刚重启）。
+- **共享树纪律（K6）**：本批的三次假红都源自共享工作区里他人的未提交改动/并发 run ⇒ **验证必须能归因**（先用隔离树跑，
+  再在转绿的共享树上跑官方命令）；报告数字必须注明工作区状态。
+- **误归因教训（M6）**：E5 的 M7 校准第一版把 VA 种进了产物自己的窗口 ⇒ `E5(a)` 先红、结论不可归因（已改种到窗口外，教训写进注释）。
+  同族：给 `DT_RELACOUNT` 选替换值时第一次用了 `0x6FFFFFFE`（那其实是 `DT_VERNEED`）⇒ ld.so
+  `unsupported version 257 of Verneed record`、未构造的对照 `rc=127` —— 是**选错标签**，不是产品问题。
+- **`AGENTS.md` 的验收数字已过期**（它写 `e2e 174`，现为 `183`）—— 按本轮契约**不动 `AGENTS.md`**，由队长维护。
+

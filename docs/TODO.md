@@ -188,9 +188,9 @@
 **修法（下一轮）**：给 `OP_CALLN` 加 ABI 蹦床 —— 切到 guest 栈、压一个返回地址、装载寄存器参数后再 call，
 返回后恢复宿主 rsp；并处理 `FrameSkew`（guest 栈相对原生栈的偏移）。
 
-**已知 flaky（要修）**：`tools/e2e.ps1` 的反调试用例（`antidebug: a single BeingDebugged signal flipped the verdict`）
-本会话已偶发三次（每次重跑就好）。时间差路径已降级为只诊断，但仍有第二条路径在某些运行环境下同时命中，
-使"只注入一个信号"的断言失败。要把它做成确定性用例（或明确哪些路径在该环境下不该参与定性）。
+**已知 flaky（已修）**：`STATUS #596`（`t4=b54d1cd`）—— 根因不是"第二条路径命中"，而是用例把墙钟量 `ticks=`
+当不变量逐字节比较；现在**字段级**剔除该量、e2e 改用确定性 `--args "check_key 10"`，并保留 `--strict` 诊断模式。
+（反调试判据本身未改：时间差路径此前已降级为只诊断；若以后要抓"环境里真有调试器/分析器附着"，需独立探针。）
 
 **验收**：`DemoFormatReport` 在 `/Od` 与 `/O2` 两种构建下都逐行一致；
 `caller5`/`caller5b` 合成用例与原生一致；并把它加成 `tools/e2e.ps1` 的用例。
@@ -628,10 +628,12 @@ vmp-x 当前不足逐条落档，每条都带 `文件:行` 依据。要点：**�
 
 ## 7. 稳定性观察（记录用，非功能项）
 
-- [ ] `E2E x86-64` 里的 **`refill`（`tools/patch_refill.py`）出现过一次 flaky**：
-      run `35833541996`（纯文档提交 `7dff5ac`）首次失败 `E2EFAIL refill: tools/patch_refill.py failed`
-      （`e2e: 164 passed, 1 failed`），**重跑同一作业即全绿** ⇒ 判定为偶发而非回归。
-      建议：查该子用例是否有时间/路径依赖（它做的是"按函数尾声把被覆盖的 5 字节推回来"的对抗测试）。
+- [x] **`refill` 的一次性 flaky 已做成可归因**（`STATUS #596`，`t4=b54d1cd`）：**没有找到根因**（本轮 0 次复现），
+      但 e2e 现在捕获 `patch_refill.py` 的 rc/stdout/stderr，失败行带 `placements-in-report`（0 ⇒ 打包端没产出放置项；
+      有值却 rc≠0 ⇒ 脚本/环境问题）、stderr 尾段与可复制的重跑命令；输出名改成**每轮唯一**
+      （`build	arget_neimg_refill_<runTag>.exe`，只删自己那个文件）。三种结局可区分（独立复算见 `t5`）：
+      真报告 rc=0/placements=2、截断报告 rc=1 + `json.JSONDecodeError`/placements=-3、空 placements rc=2/placements=0。
+      `tools/patch_refill.py` **未改**（未定位到缺陷，不做猜测性修补）。
 
 ### W3 落地设计（1b 外置密钥多平台）—— 已完成调研，待实现
 
@@ -778,27 +780,51 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       动态 PIE 对照则真的加密（721 字节）。所以真问题不是"崩"，而是**"以为加了密、其实没有"**：跳过原本只打 `[*]`。
       现改为**醒目 `[!]` 告警 + 明说本产物不含该保护**（不改 fail-fast：跳过是合法结果、产物可用），
       并在 `tools/e2e_elf_image.sh` 增加一条**先红后绿**的用例钉住"告警必须显眼 + 产物必须与原生一致"。
-- [ ] **aarch64 的"加密范围内重定位"路径没有可运行用例**（`#376` 禁掉 aarch64 只读数据节加密）⇒ 该分支只有代码级审查。
-- [ ] **fail-closed `code=8`（重定位表地址两个窗口都不在）构造不出来**（改 `DT_RELA` 会让 ld.so 先 SIGSEGV，rc=139）⇒ **未验证**；
-      其余分支（code=1/2/3/4 与打包端 DT_RELASZ 越界）已独立构造并实测为 rc=7 + stderr 诊断。
-- [ ] **E5 的"载荷绝对 VA 覆盖"在真实 Go PIE 上候选为 0**（`[OK] E5 payload: 0 absolute VA(s), all covered by 7175 RELATIVE entries`）
-      ⇒ 只对**植入**的 VA 有区分力；承重的是 E5-bookkeeping 与 t10 的运行期断言。
-- [ ] **t1 的两条工具 CLI 负例（`-provider bogus` / 非 ASCII `-keyname`）不在 committed e2e 里**（由评审独立复现：exit 2 且不落文件）
-      ⇒ 建议补进 `tools/e2e.ps1` 的 1b 段。
-- [ ] **工具"自检失败就拒绝写出"分支没有故障注入**：证据 = 代码路径（`wrapNCrypt` 里 `os.WriteFile` 唯一且在两道校验之后）
-      + 两条可达的 CNG 前负例 + `internal/cred/payloadwrap_test.go` 的坏输入用例。要更强需注入 CNG 故障。
-- [ ] **C/Go 密钥名校验不对称**：C 侧只拒 `0x00`/`>127`（`stub/win/x64/vm_interp.c:1819-1822`），Go 侧拒 `<0x20`。
-      属 fail-closed（名字对不上只是找不到密钥），未修。
-- [ ] **探针留下一把不可导出的 CNG 密钥（名字 `keys`）**：`certutil` 需管理员 ⇒ 清理失败，**无害遗留**
-      （管理员执行 `certutil -delkey -csp "Microsoft Platform Crypto Provider" keys` 可清掉）。
-- [ ] **t11 的 e2e accounting 断言是防回归护栏**（"skip 不能计成 passed"），不是"密钥形态/应用器正确"的独立证据。
+- [x] **aarch64 的"加密范围内重定位"路径**（`STATUS #596`）：打包侧契约已进 committed e2e —— aarch64 PIE 夹具
+      `-enc-image-elf-pie-relocs` 打包后由 `check_elf_layout.py --selftest` **吃 aarch64 产物**（E1–E4 + E5 `wantBase=0` +
+      bookkeeping `4 in-range RELATIVE recorded` + 应用表 `@0x29860` + 全部 CAL），且**两种合法形状**（RX+RW 覆盖段 /
+      单 RWX 段 fallback）在**本机**各跑一遍并**按实测形状**声明（`t14` 修掉原先无条件打印的 "both shapes accepted"）；
+      **运行期那半**（`vm_reloc_fix` 的 `R_AARCH64_RELATIVE` 分支）**仍无 runnable 用例**：如实标注未验证、故意不断言
+      （`[INFO] aarch64: ONLY the packing half above is verified …`）；替代覆盖 = x86-64 `PIE_RELOCS` e2e（同一段架构无关代码）+ 代码审查。
+      禁止来源与"哪些字节不可加密"的书面结论在 `tools/check_elf_layout.py` docstring 的 `E5 coverage gap on aarch64` 一节。
+- [x] **fail-closed `code=8` 已可构造、可断言**（`STATUS #596`，`t2=9199ac0` + `t14=198f0f8`）：构造点在**动态段** ——
+      `DT_RELA := page_up(linkEnd)-32`、`DT_RELASZ := 24`、`DT_RELACOUNT := 0` ⇒ `exit=7` + stderr
+      `VMPELF relocfail code=8` / `type=0` / `rva=0`；未构造 ⇒ `rc=0/143/无 relocfail`。关键更正：判的是**目标自己的**
+      `DT_RELA/DT_RELASZ`，不是 payload 里那张 `VMPR` 表（整张清零仍 rc=0/143）。`t14` 起补丁器**不再硬依赖 `DT_RELACOUNT`**
+      （标签缺失时走 glibc 通用路径，仍 rc=7 + code=8）。其余分支（code=1/2/3/4）此前已独立构造。
+- [x] **E5 在真实 PIE 上的判别力**（`STATUS #596`，`t3=ec9b738`）：候选为 0 时不再报"赚到的 OK"，改**显式 INFO**并说清谁承重
+      （并用**逐字节复扫**证明"0"不是 8 字节跨步的假象）；新增 **E5(a2)** 读**产物自己**镜像表的 `wantBase`（ET_DYN 必须 0，
+      否则 ld.so 一旦重定位就 `VMPELF basemismatch`），构造缺陷 ⇒ `[FAIL] … wantBase=0x7F0000000000` + `rc=1`，
+      `--selftest` 增 `E5-imgtable` 校准。独立复算（`t6`）：植入 `0xDEADBEEF0000` ⇒ 门禁红；把植入值留在产物里运行 ⇒
+      `VMPELF basemismatch` + SIGILL ⇒ 该断言真承重。
+- [x] **两条工具 CLI 负例已进 committed e2e**（`STATUS #596`，`t1=56e289f`）：`tools/e2e.ps1` 第 13 步断言
+      `-provider bogus` 与非 ASCII `-keyname` 都 `exit=2` + **不落文件** + stdout 空 + stderr 非空；
+      校准：把期望改成 `0` ⇒ `E2EFAIL ext-key/neg-provider` 变红（独立复算见 `t5`）。
+- [x] **工具"自检失败就拒绝写出"分支已有故障注入**（`STATUS #595` + `#596`）：判据单源化到 `internal/cred.VerifyWrappedPayload`；
+      包内接缝 `payloadUnwrap` + `selfcheck_test.go`（tag `vmpcredselftest`）；`tools/e2e.ps1` 两条路把**证据接上电网** ——
+      `keywrap/selfcheck-refuse-write` 驱动 CLI 胶水（对照 rc=0 且落盘；注入 ⇒ rc=1 + **不落文件** + stderr 命中；开关=0 回生产行为；跑完不泄漏）、
+      `keywrap/selfcheck-predicate-test` 显式跑带 tag 的判据测试并断言**不是** `[no tests to run]`。
+      测试专用注入开关的取舍与边界**登记在 #595**，本条不重复。
+- [x] **C/Go 密钥名校验已对齐**（`STATUS #596`，`t1=56e289f`）：C 侧 `vm_ncrypt_keyname_ok` 拒 `<0x20`/`>0x7e`，
+      新增 `stub/win/x64/keyname_probe.c`（include **真** `vm_interp.c`，逐字节断言 256 个字节）由 e2e 编译运行；
+      Go 侧 `TestValidWrapKeyNameBoundaries`。两侧各自实测红：C 回旧规则 ⇒ 探针 `FAIL/exit=1`（34 字节偏离）；
+      Go 回旧规则 ⇒ 单测红。运行时把 `.ncrypt` 名字首字节改成 `0x1f` ⇒ 硬门 `0xC0DE0007`。
+- [x] **残留 CNG 密钥 `keys` 已删除**（`STATUS #596`，`t1=56e289f`，`t5` 独立复算）：`vmpkeywrap -cleanup -keyname keys`
+      走 `NCryptDeleteKey`，`CngKey.Exists` 1→0；缺键时打印**实际错误码** `NCryptOpenKey 0x80090016 (NTE_BAD_KEYSET)`。
+      **仍留（本轮未清理）**：`vmpx-payload-key-v1` / `vmpx-payload-key-sw-e2e` / `vmpx-payload-key-tpm-e2e`（e2e 每轮重建）
+      与历史探针 `vmpx-t7-selfcheck-probe` / `vmpx-cng-ACME` / `t-sw-1` / `t-tpm-1` / `t-auto-1`；
+      命令：先 `buildmpkeywrap.exe -cleanup -list` 看，再 `buildmpkeywrap.exe -cleanup -keyname <name> -provider <tpm|software|auto>`。
+      API 教训：`NCryptDeleteKey` 传 `NCRYPT_SILENT_FLAG` ⇒ `0x80090009 (NTE_INVALID_PARAMETER)`，必须 `dwFlags=0`。
+- [x] **e2e accounting 断言是防回归护栏**（"skip 不能计成 passed"），不是"密钥形态/应用器正确"的独立证据 —— 独立证据由
+      `t5`/`t6`/`t12` 的复算提供（`STATUS #596`）。
 
 ## 8. 稳定性观察（追加）
 
-- [ ] `E2E x86-64` 的 **`antidebug`** 用例出现过一次 flaky：本机门禁 run 里 `E2EFAIL antidebug:
-      a single BeingDebugged signal flipped the verdict`（同批 `e2e: 164 passed, 1 failed`），
-      单独重跑同一脚本即 `165 passed, 0 failed`；同一 e2e 在 CI 上始终绿。
-      本机当时无显式调试器进程 ⇒ 属环境性偶发；建议查该用例的"单一路径不应翻转判定"在非干净环境下的敏感性。
+- [x] **`antidebug` 的 flaky 找到根因并修掉**（`STATUS #596`，`t4=b54d1cd`）：根因是**测试代码缺陷** —— 逐字节比较整段 stdout，
+      而 `--args "bench check_key 4"` 的 `ticks=` 是 `clock()` 墙钟差（实测 plain `acc=782 ticks=0` / flagged `acc=782 ticks=1`，
+      `acc` 完全相同 ⇒ 判定位根本没触发，却报 "a single BeingDebugged signal flipped the verdict"）。修法：**字段级**剔除
+      `ticks=`（不丢整行，否则用例永远不可能红）+ e2e 改确定性 `--args "check_key 10"`。独立复算（`t5`，自写探针）：
+      ticks 单差 ⇒ rc=0、`acc` 真差 ⇒ rc=1、`--strict` 下 ticks 单差 ⇒ rc=1。限制：原失败日志没留档，复现的是**同机制**实例。
 
 - [ ] **win/arm64 续（诊断第 2 轮）**：先**校准打印器**（在更早、必然执行的阶段打标记，如镜像自解密入口）——
       当前"0 标记"有两种解释：真崩在 `vm_master()` 之前，或打印器本身不可达。校准后可区分，
@@ -1097,3 +1123,25 @@ EOF
 - 现状：`cmd/vmpbuild` 白名单**关闭**（构建即拒绝，fail-fast）；原先的两个 arm64 CI 作业已于 2026-09-30 从 `ci.yml` 移除（`STATUS #593`）。
 - 已交付（保留）：ARM64 `EntryHook`/TLS thunk、无 `.reloc` 建节、ARM64 I-cache 刷新改 `FlushInstructionCache`、测试假通过修复。
 - 重启入口：上文"最终操作卡（#581）"（蹦床记录 `x0`/`sp` + 按符号核对产物 RVA ↔ manifest 偏移）。
+
+## 「小而真」批次（`STATUS #596`）新登记 / 更新的待办
+
+- [ ] **M5：加密的**可执行**范围里含重定位 ⇒ 产物 SIGSEGV（amd64 也崩）**。实测（`t3` + `t12` 独立复现）：native `rc=0/143`；
+      `-enc-image-elf-pie` 打包 ⇒ `rc=139`；再加 `-enc-image-elf-pie-relocs`（范围内 1 条、应用表 RVA=0xE210 len=0x28）⇒ `rc=139`。
+      `t12` 的夹具：`.text` 内一个指针 + `-Wl,-z,notext`（readelf 有 TEXTREL，`R_X86_64_RELATIVE` r_offset `0x1288`
+      落在被加密的 X 范围内）。与架构无关、与是否 opt-in 无关 ⇒ 待查：打包端是否该**拒绝（fail-closed）**这种范围，或运行期应用器要能处理可执行段内槽位。
+- [ ] **K5：产物 `PT_DYNAMIC.p_offset` 陈旧**（单一来源，`t2` 只读核对）：`p_offset` 仍是 `0x3DB0`，而该段已被挪到 `p_offset 0x5000`
+      ⇒ 运行时 `.dynamic` 实际在文件 **`0x6DB0`**；`0x3DB0` 处留**陈旧副本**，**节头表 `sh_offset` 也未同步**。
+      对 ld.so 无害，但按 `p_offset` 定位动态段的工具会读到陈旧副本。
+- [ ] **R4：`check_elf_layout.py` 的 route(a) 判据**（`t8` 评审登记）：把任何 `vaddr == bss_va` 的 LOAD 当覆盖段 ⇒ `bssOff == 0`
+      的布局会**假红**（当前不可达：`inject.go` 的三段划分保证可写窗口在代码之后）。修法：覆盖段判据再加"它是 RW 且 filesz==memsz==bssSize"
+      或"不是 payload LOAD 本身"。
+- [ ] **N5：`tools/e2e_elf_image.sh` 的分类器内外层各维护一次"最后一个覆盖者"**（`t16` 按边界未改）：两处轻微不一致，
+      不影响当前产物，属 tidy-up。
+- [ ] **P3：`tools/e2e.ps1` 的 `Set-StrictMode` 作用于绿跑覆盖不到的失败分支**（`t17` 评审登记）：最坏只少一行诊断，
+      **不产生假绿/假红**；留待下次动该脚本时一并整理。
+      （P2 已由 `t18=6c422f6` 修：哨兵 `127` + `try/catch` —— 命令没启动 ⇒ `rc=1` + `[FAIL] gcc build failed`；
+      **t17 建议的"只加 `$LASTEXITCODE = 0` "实测修不掉行为**：不抛错但也不打 FAIL、rc 仍 0。）
+- [ ] **环境假红（非产品缺陷）记一笔**：共享工作区并发跑时 e2e 曾出现 `171/2`、`172/1`、`181/2` 这类计数，干净重跑即恢复；
+      `t12` 还遇到一次 aarch64 **默认**（Go 目标）用例的 `[MISMATCH]` + qemu SIGSEGV（跑在**私有**树、无并发，同树 3 次未复现，
+      当时 WSL 刚重启）。⇒ 报告数字必须注明工作区状态；共享树里他人未提交改动/并发 run 会污染结论（见 `#596` 的纪律一节）。
