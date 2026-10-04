@@ -10360,3 +10360,46 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
   CreateProcess 下与原生一致。ASLR 覆盖**不依赖** payload 站点数：镜像**自身**的重定位照样被加载器搬移，
   运行期的 delta 处理因此仍被真实跑到。
 - 本机复验：`e2e: 174 passed, 0 skipped, 0 failed`，并打印 `[*] ASLR: packer appended 7 … (NOT asserted)`。
+
+### 595. 取钥侧「自检失败 ⇒ 拒绝写出」的证据接上电网；登记测试专用注入开关
+
+**做了什么**
+- **判据层**（`internal/cred`）：`TestSelfCheckRefusesToWrite`（带 `vmpcredselftest` tag）用包内接缝 `payloadUnwrap`
+  喂「能解析、但解回来不一致/解不开/长度不对」的 blob，断言 `VerifyWrappedPayload` 拒绝。它**默认不跑**，因此
+  `tools/e2e.ps1` 新增 `keywrap/selfcheck-predicate-test`：显式带 tag 跑一次，并断言输出里出现
+  `--- PASS: TestSelfCheckRefusesToWrite`（**可靠信号只有这一条**；早先还写了个"没跑"的正则，但它用 `^` 匹配
+   多行输出、永不命中，已删除）。
+- **CLI 胶水层**：`tools/e2e.ps1` 新增 `keywrap/selfcheck-refuse-write`，驱动 `cmd/vmpkeywrap` 的
+  「自检失败 ⇒ `os.Exit(1)`」那段。四段断言：对照（不注入）`rc=0` 且输出文件**真的落盘**；注入 ⇒ `exit=1`、
+  **不落文件**、stderr 含「自检失败（拒绝写出）」；把开关设成 `0` ⇒ 必须回到生产行为（证明开关真被读到）；
+  跑完开关**不许泄漏**到后面的用例。
+- **注入点登记**（本条要求的那件事）：`VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL`
+  - 位置：`cmd/vmpkeywrap/main.go`（`selfCheckInjectEnv` 常量 + `wrapNCrypt` 里的注释）；
+  - 默认：**空**（未设 = 生产行为）；
+  - 触发条件：**只在值等于 `"1"`** 时把自检结果强制判为失败；
+  - 能力边界：**fail-closed only** —— 它只能让工具**更倾向拒绝写出**，**没有**任何"绕过自检照写"的路径；
+  - 不进 `--help`（环境变量不是命令行开关），仓库里**只有** `cmd/vmpkeywrap/main.go` 与 `tools/e2e.ps1` 引用它，
+    没有任何部署脚本/CI 配置会设置它；
+  - **它替代的方案为什么不可行**：改用「换一个密钥名去解已有的 `.ncrypt`」这种纯外部构造是不行的 ——
+    工具从不读取已存在的包裹文件，自检只针对**它自己刚做出来**的那份内容；而这条分支在生产里天然不可达
+    （自己加密、自己解，除非 CNG 坏了），所以在"不改生产代码"的前提下没有可用的注入面。
+
+**证据**
+- 本机：`tools/preflight.ps1` → `[+] preflight: OK`；`tools/e2e.ps1` → **183 passed, 0 skipped, 0 failed**
+  （此前的 178 是加入这几条断言之前的口径）。
+- 校准（每条都能失败）：删掉 `wrapNCrypt` 里的 `os.Exit(1)` ⇒ 注入那次 `rc=0` 且**写出了文件**，
+  e2e 的三条断言同时为假（用例变红）；删掉 `payloadSelfCheckError` 的一致性判据 ⇒ 判据测试红在
+  「解回来的主密钥与输入不一致，自检却放行了」。
+- 顺带修掉一个**真 bug**：`tools/e2e.ps1` 里 `$runTag`（"每轮唯一"的文件名后缀）在赋值**之前**就被引用，
+  静默变成空串 ⇒ 并发两轮会 `Remove-Item` 同一批文件名。现在赋值上移到打分计数器旁，并加了
+  `Set-StrictMode -Version Latest`（未定义变量当场抛）。实测：旧时序 + StrictMode ⇒
+  `The variable '$runTag' cannot be retrieved because it has not been set`（rc=1）；旧时序且无 StrictMode ⇒
+  实测文件名 `build/sc_ctrl_.ncrypt`（后缀为空）；修好后单轮产物为
+  `e2e_keywrap_selfcheck_ctrl_<8位随机>.ncrypt`。
+
+**未做项 / 边界**
+- `internal/cred` 的 `TestCredDoesNotDependOnCmd` 是**记录性**断言：它会跑，但按设计**不可能响** ——
+  `go list -deps` 只列可导入包，而 `cmd/...` 全是 `package main`（依赖反转本身被工具链拦死）。
+  只有将来 `cmd/` 下出现可导入包、且 cred 依赖了它，它才会如实报出来。
+- `tools/e2e_elf_image.sh` 的分类器在**外层与内层循环**里各维护一次"最后一个覆盖者"，两处轻微不一致
+  （不影响当前产物，属 tidy-up）：留给 ELF 侧后续处理。

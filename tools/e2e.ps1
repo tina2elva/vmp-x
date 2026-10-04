@@ -19,6 +19,9 @@
 # **互相杀**（STATUS #594；现场是 mt/mt_many 的 try1/try2 都 rc=-1 或 lenP=0）。别人的同名进程
 # 只提示、不动手 —— 顺便把"干扰源"变成可见信息。
 $ErrorActionPreference = "Continue"
+# 未定义变量必须**当场报错**，不许静默变 $null：N6 那次"每轮唯一的后缀"就是因为 $runTag 在赋值前被引用
+# 而静默变成空串（于是并发两轮会 Remove-Item 同一批文件名 ⇒ 假红）。Set-StrictMode 让这种时序错误立刻红。
+Set-StrictMode -Version Latest
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 foreach ($pn in @("target_vmp", "target")) {
     Get-Process -Name $pn -ErrorAction SilentlyContinue | ForEach-Object {
@@ -178,10 +181,14 @@ $failLines = @()
 # 未验证项（例如"本机没有 TPM，TPM 那条路没法验"）**必须单独记账**：混进 passed 就是让"通过数"说谎。
 # 每条 skip 都要带可见原因，摘要里与 passed/failed 一起打印；skip 不会让退出码变红。
 $skipLines = @()
-$skipLines = @()
 # 用例执行的**可见**证据：新增用例默认静默（只在失败时打印一行），跑完摘要看不出
 # 它到底跑没跑。这里给每条新用例印一行 ASCII 的 [*] 行（与 e2e 现有风格一致）。
 $script:caseLog = New-Object System.Collections.ArrayList
+# 每次运行的短后缀：单轮唯一的 scratch 文件名（refill 产物、self-check 用例的输出）。
+# **必须在这里（打分计数器旁边）赋值**：下面的用例引用它时早于 ext-key 块 —— 放在后面会
+# 静默变成空串（Set-StrictMode 之前就是这么骗过所有人的，见 N6 的校准记录）。
+$runTag = [guid]::NewGuid().ToString("N").Substring(0, 8)
+
 function CaseBanner([string]$caseId) { [void]$script:caseLog.Add($caseId) }
 
 # ---- ASLR 启动验收（CreateProcess 路径 = 走加载器的重定位） ----
@@ -608,10 +615,12 @@ if ($LASTEXITCODE -ne 0) {
             # 13d) F1：**驱动 CLI 胶水**的「自检失败 ⇒ 拒绝写出」（t7 的 F1：此前这条证据只是
             #      -tags vmpcredselftest 门控的单测，默认 go test ./... 与 CI 都不跑它；cmd/vmpkeywrap
             #      里那段 os.Exit(1) 胶水没有任何 committed 用例驱动）。
-            #      怎么做：同一把包裹密钥名，先包 "AAAA..." 造出一个**真实可解析**的 .ncrypt 文件；
-            #      再一次**换个不同的密钥名**去解它 —— 解包会成功（名字存在与否只影响找不找得到密钥），
-            #      但解回来的字节不是密码 A 而是密码 B ⇒ 自检必须拒绝写出。这是可控注入，不需要给
-            #      生产代码加任何开关（也不需要故障注入到 CNG 里）。
+            #      怎么注入：cmd/vmpkeywrap 里有一个**测试专用**注入点 —— 环境变量
+            #      VMPKEYWRAP_TEST_FORCE_SELFCHECK_FAIL（名字自带 TEST 前缀；不进 --help；工具本身不读任何配置；
+            #      只在值等于 "1" 时把自检结果强制判为失败；**只能强制失败，没有任何绕过自检的路径**。
+            #      机制见 cmd/vmpkeywrap/main.go 的 selfCheckInjectEnv 与 wrapNCrypt 注释；设置/还原/泄漏检查都在下面。
+            #      为什么不用"换一个密钥名去解"这种外部构造：对该工具不可行 —— 工具从不读取已存在的 .ncrypt，
+            #      自检只针对**它自己刚做出来**的那份内容，所以在不改生产代码的前提下没有可用的外部注入面。
             #      三个断言 + 一个对照：exit=1、**输出文件不存在**、stderr 含"自检失败（拒绝写出）"；
             #      对照（不注入）必须 rc=0 且文件存在 —— 否则"用例通过"可能只是工具从来不写文件。
             #      校准：把 wrapNCrypt 里那个 os.Exit(1) 删掉后重跑，本用例必须变红（实测见任务报告）。
@@ -671,11 +680,13 @@ if ($LASTEXITCODE -ne 0) {
             $scTestOut = (go test -tags vmpcredselftest -run TestSelfCheckRefusesToWrite -v ./internal/cred 2>&1 | Out-String)
             $scTestRc = $LASTEXITCODE
             $scRan = ($scTestOut -match "--- PASS: TestSelfCheckRefusesToWrite")
-            $scNotRun = ($scTestOut -match "^(no test files|ok\s+github.com/vmpx/vmp-x/internal/cred\s+\[[^\]]*no tests to run\])")
+            # 可靠信号只有一条：`--- PASS: TestSelfCheckRefusesToWrite` 必须出现。
+            # （此前还写了一个"没跑"的正则 $scNotRun，但它用 ^ 匹配多行输出、**永不命中** —— 真正兜住的是
+            #  $scRan；t15 实测该守卫恒为 False，所以这里删掉它，别再让注释把功劳记在死守卫上。）
             $scTestTail = ($scTestOut -replace '\s+', ' ').Trim()
             if ($scTestTail.Length -gt 300) { $scTestTail = $scTestTail.Substring($scTestTail.Length - 300) }
-            if (($scTestRc -eq 0) -and $scRan -and (-not $scNotRun)) { $pass++ }
-            else { $fail++; $failLines += "E2EFAIL keywrap/selfcheck-predicate-test: the tagged predicate test did not actually run and pass (rc=" + $scTestRc + " ran=" + $scRan + " noTests=" + $scNotRun + "): " + $scTestTail }
+            if (($scTestRc -eq 0) -and $scRan) { $pass++ }
+            else { $fail++; $failLines += "E2EFAIL keywrap/selfcheck-predicate-test: the tagged predicate test did not report --- PASS (rc=" + $scTestRc + " ran=" + $scRan + "): " + $scTestTail }
             # 14) C 侧的密钥名规则（A1）：编译**真的** stub/win/x64/vm_interp.c 并调用它的
             #     vm_ncrypt_keyname_ok()。keyname_probe.c include 的是那份源文件本体（不是副本），
             #     所以改坏 vm_interp.c 里那条规则会让这个探针红；Go 侧的镜像断言在
@@ -751,9 +762,6 @@ if ($LASTEXITCODE -ne 0) {
     if ((($rf2.Code -band 0xFFFFFFFF) -eq 0xC0DE0007) -and ($rf2.Out -eq "")) { $pass++ }
     else { $fail++; $failLines += ("E2EFAIL runtime-license/forge: code=0x{0:X8} out=[{1}]" -f ($rf2.Code -band 0xFFFFFFFF), $rf2.Out.Trim()) }
 }
-# Per-run suffix for playwright-free scratch artifacts (see the refill case): two e2e runs on
-# two checkouts used to share build\target_neimg_refill.exe.
-$runTag = [guid]::NewGuid().ToString("N").Substring(0, 8)
 
 # ---- flake-attribution helpers (task C: the two one-off flakes, refill + antidebug) ----
 # Both of those cases used to end in a bare 'python <tool> failed' line: the tool printed the

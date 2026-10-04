@@ -150,10 +150,18 @@ func TestValidWrapKeyNameBoundaries(t *testing.T) {
 	}
 }
 
-// F4(b2)：把"internal/cred **不依赖** cmd/vmpkeywrap（依赖方向是单向的）"这句话变成**可执行**的。
-// 为什么值得钉：包装/自检的判据在这里，而 CLI 只是它的调用方 —— 一旦 cred 反过来 import cmd，
-// 就会形成 main 包与库的循环依赖（Go 会直接拒绝编译），也会把"判据只有一份"这件事说反。
-// 这里用 go list 的依赖图断言，而不是靠注释里的说法。
+// 依赖方向的**记录性**断言（t15 的 N3：明确它是记录，不是护栏）。
+//
+// 事实：本条**会**在默认 go test ./... 里跑，但按设计**不可能响** —— `go list -deps` 的输出里只会出现
+// 可导入的包，而 `github.com/vmpx/vmp-x/cmd/...` 全都是 `package main`（不可导入）。
+// 所以更准确的说法是：
+//
+//	· cred→cmd 的依赖反转**由工具链本身拦死**（main 包不能被 import），不需要这条断言来兜；
+//	· 这条断言真正会响的条件只有一个：将来 cmd/ 下出现一个**可导入的包**、且 cred 依赖了它 ——
+//	  那时它会如实报出来（同时那种依赖也确实该被质疑）。
+//
+// 保留它是因为它零成本、且把"依赖方向是单向的"这句话从注释里的说法变成了可复核的输出；
+// 但**不要**把它当作"拦得住依赖反转"的护栏。
 func TestCredDoesNotDependOnCmd(t *testing.T) {
 	cmd := exec.Command("go", "list", "-deps", "github.com/vmpx/vmp-x/internal/cred")
 	out, err := cmd.Output()
