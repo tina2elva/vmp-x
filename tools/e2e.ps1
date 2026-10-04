@@ -115,14 +115,22 @@ function Run-FileOnce([string]$exe, [string[]]$a, [int]$sec) {
 }
 
 Write-Output "[*] building..."
-& gcc -O2 -o build/target.exe testdata/target.c
+# ---- bootstrap native builds: "did the command even start?" must not be confused with "exit code 0" ----
+# Set-StrictMode 让**未初始化的** $LASTEXITCODE 直接抛（而 -File 脚本里的抛不会终止脚本，只中断该语句），
+# 于是 [FAIL] + exit 1 这条错误路径会被**跳过**、脚本带着陈旧/缺失的产物继续跑（t17 的 P2）。
+# 只把 $LASTEXITCODE 先置 0 不行：那会把"命令根本没启动"静默当成成功（本机实测：仍然走到脚本末尾、rc=0）。
+# 这里用**哨兵**：调用前置一个非 0 值，命令没启动就留下它（⇒ 127），真正跑起来的命令会覆盖成真实退出码。
+# try/catch 只是让 StrictMode 的抛错可读（打一行 [!]），不改变判定。
+$LASTEXITCODE = 127
+try { & gcc -O2 -o build/target.exe testdata/target.c } catch { Write-Host ("[!] " + $_.Exception.Message) }
 if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] gcc build failed"; exit 1 }
 # 预编译的测试宿主也必须一起刷新，否则会拿到旧二进制得到误导性结果
 & gcc -O2 -Wall -I stub/win/x64 -o build/runbc.exe stub/win/x64/blob_probe.c
 & gcc -O2 -Wall -I stub/win/x64 -o build/crypto_probe.exe stub/win/x64/crypto_probe.c stub/win/x64/vm_crypto.c
 & go build -o build/vmpbuild.exe ./cmd/vmpbuild
 & go build -o build/vmpack.exe ./cmd/vmpack
-& .\build\vmpbuild.exe -src stub\win\x64 -out build\vm_interp.bin -manifest build\vm_interp.json -entry vm_entry | Out-Null
+$LASTEXITCODE = 127
+try { & .\build\vmpbuild.exe -src stub\win\x64 -out build\vm_interp.bin -manifest build\vm_interp.json -entry vm_entry | Out-Null } catch { Write-Host ("[!] " + $_.Exception.Message) }
 if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] blob build failed (vmpbuild)"; exit 1 }
 
 Write-Output "[*] packing 24 functions..."
@@ -674,8 +682,7 @@ if ($LASTEXITCODE -ne 0) {
 
             # 13e) F1(a)：把**判据层**的可失败证明也接上电网。TestSelfCheckRefusesToWrite 带
             #      vmpcredselftest tag（默认 go test ./... 不会跑到它），所以这里显式跑一次；
-            #      **关键**：还要断言它真的执行了 —— 用一个跟默认测试集重合的标签表达"没跑"，
-            #      于是"压根没编进来"（输出里没有 RUN）会当场判红，而不是冒充通过。
+            #      并且必须断言它**真的执行了**（可靠信号见下面那行注释：`--- PASS:` 必须出现），
             CaseBanner "keywrap/selfcheck-predicate-test"
             $scTestOut = (go test -tags vmpcredselftest -run TestSelfCheckRefusesToWrite -v ./internal/cred 2>&1 | Out-String)
             $scTestRc = $LASTEXITCODE
