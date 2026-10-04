@@ -19,7 +19,7 @@
 
 ## 完成一项的验收（缺一不可，全部要有证据）
 1. `powershell -NoProfile -ExecutionPolicy Bypass -File tools/preflight.ps1` → `[+] preflight: OK`；
-2. `tools/gates.ps1` → `total 15 gates, 0 failed, 0 skipped`（e2e 174/0、dll 7/0、arm64 客户机 OK、Linux 半场经 WSL）；
+2. `tools/gates.ps1` → `total 15 gates, 0 failed, 0 skipped`（e2e 183/0、dll 7/0、arm64 客户机 OK、Linux 半场经 WSL）；
    **跳过的 step 单独记账**（退出码 77 约定）—— 缺 WSL/i686 的机器上会打印 `N skipped` 与醒目提示，不再混进 `[OK]`；
 3. CI **三个作业全绿**（`windows-amd64` / `linux-amd64` / `linux-arm64`；`gh run list` 取 run 号）；
 4. `docs/STATUS.md` 追加一条：做了什么、证据（含 run 号与命令）、**未做项**。
