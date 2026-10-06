@@ -1139,7 +1139,11 @@ EOF
       而 textrel 产物在载荷入口处的映射是**一段** `0x…9000-0x…3000 (a000, off 0x6000) r-xp`，正好等于**载荷 RX 段页对齐后的 memsz 范围**、把覆盖段的页也盖住。
       与「glibc **只在 TEXTREL 路径**按 PT_LOAD 重新 `mprotect` 回原保护」吻合：非 textrel 产物从不重设保护 ⇒ 内核"后映射者胜"的 `rw` 保留；textrel 产物重设保护时，载荷 RX 段的保护落到覆盖段的页上 ⇒ 可写窗口变只读。
       **拟修（已修正）**：**窗口不在载荷尾部**（实测 `bssOff 0x8000 + bssSize 0x1000 = 0x9000`，而 `sectionSize = 0x9203` ⇒ 尾部还有 `0x203` 字节的表），所以单段 RX 止于 `bssOff` **不够** ——
-      需要**三段**（RX 前缀 + RW 窗口 + 尾部 RX），即要**两个可复用槽位**；只剩 1 个槽时走现有的 RWX 回退（整段可写）⇒ **三段布局与回退路径相互影响**。
+      需要**三段**（RX 前缀 + RW 窗口 + **R+X 尾部**），即要**两个可复用槽位**；只剩 1 个槽时走现有的 RWX 回退（整段可写）⇒ **三段布局与回退路径相互影响**。
+      **2026-10-04 实测（已整体回退，设计已验证、实现还差一轮）**：三段版让目标用例**真的修好**（`textrel: native=143/packed=143 MATCH`、`normal` 同样 MATCH、`sum-to` 两边 55）；
+      但先试的**两段版是错的**（尾部含**可执行蹦床**，并进 RW 段 ⇒ `normal` 与 `textrel` 都立刻 `rc=139`）；三段版另让**三步回归**：
+      static PIE「must behave like native」、一次 `pack (default -enc-image-elf)` 失败、`E3 15376/36864 blob bytes differ`。
+      下一轮要点：① `!m5Split` 路径**一律整段 RWX**（我的实现里它仍会退回重叠形状 —— 新门禁不变量**当场抓到了 5 个产物**）；② 处理那三步回归；③ 门禁不变量与打包端修复**同一轮**落地。
       **爆炸半径（必须同一轮改完并端到端验证）**：`internal/inject/elf.go` 的载荷段发射、`tools/check_elf_layout.py` 的 E2
       （现断言 `payload LOAD filesz == report.sectionSize` 且「唯一允许的 VA 重叠就是覆盖段」）、`tools/e2e_elf_image.sh` 的形状期望、运行期对窗口地址的假设。
       **复现配方与现场证据见 `STATUS #597`**。

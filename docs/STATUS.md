@@ -10554,6 +10554,17 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
   实测 `bssOff(0x8000) + bssSize(0x1000) = 0x9000`，而 `sectionSize = 0x9203` ⇒ **窗口后面还有 `0x203` 字节**（镜像/应用表）⇒ 单段 RX 无法只避开窗口。
   正确形态是**三段**：RX 前缀 `[0, bssOff)` + RW 窗口 `[bssOff, bssOff+bssSize)` + RX 尾部 `[…, sectionSize)`；这需要**两个可复用程序头槽位**，
   而只有 1 个槽时要走现有的 **RWX 回退**（整段可写）⇒ **三段布局必须与回退路径一起设计**。
+- **2026-10-04 实现尝试（已整体回退；设计被验证，实现还差一轮）**：
+  - **设计被验证**：三段版（RX 前缀 `[0,bssOff)` + RW 窗口 + **R+X 尾部**）落地后，目标用例**真的修好了** ——
+    `textrel: native=143 / packed=143 (rc=0) ⇒ MATCH`、`normal` 同样 MATCH、`sum-to 10` 两边都是 `55`（修复前 textrel 是 `rc=139`）。
+  - **两段版是错的**（先试的简化）：把尾部并进 RW 段后**两个产物都立刻崩**（`normal` 与 `textrel` 都 `rc=139`、无输出）⇒ 尾部不只是只读表，**装着可执行蹦床**，必须 R+X。
+  - **但三段版让另三步回归** ⇒ 不可直接落地：`a skipped-over static PIE product must still behave like native`（`#594` 那个 static PIE 用例）、一次 `pack (default -enc-image-elf)` 失败、
+    `E3 15376 of 36864 blob byte(s) differ inside the payload`（载荷文件布局被改动波及）。
+  - **新门禁不变量本身是对的、而且立刻抓到了 5 个产物**（`[FAIL] E2 LOAD at vaddr=… flags=0x5 intersects the writable window …`）——
+    它同时暴露了实现里的一个洞：`m5Split` 为假、但**恰好还有一个空槽**时，代码仍会退回**老的重叠形状**（正是 M5 的成因）。
+  - ⇒ 下一轮必须：① `!m5Split` 路径**一律整段 RWX**（绝不再产生重叠形状）；② 处理上面三步回归（static PIE / pack 失败 / E3 载荷布局）；③ **门禁不变量与打包端修复同一轮落地**（它单独落地会让现有产物全红）。
+  - 本轮**全部回退**（`git checkout -- internal/load/elf/elf.go internal/inject/elf.go tools/check_elf_layout.py`），回退后 `tools/wsl_linux.sh all` = `[OK] wsl_linux: every step passed`（0 个 `[FAIL]`），工作区干净。
+
 - **爆炸半径（下一批，同一轮端到端验证）**：`internal/load/elf`（`AddLoadSegmentFromNote` 需支持"只映射前缀" + 尾部再起一段）、`internal/inject/elf.go`、
   门禁 `tools/check_elf_layout.py` 的 E1（"唯一允许的 VA 重叠是覆盖段"→ 三段的相邻/顺序约束）与 E2（载荷 LOAD `filesz` 的期望）、`tools/e2e_elf_image.sh` 的形状分类器、
   以及"只 1 个槽"的 RWX 回退路径（CI 的 aarch64 夹具就走这条）。
