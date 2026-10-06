@@ -1130,9 +1130,21 @@ EOF
       `-enc-image-elf-pie` 打包 ⇒ `rc=139`；再加 `-enc-image-elf-pie-relocs`（范围内 1 条、应用表 RVA=0xE210 len=0x28）⇒ `rc=139`。
       `t12` 的夹具：`.text` 内一个指针 + `-Wl,-z,notext`（readelf 有 TEXTREL，`R_X86_64_RELATIVE` r_offset `0x1288`
       落在被加密的 X 范围内）。与架构无关、与是否 opt-in 无关 ⇒ 待查：打包端是否该**拒绝（fail-closed）**这种范围，或运行期应用器要能处理可执行段内槽位。
-- [ ] **K5：产物 `PT_DYNAMIC.p_offset` 陈旧**（单一来源，`t2` 只读核对）：`p_offset` 仍是 `0x3DB0`，而该段已被挪到 `p_offset 0x5000`
-      ⇒ 运行时 `.dynamic` 实际在文件 **`0x6DB0`**；`0x3DB0` 处留**陈旧副本**，**节头表 `sh_offset` 也未同步**。
-      对 ld.so 无害，但按 `p_offset` 定位动态段的工具会读到陈旧副本。
+      **2026-10-04 根因定位（队长实测，玩具夹具 100% 复现）：与「加密」无关** —— **plain 打包（不加 `-enc-image-elf-pie`）同样 `rc=139`**。
+      崩溃现场：解释器在写**自己的可写窗口**（`bssOff` 对应的运行期页，实测落点偏移 `0xD038`）时 SIGSEGV，而那一页被映射成 **`r-xp`**：
+      内核把载荷的 RX 段与 RW 覆盖段**合成成一段** `[0x5000,0xF000)` 的 `r-x` 映射（「覆盖段在程序头表里靠后、后映射者胜」在这份二进制上没生效）。
+      对照实验（同几何、去掉 TEXTREL 的普通 PIE 产物）一切正常：RX 映射止于 `0xD000`、覆盖段是 `rw-p`、`rc=0`。
+      ⇒ **脆弱点是载荷几何**：RX 段的 `filesz` 覆盖了可写窗口所在的那一页。**拟修**：RX 段止于 `bssOff`、可写窗口紧跟其后（两段**相邻不重叠**）。
+      **爆炸半径（必须同一轮改完并端到端验证）**：`internal/inject/elf.go` 的载荷段发射、`tools/check_elf_layout.py` 的 E2
+      （现断言 `payload LOAD filesz == report.sectionSize` 且「唯一允许的 VA 重叠就是覆盖段」）、`tools/e2e_elf_image.sh` 的形状期望、运行期对窗口地址的假设。
+      **复现配方与现场证据见 `STATUS #597`**。
+- [x] **K5 重新定性：不是缺陷（2026-10-04 队长实测）。** 原登记说「产物 `PT_DYNAMIC.p_offset` 陈旧」——实测确有其事（非加密产物：`DYNAMIC off=0x2db8` 而段已搬到 `0x4db8`），
+      但**没看到它为什么在那儿**：(a) 搬移前那份字节**内容相同** ⇒ 按 `p_offset` 读到的是**正确的明文**；(b) 对 `-enc-image-elf-pie*` 产物，
+      程序头**必须**指向明文副本 —— 原始镜像（含 `.dynamic`）是以**密文**存在文件尾的；把 `p_offset` 修正进 LOAD ⇒ 指进**密文**，
+      门禁/工具再也读不到动态表（实测：`[FAIL] E5 ET_DYN product has no readable PT_DYNAMIC relocation table`，直接读该偏移得 `tag=0xb17e265388143d6c`；
+      `readelf -d` 仍正常，因为它走**节头** `.dynamic`）；(c) glibc 读动态表走 `p_vaddr` ⇒ 两种情形都不受影响。
+      ⇒ 队长那版「搬移后同步其它程序头 + E6 门禁（每个非 LOAD 程序头必须落在某个 PT_LOAD 内）」**已整体回退**，回退后 `tools/wsl_linux.sh all` 立即恢复 `[OK] wsl_linux: every step passed`。
+      **教训**：「程序头必须落在某个 LOAD 内」这条**看起来显然**的不变量，在本仓库的**镜像加密**产物上是**假的**（那些 LOAD 里装的是密文）—— 与上一批的形状依赖同族；动主干前先量。
 - [ ] **R4：`check_elf_layout.py` 的 route(a) 判据**（`t8` 评审登记）：把任何 `vaddr == bss_va` 的 LOAD 当覆盖段 ⇒ `bssOff == 0`
       的布局会**假红**（当前不可达：`inject.go` 的三段划分保证可写窗口在代码之后）。修法：覆盖段判据再加"它是 RW 且 filesz==memsz==bssSize"
       或"不是 payload LOAD 本身"。

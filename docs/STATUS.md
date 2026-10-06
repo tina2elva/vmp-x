@@ -10512,3 +10512,34 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
   `unsupported version 257 of Verneed record`、未构造的对照 `rc=127` —— 是**选错标签**，不是产品问题。
 - **`AGENTS.md` 的验收数字已过期**（它写 `e2e 174`，现为 `183`）—— 按本轮契约**不动 `AGENTS.md`**，由队长维护。
 
+### 597. M5 根因定位（可写窗口被 RX 段吃掉的映射竞争）+ K5 重新定性（不是缺陷；一次错误修复已回退）
+
+**1. M5（「加密可执行范围含重定位 ⇒ 产物 SIGSEGV」）根因定位：与加密无关。**
+
+- 复现（WSL / amd64，玩具夹具）：把指针放进 `.text` + `gcc -fPIE -pie -O1 -Wl,-z,notext`（`readelf` 有 `TEXTREL`）⇒ native `143`/`rc=0`；
+  用 `stub/linux/amd64` 的 blob 打包，**不加** `-enc-image-elf-pie`（纯 plain）⇒ **`rc=139`**。⇒ 与加密、与重定位应用器**都无关**。
+- 崩溃现场（gdb）：`SIGSEGV`，`rip` 位于载荷 RX 区（文件偏移 `0x6b78`），失败指令 `mov %rax,0x64b9(%rip)` ⇒ 目标运行期地址偏移 **`0xD038`**，
+  即**解释器在写自己的可写窗口**（`bssOff` 对应的页）时崩 —— 而那一页是 **`r-xp`**。
+- 映射证据（textrel 产物）：内核给出**一段** `…9000-…3000 (0xa000, offset 0x6000) r-xp`，覆盖 va `[0x5000,0xF000)`（含窗口 `0xD000`）；
+  **覆盖段的 `rw-p` 映射不存在**。
+- **对照实验**（同几何、去掉 TEXTREL 的普通 PIE 产物）：一切正常 —— `[0x5000,0xD000) r-xp` + 覆盖段 `rw-p`、`rc=0`。
+- ⇒ 根因：**载荷几何把可写窗口放在 RX 段的 vaddr 范围之内**，依赖「覆盖段在程序头表里靠后 ⇒ 后映射者胜」拿到可写；这份二进制上内核把两者合成了一段 `r-x`。
+- **拟修 + 爆炸半径（下一批，属打包端/门禁/验收一致性改动，必须同一轮端到端验证）**：RX 段 `filesz` 止于 `bssOff`、窗口紧跟其后（相邻不重叠）；
+  需同时改 `internal/inject/elf.go`、`tools/check_elf_layout.py` 的 E2（现断言 `payload LOAD filesz == report.sectionSize` 且「唯一允许的 VA 重叠就是覆盖段」）、
+  `tools/e2e_elf_image.sh` 的形状期望、运行期对窗口地址的假设。
+
+**2. K5 重新定性：不是缺陷；我的修复更坏，已回退。**
+
+- 现象确有其事（非加密产物：`PT_DYNAMIC off=0x2db8`，而它所在段已被 `MakeBssFileBacked` 搬到 `0x4db8`），但**那是故意的**：
+  搬移前那份字节**内容相同** ⇒ 按 `p_offset` 读到的是**正确的明文**；对 `-enc-image-elf-pie*` 产物，程序头**必须**指向明文副本 ——
+  原始镜像（含 `.dynamic`）是以**密文**存在文件尾的。
+- 我按「搬移后同步其它程序头」改了 `internal/load/elf/elf.go`，并加了门禁 **E6**（每个有文件内容的非 LOAD 程序头必须落在某个 PT_LOAD 内）⇒ **立刻在 aarch64 上红**：
+  `[FAIL] E5 ET_DYN product has no readable PT_DYNAMIC relocation table`（修正后的 `p_offset` 指进密文；直接读得 `tag=0xb17e265388143d6c`）。
+  `readelf -d` 之所以仍正常，是因为它走**节头** `.dynamic`（`sh_offset`，未被改动）。
+- ⇒ **两处改动整体回退**（`git checkout -- internal/load/elf/elf.go tools/check_elf_layout.py`），回退后 `tools/wsl_linux.sh all` **立即恢复** `[OK] wsl_linux: every step passed`；
+  工作区干净、无半成品：**本轮没有代码改动落地**。
+- **教训（与上一批形状依赖同族）**：「程序头必须落在某个 PT_LOAD 内」这条**看起来显然**的不变量，在本仓库的**镜像加密**产物上是**假的**
+  （那些 LOAD 里装的是**密文**，程序头指**明文副本**才是对的）。⇒ 动主干前先用真实产物量一遍；看起来更干净的改写可能把工具的读取路径从明文换成密文。
+
+**验收/证据**：回退后 `tools/wsl_linux.sh all` = `[OK] wsl_linux: every step passed`（无 `[FAIL]`）；根因与对照的实验输出（gdb `rip`/指令/映射、两产物映射差异、`readelf -lW` 程序头前后对比）均在本条正文中。
+
