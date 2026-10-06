@@ -10543,3 +10543,18 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
 
 **验收/证据**：回退后 `tools/wsl_linux.sh all` = `[OK] wsl_linux: every step passed`（无 `[FAIL]`）；根因与对照的实验输出（gdb `rip`/指令/映射、两产物映射差异、`readelf -lW` 程序头前后对比）均在本条正文中。
 
+**追加（同日，机制查清 + 拟修修正；仍未动主干）**
+
+- **机制**：载荷几何的脆弱点确认，并把责任从"内核"定到 **glibc 只在 TEXTREL 路径上的保护恢复**：
+  - 两份产物的**载荷/覆盖段程序头逐字段相同**（`[7] LOAD va=0x5000 off=0x6000 filesz=0x917d memsz=0x917d flags=5(RX)`；`[8] LOAD va=0xd000 off=0xe000 filesz=0x1000 memsz=0x1000 flags=6(RW)`）⇒ 差异**不在 ELF 头**。
+  - textrel 产物在载荷入口处的映射是**一段** `0x…9000-0x…3000 (0xa000, offset 0x6000) r-xp` —— 正好是**载荷 RX 段 `memsz` 页对齐后的范围** `[0x5000,0xF000)`，把覆盖段的页（`0xD000`）也盖住；覆盖段的 `rw-p` 不存在。
+  - ⇒ 与「glibc **仅在有 TEXTREL 时**按 PT_LOAD 重新 `mprotect` 回原保护」吻合：非 textrel 产物从不重设保护 ⇒ 内核"后映射者胜"的 `rw` 保留（这就是同几何对照产物正常的原因）；
+    textrel 产物重设保护时，**载荷 RX 段的保护覆盖到了覆盖段的页** ⇒ 解释器的可写窗口变只读 ⇒ 第一次写就 SIGSEGV。
+- **拟修修正（重要）**：`#597` 正文原先写"RX 段 `filesz` 止于 `bssOff`、窗口紧跟其后"—— **不够**：
+  实测 `bssOff(0x8000) + bssSize(0x1000) = 0x9000`，而 `sectionSize = 0x9203` ⇒ **窗口后面还有 `0x203` 字节**（镜像/应用表）⇒ 单段 RX 无法只避开窗口。
+  正确形态是**三段**：RX 前缀 `[0, bssOff)` + RW 窗口 `[bssOff, bssOff+bssSize)` + RX 尾部 `[…, sectionSize)`；这需要**两个可复用程序头槽位**，
+  而只有 1 个槽时要走现有的 **RWX 回退**（整段可写）⇒ **三段布局必须与回退路径一起设计**。
+- **爆炸半径（下一批，同一轮端到端验证）**：`internal/load/elf`（`AddLoadSegmentFromNote` 需支持"只映射前缀" + 尾部再起一段）、`internal/inject/elf.go`、
+  门禁 `tools/check_elf_layout.py` 的 E1（"唯一允许的 VA 重叠是覆盖段"→ 三段的相邻/顺序约束）与 E2（载荷 LOAD `filesz` 的期望）、`tools/e2e_elf_image.sh` 的形状分类器、
+  以及"只 1 个槽"的 RWX 回退路径（CI 的 aarch64 夹具就走这条）。
+
