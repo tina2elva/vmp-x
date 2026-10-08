@@ -1188,3 +1188,11 @@ EOF
       `1a238fe` 在同一夹具上给出**相同**的恒定值。夹具/复现：`.text` 内指针 + `gcc -fPIE -pie -O1 -Wl,-z,notext`，
       两个循环函数各跑 `2×10⁶ ~ 10⁷` 次。**待查**：解释器的步数预算 / 循环计数器位宽 / lift 对循环的后端处理 ——
       本轮未定位机制；与 M5 的载荷几何无关。
+
+      ⚠️ **队长补测（`STATUS #599`，release blob 下复现并细化本节表述）**：不是「结果与 n 无关的恒定值」那么简单 ——
+      计数的循环（`s += i; c++` 与 `s += 1`）在 `n≥5e6` **恒 `5,000,000`**（且 `n=4,999,999` 时返回 `5,000,000 > n`），
+      **空体循环**在 `n=2e7` 返回 **`6,666,666` ≈ n/3**，`s = (s+1) & 0xFFFF` **恒 `2,303`** ⇒ 更像**归纳变量/行程语义被改错**（不同函数形状给不同倍数）。
+      **已排除 `VM_STEP_BUDGET`**：它在 `#ifndef VM_RELEASE` 内，而 `cmd/vmpbuild:738` 固定 `-DVM_RELEASE=1` ⇒ 这是 **release 路径的真实缺陷**。
+      失败形态是**静默错值**（产物正常退出并把错值当返回值，不崩也不走硬门）⇒ 定位后**必须让它变响亮**（`__builtin_trap()` / 硬门）。
+      复现：`build/loop2.c` → `vmpbuild -src stub/linux/amd64` → `vmpack -exe … -func sumTo -func countIters -func lastI -func sumSmall -func sumAddOne`；
+      诊断用 `vmpack -v`（打印 IR）与 `-dumpbytecode <dir>`（转储明文字节码）。线索：`sumTo` 的 IR 初始化是 `MOV_RI w=32`、循环体是 `w=64`。
