@@ -784,6 +784,8 @@ LoadLibrary/PEB）整段守卫掉，并给出 Linux 版或桩（桩要能正确�
       `-enc-image-elf-pie-relocs` 打包后由 `check_elf_layout.py --selftest` **吃 aarch64 产物**（E1–E4 + E5 `wantBase=0` +
       bookkeeping `4 in-range RELATIVE recorded` + 应用表 `@0x29860` + 全部 CAL），且**两种合法形状**（RX+RW 覆盖段 /
       单 RWX 段 fallback）在**本机**各跑一遍并**按实测形状**声明（`t14` 修掉原先无条件打印的 "both shapes accepted"）；
+      ⚠️ **M5 之后这套「两形状」词汇已作废**（`STATUS #598`）：覆盖段形状现在是 **DEFECT**，合法档位是
+      (1) 三段相邻 / (2) 前缀只读 + 一段 W+X「窗口+尾部」/ (3) 整段 W+X / (0) 无窗口；分类器与断言都按新词汇（见 `#598` 补记 §1/§2）。
       **运行期那半**（`vm_reloc_fix` 的 `R_AARCH64_RELATIVE` 分支）**仍无 runnable 用例**：如实标注未验证、故意不断言
       （`[INFO] aarch64: ONLY the packing half above is verified …`）；替代覆盖 = x86-64 `PIE_RELOCS` e2e（同一段架构无关代码）+ 代码审查。
       禁止来源与"哪些字节不可加密"的书面结论在 `tools/check_elf_layout.py` docstring 的 `E5 coverage gap on aarch64` 一节。
@@ -1129,8 +1131,13 @@ EOF
 - [x] **M5：加密的**可执行**范围里含重定位 ⇒ 产物 SIGSEGV（amd64 也崩）** —— **已落地（`STATUS #598`）**：
       载荷改成**相邻不重叠**的三段（RX 前缀 + RW 窗口 + R+X 尾部；槽位 2 时前缀只读 + 一段 W+X「窗口+尾部」；
       槽位 1 时整段 W+X）⇒ 老形状「RX 段盖住可写窗口 + 靠后映射者胜」被彻底移除；门禁把这条件做成
-      **任何非可写 LOAD 都不得与可写窗口相交**（E1 直接断言 + E2 独立不变量），并把 `report.payloadWXFallback` 与程序头对账
-      ⇒ **槽位足够的目标不得走回退**在 CI 上可断言。实测：textrel 夹具 `native=143 / packed=143 (rc=0)`（修前 `rc=139`）、
+      **任何非可写 LOAD 都不得与可写窗口相交**（E1 直接断言 + E2 独立不变量），并把 `report.payloadWXFallback` 与程序头对账。
+      **「槽位足够的目标不得走回退」由 `tools/e2e_elf_image.sh` 的 `形状账 ②` 承担**：`payload_slots()` 在**源目标**上复刻
+      `SparePhdrSlots`，`assert_tier_matches_slots()` 断言 `tier == f(源目标槽位)`（覆盖默认 / PIE / PIE_RELOCS / aarch64）；
+      只做「报告 ↔ 程序头」对账抓不到打包端**整体**降级（`t7/G2` 实测，`t9` 复核）。三档实测（`t4` 在 `5010163` 上亲测，
+      **真 TEXTREL 二进制**、各 16 组调用与原生逐字节一致）：`S=4` ⇒ 三段（`payloadWXFallback=False`）、`S=2` ⇒ 前缀只读 +
+      一段 W+X「窗口+尾部」（`True`）、`S=1` ⇒ 整段 W+X（`True`）；Go 的 ET_EXEC 目标是 **2 槽 ⇒ (2)**（`e_phnum=6`，
+      可复用 = `PT_PHDR[0]` + `PT_NOTE[1]`）。实测：textrel 夹具 `native=143 / packed=143 (rc=0)`（修前 `rc=139`）、
       普通 PIE MATCH、输出逐字节一致。复核记录：t5 的 E4 校准「静默 no-op ⇒ 醒目 SKIP」保留，但 t5 那句
       「ET_EXEC 守卫是死代码 / 假报 not caught」**经复核不实**（ET_EXEC 上该守卫本来就有效），且 t5 新加的
       `imgSections` 支**属过度 SKIP，已按 F1 撤回**。
@@ -1174,3 +1181,10 @@ EOF
 - [ ] **环境假红（非产品缺陷）记一笔**：共享工作区并发跑时 e2e 曾出现 `171/2`、`172/1`、`181/2` 这类计数，干净重跑即恢复；
       `t12` 还遇到一次 aarch64 **默认**（Go 目标）用例的 `[MISMATCH]` + qemu SIGSEGV（跑在**私有**树、无并发，同树 3 次未复现，
       当时 WSL 刚重启）。⇒ 报告数字必须注明工作区状态；共享树里他人未提交改动/并发 run 会污染结论（见 `#596` 的纪律一节）。
+
+- [ ] **VM 解释器对大循环次数有既存上限**（`t2` 观测 / `t4` 复核；`STATUS #598` 补记 §7）：packed 产物在迭代数 ≳ 5×10⁶ 后
+      与原生分叉，且结果与 `n` 无关 —— `count-up`（`s += i`）在 `n <= 4,999,998` 与原生一致、`n >= 4,999,999` 起**恒返回 `4,999,999`**；
+      同一夹具的 `sum-to`（`s += i*3-1`）在 `n >= 5×10⁶` 起恒返回 `14,999,996`。**已实测排除 M5 改动**：父提交 `3eda950` 与
+      `1a238fe` 在同一夹具上给出**相同**的恒定值。夹具/复现：`.text` 内指针 + `gcc -fPIE -pie -O1 -Wl,-z,notext`，
+      两个循环函数各跑 `2×10⁶ ~ 10⁷` 次。**待查**：解释器的步数预算 / 循环计数器位宽 / lift 对循环的后端处理 ——
+      本轮未定位机制；与 M5 的载荷几何无关。

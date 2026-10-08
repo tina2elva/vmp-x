@@ -10569,7 +10569,7 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
   门禁 `tools/check_elf_layout.py` 的 E1（"唯一允许的 VA 重叠是覆盖段"→ 三段的相邻/顺序约束）与 E2（载荷 LOAD `filesz` 的期望）、`tools/e2e_elf_image.sh` 的形状分类器、
   以及"只 1 个槽"的 RWX 回退路径（CI 的 aarch64 夹具就走这条）。
 
-### 598. M5 三段布局落地（非重叠载荷几何 + 门禁不变量 + 7 条评审修复）
+### 598. M5 三段布局落地（非重叠载荷几何 + 门禁不变量 + 槽位三档回退 + t3/t7 共 10 条评审修复）
 
 **代码 sha**：`1a238fe`（t1：三段布局 + 门禁 E1/E2/E4 不变量）→ `13d2687`（t5：E4/E5-payload 校准的
 无输入情形改成醒目 SKIP）→ 本条 t6 的修复提交（见下）。**#597 的老形状**（整段 RX + 重叠的 RW 覆盖段，
@@ -10620,8 +10620,11 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
   `payload [0x…,0x…) (sectionSize 0x…, scanned in full …)`。
 - **F6（已修）**：新增 `Result.PayloadWXFallback`（`report.payloadWXFallback`，自动随 `WriteReport` 落进报告），
   取代原来赋值后从不读的死变量 `warnRWX`；门禁 E2 断言"报告声明的形状 ↔ 产物程序头里的 W+X 载荷段"一致，
-  `tools/e2e.sh` 与 `tools/e2e_elf_image.sh`（三种模式）各加同一对账 ⇒ **槽位足够的目标不得走回退**在 CI 上落地
-  （aarch64 那边按实测档位断言：档 (1) ⇒ flag=false，档 (2)/(3) ⇒ flag=true）；删掉重复定义的 `va_to_off`；
+  `tools/e2e.sh` 与 `tools/e2e_elf_image.sh`（三种模式）各加同一对账（aarch64 按实测档位断言：档 (1) ⇒ flag=false，
+  档 (2)/(3) ⇒ flag=true）。**注意：这条对账只证明「报告 ↔ 程序头」一致** —— 打包端若**整体**降级到 (2)/(3)，
+  `flag` 会一起变 true、形状仍是合法档 ⇒ 仍然全绿（`t7/G2` 实测）；「**槽位足够的目标不得走回退**」的**真断言**
+  由 `t8=5010163` 的 `形状账 ②`（`assert_tier_matches_slots`：`tier == f(源目标槽位)`）承担，见本节末尾补记；
+  删掉重复定义的 `va_to_off`；
   把 `internal/inject/elf.go` 的"窗口必然最后映射"注释改成"**不重叠 ⇒ 与顺序无关**"（实测产物里窗口段可以
   排在载荷前缀段之前，正确性只来自页不相交）。
 - **F7（已按实际措辞登记，就是本条）**：不照抄"死代码+ET_EXEC 假报 not caught"，按实际写成"把静默 no-op 升级为
@@ -10646,5 +10649,98 @@ tier (3)，分类器就只说这一档、缺的档显式 SKIP，不超出实测�
 
 **本条之后仍未做**：多目标全量加密（`-enc-image-elf` 之外）在 aarch64 上的运行期验证仍缺可跑用例（见 E5 覆盖缺口）；
 上一轮 `#597` 的"可执行段内含重定位是否该 fail-closed 拒绝"仍是独立待办。
+
+**补记（`t8` / `t9` 评审闭环 + `t4` 独立复核与终局）**
+
+> 上面 1–3 节是 `t1` / `t5` / `t6` 的第一手记录；本节由 `t4`（整合）在**被验 sha `5010163`** 上补写。
+> 本节数字都是 `t4` 自己重跑得到的（不转述他人结论），并与 `t7`（round-2）/ `t9`（round-3）的独立复算一致。
+
+**1. 形状梯子：三档的触发条件与代价（逐条核过）**
+
+| 档 | 触发条件（**源目标**的可复用槽位数 `S`） | 产物形状 | `report.payloadWXFallback` | 代价 |
+|---|---|---|---|---|
+| (1) | `S >= 需要段数`（载荷有尾部时 = 3） | RX 前缀 + RW 窗口 + R+X 尾部（相邻不重叠） | `false` | 无（代码页保持只读） |
+| (2) | `S == 2` 且载荷有尾部（需要 3 段） | 前缀只读 + **一段 W+X**「窗口+尾部」 | `true` | **载荷尾段可写** |
+| (3) | `S <= 1` | **整段 W+X** | `true` | **整个载荷可写** |
+
+- `S` 由 `internal/load/elf.File.SparePhdrSlots()` 按「类型优先 + 取最低空闲索引」**逐趟模拟**得出
+  （`PT_NOTE` → `PT_GNU_RELRO` → 无 `PT_INTERP` 时的 `PT_PHDR` / `PT_NULL`；分类型简单计数会多算，实测踩过两次）。
+- **Go 的 ET_EXEC 目标 = 2 槽 ⇒ 落 (2)**：`e_phnum=6`，可复用 = `PT_PHDR[0]` + `PT_NOTE[1]`（无 `PT_INTERP` ⇒ 两者都可丢）。
+  `t3/F4(b)` 曾把这里写成「1 槽走整段 RWX」，**实测是 2 槽、走两段的 (2)**——已更正。
+- **三档都已在真 TEXTREL 二进制上端到端实测**（`t4` 在 `5010163` 上亲测；夹具 `readelf -d` 有 `TEXTREL`，
+  `.rela.dyn` 里两条 `R_X86_64_RELATIVE` 的 `r_offset=0x1390/0x1398` 落在 `.text`(0x10C0,0x2E0) 内）：
+  - `S=4` ⇒ 三段：`payload LOAD flags=R-X filesz=0x8000` + `RW- 0x1000` + `R+X 0x24D`，`payloadWXFallback=False`；
+  - `S=2` ⇒ 两段：`R-X 0x8000` + `RWX 0x124D`，`payloadWXFallback=True`；
+  - `S=1` ⇒ 整段：`RWX 0x924D`，`payloadWXFallback=True`；
+  - 三档各 16 组 `mode × arg` 调用（`check-key` / `sum-to` / `count-up` / `tprobe` × 4 个实参）与原生**逐字节一致**，
+    且三档都满足「**没有任何非可写 LOAD 与窗口同页**」。
+  - 附注：`t2` 早期登记的「1 槽未复现」是**夹具构造方法错**——只抹 `PT_PHDR` 会让 PIE 的原生程序跑不起来；
+    正确做法是抹掉多余的 `PT_NOTE` / `PT_GNU_RELRO`（loader 不需要它们，原生仍可运行）⇒ 该降级已撤销。
+
+**2. 「槽位足够的目标不得走回退」在 CI 上是真断言（指向承重代码）**
+
+- 承重的是 `tools/e2e_elf_image.sh` 的 **`形状账 ②`**：`payload_slots()` 在**源目标**上复刻 `SparePhdrSlots`，
+  `payload_tier()` 从**产物**程序头 + report + manifest 读出实际档位，
+  `assert_tier_matches_slots()` 断言 **`tier == f(源目标槽位)`**（不符即 `fail`）。覆盖默认 / PIE / PIE_RELOCS / aarch64 四段。
+- 为什么必须它：`report.payloadWXFallback` ↔ 程序头那条对账只证明「报告与产物一致」；打包端若**整体**降级到 (2)/(3)，
+  `flag` 会一起变 true、形状仍是合法档 ⇒ 全部绿（`t7/G2` 实测）。
+- CI 实证（`t4` 用 `gh run view --job --log` 亲自下载并 grep）：`linux-amd64` 三次打包各打印
+  `[*] 形状账 ②…` + `measured payload tier: (2) …` + `payload tier follows from the source reusable program-header slots (slots=2): (2) …`；
+  `linux-arm64` 打印 `(slots=2): (2) …` 与 `(slots=1): (3) ONE W+X payload segment …`。
+- **已知漂移风险（如实登记）**：`payload_slots()` 是 Go 规则 `SparePhdrSlots()` 的 **shell 副本**（代码里已注明）。
+  两边一旦漂移，断言会**报红**而不是静默变绿：副本多算 ⇒ 应有档位偏高（例如算成 (1)）而实测是 (2)/(3) ⇒ `fail`；
+  副本少算 ⇒ 相反方向同样 `fail`。即漂移落在**安全侧**（假红，不是假绿），但两处实现必须同步修改。
+
+**3. 评审链（两个 `failed` 判词如实保留）**
+
+- `t3`（round-1）= **needs_revision / failed**，7 条（F1–F7）→ `t6 = c34a0c0` repair；
+- `t7`（round-2）= **needs_revision / failed**，3 条（G1–G3）→ `t8 = 5010163` repair；
+- `t9`（round-3）= **pass**，是本轮的**最终评审**。
+- 两个 `failed` 不是「没做完」，而是「当时确实不合格、随后 repair + 复审通过」的记录，按原样保留。
+
+**4. F1–F7 / G1–G3 交付核对（`t4` 在 `5010163` 上逐条 grep + 读代码）**
+
+- F1 ✓ 撤回 `imgSections` 过度 SKIP；F2 ✓ 档位分类器 (1)/(2)/(3)/(0)/(DEFECT)；
+  F3 ✓ `E2-prefix-not-stopped-at-window`（改名）+ 真 `E2-M5-window-covers`（只动非载荷、非可写 LOAD，E2 以自己的原话变红）；
+  F4 ✓ 窗口段 `flags` / `filesz` / `memsz` 打印、W+X 明说；F5 ✓ E5(a) 扫描范围改 `sectionSize` 并写明；
+  F6 ✓ `Result.PayloadWXFallback`（`internal/inject/payload.go`）取代死变量 `warnRWX`、删重复 `va_to_off`；
+  F7 ✓ 本条措辞（含对 `t5` 那句不实叙述的更正）。
+- G1 ✓ `tools/e2e.sh` 注释改三档机制、`internal/load/elf/elf.go` 同类旧词汇统一（纯注释）；
+  G2 ✓ `形状账 ②` 真断言（见 §2）；G3 ✓ `E2-M5-window-covers` 的 SKIP 文案按 (a)(b)(c) 三条判据分别计数。
+- **未修残留：无**（F1–F7 与 G1–G3 全部落地，`t9` 已独立复核）。
+
+**5. 越界与台账（如实）**
+
+- `c34a0c0` 动了 `internal/inject/payload.go`：**只加** `Result.PayloadWXFallback` 一个字段（`git show` 核过，+6 行）；
+  `Result` 定义在该文件，F6 要求「报告布尔字段」。
+- `docs/TODO.md` 由 `t6 = c34a0c0` 先写过一部分；本轮 `t4` 才是 docs 的正式写面，已按事实续写。
+- `t8` 的 `changedPaths` 把 `tools/e2e_elf_image.sh` 写成**不带 `tools/` 前缀**的字面量（`e2e_elf_image.sh`）——
+  harness 的字面量口径问题，**登记即可**；`5010163` 的 diff 里确有该文件。
+
+**6. `t4` 终局（在被记录的干净 sha 上跑）**
+
+- 被验 sha = **`5010163`**（跑前 `git status --short` 为空）；本机 `preflight` / `gates` 都跑在该 sha 上。
+- `tools/preflight.ps1` ⇒ `[+] preflight: OK`（exit 0）。
+- `tools/gates.ps1` ⇒ `total 15 gates, 0 failed, 0 skipped`（exit 0）；`e2e: 183 passed, 0 skipped, 0 failed`、
+  `dll e2e: 7 passed, 0 failed`、WSL 半场 `wsl_linux: every step passed`。
+- CI（`gh run view` 亲核，三作业 = `windows-amd64` / `linux-amd64` / `linux-arm64`）：
+
+  | 提交 | run | 结论 |
+  |---|---|---|
+  | `13d2687`（t5） | `37723442259` | success（三作业全 success） |
+  | `c34a0c0`（t6） | `37725768163` | success |
+  | `ea71592`（t6 文档） | `37726130295` | success |
+  | `5010163`（t8） | `37727947032` | success |
+
+- 本条 `docs/` 提交是**纯文档改动**（不改被验代码），其 CI run 号记在任务报告与队长复核里（不写进正文以免自引用）。
+
+**7. 新增未做项（独立待查）**
+
+- **VM 解释器的大循环上限**（`t2` 首先观测、`t4` 在 `5010163` 上重测）：packed 产物在迭代数 ≳ 5×10⁶ 后与原生分叉，
+  结果与 `n` 无关：`count-up`（`s += i`）在 `n <= 4,999,998` 与原生一致、`n >= 4,999,999` 起**恒返回 `4,999,999`**；
+  同一夹具的 `sum-to`（`s += i*3-1`）在 `n >= 5×10⁶` 起恒返回 `14,999,996`。
+  **已实测排除本次改动**：父提交 `3eda950` 与 `1a238fe` 在同一夹具上给出**相同**的恒定值。
+  ⇒ 与 M5 几何无关，已登记进 `docs/TODO.md` 作为独立待查项（本轮未定位机制）。
+
 
 
