@@ -75,8 +75,8 @@ func main() {
 	stripRelocs := flag.Bool("strip-relocs", false, "退回旧行为：拆掉重定位表 + 清 DYNAMIC_BASE（放弃 ASLR）。默认**保留**，运行期按「先减回去→解密→再加回来」处理")
 	flag.BoolVar(&encImageELFData, "enc-image-elf-data", false, "ELF 侧把 .rodata/.gopclntab 也纳入整体加密（实验：CI 上 aarch64 会 SIGSEGV，默认关）")
 	noEncImageELF := flag.Bool("no-enc-image-elf", false, "对 ET_EXEC 的 ELF 关闭原镜像整体加密（默认开；探针已改为合成补丁字节，不再依赖明文）")
-	encImageELFPIEFlag := flag.Bool("enc-image-elf-pie", false, "对 ET_DYN(PIE) 也做原镜像整体加密（默认关；只加密**不含相对重定位**的范围，含重定位的范围会跳过并说明）")
-	encImageELFPIERelocsFlag := flag.Bool("enc-image-elf-pie-relocs", false, "允许加密**含相对重定位**的 PIE 范围（需要运行期应用器：把重定位表落进 payload/报告，见 internal/inject 的 RelocTableHeaderSize）")
+	encImageELFPIEFlag := flag.Bool("enc-image-elf-pie", false, "对 ET_DYN(PIE) 也做原镜像整体加密（默认关；只加密**不含相对重定位**的范围，含重定位的范围会**醒目**跳过并说明）。⚠️ 含 PT_DYNAMIC（ld.so 在入口点前就要读的动态段）的范围**任何配置下都不会被加密**，见 #597")
+	encImageELFPIERelocsFlag := flag.Bool("enc-image-elf-pie-relocs", false, "允许加密**含相对重定位**的 PIE 范围（需要运行期应用器：把重定位表落进 payload/报告，见 internal/inject 的 RelocTableHeaderSize）。加密范围里若还出现**非 R_*_RELATIVE** 的动重定位，打包端会**拒绝打包**（运行期无法还原 ld.so 写进去的值）")
 	credFlag := flag.String("cred", "", "构建凭据路径（默认 $VMPX_CRED 或工具同目录 vmpx.cred）；仅当工具烘焙了厂商根公钥时才校验")
 	vendorFlag := flag.String("vendor", "", "本次构建声明的 vendorID；工具授权开启时会强制与凭据里的一致")
 	verify := flag.Bool("verify", false, "自检：跑一遍原始与受保护产物并比对输出，不一致就**删除产物**并失败退出")
@@ -865,6 +865,27 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 		case imgMaster == nil:
 			fmt.Println("[*] ELF 整体加密：跳过（没有主密钥）")
 		default:
+			// #597 守卫 1（**两个架构都要**，不是只修 aarch64）：装载器在入口点之前要读的动态段
+			// （PT_DYNAMIC 及其指向的表：.dynsym/.dynstr/.rela.dyn/.rela.plt/.hash/…）绝不能被加密。
+			//
+			// 为什么必须有这条打包端不变量：aarch64 的链接器会把 PT_DYNAMIC 放进那个要加密的
+			// PT_LOAD 内部（实测 C PIE：PT_LOAD(X) filesz=0x20018，PT_DYNAMIC va=0x1FD90 就在里面），
+			// ld.so 于是读到**密文** ⇒ 产物 SIGSEGV(rc=139)；amd64 今天只是**碰巧**把动态段放在段外
+			// （实测 PT_DYNAMIC va=0x3DB0 落在 [0x1000,0x12ED)/[0x2000,0x2080) 之外），那**不是**
+			// 打包端保证的不变量，换一个 linker/布局就会同时踩到 —— 所以守卫覆盖两个架构。
+			// 做法与"文件头那一页不加密"完全同构：把要保留的区间从候选范围里切掉
+			// （只有一部分重叠 ⇒ 只加密保留段**之前**那一段）；report.imgSections 因此如实反映真正加密的范围。
+			// 注意用**文件偏移**判定：本循环的候选范围是 [p.Off+inner, p.Off+p.Filesz)，与 VA 空间无关。
+			// （第一版拿 VA 去比，在 ET_EXEC 上（镜像基址 0x400000）永远不重叠 —— 直接把 Go ET_EXEC 的
+			//  代码段整段跳过、又把 .rodata 留在解密表里，打包当场失败。）
+			dynOffLo, dynOffHi := uint64(0), uint64(0)
+			for _, dp := range f.Progs {
+				if dp.Type == elfload.PT_DYNAMIC {
+					dynOffLo, dynOffHi = dp.Off, dp.Off+dp.Filesz
+					break
+				}
+			}
+			imgSkipWhy := ""
 			for _, p := range f.Progs {
 				if p.Type != 1 || p.Flags&elfload.PF_X == 0 || p.Filesz == 0 {
 					continue
@@ -886,12 +907,47 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 					inner = skip - p.Off
 				}
 				if p.Filesz <= inner {
+					imgSkipWhy = "可执行段全落在文件头那一页里"
 					fmt.Println("[*] ELF 整体加密：跳过（可执行段全落在文件头那一页里）")
-					break
+					// 注意是 continue 不是 break：**后续候选段仍然要评估**。原来这里 break，只有
+					// "第一个 R-X 段不可用"时才不出问题；一旦守卫 1 把某一段排除而继续看后面的段，
+					// break 会让 imgSecs 只按部分候选算，加密表里就会出现"不在任何 PT_LOAD 中"的
+					// 范围（实测：Go 的 ET_EXEC 上 break 把 .rodata/.gopclntab 留在表里但它们在
+					// 被排除的段里 —— 打包直接失败）。
+					continue
+				}
+				// 地址口径：p.Vaddr 本身就是**绝对 VA**（ImageBase() 返回的就是最小 PT_LOAD 的 vaddr），
+				// 所以段起止 = p.Vaddr(+inner) .. p.Vaddr+p.Filesz，RVA 才是减 imageBase 之后的。
+				// （第一版在这里又加了一次 imageBase ⇒ RVA 变成 0x401000 而不是 0x1000，
+				//  解密表指向一个不存在的 VA 0x801000，打包直接失败。）
+				secOffLo := p.Off + inner
+				secOffHi := p.Off + p.Filesz
+				segLo := p.Vaddr + inner
+				segHi := p.Vaddr + p.Filesz
+				if dynOffHi > dynOffLo && dynOffLo < secOffHi && dynOffHi > secOffLo {
+					if dynOffLo <= secOffLo {
+						imgSkipWhy = fmt.Sprintf("可执行段 [0x%X,0x%X) 载着 PT_DYNAMIC（文件偏移 [0x%X,0x%X)）", segLo, segHi, dynOffLo, dynOffHi)
+						fmt.Printf("[!] ELF 整体加密：跳过可执行段 [0x%X,0x%X) —— 它载着 PT_DYNAMIC（文件偏移 [0x%X,0x%X)，ld.so 在入口点之前要读的动态段，指向 .dynsym/.dynstr/.rela.dyn）", segLo, segHi, dynOffLo, dynOffHi)
+						fmt.Println()
+						fmt.Println("[!]   加密它会让 ld.so 读到密文（实测 aarch64 的 C PIE 就是这么 SIGSEGV 的；amd64 只是因为链接器把动态段放在段外才没事）")
+						fmt.Println("[!]   这个目标上 ELF 整体加密对代码段不可用：去掉 -enc-image-elf* 开关，或改用动态段与代码段分开的链接布局")
+						continue
+					}
+					// 只有前段可加密：PT_DYNAMIC 及其后的代码**留着不动**。
+					imgSecs = append(imgSecs, inject.ImgSection{
+						RVA:   uint32(segLo - imageBase),
+						Size:  uint32(dynOffLo - secOffLo),
+						Flags: 1,
+					})
+					fmt.Printf("[!] ELF 整体加密：可执行段 [0x%X,0x%X) 里有 PT_DYNAMIC（文件偏移 [0x%X,0x%X)）⇒ 只加密它**之前**的 [0x%X,0x%X)（%d 字节；报告里的加密范围就是这一段）",
+						segLo, segHi, dynOffLo, dynOffHi, segLo, segLo+(dynOffLo-secOffLo), dynOffLo-secOffLo)
+					fmt.Println()
+					fmt.Println("[!]   PT_DYNAMIC 之后的可执行代码**没有被加密**（加密它会让 ld.so 读到密文）")
+					continue
 				}
 				imgSecs = append(imgSecs, inject.ImgSection{
-					RVA:   uint32(p.Vaddr - imageBase + inner),
-					Size:  uint32(p.Filesz - inner),
+					RVA:   uint32(segLo - imageBase),
+					Size:  uint32(segHi - segLo),
 					Flags: 1,
 				})
 				fmt.Printf("[*] ELF 整体加密：PT_LOAD(X) va=0x%X off=0x%X 跳过头部 %d 字节，加密 %d 字节（入口自解密）", p.Vaddr, p.Off, inner, p.Filesz-inner)
@@ -956,6 +1012,9 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 						fmt.Printf("[*] ELF 整体加密：跳过 %s（RVA 0x%X size 0x%X 内有 %d 条相对重定位；加密它们需要运行期应用器，见 -enc-image-elf-pie-relocs）",
 							where, s.RVA, s.Size, len(in))
 						fmt.Println()
+						if imgSkipWhy == "" {
+							imgSkipWhy = fmt.Sprintf("范围 RVA 0x%X size 0x%X 里有 %d 条相对重定位（未打开 -enc-image-elf-pie-relocs）", s.RVA, s.Size, len(in))
+						}
 						continue
 					}
 					for _, r := range in {
@@ -968,8 +1027,82 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				}
 				imgSecs = kept
 			}
+			// #597 守卫 2（fail-closed，**两个架构都要**）：加密范围里只要出现一条**非 R_*_RELATIVE**
+			// 的动重定位，就拒绝打包、非零退出、**不落产物**。
+			//
+			// 为什么不能放过去：ld.so 在入口点之前会按动态表**无条件改写**那个槽位（实测 aarch64 的
+			// R_AARCH64_GLOB_DAT 就落在加密段尾：rva 0x1FFD8/0x1FFE8/0x1FFF0）；运行期应用器只还原
+			// R_*_RELATIVE（stub 的 vm_reloc_fix 对其它类型走 vm_reloc_bad=3 硬门），于是密文的
+			// Poly1305 tag 已经变了 —— 产物要么验签失败、要么崩，**没有静默正确的可能**。
+			// internal/inject.BuildPayload 只校验"表里的槽位都在加密范围内"（必要方向），
+			// 这里补上**反方向**：加密范围内**每一条**动重定位都必须在表里、且都是应用器认识的那种。
+			if len(imgSecs) > 0 {
+				dynAll, derr := f.DynRelocs()
+				if derr != nil {
+					fatalf("读不出动态重定位表：%v（不能当成没有重定位：加密范围里可能藏着非相对项）", derr)
+				}
+				relType := elfRelativeRelocType(f.Machine)
+				if relType == 0 {
+					fatalf("机器类型 0x%X 没有登记相对重定位类型号（无法判断加密范围里的重定位是否可还原）", f.Machine)
+				}
+				bad := 0
+				for _, r := range dynAll {
+					inside := false
+					for _, s := range imgSecs {
+						lo, hi := imageBase+uint64(s.RVA), imageBase+uint64(s.RVA+s.Size)
+						if r.Offset >= lo && r.Offset < hi {
+							inside = true
+							break
+						}
+					}
+					if !inside || r.Type == relType {
+						continue
+					}
+					if bad < 4 {
+						fmt.Fprintf(os.Stderr, "[!] ELF 整体加密：加密范围里有一条**非 R_*_RELATIVE** 的动重定位 r_offset=RVA 0x%X type=%d —— 运行期无法还原 ld.so 写进去的值\n", r.Offset-imageBase, r.Type)
+					}
+					bad++
+				}
+				if bad > 0 {
+					fatalf("拒绝打包：%d 条非相对动重定位落在要加密的范围里（RVA 见上）。ld.so 会在入口点之前**无条件改写**这些槽位，而运行期应用器只认识 R_*_RELATIVE(type=%d) ⇒ 这个产物要么验签失败、要么跑错。\n    可操作选项：去掉 -enc-image-elf-pie-relocs / -enc-image-elf-pie（不加密这些范围），或改用把这些槽位放在加密范围之外的链接布局。", bad, relType)
+				}
+				fmt.Printf("[*] ELF 整体加密：加密范围内的动重定位全部是 R_*_RELATIVE(type=%d)，共核对 %d 条动态项（没有 ld.so 会在入口点前改写、而应用器无法还原的槽位）", relType, len(dynAll))
+				fmt.Println()
+			}
+			// fail-closed 的最后一道自洽检查：要写进解密表的每个范围，必须能用**产物自己**的程序头
+			// 折算回文件（否则 encryptImageSectionsELF 会在写盘前才报"VA 不在任何 PT_LOAD 中"，
+			// 而且那时已经改了一半文件）。范围还必须避开文件头/程序头表所在的那一页 —— 那里装着
+			// 加载器要从**文件**读的结构。
+			headEnd := uint64(f.Phoff) + uint64(f.Phnum)*uint64(f.Phentsize)
+			if headEnd < 0x1000 {
+				headEnd = 0x1000
+			}
+			for _, s := range imgSecs {
+				lo := imageBase + uint64(s.RVA)
+				hi := lo + uint64(s.Size)
+				// 首字节与末字节都必须落到某个 PT_LOAD 的**文件镜像**里（空洞会让解密表指到没有内容的地址）。
+				// 空范围（size==0）没有字节，只查首字节。
+				vas := []uint64{lo}
+				if s.Size > 0 {
+					vas = append(vas, hi-1)
+				}
+				for _, va := range vas {
+					if _, err := f.VAtoOffset(va); err != nil {
+						fmt.Fprintf(os.Stderr, "[!] ELF 整体加密：范围 RVA=0x%X size=0x%X（VA [0x%X,0x%X)）在产物里不可映射（VA 0x%X：%v）\n", s.RVA, s.Size, lo, hi, va, err)
+						fatalf("拒绝打包：加密范围不能映射到文件（解密表会指到空洞）")
+					}
+				}
+				if lo < headEnd && hi > uint64(f.Phoff) {
+					fmt.Fprintf(os.Stderr, "[!] ELF 整体加密：范围 RVA=0x%X size=0x%X 与文件头/程序头表 [0x%X,0x%X) 重叠\n", s.RVA, s.Size, f.Phoff, headEnd)
+					fatalf("拒绝打包：解密表里出现了文件头/程序头表所在的范围")
+				}
+			}
 			if len(imgSecs) == 0 {
-				fmt.Println("[*] ELF 整体加密：跳过（找不到可安全加密的范围）")
+				if imgSkipWhy == "" {
+					imgSkipWhy = "没有任何可加密的范围"
+				}
+				fmt.Printf("[!] ELF 整体加密：**本产物不含原镜像加密**（%s）—— 代码/数据仍是明文，不要以为拿到了这层保护", imgSkipWhy)
+				fmt.Println()
 			}
 		}
 	}
@@ -1671,6 +1804,18 @@ func elfHasInterp(f *elfload.File) bool {
 		}
 	}
 	return false
+}
+
+// elfRelativeRelocType 返回本架构 R_*_RELATIVE 的类型号（0 = 没登记）。
+// 与 internal/load/elf.RelativeRelocs 的登记保持一致：运行期应用器只认识这一种。
+func elfRelativeRelocType(machine uint16) uint32 {
+	switch machine {
+	case elfload.EM_X86_64:
+		return elfload.R_X86_64_RELATIVE
+	case elfload.EM_AARCH64:
+		return elfload.R_AARCH64_RELATIVE
+	}
+	return 0
 }
 
 // elfSectionName 按原始镜像的节头表反查一个 VA 落在哪个节里（找不到返回 "-"）。

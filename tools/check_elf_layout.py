@@ -63,22 +63,25 @@ Everything is derived from the PRODUCT FILE plus the same build's blob manifest 
             missing record is either an AEAD verify failure or a silently corrupted slot.
         ET_EXEC keeps its INFO line (the image never moves).
 
-  E5 coverage gap on aarch64 (REGISTERED, not fixed): the runtime applier's aarch64 branch
-  (VM_RT_RELATIVE = 1027) has no runnable acceptance case.
-    * What forbids it: docs/STATUS.md #376/#377 keep ELF read-only-data-section encryption off
-      on aarch64 (the SIGSEGV root cause is still unknown) and AGENTS.md forbids turning it on;
-      the only range type left that aarch64 can encrypt is the executable one, and a reloc slot
-      inside an encrypted *executable* range makes the product SIGSEGV on amd64 as well
-      (measured with DT_TEXTREL-style fixtures, plain pack included). A small aarch64 PIE is
-      refused a third time: its executable segment lies entirely inside the 64 KiB file-header
-      page ("跳过（可执行段全落在文件头那一页里）").
+  E5 coverage gap on aarch64 (partly closed by #597; updated after measuring the real root cause):
+    * What used to forbid it: docs/STATUS.md #376/#377 keep ELF read-only-data-section encryption
+      off on aarch64 (AGENTS.md forbids turning it on), so the only range type left is the
+      executable one -- and a reloc slot inside an encrypted *executable* range made the product
+      SIGSEGV. The real cause was NOT the relocation applier: the aarch64 linker puts PT_DYNAMIC
+      (and the tables it points at) INSIDE that executable segment, so the loader read ciphertext.
+      The #597 guards in cmd/vmpack/main.go now (1) exclude any range that carries PT_DYNAMIC
+      ("载着 PT_DYNAMIC") and (2) refuse to pack when a non-R_*_RELATIVE relocation lands inside a
+      range that IS encrypted (the apply table cannot restore what ld.so wrote).
     * Which bytes stay unverifiable: every R_AARCH64_RELATIVE target inside a range the packer
-      would have to encrypt (i.e. exactly the slots the runtime applier would rewrite).
-    * What covers it instead: tools/e2e_elf_image.sh's x86-64 PIE_RELOCS case is the applier's
-      only end-to-end acceptance point -- vm_reloc_fix is ONE arch-independent function and the
-      packer copies the target's own reloc type into the table -- while this gate re-derives the
-      recorded count/targets from an aarch64 product's own PT_DYNAMIC, so the packing half of
-      the contract stays checked from the artifact even where the runtime half cannot run.
+      would have to encrypt (i.e. exactly the slots the runtime applier would rewrite). On
+      aarch64 today that means the whole executable range of a normal C PIE is left plaintext --
+      the product must then answer exactly like native, which tools/e2e_elf_image.sh asserts.
+    * What covers the rest: tools/e2e_elf_image.sh's x86-64 PIE_RELOCS case and the committed
+      DT_TEXTREL case (relocations inside an encrypted *executable* range, applied by the runtime
+      applier and byte-compared with native) are the applier's end-to-end acceptance points --
+      vm_reloc_fix is ONE arch-independent function and the packer copies the target's own reloc
+      type into the table -- while this gate re-derives the recorded count/targets from a
+      product's own PT_DYNAMIC, so the packing half stays checked from the artifact.
 
 --selftest mutates copies and requires every check to catch its own mutation.
 
@@ -746,16 +749,24 @@ def check_relocs(elf, report, rep):
     else:
         rep.ok("E5", "bookkeeping: %d in-range RELATIVE reloc(s) recorded (%s), apply table at RVA 0x%X"
                % (found, ",".join(where), int(report["imgRelocTableRVA"])))
-    # aarch64: say out loud that only the PACKING half of this contract is verified here. The runtime
-    # half (vm_reloc_fix with VM_RT_RELATIVE = 1027) has no runnable case today; see the docstring
-    # section "E5 coverage gap on aarch64".  A NOTE, not an assertion: the gap is architectural
-    # (#376/#377 + relocs inside an encrypted executable range), not a property of this product, and
-    # the task contract forbids shape-dependent assertions.
+    # aarch64: state exactly which half was verified HERE. A NOTE, not an assertion: the remaining gap
+    # is architectural (#376/#377 keep read-only-data encryption off on aarch64), not a property of the
+    # product, and the task contract forbids shape-dependent assertions. #597 closed the part that used
+    # to make this gap dangerous: a range carrying PT_DYNAMIC is never encrypted, and a range that IS
+    # encrypted may only contain R_*_RELATIVE relocations (cmd/vmpack/main.go guards 1/2).
     if elf.machine == 183:  # EM_AARCH64
-        rep.info("E5", "aarch64: ONLY the packing half above is verified -- the runtime applier branch "
-                       "(VM_RT_RELATIVE=1027) has no runnable acceptance case (#376/#377 keep read-only-data "
-                       "encryption off on aarch64, and a reloc slot inside an encrypted executable range "
-                       "SIGSEGVs on amd64 too); it is covered by the x86-64 PIE_RELOCS e2e plus code review")
+        if found > 0:
+            rep.info("E5", "aarch64: the recorded relocations above live in an executable range whose "
+                           "tail carries PT_DYNAMIC; #597 guard 1 encrypted the part before it (never the "
+                           "dynamic data itself), and tools/e2e_elf_image.sh asserts end-to-end that this "
+                           "product answers exactly what native answers under qemu")
+        else:
+            rep.info("E5", "aarch64: no range carrying R_AARCH64_RELATIVE was encrypted on this product "
+                           "(#376/#377 keep read-only-data encryption off, and #597 guard 1 leaves any "
+                           "executable range that carries PT_DYNAMIC plaintext); what still needs a "
+                           "runnable case here is therefore the *data*-section variant, not the applier "
+                           "itself: vm_reloc_fix is one arch-independent function and the x86-64 "
+                           "PIE_RELOCS + DT_TEXTREL e2e cases drive it end-to-end")
 
 
 def run_checks(path, manifest, report, blob, quiet=False):

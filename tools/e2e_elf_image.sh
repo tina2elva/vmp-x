@@ -72,6 +72,7 @@ fail() {
     if [ "$STRICT" = "1" ]; then exit 1; else exit 0; fi
 }
 
+
 BLOB_SRC=${BLOB_SRC:-stub/linux/amd64}
 BLOB_CC=${BLOB_CC:-}
 GOARCH_TARGET=${GOARCH_TARGET:-amd64}
@@ -87,6 +88,21 @@ PIE_RELOCS=${PIE_RELOCS:-0}
 mkdir -p build
 go build -o build/vmpbuild ./cmd/vmpbuild || fail "build vmpbuild"
 go build -o build/vmpack ./cmd/vmpack || fail "build vmpack"
+# run_target：执行一个产物（qemu 下要带上 -L 前缀）。参数化的执行器（$1 可省略 = 本机直接跑），
+# 这样同一段断言在"本机原生"和"经 qemu 跑另一种架构"两种驱动下都能用。
+run_target() {
+    local runner="$1"; shift
+    if [ -n "$runner" ]; then "$runner" "$@"; else "$@"; fi
+}
+TARGET_RUN="$QEMU"
+if [ -n "$QEMU" ] && [ "$GOARCH_TARGET" = "arm64" ]; then
+    A64_RT_CC="${A64_CC:-aarch64-linux-gnu-gcc}"
+    A64_RT_LDFILE="$("$A64_RT_CC" -print-file-name=ld-linux-aarch64.so.1 2>/dev/null)"
+    if [ -f "$A64_RT_LDFILE" ]; then
+        A64_RT_LD="$(dirname "$(dirname "$A64_RT_LDFILE")")"
+        TARGET_RUN="$QEMU -L $A64_RT_LD"
+    fi
+fi
 
 # ---- 载荷形状的两把尺子（t8/G2）：槽位数 + 实测档位 ----
 #
@@ -610,18 +626,302 @@ EOF
     echo "[OK  ] 静态 PIE：打包端醒目告警且产物与原生一致（check-key 10 -> $SP_PACKED）"
 fi
 
-# ---- aarch64：加密范围内重定位 —— 打包侧可断言，运行期侧如实登记为"无可跑用例" ----
+# ---- #597：可执行段内的重定位（DT_TEXTREL 类）---- 打包端决策的 committed 见证 ----
+#
+# 背景与实测（本轮，M5 三段布局之后）：
+#   * **amd64 已经修好**：#597 正文里那句"plain 打包也 rc=139"是 M5 的几何缺陷（载荷 RX 段盖住可写窗口），
+#     已被 #598 的三段布局修掉 —— 自造 DT_TEXTREL 夹具（.text 内两个指针槽 + -Wl,-z,notext）现在
+#     plain / -enc-image-elf-pie / -enc-image-elf-pie-relocs 三种打包**都与原生一致**。
+#   * 但"可执行段内的重定位"本身仍需要打包端把账做平：默认（不带 -relocs）必须**跳过**含相对重定位的
+#     范围并说清；带 -relocs 则是打包端记表 + 运行期应用器（vm_interp.c 的 vm_reloc_fix）端到端可用。
+#     下面这条用例就是这两半的 committed 见证。
+#   * 同族的两条 fail-closed 守卫（#597 守卫 1/2，见 cmd/vmpack/main.go）：装载器在入口点前要读的
+#     PT_DYNAMIC **不加密**（该范围从候选里排除，报告如实反映），且加密范围里出现非 R_*_RELATIVE 的
+#     动重定位就**拒绝打包**。aarch64 的 C PIE 正是靠守卫 1 才不再产出 SIGSEGV 产物（见本文件末尾的真断言）。
+#
+# 校准 A（"含相对重定位的范围默认跳过"必须承重）：把 cmd/vmpack/main.go 里
+#   `if !encImageELFPIERelocs {` 那个跳过分支临时去掉 ⇒ 下面的 pie 子例必须变红
+#   （该范围被加密但**没有应用表** ⇒ 目标自检打印 BADSLOTS 或直接崩，与原生不同）。
+# 校准 B（运行期应用器必须承重）：把 stub/win/x64/vm_interp.c 的 vm_reloc_fix 短路掉（**只在本地做、
+#   不要提交 stub/**）⇒ relocs 子例必须变红（verifyfail / rc≠0）。
+if [ -z "$QEMU" ] && [ "$GOARCH_TARGET" = "amd64" ]; then
+    echo "[*] #597: relocations INSIDE the executable segment (DT_TEXTREL) -- skipped by default, applied with -enc-image-elf-pie-relocs"
+    # 本块用**自己的** blob：后面 PIE/静态 PIE 那几步会重建 build/vm_interp_elf.bin，而"打包用的 blob 与
+    # 运行时不一致"正是这条用例最容易踩的坑（本轮实测：拿旧 blob 打包 ⇒ 产物 rc=139，看起来像产品缺陷）。
+    TRBLOB=build/vm_interp_elf_textrel
+    ./build/vmpbuild -src "$BLOB_SRC" $([ -n "$BLOB_CC" ] && echo "-cc $BLOB_CC") $([ -n "$BLOB_GUEST" ] && echo "-guest $BLOB_GUEST") $BLOB_EXTRA \
+        -out "$TRBLOB.bin" -manifest "$TRBLOB.json" -entry vm_entry >/dev/null || fail "build the DT_TEXTREL block's own blob"
+    cat > build/textrel_target.c <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int g_a = 7;
+static int g_b = 9;
+
+/* Two absolute pointer slots placed in the EXECUTABLE section: the linker must emit
+ * R_X86_64_RELATIVE entries whose r_offset is inside .text, i.e. DT_TEXTREL. */
+__asm__(".section .text\n"
+        ".globl textrel_tbl\n"
+        "textrel_tbl:\n"
+        ".quad g_a\n"
+        ".quad g_b\n"
+        ".previous\n");
+extern int *const textrel_tbl[2];
+
+__attribute__((noinline)) unsigned long checkKey(unsigned long x) { return ((x * 7) + 42) ^ 0xFF; }
+__attribute__((noinline)) long sumTo(long n) { long s = 0; for (long i = 1; i <= n; i++) s += i; return s; }
+
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: textrel_target <check-key|sum-to> <arg>\n"); return 2; }
+    /* a slot the loader never applied reads as a WRONG VALUE (or faults): print the
+     * difference so the failure is a distinct output, not just a crash. */
+    long da = (long)textrel_tbl[0] - (long)&g_a;
+    long db = (long)textrel_tbl[1] - (long)&g_b;
+    if (da != 0 || db != 0) { printf("BADSLOTS %ld %ld\n", da, db); return 4; }
+    unsigned long v = strtoul(argv[2], 0, 0);
+    if (strcmp(argv[1], "check-key") == 0) printf("%lu\n", checkKey(v));
+    else if (strcmp(argv[1], "sum-to") == 0) printf("%ld\n", sumTo((long)v));
+    else return 2;
+    return 0;
+}
+EOF
+    gcc -fPIE -pie -O1 -Wl,-z,notext -o build/elf_target_textrel build/textrel_target.c || fail "build the DT_TEXTREL fixture"
+    # 校准 0：夹具必须真的把相对重定位放进**可执行**范围（否则这条用例是空转）。
+    readelf -dW build/elf_target_textrel | grep -q 'TEXTREL' || fail "the DT_TEXTREL fixture has no TEXTREL dynamic tag"
+    python3 - <<'PY' || fail "the fixture has no R_X86_64_RELATIVE slot inside an executable range"
+import struct
+d = open("build/elf_target_textrel", "rb").read()
+phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+loads, dyn = [], None
+for i in range(phn):
+    o = phoff + i * pes
+    t, fl, off, va, _pa, fsz, msz, _al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1:
+        loads.append((va, msz, fl))
+    elif t == 2:
+        dyn = va
+def off_of(va):
+    for i in range(phn):
+        o = phoff + i * pes
+        t, fl, off, v, _pa, fsz, msz, _al = struct.unpack_from("<IIQQQQQQ", d, o)
+        if t == 1 and v <= va < v + msz:
+            return off + (va - v)
+    return None
+do = off_of(dyn)
+rela = sz = ent = 0
+for j in range(0x400 // 16):
+    tag, val = struct.unpack_from("<QQ", d, do + j * 16)
+    if tag == 0:
+        break
+    if tag == 7: rela = val
+    if tag == 8: sz = val
+    if tag == 9: ent = val
+ro = off_of(rela)
+hits = []
+for k in range(sz // (ent or 24)):
+    off, info, _add = struct.unpack_from("<QQq", d, ro + k * 24)
+    if (info & 0xFFFFFFFF) != 8:
+        continue
+    for va, msz, fl in loads:
+        if (fl & 1) and va <= off < va + msz:
+            hits.append(off)
+            break
+assert hits, "no R_X86_64_RELATIVE r_offset inside an executable PT_LOAD"
+print("    fixture: %d R_X86_64_RELATIVE slot(s) inside an executable range (e.g. 0x%X)" % (len(hits), hits[0]))
+PY
+    TR_NATIVE_RC=0
+    TR_NATIVE="$($TARGET_RUN ./build/elf_target_textrel check-key 10 2>&1)" || TR_NATIVE_RC=$?
+    TR_NATIVE_SUM_RC=0
+    TR_NATIVE_SUM="$($TARGET_RUN ./build/elf_target_textrel sum-to 100 2>&1)" || TR_NATIVE_SUM_RC=$?
+    if [ "$TR_NATIVE_RC" -ne 0 ] || [ "$TR_NATIVE" != "143" ]; then
+        echo "[MISMATCH] DT_TEXTREL fixture native: rc=$TR_NATIVE_RC out=[$TR_NATIVE] (want 143)"
+        fail "the DT_TEXTREL fixture does not run natively"
+    fi
+    for trmode in plain pie relocs; do
+        case "$trmode" in
+            plain)  TR_EXTRA="" ;;
+            pie)    TR_EXTRA="-enc-image-elf-pie" ;;
+            relocs) TR_EXTRA="-enc-image-elf-pie -enc-image-elf-pie-relocs" ;;
+        esac
+        TR_OUT="build/elf_textrel_${TAG}_${trmode}.enc"
+        TR_REP="build/elf_textrel_${TAG}_${trmode}.json"
+        rm -f "$TR_OUT" "$TR_REP"
+        # shellcheck disable=SC2086
+        TR_PACK="$($TARGET_RUN ./build/vmpack -exe build/elf_target_textrel -func checkKey -func sumTo $TR_EXTRA \
+            -blob "$TRBLOB.bin" -manifest "$TRBLOB.json" \
+            -out "$TR_OUT" -report "$TR_REP" 2>&1)" || fail "pack the DT_TEXTREL fixture ($trmode)"
+        [ -f "$TR_OUT" ] || fail "packing the DT_TEXTREL fixture ($trmode) produced no artifact"
+        TR_RC=0; TR_GOT="$($TARGET_RUN "./$TR_OUT" check-key 10 2>&1)" || TR_RC=$?
+        TR_SUM_RC=0; TR_GOT_SUM="$($TARGET_RUN "./$TR_OUT" sum-to 100 2>&1)" || TR_SUM_RC=$?
+        if [ "$TR_RC" -ne 0 ] || [ "$TR_GOT" != "$TR_NATIVE" ] || [ "$TR_SUM_RC" -ne 0 ] || [ "$TR_GOT_SUM" != "$TR_NATIVE_SUM" ]; then
+            echo "[MISMATCH] DT_TEXTREL product ($trmode): check-key native=[$TR_NATIVE](rc=$TR_NATIVE_RC) packed=[$TR_GOT](rc=$TR_RC); sum-to native=[$TR_NATIVE_SUM](rc=$TR_NATIVE_SUM_RC) packed=[$TR_GOT_SUM](rc=$TR_SUM_RC)"
+            printf '%s\n' "$TR_GOT" | head -n 3 | sed 's/^/    /'
+            fail "DT_TEXTREL product ($trmode) is not identical to native"
+        fi
+        ELF_REPORT="$TR_REP" TR_MODE="$trmode" python3 - <<'PY' || fail "DT_TEXTREL report contract ($trmode)"
+import json, os, struct
+rep = json.load(open(os.environ["ELF_REPORT"]))
+mode = os.environ["TR_MODE"]
+secs = rep.get("imgSections") or []
+d = open("build/elf_target_textrel", "rb").read()
+phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+# DERIVE the executable range carrying the R_X86_64_RELATIVE slots from the TARGET itself
+loads, dyn, base = [], None, None
+for i in range(phn):
+    o = phoff + i * pes
+    t, fl, off, va, _pa, fsz, msz, _al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1:
+        loads.append((va, msz, fl))
+        base = va if base is None else min(base, va)
+    elif t == 2:
+        dyn = va
+def off_of(va):
+    for i in range(phn):
+        o = phoff + i * pes
+        t, fl, off, v, _pa, fsz, msz, _al = struct.unpack_from("<IIQQQQQQ", d, o)
+        if t == 1 and v <= va < v + msz:
+            return off + (va - v)
+    return None
+do = off_of(dyn)
+rela = sz = ent = 0
+for j in range(0x400 // 16):
+    tag, val = struct.unpack_from("<QQ", d, do + j * 16)
+    if tag == 0:
+        break
+    if tag == 7: rela = val
+    if tag == 8: sz = val
+    if tag == 9: ent = val
+ro = off_of(rela)
+need = None
+for k in range(sz // (ent or 24)):
+    off, info, _add = struct.unpack_from("<QQq", d, ro + k * 24)
+    if (info & 0xFFFFFFFF) != 8:
+        continue
+    for va, msz, fl in loads:
+        if (fl & 1) and va <= off < va + msz and off + 8 <= va + msz:
+            need = (va - base, va + msz - base)
+            break
+    if need:
+        break
+assert need, "could not derive the executable reloc range"
+lo, hi = need
+covered = any(int(s["rva"]) <= lo and hi <= int(s["rva"]) + int(s["size"]) for s in secs)
+if mode == "relocs":
+    assert covered, "with -enc-image-elf-pie-relocs the executable reloc range [%#x,%#x) MUST be encrypted; imgSections=%s" % (lo, hi, secs)
+    nn = int(rep["imgRelocCount"] or 0)
+    assert nn >= 1, "the encrypted executable range carries relocations but imgRelocCount=%s" % rep.get("imgRelocCount")
+    assert int(rep["imgRelocTableRVA"] or 0) != 0, "an apply table must be emitted (imgRelocTableRVA=0)"
+    print("    relocs: executable range [%#x,%#x) encrypted, %d relative reloc(s) recorded, apply table RVA=%#x" % (lo, hi, nn, int(rep["imgRelocTableRVA"])))
+else:
+    assert not covered, "the executable reloc range MUST NOT be encrypted without -enc-image-elf-pie-relocs; imgSections=%s" % (secs,)
+    assert int(rep["imgRelocCount"] or 0) == 0, "no reloc-bearing range is encrypted => imgRelocCount must be 0, got %s" % rep.get("imgRelocCount")
+    assert int(rep["imgRelocTableRVA"] or 0) == 0, "no relocations => no apply table"
+    print("    %s: executable reloc range [%#x,%#x) deliberately NOT encrypted (report says so)" % (mode, lo, hi))
+PY
+        case "$trmode" in
+            pie)
+                # ASCII anchor only: the packer's skip line is the only place that prints this switch's
+                # name while reporting a skipped range. (Chinese literals in this harness come back
+                # mangled through the CI/WSL text pipeline -- see the same trap the aarch64 block hit.)
+                printf '%s' "$TR_PACK" | grep -aq -- '-enc-image-elf-pie-relocs' || fail "the default -enc-image-elf-pie must SAY how to encrypt the skipped reloc-bearing range"
+                ;;
+            relocs)
+                printf '%s' "$TR_PACK" | grep -aq 'imgRelocTableRVA\|RVA=0x' || fail "with -enc-image-elf-pie-relocs the packer must SAY the relocations were recorded"
+                ;;
+        esac
+        echo "[OK  ] DT_TEXTREL ($trmode): the packed artifact answers 143/5050 exactly like native"
+    done
+
+    # ---- negative case: a non-R_*_RELATIVE dynamic relocation inside a range that WOULD be encrypted
+    #      => the packer must refuse (non-zero exit + loud message + NO artifact) ----
+    # Why this must be fail-closed: ld.so UNCONDITIONALLY writes those slots before the entry point, while
+    # the runtime applier (vm_reloc_fix) only understands R_*_RELATIVE and the stub hard-fails on anything
+    # else -- the product can therefore never be correct. Construction: patch the ONE R_X86_64_RELATIVE
+    # (type 8) that sits inside the executable range into R_X86_64_64 (type 1) -- same table, same slot,
+    # different type. Calibration: turn the guard off in cmd/vmpack/main.go ("if !inside || r.Type ==
+    # relType" -> "if !inside || true") => the pack SUCCEEDS and leaves an artifact => this block goes red.
+    echo "[*] #597: a non-R_*_RELATIVE dynamic relocation inside an encryptable range must refuse the pack"
+    python3 - build/elf_target_textrel build/elf_target_textrel_abs <<'PY' || fail "build the non-RELATIVE-in-executable fixture"
+import os, struct, sys
+src, dst = sys.argv[1], sys.argv[2]
+d = bytearray(open(src, "rb").read())
+phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+loads, dyn = [], None
+for i in range(phn):
+    o = phoff + i * pes
+    t, fl, off, va, _pa, fsz, msz, _al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1:
+        loads.append((va, msz, fl))
+    elif t == 2:
+        dyn = va
+def off_of(va):
+    for i in range(phn):
+        o = phoff + i * pes
+        t, fl, off, v, _pa, fsz, msz, _al = struct.unpack_from("<IIQQQQQQ", d, o)
+        if t == 1 and v <= va < v + msz:
+            return off + (va - v)
+    return None
+do = off_of(dyn)
+rela = sz = 0
+for j in range(0x400 // 16):
+    tag, val = struct.unpack_from("<QQ", d, do + j * 16)
+    if tag == 0:
+        break
+    if tag == 7: rela = val
+    if tag == 8: sz = val
+ro = off_of(rela)
+hit = 0
+for k in range(sz // 24):
+    o = ro + k * 24
+    r_off, info, _add = struct.unpack_from("<QQq", d, o)
+    if (info & 0xFFFFFFFF) != 8:
+        continue
+    for va, msz, fl in loads:
+        if (fl & 1) and va <= r_off < va + msz:
+            struct.pack_into("<Q", d, o + 8, (info & ~0xFFFFFFFF) | 1)  # R_X86_64_RELATIVE -> R_X86_64_64
+            print("    patched the in-executable RELATIVE at 0x%X into R_X86_64_64" % r_off)
+            hit += 1
+            break
+assert hit, "no R_X86_64_RELATIVE slot inside an executable range to patch"
+open(dst, "wb").write(d)
+os.chmod(dst, 0o755)
+PY
+    G2_OUT="build/elf_textrel_${TAG}_nonrelative.enc"
+    G2_REP="build/elf_textrel_${TAG}_nonrelative.json"
+    rm -f "$G2_OUT" "$G2_REP"
+    G2_RC=0
+    G2_MSG="$(./build/vmpack -exe build/elf_target_textrel_abs -func checkKey -func sumTo \
+        -enc-image-elf-pie -enc-image-elf-pie-relocs \
+        -blob "$TRBLOB.bin" -manifest "$TRBLOB.json" \
+        -out "$G2_OUT" -report "$G2_REP" 2>&1)" || G2_RC=$?
+    if [ "$G2_RC" -eq 0 ]; then
+        echo "[MISMATCH] the packer ACCEPTED a non-R_*_RELATIVE relocation inside a range it would encrypt"
+        printf '%s\n' "$G2_MSG" | tail -n 3 | sed 's/^/    /'
+        fail "a non-RELATIVE relocation inside an encrypted range must be refused (fail-closed)"
+    fi
+    # loud message: ASCII keyword only (Chinese literals do not survive this harness pipe)
+    printf '%s' "$G2_MSG" | grep -aqF 'R_*_RELATIVE' || fail "the refusal must say which relocation kinds the runtime applier understands"
+    # and no artifact / no report may be left behind
+    if [ -f "$G2_OUT" ] || [ -f "$G2_REP" ]; then
+        fail "a refused pack must not leave an artifact or a report behind"
+    fi
+    echo "[OK  ] #597 fail-closed: non-relative reloc inside an encryptable range -> rc=$G2_RC, no artifact, refusal names the R_*_RELATIVE kernel the applier implements"
+fi
+
+# ---- aarch64：加密范围内重定位 —— 打包侧的范围等式 + 运行期"必须与原生一致"都是真断言 ----
 # #376/#377 把 aarch64 的只读数据节加密默认关掉（根因未定，AGENTS.md 禁止打开），所以
-# "加密范围里带 R_AARCH64_RELATIVE" 这条运行期路径一直没有可跑用例。本块做两件**能跑**的事，
-# 并把跑不了的那半用实测数字打进日志（不做断言）：
+# "加密范围里带 R_AARCH64_RELATIVE" 这条运行期路径一直没有可跑用例。本块做两件**都跑**的事：
 #   ① 打包侧契约：造一个 aarch64 PIE 夹具（.rodata 里两条相对重定位），用
 #      -enc-image-elf-pie -enc-image-elf-pie-relocs 打包，然后让**布局门禁**从产物自己的
 #      PT_DYNAMIC 重新推导"范围内重定位条数/应用表 RVA/类型"（E5(b)），并顺带把 E1..E4 与
 #      全部校准跑在**aarch64 产物**上（此前门禁只吃过 amd64 产物）。
-#   ② 运行期侧：今天不可达 —— 数据节加密被 #376/#377 禁；把重定位放进**可执行**范围则产物在
-#      amd64 上也会 SIGSEGV（DT_TEXTREL 类夹具，plain 打包同样崩）。所以这里只**记录**实测
-#      运行结果，不写成断言：把一个"当前崩"的状态钉成期望值，等于给未来的修复埋一颗假红，
-#      而这部分的结论写在 tools/check_elf_layout.py 的 "E5 coverage gap on aarch64" 一节里。
+#   ② 运行期侧（#597 起**升级为真断言**）：aarch64 的链接器把 PT_DYNAMIC 放在那个 R-X 段内部，
+#      所以旧行为是"整段加密 ⇒ ld.so 读到密文 ⇒ SIGSEGV(rc=139)"；#597 守卫 1 改成只加密
+#      PT_DYNAMIC **之前**的那一段，产物必须与原生逐字节一致（下面 a64_guard_partial + 运行期断言）。
+#      校准（必须能红）：把 cmd/vmpack/main.go 里守卫 1 的 `if dynOffHi > dynOffLo && ...` 改成
+#      `if false` ⇒ 打包端整段加密 ⇒ qemu 下 rc=139 ⇒ 运行期断言变红。结论同步写在
+#      tools/check_elf_layout.py 的 "E5 coverage gap on aarch64" 一节里。
 if [ "${GOARCH_TARGET}" = "arm64" ] && [ -n "${BLOB_CC}" ]; then
     echo "[*] aarch64: reloc-in-encrypted-range -- packing half asserted, runtime half registered as unverified (#376/#377)"
     A64_CC=${A64_CC:-aarch64-linux-gnu-gcc}
@@ -665,24 +965,59 @@ PY
     }
     A64_NOTE_ASBUILT="$(a64_note_count build/elf_target_a64reloc)"
     echo "    as-built aarch64 fixture: PT_NOTE=$A64_NOTE_ASBUILT (the injector needs 3 reusable slots for the three-segment split, 2 for prefix + W+X window+tail, 1 for the whole-payload W+X fallback)"
-    ./build/vmpack -exe build/elf_target_a64reloc -func checkKey -func sumTo \
+    A64_PACK1="$(./build/vmpack -exe build/elf_target_a64reloc -func checkKey -func sumTo \
         -enc-image-elf-pie -enc-image-elf-pie-relocs \
         -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
-        -out build/elf_target_a64reloc.enc -report build/elf_enc_a64reloc.json || fail "pack aarch64 reloc case"
-    # 先钉住"这条用例不是空转"：夹具必须真的把相对重定位放进了加密范围，且打包端真的记了账、
-    # 真的落了应用表。门禁的 E5(b) 会把 recorded 与产物自己 DT_DYNAMIC 里的条数对一遍，但如果两边
-    # 都是 0，那条等式会平凡成立 —— 所以这里单独断言 >= 1。
-    a64_reloc_bookkeeping() {  # $1 = report path
-        ELF_REPORT="$1" python3 - <<'PY' || fail "aarch64 reloc bookkeeping is vacuous ($1)"
-import json, os
+        -out build/elf_target_a64reloc.enc -report build/elf_enc_a64reloc.json 2>&1)" || fail "pack aarch64 reloc case"
+    # #597 守卫 1 在这条夹具上的**实测结论**（本轮之前这里是"记账 >= 1"的断言）：
+    #   aarch64 的链接器把 PT_DYNAMIC 放在那个 R-X 段**内部**（本夹具：段文件范围 [0,0x20018)，
+    #   PT_DYNAMIC 文件范围 [0x1FD90,0x1FF80)）⇒ 守卫 1 把它之前的部分加密、之后的部分**留着明文**。
+    #   断言的就是这个**实测出来的**范围等式（不是"加密范围为空"，也不是"整段加密"）：
+    #   加密范围 == [align_up(程序头表末尾), PT_DYNAMIC 文件偏移)。
+    a64_guard_partial() {  # $1 = report path, $2 = pack output, $3 = source fixture
+        ELF_REPORT="$1" A64_PACK_OUT="$2" ELF_SRC="$3" python3 - <<'PY' || fail "aarch64 PT_DYNAMIC guard did not take effect ($1)"
+import json, os, struct
 rep = json.load(open(os.environ["ELF_REPORT"]))
-n = int(rep.get("imgRelocCount") or 0)
-assert n >= 1, "the fixture put NO relative relocation inside the encrypted range: imgRelocCount=%s" % rep.get("imgRelocCount")
-assert int(rep.get("imgRelocTableRVA") or 0) != 0, "a relocation apply table must be emitted (imgRelocTableRVA=0)"
-print("    imgRelocCount=%d in-range RELATIVE reloc(s) recorded, apply table RVA=0x%X" % (n, int(rep["imgRelocTableRVA"])))
+d = open(os.environ["ELF_SRC"], "rb").read()
+phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+head = phoff + phn * pes
+inner = (head + 0xFFF) & ~0xFFF
+if inner < 0x1000:
+    inner = 0x1000
+base = min(struct.unpack_from("<Q", d, phoff + i * pes + 16)[0] for i in range(phn)
+           if struct.unpack_from("<I", d, phoff + i * pes)[0] == 1)
+dyn_off = dyn_hi = None
+for i in range(phn):
+    o = phoff + i * pes
+    if struct.unpack_from("<I", d, o)[0] == 2:  # PT_DYNAMIC
+        dyn_off = struct.unpack_from("<Q", d, o + 8)[0]
+        dyn_hi = dyn_off + struct.unpack_from("<Q", d, o + 32)[0]
+        break
+assert dyn_off is not None, "the fixture has no PT_DYNAMIC"
+exec_los = [struct.unpack_from("<Q", d, phoff + i * pes + 8)[0] for i in range(phn)
+            if struct.unpack_from("<I", d, phoff + i * pes)[0] == 1 and (struct.unpack_from("<I", d, phoff + i * pes + 4)[0] & 1)]
+assert exec_los, "no executable PT_LOAD"
+exec_lo, exec_hi = min(exec_los), None
+for i in range(phn):
+    o = phoff + i * pes
+    if struct.unpack_from("<I", d, o)[0] == 1:
+        off, sz = struct.unpack_from("<Q", d, o + 8)[0], struct.unpack_from("<Q", d, o + 32)[0]
+        if off <= dyn_off < off + sz:
+            exec_hi = off + sz
+assert exec_lo < dyn_off < exec_hi, "PT_DYNAMIC is not inside the executable segment on this fixture"
+want = [(inner - base, dyn_off - inner)] if dyn_off > inner else []
+got = [(int(x["rva"]), int(x["size"])) for x in (rep.get("imgSections") or [])]
+assert got == want, ("guard 1 must encrypt exactly the part BEFORE PT_DYNAMIC -- want %s, got %s" % ([hex(a) for a in want], got))
+assert int(rep.get("imgRelocCount") or 0) >= 1, ("the encrypted part still carries relocations, so they must be recorded: %s" % rep.get("imgRelocCount"))
+assert int(rep.get("imgRelocTableRVA") or 0) != 0, "an apply table must be emitted for the recorded relocations"
+print("    guard 1 active: encrypted [0x%X,0x%X), PT_DYNAMIC [0x%X,0x%X) left plaintext, %d reloc(s) recorded"
+      % (want[0][0], want[0][0] + want[0][1], dyn_off - base, dyn_hi - base, int(rep["imgRelocCount"])))
 PY
+        # ASCII anchor: this exact string appears ONLY in the guard-1 message (the source prints
+        # "载着 PT_DYNAMIC" and nothing else mentions PT_DYNAMIC in that line).
+        printf '%s' "$2" | grep -aq 'PT_DYNAMIC' || fail "the packer must LOUDLY say that the range carrying PT_DYNAMIC is not fully encrypted ($1)"
     }
-    a64_reloc_bookkeeping build/elf_enc_a64reloc.json
+    a64_guard_partial build/elf_enc_a64reloc.json "$A64_PACK1" build/elf_target_a64reloc
     python3 tools/check_elf_layout.py --packed build/elf_target_a64reloc.enc \
         --manifest build/vm_interp_elf.json --blob build/vm_interp_elf.bin \
         --report build/elf_enc_a64reloc.json --selftest || fail "aarch64 layout gate (packing half of the reloc contract)"
@@ -719,7 +1054,7 @@ PY
     else
         echo "[INFO] aarch64: no fallback line in this run's pack output (informational only -- the shape is asserted from the product below)"
     fi
-    a64_reloc_bookkeeping build/elf_enc_a64reloc_rwx.json
+    a64_guard_partial build/elf_enc_a64reloc_rwx.json "$RWX_OUT" build/elf_target_a64reloc_rwx
     python3 tools/check_elf_layout.py --packed build/elf_target_a64reloc_rwx.enc \
         --manifest build/vm_interp_elf.json --blob build/vm_interp_elf.bin \
         --report build/elf_enc_a64reloc_rwx.json --selftest || fail "aarch64 layout gate (one-RWX-segment shape)"
@@ -767,13 +1102,26 @@ PY
     # 所以前缀要取"loader 所在目录的上一级"（例如 /usr/aarch64-linux-gnu/lib -> /usr/aarch64-linux-gnu）。
     A64_LDFILE="$("$A64_CC" -print-file-name=ld-linux-aarch64.so.1 2>/dev/null)"
     A64_LD="$(dirname "$(dirname "$A64_LDFILE")")"
+    # 运行期那半**升级为真断言**（#597）：守卫 1 把载着 PT_DYNAMIC 的 R-X 范围排除之后，
+    # 产物不再含密文代码段，必须与原生逐字节一致。
+    # 校准（必须能红）：把 cmd/vmpack/main.go 里守卫 1 的 `if dynHi > dynLo && ...` 改成 `if false`
+    #   ⇒ 打包端会把那个范围整体加密 ⇒ 产物在 qemu 下 SIGSEGV(rc=139) ⇒ 下面这条断言变红。
+    #   （本轮实测：守卫关掉后 exactly 这条命令 rc=139；守卫打开后 rc=0 且输出 143。）
     if [ -f "$A64_LDFILE" ]; then
         A64_NAT_RC=0; A64_NAT="$($QEMU -L "$A64_LD" ./build/elf_target_a64reloc check-key 10 2>&1)" || A64_NAT_RC=$?
         A64_RC=0; A64_OUT="$($QEMU -L "$A64_LD" ./build/elf_target_a64reloc.enc check-key 10 2>&1)" || A64_RC=$?
-        echo "[INFO] aarch64 reloc product runtime (NOT asserted): native rc=$A64_NAT_RC -> [$A64_NAT] ; packed rc=$A64_RC -> [$(printf '%s' "$A64_OUT" | head -n 2 | tr '\n' ' ')]"
-        echo "[INFO]   today the packed one cannot answer like native: read-only-data encryption is off on aarch64 (#376/#377) and a reloc slot inside an encrypted executable range SIGSEGVs on amd64 too"
+        if [ "$A64_NAT_RC" -ne 0 ] || [ "$A64_NAT" != "143" ]; then
+            echo "[MISMATCH] aarch64 fixture native: rc=$A64_NAT_RC out=[$A64_NAT]"
+            fail "the aarch64 reloc fixture does not run natively"
+        fi
+        if [ "$A64_RC" -ne 0 ] || [ "$A64_OUT" != "$A64_NAT" ]; then
+            echo "[MISMATCH] aarch64 guard-1 product: native=[$A64_NAT](rc=$A64_NAT_RC) packed=[$(printf '%s' "$A64_OUT" | head -n 2 | tr '\n' ' ')](rc=$A64_RC)"
+            fail "the aarch64 product must answer exactly what native answers (#597 guard 1)"
+        fi
+        echo "[OK  ] aarch64: guard-1 product answers like native (check-key 10 -> $A64_OUT)"
     else
-        echo "[INFO] aarch64 reloc product runtime: no aarch64 loader next to $A64_CC (looked for [$A64_LDFILE]) -- runtime half left unverified (#376/#377)"
+        echo "[INFO] aarch64 reloc product runtime: no aarch64 loader next to $A64_CC (looked for [$A64_LDFILE])"
+        fail "the aarch64 loader is missing: the #597 runtime assertion cannot run (refusing to report a silent pass)"
     fi
 fi
 
