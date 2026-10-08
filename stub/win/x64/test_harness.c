@@ -12,7 +12,14 @@
 #include "vm_types.h"
 #include "vm_opcodes.h"
 
-int vm_run(vm_ctx_t *vm);
+/* vm_interp.c 是 blob 源文件：它依赖 cmd/vmpbuild 每次构建生成的 vm_crypto_key.h
+ * （VM_KEY_BYTES / 掩码种子 / KCV / sigma）。本文件只测**字节码语义**，那些常量无关紧要，
+ * 所以用与 stub/win/x64/keyname_probe.c 完全相同的占位头（该头不在任何 blob 构建的源清单里）。
+ * 编译方式见 tools/gates.ps1 与 docs/RUNBOOK.md。*/
+#include "keyname_probe_key.h"
+
+/* 包含**真源码本体**（不是副本）：解释器改错，这里就红。 */
+#include "vm_interp.c"
 
 static u8 buf[2048];
 static u32 n;
@@ -40,11 +47,14 @@ static void emit_cmp_rr(u32 kind, u32 w, int a, int b) {
 static void emit_cmp_ri(u32 kind, u32 w, int a, u32 imm) {
     e1(OP_CMP_RI); e1((u8)kind); e1((u8)w); e1((u8)a); e4(imm);
 }
+/* 编码必须与 stub/win/x64/vm_opcodes.h 的注释和解释器的解码逐字节一致（踩过一次：
+ * 老的 emit_load/emit_store 少了 index+scale 两个字节，解释器按错位读 disp32 得到野地址 ⇒
+ * 第 8 条用例直接 ACCESS_VIOLATION。ISA 改编码时这里要同步改）。 */
 static void emit_load(u32 kind, u32 w, int dst, int base, i32 disp) {
-    e1(OP_LOAD); e1((u8)kind); e1((u8)w); e1((u8)dst); e1((u8)base); e4((u32)disp);
+    e1(OP_LOAD); e1((u8)kind); e1((u8)w); e1((u8)dst); e1((u8)base); e1(VM_NO_REG); e1(0); e4((u32)disp);
 }
 static void emit_store(u32 w, int base, i32 disp, int src) {
-    e1(OP_STORE); e1((u8)w); e1((u8)base); e4((u32)disp); e1((u8)src);
+    e1(OP_STORE); e1((u8)w); e1((u8)base); e1(VM_NO_REG); e1(0); e4((u32)disp); e1((u8)src);
 }
 static void emit_jcc(u32 cond, u32 target) { e1(OP_JCC); e1((u8)cond); e4(target); }
 static void emit_ret(void) { e1(OP_RET); }
@@ -63,6 +73,8 @@ static void reset(vm_ctx_t *vm) {
 
 int main(void) {
     vm_ctx_t vm;
+    /* 崩溃时不做缓冲：否则看不到"跑到哪一步"（本文件的调试经验）。 */
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     /* 1. check_key 的真实指令序列：
      *    lea rax,[rcx*8] ; sub rax,rcx ; add rax,0x2a ; xor al,0xff ; ret */

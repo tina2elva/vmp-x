@@ -51,6 +51,12 @@ Step "linux payloads via WSL (CI's linux-amd64/arm64 command set)" {
 Step "go test ./..."     { go test ./... }
 # Blob must build: the Go gates never compile C, which once let a broken source stay green.
 # vmpbuild wants -src relative to the repo root, so run it from there.
+# Interpreter semantics, in-process and fast: test_harness.c includes the REAL vm_interp.c and
+# drives vm_run() with hand-written bytecode (real NZCV flags, 32-bit zero extension, 8/16-bit
+# partial writes, LEA addressing, LOAD/STORE widths, TEST/CMP + Jcc). The file existed for years
+# but NO script ran it, so it rotted: its emit_load/emit_store had lost the index+scale bytes and
+# case 8 died with an access violation. A test nobody runs is not a test (STATUS #602).
+Step "interpreter semantics (C harness)" { & powershell -NoProfile -File (Join-Path $PSScriptRoot "harness.ps1") }
 Step "vmpbuild (blob builds)" {
     Push-Location (Join-Path $PSScriptRoot "..")
     & ".\build\vmpbuild.exe" -src "stub/win/x64" -out "build/gates_blob.bin" -manifest "build/gates_blob.json" -entry vm_entry 2>&1 | Out-Null
