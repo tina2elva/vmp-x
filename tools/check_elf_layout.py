@@ -1034,20 +1034,36 @@ def selftest(path, manifest, report, blob):
         # case the invariant exists for: the payload still passes every shape check, so E2 reaches the
         # invariant and fails with "intersects the writable window" (its own sentence). This is the
         # calibration that proves E2's invariant -- as opposed to E1's -- still has teeth.
+        # The SKIP text must name the REAL blocker, so each candidate is filtered through the three
+        # criteria in order and the surviving count is reported per criterion (t7/G3: the old text
+        # blamed "growing it runs past EOF" unconditionally, but on an aarch64 product there is usually
+        # no non-payload, non-writable LOAD at all -- nothing to plant on, EOF never enters into it).
         victim = None
+        n_alive = 0   # PT_LOADs that are neither the payload itself, nor writable, nor empty
+        n_below = 0   # ...and whose vaddr range still ends at/below the window start
+        n_fits = 0    # ...and growing them to the window's end stays inside the file
         for q in elf.loads:
             if q["vaddr"] == sec_va or (q["flags"] & PF_W) or q["memsz"] == 0:
-                continue
+                continue                      # criterion (a) fails: it IS the payload / is writable / empty
+            n_alive += 1
             if q["vaddr"] + q["memsz"] > win_va:
-                continue                      # already touches the window: not a clean victim
+                continue                      # criterion (b): it already reaches the window's start
+            n_below += 1
             if q["off"] + (win_end - q["vaddr"]) > len(elf.data):
-                continue                      # growing it that far would run past EOF
+                continue                      # criterion (c): growing it would run past EOF
+            n_fits += 1
             victim = q
             break
         if victim is None:
-            print("[SKIP] CAL  E2-M5-window-covers: no non-writable, non-payload LOAD below the window "
-                  "that could be grown over it without running past EOF -- there is nothing to plant "
-                  "the defect on, so this calibration is deliberately skipped, NOT counted as a pass")
+            print("[SKIP] CAL  E2-M5-window-covers: no PT_LOAD can host this mutation, so there is "
+                  "nothing to plant the defect on (deliberate SKIP, NOT counted as a pass). Criteria, "
+                  "applied in order over %d PT_LOAD(s):" % len(elf.loads))
+            print("       (a) NOT the payload itself and NOT writable and memsz>0: %d LOAD(s) left"
+                  % n_alive)
+            print("       (b) ...and its vaddr range still ends at/below the window start 0x%X: %d left"
+                  % (win_va, n_below))
+            print("       (c) ...and growing it to the window's end (0x%X) stays inside the %d-byte file: "
+                  "%d left" % (win_end, len(elf.data), n_fits))
         else:
             need = win_end - victim["vaddr"]
 

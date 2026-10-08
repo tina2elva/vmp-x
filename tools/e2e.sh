@@ -111,7 +111,11 @@ if not (ok_split or ok_wx_one_seg or ok_no_window):
     print("    unexpected payload shape: payload flags=0x%X filesz=0x%X memsz=0x%X ; window=%r"
           % (pl["flags"], pl["filesz"], pl["memsz"], win))
     sys.exit(1)
-# 报告里的 payloadWXFallback 必须与程序头一致（t6/F6）："槽位够的目标不得走回退"由这条落地。
+# 报告里的 payloadWXFallback 必须与程序头一致（t6/F6）：这条只证"**报告声明的形状 == 产物形状**"。
+# 它**证不出**"槽位足够的目标不得走回退"—— 打包端整体回归到 (2)/(3) 时 flag 会一起变 true、形状
+# 仍合法 ⇒ 这条照样全绿。那句更强的断言由 tools/e2e_elf_image.sh 承担（在**源目标**上复刻
+# sparePhdrSlot 数槽位，按 sectionSize/bssOff/bssSize 算出应有档位，断言 tier == f(slots)）；
+# 本文件只做这个一致性对账。
 got = rep.get("payloadWXFallback")
 payload_wx = any((l["flags"] & PF_W) and (l["flags"] & PF_X)
                  for l in loads if l["vaddr"] < sec_va + sec_size and sec_va < l["vaddr"] + l["memsz"])
@@ -187,9 +191,14 @@ if command -v objdump >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
     done
 fi
 
-# 打包后把程序头打出来：注入段是 RX，blob 的 .bss（解密缓存）靠一个**重叠的 RW** LOAD 覆盖。
-# 覆盖段缺失/尺寸不对时，内核会把 .bss 留在只读 RX 映射里 → VM 第一次写缓存就 SIGSEGV，
-# 而 Windows 的 PE 路径没有这种映射检查，所以这个 bug 只在 Linux 上现形。
+# 打包后把程序头打出来，供人核对 —— 注入器把载荷放成**相邻不重叠**的段，按可复用槽位数分三档
+# （判据见本文件上面那段 python 断言）：
+#   ① 三段相邻：RX 前缀 [0,bssOff) + RW 窗口 [bssOff,+bssSize) + R+X 尾部（窗口后面还有字节时）；
+#   ② 2 个可用槽位且载荷有尾部：前缀仍只读，窗口与尾部合成**一段 W+X**；
+#   ③ 槽位更少：**整段 W+X** 的载荷段。
+# 三种都靠"窗口那一段本身可写"成立（不是靠映射顺序）：老形状"整段 RX + **重叠的 RW** 覆盖段"
+# 已废除 —— 它靠"后映射者胜"，而 glibc 在 DT_TEXTREL 路径按 PT_LOAD 重设保护时会把窗口那页
+# 设成只读 ⇒ VM 第一次写解密缓存就 SIGSEGV（#597）；PE 路径按节合并、写标志生效，所以只在 Linux 现形。
 if command -v readelf >/dev/null 2>&1; then
     echo "[*] 打包后程序头（只看 LOAD/NOTE）:"
     readelf -lW build/linux_target.vmp | grep -E "LOAD|NOTE" | sed "s/^/    /"

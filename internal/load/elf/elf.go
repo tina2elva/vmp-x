@@ -239,10 +239,12 @@ func (f *File) WriteVA(va uint64, b []byte) error {
 
 // sparePhdrSlot 找一个可以改写成 PT_LOAD 的空槽位。
 //
-// 优先级：PT_NOTE（对内核无意义）→ PT_PHDR（仅当是**静态 ET_EXEC**时）。
-// PT_PHDR 被复用会丢掉"程序头表位置"这条信息：内核自己从 e_phoff 取（不受影响），
-// 而 ld.so 只在动态/静态-PIE 时依赖它——所以只有"没有 PT_INTERP 且 e_type==ET_EXEC"
-// 时才允许复用，其它情况宁可不做分段（调用方退回整体 RWX）。
+// 优先级：PT_NOTE（对内核无意义）→ PT_GNU_RELRO（只削弱 RELRO 加固）→ PT_PHDR / PT_NULL
+// （仅当没有 PT_INTERP 时；有 PT_INTERP 的动态镜像里 ld.so 会用到它）。
+//
+// 复用的**代价**只是"这一段语义丢了"（NOTE 对内核无意义、RELRO 只是加固、PHDR 的位置内核从
+// e_phoff 取），所以调用方可以放心用它来放相邻的载荷段。槽位不够时**不是**退回老的重叠形状，
+// 而是按 inject 侧的三档梯子降级（② 窗口+尾部合一成一段 W+X / ③ 整段 W+X），见 SparePhdrSlots。
 func (f *File) sparePhdrSlot() int {
 	for i, p := range f.Progs {
 		if p.Type == PT_NOTE {
@@ -286,8 +288,9 @@ func (f *File) canDropPHDR() bool {
 // AddLoadSegmentFromNote 把第一个可复用槽位改写为指向 payload 的 PT_LOAD(R+X)，
 // payload 追加到文件尾（页对齐）。返回新段的虚拟地址与**文件偏移**。
 //
-// 这里只给 R+X：blob 里 .bss（解释器的明文解密缓存）需要的**写**权限由调用方
-// 用 AddOverlayLoadSegment 覆盖成单独的 RW 段——这样代码页不会变成可写（去掉 RWX）。
+// 这里只给 R+X：blob 里 .bss（解释器的明文解密缓存）需要的**写**权限由调用方再加一个
+// **相邻**（不是重叠）的段来给，见 AddOverlayLoadSegment —— 这样代码页不会变成可写（去掉 RWX）。
+// 也就是 M5 的首选几何：RX 前缀 [0,bssOff) + RW 窗口 [bssOff,+bssSize) +（有尾部时）R+X 尾部。
 func (f *File) AddLoadSegmentFromNote(payload []byte) (uint64, int64, error) {
 	return f.AddLoadSegmentFromNoteSized(payload, len(payload))
 }
@@ -340,9 +343,10 @@ func (f *File) AddLoadSegmentFromNoteSized(payload []byte, mapLen int) (uint64, 
 
 // SparePhdrSlots 返回**还能**改写成新段的槽位数（判据与 sparePhdrSlot 完全一致）。
 //
-// 调用方必须先问这个数再决定"能不能分段"：分段需要 2 个槽（RX 前缀 + RW 窗口），
-// 载荷尾部需要 R+X 时是 3 个。槽位不够时 inject 侧退回"整段 RWX"——整段可写，
-// 对 glibc 的 TEXTREL 保护重设同样免疫（M5 的成因是"RX 段覆盖窗口"，不是 RWX 本身）。
+// 调用方必须先问这个数再决定"能不能分段"：三段相邻需要 3 个槽（RX 前缀 + RW 窗口 + R+X 尾部；
+// 载荷在窗口之后没有字节时只要 2 个）。**槽位不够时按 ②窗口+尾部合一 / ③整段 的梯子降级**，
+// 绝不回到重叠形状：② = 前缀仍只读、窗口与尾部合成一段 W+X；③ = 整段 W+X。②③ 都是"那一整段
+// 可写"，所以对 glibc 的 TEXTREL 保护重设同样免疫（M5 的成因是"非可写段盖住窗口"，不是可写本身）。
 //
 // 关键：必须**按 sparePhdrSlot 的优先级顺序**模拟消耗，不能简单地对 PR_NOTE / PT_NULL /
 // PT_PHDR 各数一遍。实测过的反例：aarch64 夹具（1 个 PT_NOTE + 若干被改成 PT_NULL 的 NOTE）
@@ -480,7 +484,8 @@ func (f *File) unmappedBss() []Program {
 	return bad
 }
 
-// SetLoadSegmentFlags 改一个已存在 PT_LOAD 的权限（用于"分段不可行时退回整体 RWX"）
+// SetLoadSegmentFlags 改一个已存在 PT_LOAD 的权限（梯子 ③ 用：整段 W+X；整段可写 ⇒ 对
+// glibc 的 TEXTREL 保护重设同样免疫，且不产生任何重叠段）。
 func (f *File) SetLoadSegmentFlags(va uint64, flags uint32) bool {
 	for i, p := range f.Progs {
 		if p.Type == PT_LOAD && p.Vaddr == va {
