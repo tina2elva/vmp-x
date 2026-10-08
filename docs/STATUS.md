@@ -10970,6 +10970,85 @@ tier (3)，分类器就只说这一档、缺的档显式 SKIP，不超出实测�
 
 **互指**：本条是 `#600.5` 登记缺口的**补齐**；`#600` 的取向（不支持 RELR ⇒ 拒绝打包）在本条被**测试化**。真支持落地时，601.2 的第 3 步会从"必须拒绝"翻转成"必须与原生一致"。
 
+### 602. 测试地基：把一个"写好却没人跑"的解释器语义 harness 接成第 16 道门禁（并修好它的锈蚀）
+
+**范围与 sha**：`38298af`（harness 接线与锈蚀修复）+ 本条 docs 提交。
+改的是 `stub/win/x64/test_harness.c`、`tools/harness.ps1`（新增）、`tools/gates.ps1`、`.github/workflows/ci.yml`、
+`AGENTS.md`、`docs/RUNBOOK.md`。**产品行为零改动**（没有动解释器的语义，只把它们测起来）。
+
+#### 602.1 为什么做这个（本条的动机与诊断）
+
+起因是一个问题："感觉改一个问题总是又冒出别的问题，要不要写单测？" 用数据回答后的结论是：
+**不是缺单测**，而是**缺"反馈快、且跨边界"的那一层**。盘点（本轮实测）：
+
+| 层 | 现状 |
+|---|---|
+| Go 侧 | **274** 个 Test 函数 / **137** 个测试文件，`go test ./...` **5.9 秒**全绿 —— 这块不缺 |
+| C 侧（219KB 的 `vm_interp.c`） | 有一个 `stub/win/x64/test_harness.c`（解释器语义测试），但**全仓库没有任何脚本引用它**，而且**已经编不过** ⇒ 解释器语义只能靠**分钟级**的 e2e 验证 |
+| 差分测试 | `tools/difftest.ps1` 只覆盖 2 个函数 × 13 个取值 |
+| 跨边界契约 | KAT 只覆盖 kdf/salt/patch_mac/字节码；重定位应用表、`vm_reloc_ks` 的密码流、描述符字段掩码**没有** |
+
+并且从最近三批的死因看（`#599` 编译开关 + 蹦床丢返回码；`#597` glibc 只在 TEXTREL 路径重设页保护；
+`#600` round-2/3 的守卫缺口），**这些 bug 是"两侧各自正确、拼起来错"的跨边界型，单测在结构上抓不到** ——
+所以补测试的方向必须同时包含"**更快**"（别只靠 e2e）与"**跨边界契约**"（RELR 就是第一个样板，见 602.5）。
+
+#### 602.2 锈蚀到什么程度（修之前，实测）
+
+- **没有任何脚本引用它**（全库 grep 零命中）；
+- 装了 define 也**编不过**（缺 vmpbuild 生成的 `vm_crypto_key.h`；`vm_run` 未链接）；
+- 编译方式对齐 `keyname_probe.c` 之后**一跑就 ACCESS_VIOLATION** —— 用无缓冲 stdout 定位到第 8 条用例；
+- **根因**：它的 `emit_load`/`emit_store` 是**旧编码**，少了 `index`+`scale` 两个字节。
+  当前 ISA（`vm_opcodes.h` 的注释、以及解释器的解码）是
+  `OP_LOAD` 11B = `[op][kind][width][dst][base][index][scale][disp32]`、
+  `OP_STORE` 10B = `[op][width][base][index][scale][disp32][src]`。
+  少两个字节 ⇒ 解释器把 disp32 从错位处读出来 ⇒ 野地址 ⇒ 崩。
+  **这正是"手写编码器与真 ISA 漂移"这类 bug 的活样本**，也正是它作为门禁的价值。
+
+#### 602.3 改动（`38298af`）
+
+1. `test_harness.c`：按 `keyname_probe.c` 的既有范式接线（`keyname_probe_key.h` 占位常量 + `#include "vm_interp.c"`，
+   包含**真源码本体**而不是副本）；去掉过时的 `extern vm_run`；stdout 改**无缓冲**（崩溃时能看到跑到哪一步）；
+   **修好 `emit_load`/`emit_store` 的 index+scale**。
+2. `tools/harness.ps1`（新增，**ASCII-only**，避免 PS 5.1 的 ANSI 坑）：编译并运行 harness；
+   缺 gcc 时按 77 约定**醒目 SKIP**（`VMP_REQUIRE_GCC=1` 变硬失败）。
+3. `tools/gates.ps1`：新增第 16 道门 `interpreter semantics (C harness)`（**门禁数 15 ⇒ 16**，`AGENTS.md` 同步更新）。
+4. `ci.yml`：windows-amd64 作业新增同名 step —— 该作业**不跑 `gates.ps1`**（它跑的是各个单独步骤），
+   所以不单独加就**覆盖不到**。
+5. `docs/RUNBOOK.md` §5.1 补上这道门与"约 2 秒"的定位；顺带**更正** §5.2 那句"本机跑不了 Linux 侧"（WSL Ubuntu 已可用，门禁已在跑它）。
+
+#### 602.4 证据
+
+- 修复后：`PASS: 0 failure(s)`，9 组断言（真实 NZCV / 32 位零扩展 / 8 位局部写 / LEA / TEST+CMP+Jcc / 移位进位 /
+  LOAD 符号扩展 / STORE-LOAD 宽度）。
+- **校准（必须能红，本轮亲测）**：把 `vm_interp.c` 的 `write_reg` 32 位分支改成不做零扩展 ⇒
+  `[FAIL] mov r8d,ecx 得到 5（高位清零）`、`rc=1`；`git checkout -- stub/win/x64/vm_interp.c` 恢复后 `git status` 干净。
+- `tools/preflight.ps1` ⇒ `[+] preflight: OK`（按既有约定重建了被 `test_harness.c` 时间戳顶旧的
+  `build/runbc.exe`、`build/runbc_a64g.exe`）。
+- `tools/gates.ps1` ⇒ `total 16 gates, 0 failed, 0 skipped`（`gates_602.log` 里能看到
+  `[*] interpreter semantics (C harness)` → `PASS: 0 failure(s)` → `[OK  ] ... (exit 0)`）。
+- CI **三个作业全绿**：run `37780657286`（`windows-amd64` / `linux-amd64` / `linux-arm64`）。
+  CI 侧亲核：新增 step 里 `PASS: 0 failure(s)` + `[OK  ] harness: interpreter semantics (real vm_interp.c, hand-written bytecode)`，
+  从 step 开始到 PASS 约 **2 秒**。
+
+#### 602.5 未做项（醒目）
+
+- **"每条跨边界字节格式必须有 KAT"这条规矩还没落地**（本轮只立了方向）：下一轮做 **RELR** 时按它的第一个样板执行 ——
+  先 Go 解码器 + 单测，再 C 侧 KAT（同一组向量喂两侧），最后才动运行期与 e2e 翻转。
+- 本 harness 只覆盖**解释器语义**（9 组）。密码/KDF/字节码容器那几层**不归它管**，它们已有各自的 KAT
+  （`kdf_kat.c`/`kdf_blob_kat.c`/`crypto_probe.c`）。RELR 的应用器属于哪一层、需要哪种 KAT，在下一轮定。
+- 差分测试仍只有 2 函数 × 13 取值（扩成"随机字节码程序 vs Go 参考 VM"**未做**）。
+- 阶段性目标"每条 fail-closed 硬门分支都有一个测试真的走到它"**未做**（`#600` 已登记过个别不可达分支）。
+
+#### 602.6 过程事故（如实记，且已有门禁兜住）
+
+用编辑工具改 `tools/gates.ps1` 时**把它的 UTF-8 BOM 吃掉了**（HEAD 里有 BOM，改完没了）——
+这正是 `preflight` 第 5 项门禁与 MEMORY 里记过的老事故（PS 5.1 按 ANSI 读 ⇒ 中文注释乱码/语法错误）。
+本轮在提交前核对 HEAD↔工作区的 BOM 状态时**发现并恢复**（BOM + CRLF），`preflight` 复绿。
+⇒ 教训：**动 `tools/*.ps1`（尤其含中文的）之后必须逐文件核对 BOM**，不能只看脚本能不能跑。
+
+**互指**：本条是 `#601.5` 与"测试地基"讨论的落地；`#602.5` 的 KAT 规矩在 RELR 那一轮执行。
+
+
 
 
 

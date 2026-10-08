@@ -186,14 +186,25 @@ powershell -NoProfile -File tools/e2e_pyd.ps1 -Pyd <pyd> -Map <map> \
 ### 5.1 一条命令跑完全部本机门禁
 
 ```powershell
-powershell -NoProfile -File tools/gates.ps1     # gofmt / vet / test / x86 E2E / DLL E2E
+powershell -NoProfile -File tools/gates.ps1     # gofmt / vet / test / interpreter harness / x86 E2E / DLL E2E
 ```
 
-### 5.2 本机为什么跑不了 Linux 侧（已实测，不是猜测）
+其中**第 16 道门**（`tools/harness.ps1`，`STATUS #602` 接入）是最快的一道：它编译
+`stub/win/x64/test_harness.c` —— 该文件 include 的是**真的** `vm_interp.c`，用手写字节码直接驱动
+`vm_run()`，断言真实 NZCV 标志、32 位零扩展、8/16 位局部写、LEA 寻址、LOAD/STORE 宽度、TEST/CMP+Jcc。
+约 2 秒出结果（对比 e2e 的分钟级），所以解释器语义改动应该先看它。单独跑：
 
-- `wsl.exe` 存在但**没有安装任何发行版**（`wsl --status` 明确提示未安装）；
-- 没有 docker / podman / qemu-aarch64（都已用 `Get-Command` 确认）；
-- 因此 Linux/amd64 与 Linux/arm64 的执行验证**只能**在 CI 或真机上完成。
+```powershell
+powershell -NoProfile -File tools/harness.ps1
+```
+
+### 5.2 Linux 侧怎么跑（**2026-10-08 更正：本节原先写"本机跑不了"，已不成立**）
+
+- 本机现在**有** WSL Ubuntu，`tools/wsl_linux.ps1` 会把工作树 rsync 到 `~/vmp-x` 并在那里跑 CI 的
+  linux-amd64 / linux-arm64 命令集（`gates.ps1` 已把它接成一道门，见 `STATUS #583`/`#584`）。
+  它会先同步（`--exclude build/ --exclude .git/`），所以 Linux 产物不会污染 Windows 的 `build/`。
+- 仍然**没有**的：aarch64 的 Windows 侧工具链。win/arm64 已暂缓（`STATUS #581`），本地不验证它。
+- 原先那句"只能在 CI 或真机上完成"对 arm64 **原生** 执行仍然成立（本机走 qemu-user）。
 
 ## 7. 推送前最小改动清单（为了跑 CI）
 
