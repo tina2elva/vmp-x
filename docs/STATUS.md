@@ -10514,6 +10514,8 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
 
 ### 597. M5 根因定位（可写窗口被 RX 段吃掉的映射竞争）+ K5 重新定性（不是缺陷；一次错误修复已回退）
 
+> **状态更新与更正（`STATUS #600`，2026-10-08）**：本节正文里「**不加 `-enc-image-elf-pie`（纯 plain）⇒ `rc=139`**」的观察是 **M5 的载荷几何缺陷**，已由 `#598` 的三段布局修掉 —— 修后 `amd64` 上 plain / `-enc-image-elf-pie` / `+relocs` **三种打包的产物都与原生逐字节一致**（`#600` 有实测）。**真缺陷在 `aarch64`**：链接器把 `PT_DYNAMIC` 放进被加密的那个 `PT_LOAD` 内部 ⇒ `ld.so` 读到密文 ⇒ 装载阶段 `rc=139`。`#597` 的 fail-closed 决策（含 `PT_DYNAMIC` 的范围不加密；加密范围内非 `R_*_RELATIVE` 动重定位拒绝打包；`DT_RELR` 保守拒绝）已在 `#600` 落地。原文保留作痕迹。
+
 **1. M5（「加密可执行范围含重定位 ⇒ 产物 SIGSEGV」）根因定位：与加密无关。**
 
 - 复现（WSL / amd64，玩具夹具）：把指针放进 `.text` + `gcc -fPIE -pie -O1 -Wl,-z,notext`（`readelf` 有 `TEXTREL`）⇒ native `143`/`rc=0`；
@@ -10742,11 +10744,14 @@ tier (3)，分类器就只说这一档、缺的档显式 SKIP，不超出实测�
   **已实测排除本次改动**：父提交 `3eda950` 与 `1a238fe` 在同一夹具上给出**相同**的恒定值。
   ⇒ 与 M5 几何无关，已登记进 `docs/TODO.md` 作为独立待查项（本轮未定位机制）。
 
-  ⚠️ **`#599` 更正本节的表述**：本轮（队长）用 release blob 复现后发现它不是「迭代数 ≳5e6 后与 n 无关的恒定值」那么简单 —— 见 `#599` 的实测表（不同函数形状给出 `5,000,000`、`n/3`、`2,303` 等**不同**错值），且**与 `VM_STEP_BUDGET` 无关**（那是 `#ifndef VM_RELEASE`，而 `cmd/vmpbuild:738` 固定 `-DVM_RELEASE=1`）。§7 的结论按 `#599` 读。
+  ⚠️ **`#599` 更正本节的表述**：本轮（队长）用 blob 复现后发现它不是「迭代数 ≳5e6 后与 n 无关的恒定值」那么简单 —— 见 `#599` 的实测表（不同函数形状给出 `5,000,000`、`n/3`、`2,303` 等**不同**错值）。§7 的结论按 `#599` 读。
+  **⚠️ 二次更正（`STATUS #600`，2026-10-08）**：上面原写「**与 `VM_STEP_BUDGET` 无关**（那是 `#ifndef VM_RELEASE`，而 `cmd/vmpbuild:738` 固定 `-DVM_RELEASE=1`）」—— **这句是错的，已作废**（原文痕迹留在本句里，不删）：`cmd/vmpbuild` 那一行在 `if releaseBuild` **内**，而 `releaseBuild` 只在显式 `-release` 时置真（`cmd/vmpbuild/main.go:57-61/:103/:125-127/:737-740`）⇒ 复现用的 blob 是**非 release** 构建，`VM_STEP_BUDGET` **正是病根**。三源证据（源码 / manifest 符号 / 运行期对照）见 `#600`。
 
 ### 599. 新发现（机制未定位）：被保护函数的**大行程循环**会静默返回错值（release 产物，可稳定复现）
 
-**现象**（release blob：`cmd/vmpbuild:738` 固定 `-DVM_RELEASE=1`；plain 打包 / amd64；夹具 `build/loop2.c`，五个函数各一个循环，`n` 由命令行给）：
+> **状态更新（`STATUS #600`，2026-10-08）：已定位（解释器 `VM_STEP_BUDGET`）→ 已修（`t1=7607b56`，CI `37737668462` 三作业绿）→ 边界已收口（`t6=39e8aab` 把 `pc>=codeLen` 与 `OP_CALLR addr==0` 两条静默出口改成 100/101，走同一个硬门）。** 本节下面两处表述（「release blob：`cmd/vmpbuild:738` 固定 `-DVM_RELEASE=1`」与「**已排除** `VM_STEP_BUDGET`」）**已被 `#600` 更正，原文保留作痕迹**。
+
+**现象**（~~release blob：`cmd/vmpbuild:738` 固定 `-DVM_RELEASE=1`~~ —— **⚠️ 更正（`#600`）：那个 blob 是「默认 / 非 release」构建，`-DVM_RELEASE=1` 只在显式 `-release` 时加**；plain 打包 / amd64；夹具 `build/loop2.c`，五个函数各一个循环，`n` 由命令行给）：
 
 | 函数 | n | native | packed |
 |---|---|---|---|
@@ -10766,13 +10771,138 @@ tier (3)，分类器就只说这一档、缺的档显式 SKIP，不超出实测�
 - 但 `lastI`（空体）在 `n=2e7` 返回 **6,666,666 ≈ n/3** ⇒ 与「5e6 次上限」**矛盾** ⇒ 更像**归纳变量/行程语义被改错**（不同函数形状给出不同倍数）⇒ 机制**未定位**。
 - 线索：`sumTo` 的 IR 是 `IR[03] MOV_RI w=32 dst=0 imm=1`、`IR[04] MOV_RI w=32 dst=2 imm=0`，而循环体是 `ALU_RR/ALU_RI/CMP_RR w=64` ⇒ **初始化 32 位、运算 64 位**混用，值得先查「32 位写是否零扩展高位」。
 
-**已排除**：`VM_STEP_BUDGET`（`stub/win/x64/vm_interp.c:2503` = 20,000,000）在 `#ifndef VM_RELEASE` 内，而打包器固定 `-DVM_RELEASE=1` ⇒ **与本现象无关**（说明它不是调试预算，而是 **release 路径的真实缺陷**）。
+**已排除（⚠️ 本条已作废，见下）**：~~`VM_STEP_BUDGET`（`stub/win/x64/vm_interp.c:2503` = 20,000,000）在 `#ifndef VM_RELEASE` 内，而打包器固定 `-DVM_RELEASE=1` ⇒ 与本现象无关~~。
+**⚠️ 更正（`STATUS #600`，2026-10-08）**：上面这句不成立（`-DVM_RELEASE=1` 只在显式 `-release` 时加）—— 实测病根**就是** `VM_STEP_BUDGET`：默认/非 release blob 把它编了进来，`-release` blob 才没有（三源证据见 `#600`）。已由 `t1=7607b56` 修掉（默认与 `-release` 产物都不再含这条截断；`-diag` 打开时超限走硬门）。
 
 **复现配方**：`build/loop2.c` → `vmpbuild -src stub/linux/amd64` → `vmpack -exe … -func sumTo -func countIters -func lastI -func sumSmall -func sumAddOne` → 对比 `n = 4,999,990 / 4,999,999 / 20,000,000`。**诊断工具**：`vmpack -v`（打印 IR）与 `-dumpbytecode <dir>`（转储明文字节码）。
 
 **下一轮要做的**：① 判定是**提升器/代码生成**还是**解释器执行**；② 用 `-dumpbytecode` 把字节码与 IR 逐条对齐（尤其 `ALU_RI` 的宽度与立即数）；③ 定位后**必须让这类失败变响亮**（超限/非法状态走 `__builtin_trap()` 或硬门，绝不把错值当返回值）——fail-closed 原则要求如此。
 
 **过程教训（队长自身，已记入 MEMORY）**：本轮我用 PowerShell `Get-Content -Raw` + `Set-Content -Encoding UTF8` 往本文件追加内容 ⇒ **把 UTF-8 按 ANSI 读**，造成乱码与大规模内容丢失（`git diff` 一度显示 10240 行删除）；已 `git checkout -- docs/STATUS.md` 恢复（`git status` 干净、行号与 HEAD 一致）。**规则：这批文档一律用编辑工具改，禁止 PS 文本管道 round-trip。**
+
+### 600. 本批收口：`#599` 大行程循环静默错值（定位→修复→边界收口）+ `#597` 可执行段内重定位的 fail-closed 决策与落地（含 `DT_RELR` 保守拒绝）
+
+**范围与 sha**：`7607b56`（#599 修复）→ `c242c55`（#597 打包端守卫）→ `39e8aab`（复评 round-2）→ `fd201f1`（复评 round-3）。
+本条是**收口记录**：`#599` / `#597` 的正文按其更正后的事实读（那两条里**被推翻的句子保留原文作痕迹**）。
+任务链：`t1`（#599 实现）/ `t3`（独立验证，被验 `c242c55`）/ `t2`（#597 实现）/ `t6`（round-2 修复 `39e8aab`）/ `t8`（round-3 修复 `fd201f1`）/ `t9`（round-3 复评 **pass**）/ `t5`（本条整合）。
+
+**CI（`gh run view` 亲核；三作业 = `windows-amd64` / `linux-amd64` / `linux-arm64`）**
+
+| 提交 | 摘要 | run | 三作业 |
+|---|---|---|---|
+| `7607b56` | #599：预算不再编入产物 + 解释器异常退出走硬门 | `37737668462` | 全 success |
+| `c242c55` | #597：`PT_DYNAMIC` 范围不加密 + 非相对象拒绝打包 | `37745919195` | 全 success |
+| `39e8aab` | round-2：`rc==1` 两个静默出口、守卫 2 的 ET_EXEC 空转、`DT_JMPREL`/`DT_RELR` 覆盖 | `37752098508` | 全 success |
+| `fd201f1` | round-3：`DT_RELR` 保守拒绝、隐式 addend 不入应用器、e2e 硬门常量修正 | `37755548669` | 全 success |
+
+#### 600.1 `#599`：病根是**解释器**（不是提升器/代码生成）
+
+现象（见 `#599` 表）：被保护函数在**大行程循环**上给出**正常退出（`rc=0`）的错值**。
+
+机制（三条证据 + 一条单变量对照）：
+1. **IR → 字节码的账是对的**（`t1`）：`vmpack -v` 与 `-dumpbytecode` 对 `sumTo` 76 字节逐字节核对 ——
+   `IR[03] MOV_RI w=32 dst=0 imm=1` ↔ `47 20 00 01 00 00 00 00 00 00 00`；`IR[07] ALU_RR ADD w=64 dst=2 a=2 b=0` ↔ `ed 00 40 02 02 00`；
+   `IR[10] JCC`（cond=3=AE）↔ `80 03 24 00 00 00`（target `0x24`=36=IR[07] 的字节码偏移）；`IR[14] JMP` ↔ target `0x3E`。⇒ 宽度/立即数/跳转目标全对，**排除提升器/代码生成**；
+   线索里的「32 位写未零扩展」不成立（`write_reg` 的 `w=32` 分支就是 `val & 0xFFFFFFFF`）。
+   **（独立复核 `t3`）**：用自造夹具复算了 IR 的循环体条数（`count_loop`=4、`sum_loop`=6、`empty_loop`=3 条/迭代）；**未**能独立复现「IR↔字节码逐字节对齐」——字节码操作码映射是**构建期随机**、没有公开解码入口 ⇒ 该条只作为 `t1` 的自证记录，不算独立复现。
+2. **病根**：`stub/win/x64/vm_interp.c` 的 `VM_STEP_BUDGET = 20,000,000` 条/次调用；`vm_run_inner` 每步 `++steps`，超限 `return 96`。
+3. **决定性因果实验**（`t1`）：把预算改成 1/100（200,000）⇒ 错值切点**精确前移 100 倍**且仍 `rc=0` 有输出（`4,999,999→49,999`、`5,000,000→50,000`、`6,666,666→66,666`、`2,303→39,999`），每迭代字节码条数 4/4/3/5 精确预测各切点。
+   **（独立复核 `t3`，自造夹具）**：预算 `2e7` ⇒ 切点 `4,999,999` / `3,333,333` / `6,666,665`（= `2e7 ÷ (4/6/3)` 条/迭代）；预算 `2e5` ⇒ `49,999` / `33,333` / `66,665`（正好 1/100）。
+4. **为什么是静默的**：入口蹦床 `stub/<平台>/vm_entry_asm.S` 在 `:108/:112` `call vm_run`，之后在 `:152` `movq VM_CTX_RAX(%rsp), %rax` 直接 `ret` —— **`vm_run` 的返回码被丢弃**，调用方拿到的是「循环跑到一半的客户机 RAX」。
+5. **单变量对照（独立复核 `t3`）**：同一夹具、同一 `vmpack`、同一目标，只把 blob 的解释器源换成父提交 `352c0c2` 的 `vm_interp.c` ⇒ `n=4,999,999/2e7` 出现 `rc=0` 的静默错值；换成修后源码 ⇒ 与原生逐字节一致。
+
+**修法（`t1=7607b56`，四处）**：① `VM_STEP_BUDGET` 改为**显式打开**（`#ifdef VM_STEP_BUDGET_ON`），默认与 `-release` 产物里不再有这条截断；
+② 新增 `vm_fail_closed()`：`vm_run` 对 `vm_run_inner` 的异常返回统一硬门（Linux：`exit_group(0xC0DE0000|code)`；其它目标：`ud2`），覆盖 96/97/98/99；`OP_HALT(1)` 保持历史语义；
+③ `cmd/vmpbuild -diag` 带上 `-DVM_STEP_BUDGET_ON=1`（诊断能力保留且**响亮**）；④ `tools/e2e.ps1` 加 `sum_to 20000000`（≈8×10⁷ 条字节码）回归钉子。
+
+**fail-closed 实测**：`-diag` 打开预算时 `n=20,000,000` **不返回任何值**（Linux：无输出 + `rc=96`（`0xC0DE0060` 低 8 位）；Windows：`rc=0xC000001D`（ud2））；默认 blob 下夹具用例全部 MATCH native。
+**`t3` 独立复核**：自造 4 形状（计数/累加/空体/最小行程）× `n ∈ {10, 1000, 1e6, 4,999,999, 2e7}`，Linux/ELF 与 Windows/PE 各 20 格**全部与原生逐字节一致**；同一夹具在 `352c0c2` 的 blob 上**必红**（静默错值）；`-diag` 在 `n=4,999,999/2e7` 无输出 + 硬门码。
+
+#### 600.2 边界收口（`t6=39e8aab`）：`rc==1` 的两条静默出口
+
+`vm_run_inner` 原有**三处** `return 1`：`OP_HALT`（历史定义的正常停机）与两条**失败**路径。`t6` 逐条处置：
+- `vm->pc >= vm->codeLen`（跑出字节码末尾，`vm_interp.c:2579`）→ **`return 100`**，走 `vm_fail_closed` 硬门；
+- `OP_CALLR` 的 `addr == 0`（间接调用空指针，`:3118`）→ **`return 101`**，走同一个硬门；
+- `case OP_HALT`（`:2607`）→ **保留 `1`**（`x86-32` 的字节码用例与 Go 参考实现都依赖它）。
+
+⇒ 两条失败路径**不再与 `OP_HALT` 共用码值**，`#599` 的「把当时的 RAX 当返回值」在这一类里也已被堵死（`t3` 登记的那条 `OP_CALLR` 就是它）。
+**committed 回归（`tools/e2e.ps1`，改前必红）**：
+- `[OK] #599 hard gate: n=1000 -> 500500 (rc=0); n=20000000 -> no output, rc=0xC000001D`；
+- `[OK] #599 pc-overrun gate: with RET -> rax=287454020 rc=0 ; without RET -> no value, rc=0xC000001D`（旧行为是**打印 rax 并 `rc=1`** ⇒ 这条证明改的不是「只换了个码值」）。
+
+**可达性如实登记**：`pc` 越界路径需要**没有 RET 结尾**的字节码，而 codegen 恒以 `RET` 收尾 + 字节码是 AEAD 认证的 ⇒ **正常产物不可达**；`OP_CALLR` 空指针**可达**（客户机程序自己就能构造），现在同样「不返回任何值」。
+
+#### 600.3 文档更正（F6）：`cmd/vmpbuild:738 固定 -DVM_RELEASE=1` 是**错的**
+
+原 `#598 §7`、`#599`、`TODO` 里都写「`VM_STEP_BUDGET` 在 `#ifndef VM_RELEASE` 内，而打包器固定 `-DVM_RELEASE=1` ⇒ 与本现象无关」。**三源证据（`t5` 本轮亲测，均可复现）**：
+1. **源码**：`cmd/vmpbuild/main.go:57-61` 定义 `releaseBuild bool`（默认 `false`）；`:103` `-release` 是**显式开关**；`:125-127` `if *release { releaseBuild = true }`；`:737-740` 才是 `if releaseBuild { ... "-DVM_RELEASE=1" ... }` ⇒ **不显式传 `-release` 就绝不加 `-DVM_RELEASE=1`**。
+2. **manifest 符号**（`vmpbuild -src stub/win/x64 … -entry vm_entry`，对比加不加 `-release`）：默认 blob 的 manifest **含** `vm_call_ring` / `vm_diag` / `vm_last_pc` / `vm_r1_pcs` / `vm_ring_hdr`；`-release` 的 manifest **一个都没有**（这些符号都在 `#ifndef VM_RELEASE` 里）⇒ 两者确实是不同的编译开关。
+3. **运行期**（`t5`，`352c0c2` 的源码 + 同一夹具）：默认（非 release）blob 在 `n=4,999,999` 就给出静默错值（`sum=3333333`、`count=4999999`、`empty=6666665`，`rc=0`），**`-release` blob 与原生逐字节一致** ⇒ **病根正是 `VM_STEP_BUDGET`**（默认构建把它编了进来）；修后（`fd201f1`）默认与 `-release` 都与原生一致、`-diag` 在超限时走硬门（`rc=96`、无输出）。
+
+⇒ `#598 §7` / `#599` / `TODO` 三处的原句已**就地标注更正（原文保留，不静默删）**。另注：`-diag` 是**第三个**开关（`VM_STEP_BUDGET_ON`），与 `-release` 无关。
+
+#### 600.4 `#597`：决策与落地
+
+**决策**：**不**拒绝「可执行段内含重定位 + 该范围要加密」本身（运行期应用器可用，`amd64` 三态实测与原生一致）；把两个**真会产出坏产物**的情形做成打包端 **fail-closed**：
+1. **守卫 1**：**任何含 `PT_DYNAMIC` 的范围不加密**（部分重叠只加密其**前段**），打醒目 `[!]`，`report.imgSections` 如实反映真正加密的范围；
+2. **守卫 2**：加密范围内出现**非 `R_*_RELATIVE`** 的动重定位 ⇒ **拒绝打包**（非零退出 + 醒目信息 + **不落产物**）；
+3. 另有**解密表自洽检查**：每个范围的首/末字节必须能用产物自己的程序头折算回文件，且不得与文件头/程序头表页重叠（写盘前响亮失败）；
+4. `tools/check_elf_layout.py` 的 **E5 覆盖缺口措辞**同轮按实测更正（仅 INFO 文案，**未删任何断言**）。
+
+**旧记载更正**：`#597` 原文「plain 打包也 `rc=139`」「`amd64` 也崩」是 **M5 的载荷几何缺陷**（`#598` 三段布局已修）；修后 `amd64` 上 plain / `-enc-image-elf-pie` / `+relocs` **三种打包的产物都与原生逐字节一致**（`t2` 与 `t3` 各自实测）。
+**真缺陷在 `aarch64`**：链接器把 **`PT_DYNAMIC` 放进被加密的那个 `PT_LOAD` 内部**（committed 夹具实测：加密候选 `[0x1000,0x20018)`、`PT_DYNAMIC` va `0x1FD90` **在范围内**）⇒ `ld.so` 读到**密文**、在装载阶段 `rc=139`（**不是**运行期应用器被调用）；`amd64` 只是**碰巧**把动态段放在段外 —— 那不是打包端保证的不变量。
+
+**实测（`t2` 实现、`t3` 独立复核，本批门禁里再跑一遍）**：
+- `[OK] DT_TEXTREL (plain|pie|relocs): the packed artifact answers 143/5050 exactly like native`；
+- `[OK] #597 fail-closed: non-relative reloc inside an encryptable range -> rc=1, no artifact, refusal names the R_*_RELATIVE kernel the applier implements`；
+- `[OK] aarch64: guard-1 product answers like native (check-key 10 -> 143)`，且 `guard 1 active: encrypted [0x1000,0x1FD90), PT_DYNAMIC [0x1FD90,0x1FF80) left plaintext, 2 reloc(s) recorded`。
+- **校准（必须能红，`t3` 亲测）**：守卫 2 关掉 ⇒ 负例 **`rc=0` 且落产物**（断言变红）；守卫 1 关掉 ⇒ committed `aarch64` 用例 `[FAIL] pack aarch64 reloc case`。
+
+#### 600.5 `DT_RELR`（复评 round-3，`t8=fd201f1`）
+
+取向：**不支持 RELR**；目标带 `DT_RELR` 且要加密任何范围 ⇒ **直接拒绝打包**（不依赖解码器）。
+- `internal/load/elf`：**删除** `decodeRelr`（不再声称能正确解码）；新增 `HasRELR()` 只做「带不带」探测（`DT_RELR` 的 `d_ptr` 或 `DT_RELRSZ` 非 0；**读不出动态表就报错**，绝不当成没有）。
+- `elf.Reloc.ImplicitAddend`：标记 `DT_REL` 语义 / `DT_JMPREL`+`DT_PLTREL=REL` / RELR 这类**加数在槽位里**的表；`RelativeRelocs()` 过滤掉它们 ⇒ 这些条目**不进**重定位应用表、也**不进** `NormalizeRelocSlots`（不会清零真实槽位）。
+- 守卫 2 的判据顺序：**隐式 addend (a) → 类型 (b) → 是否入表 (c)**；**(a) 即使已经入表也拒绝**（单测⑥专门喂了「已入表」的输入）。
+
+**⚠️ 严重性措辞（按 `t9` 校准，不许过度宣称）**：`t9` 的校准显示，**被拒的那种布局在关掉判据后其实能跑（`rc=0`、与原生一致）** ⇒ 不能写成「放行 = 运行期必然硬门」；正确表述是「**在没有可靠解码器时无法判定这些槽位是否可还原 ⇒ 按 fail-closed 保守拒绝**」。
+
+**登记为后续项（不是本轮已完成）**：① RELR 真正支持（正确解码 + `stub` 应用器 + 运行期端到端）**未做**；
+② `HasRELR→fatalf` 目前**只有单测 + 手工端到端**，**没有 committed e2e**（建议在 `tools/e2e_elf_image.sh` 补「自造 RELR PIE ⇒ 断言 `rc≠0` + 不落产物 + 信息含 `DT_RELR`」）；
+③ 旧解码器的**三处缺陷**（如需重启该功能时参考）：bitmap 之后缺 `base += 63*8`、首个 bitmap 的 base 应为 `addr+8`、裸地址条目本身也是一条重定位却被丢掉 —— 对照 `readelf`：真实产物 `readelf` 解出 **203** 条，本仓库旧码只给 **202**、**去重 68**、139 重复、`>=0x5970` **全丢**。
+
+#### 600.6 终局门禁（冻结 sha = `fd201f1`，跑前 `git status --short` 为空）
+
+- `tools/preflight.ps1` ⇒ `[+] preflight: OK`（exit 0）。
+- `tools/gates.ps1` ⇒ `total 15 gates, 0 failed, 0 skipped`（exit 0）；`e2e: 186 passed, 0 skipped, 0 failed`、`dll e2e: 7 passed, 0 failed`、`32-bit e2e: 12/12`（两种模式）、
+  WSL 半场 14 个 step 全 `[OK]` + 汇总 `[OK] wsl_linux: every step passed`（15 个 `[OK]`、0 `[FAIL]`、0 `[SKIP]`）。
+- 本条 `docs/` 提交是**纯文档改动**（不改被验代码）；其 CI run 号记在任务报告里（不写进正文以免自引用）。
+
+#### 600.7 未做项 / 如实降级（醒目）
+
+- **运行期方案 (b)**（改 `stub/` 让应用器处理可执行段内的重定位槽位）：**未做** —— 打包端 fail-closed 守卫已挡住坏产物。
+- **RELR 真支持 + committed e2e**：**未做**（见 600.5）。
+- **Go `ET_EXEC` 的 `PT_DYNAMIC` 在段外（无文件映射）** ⇒ 守卫 1 对它**不适用**（`amd64` 恰好如此）；这类目标由 600.4 的③ **解密表自洽检查**兜住。
+- **`t3` 验证者未能独立逐字节复核 IR→字节码映射**（操作码映射构建期随机、无解码入口）；只独立复核了 IR 条数 / 切点 / 编译期开关 / 二进制常量（默认 blob 里 `0x01312D00` 出现 **0** 次、`-diag` blob **1** 次）与端到端行为。
+- **没有已知的「静默错值/崩溃」被写成已修**：`pc>=codeLen` 与 `OP_CALLR addr==0` 已在 `39e8aab` 收口（100/101，`e2e` 有回归）；仍保留 `rc=1` 的只有 `OP_HALT`（正常停机语义）。
+- **环境假红（非产品缺陷，但影响报告数字）**：打包用的 blob 与运行期不一致会让产物「看起来是产品崩了」（实测旧 blob ⇒ `rc=139`）；共享工作区并发跑 e2e 会互相覆盖原生夹具（见过 `Invalid ELF image for this architecture` 假红）⇒ 用私有 worktree / 私有 WSL 树，报告数字注明工作区状态。
+
+#### 600.8 契约/harness 缺口 + 测试教训
+
+- **契约 scope 两次窄过**：`t6`（`39e8aab`）实际改了 6 个文件、`t8`（`fd201f1`）改了 5 个（含**新增测试文件** `cmd/vmpack/guard_reloc_test.go`、`internal/load/elf/elf_reloc_test.go`），而契约的路径清单只列了主干文件 ⇒ harness 报 `repair cannot complete: … is undeclared`。**本批真实改动一律按 `git show --stat` 记账**（见下表），以后 in-scope 建议直接写包/目录。
+- **PowerShell 5.1 的退出码坑**：`0xC000001D` 这类字面量被解析成**负 Int32**，与加宽后的退出码比较**永不相等** ⇒ 硬门/陷阱码一律用**十进制**常量（陷阱 `3221225501`、掩码 `4294967040`、硬门族 `3235774464` = `0xC0DE0000`）。`tools/e2e.ps1` 里曾有一个错值 `3235643392`（`0xC0DC0000`）⇒ 那段判断是**死代码**，`t8` 已改对并留注释。
+- **文档纪律**：本批 docs 一律用编辑工具改（**禁止** PowerShell 文本管道 round-trip —— `#599` 记过一次）；本条的所有更正一律**保留原文**。
+
+**本批真实改动文件（`git show --stat`）**
+
+| 提交 | 文件 |
+|---|---|
+| `7607b56` | `cmd/vmpbuild/main.go`、`stub/win/x64/vm_interp.c`、`tools/e2e.ps1` |
+| `c242c55` | `cmd/vmpack/main.go`、`tools/check_elf_layout.py`、`tools/e2e_elf_image.sh` |
+| `39e8aab` | `cmd/vmpack/main.go`、`cmd/vmpack/guard_reloc_test.go`（新增）、`internal/load/elf/elf.go`、`internal/load/elf/elf_reloc_test.go`（新增）、`stub/win/x64/vm_interp.c`、`tools/e2e.ps1` |
+| `fd201f1` | `cmd/vmpack/main.go`、`cmd/vmpack/guard_reloc_test.go`、`internal/load/elf/elf.go`、`internal/load/elf/elf_reloc_test.go`、`tools/e2e.ps1` |
+
+**互指**：`#599` 是本条的**依据**（现象 + 首轮修复），本条是**收口**；`#597` 同上（决策在本条落地）。`#598` 的 M5 几何修复是本条 `amd64` 三态正常的前提。
 
 
 
