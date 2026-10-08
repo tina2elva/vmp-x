@@ -43,6 +43,14 @@ const (
 	DT_REL     = 17
 	DT_RELSZ   = 18
 	DT_RELENT  = 19
+	// PLT/IFUNC 重定位表（.rela.plt）：长度与语义分别由 DT_PLTRELSZ / DT_PLTREL 给出。
+	DT_PLTRELSZ = 2
+	DT_PLTREL   = 20
+	DT_JMPREL   = 23
+	// 压缩相对重定位表（.relr.dyn）：条目本身不写类型，隐含为 R_*_RELATIVE。
+	DT_RELRSZ  = 35
+	DT_RELR    = 36
+	DT_RELRENT = 37
 
 	// 相对重定位的类型号（本仓库支持的两种架构）。两者语义相同：
 	// 运行期槽位值 = 装载基址 + r_addend，所以运行期一套「先减 delta → 验签 → 解密 → 再加回 delta」
@@ -643,10 +651,18 @@ func (f *File) DynamicEntries() ([]DynEntry, error) {
 	return nil, nil
 }
 
-// DynRelocs 读动态重定位表（DT_RELA/DT_RELASZ/DT_RELAENT，或 REL 语义的 DT_REL/…）。
+// DynRelocs 读**三张**动态重定位表，合并成一个按"表顺序"排列的切片：
+//
+//	① DT_RELA/DT_RELASZ/DT_RELAENT（x86-64/aarch64 的主表，.rela.dyn），或 REL 语义的 DT_REL/…
+//	② DT_JMPREL/DT_PLTRELSZ/DT_PLTREL（.rela.plt：JUMP_SLOT 与 **IRELATIVE**）
+//	③ DT_RELR/DT_RELRSZ/DT_RELRENT（压缩相对重定位，.relr.dyn：条目不写类型，按架构隐含 RELATIVE）
+//
+// 为什么要读全三张（#597 复评 F4）：打包端守卫 2 的判据是"加密范围内的动重定位必须可还原"，
+// 而 ld.so 在**入口点之前**会把这三张表都应用一遍。少读一张，那条守卫对**那一类**槽位就是空的 ——
+// 尤其 DT_JMPREL 里的 R_*_IRELATIVE，它的 r_offset 指向的正是可执行段里的 PLT 桩（加密范围）。
 //
 // 表本身用 **VA** 寻址，走 VAtoOffset（也就是按程序头映射），因此对打包端搬动过的产物仍有效。
-// 读不出来（越界/条目尺寸不对）时返回错误，调用方必须 fail-closed —— 静默当成"没有重定位"
+// 读不出来（越界/条目尺寸/语义不对）时返回错误，调用方必须 fail-closed —— 静默当成"没有重定位"
 // 会让加密范围里那些真存在的重定位在运行期被解出垃圾。
 func (f *File) DynRelocs() ([]Reloc, error) {
 	ents, err := f.DynamicEntries()
@@ -656,9 +672,16 @@ func (f *File) DynRelocs() ([]Reloc, error) {
 	if len(ents) == 0 {
 		return nil, nil
 	}
-	// DT_RELA 优先（x86-64/aarch64 都是 RELA）；没有再退回 DT_REL。
+	// 三张表都要读，缺一张就会让调用方（打包端守卫 2）对**那一类**槽位空转：
+	//   ① DT_RELA/DT_REL      —— 主表（.rela.dyn）
+	//   ② DT_JMPREL           —— PLT/IFUNC 表（.rela.plt）：JUMP_SLOT 落在可写段不算危险，
+	//      但 **IRELATIVE** 的 r_offset 指向的正是可执行段里的 PLT 桩，也就是加密范围
+	//   ③ DT_RELR             —— 压缩相对重定位（.relr.dyn）：槽位类型不写在条目里，按架构隐含
+	// 这三张表都会在**入口点之前**被 ld.so 改写，所以它们的目标落在加密范围里就必须能被
+	// 运行期应用器还原（否则密文的 AEAD tag 已经变了）。详见 cmd/vmpack 的守卫 2。
 	type table struct{ addr, size, ent uint64 }
-	var tbl, tblRel table
+	var tbl, tblRel, tblJmp, relr table
+	var pltRel uint64
 	for _, e := range ents {
 		switch e.Tag {
 		case DT_RELA:
@@ -673,41 +696,111 @@ func (f *File) DynRelocs() ([]Reloc, error) {
 			tblRel.size = e.Val
 		case DT_RELENT:
 			tblRel.ent = e.Val
+		case DT_JMPREL:
+			tblJmp.addr = e.Val
+		case DT_PLTRELSZ:
+			tblJmp.size = e.Val
+		case DT_PLTREL:
+			pltRel = e.Val
+		case DT_RELR:
+			relr.addr = e.Val
+		case DT_RELRSZ:
+			relr.size = e.Val
+		case DT_RELRENT:
+			relr.ent = e.Val
 		}
 	}
-	if tbl.size == 0 && tblRel.size == 0 {
-		return nil, nil
+	var out []Reloc
+	// DT_RELA 优先（x86-64/aarch64 都是 RELA）；没有再退回 DT_REL。
+	if tbl.size != 0 || tblRel.size != 0 {
+		withAddend := tbl.size != 0
+		t := tbl
+		if !withAddend {
+			t = tblRel
+		}
+		if t.addr == 0 {
+			return nil, fmt.Errorf("动态表声明了重定位（size=0x%X）但没有地址", t.size)
+		}
+		entSize := t.ent
+		if entSize == 0 {
+			if withAddend {
+				entSize = RelaEntrySize
+			} else {
+				entSize = RelEntrySize
+			}
+		}
+		if withAddend && entSize != RelaEntrySize {
+			return nil, fmt.Errorf("DT_RELAENT=%d，本包只支持 %d", entSize, RelaEntrySize)
+		}
+		if !withAddend && entSize != RelEntrySize {
+			return nil, fmt.Errorf("DT_RELENT=%d，本包只支持 %d", entSize, RelEntrySize)
+		}
+		rs, rerr := f.readRelTable(t.addr, t.size, entSize, withAddend)
+		if rerr != nil {
+			return nil, rerr
+		}
+		out = append(out, rs...)
 	}
-	withAddend := tbl.size != 0
-	t := tbl
-	if !withAddend {
-		t = tblRel
-	}
-	if t.addr == 0 {
-		return nil, fmt.Errorf("动态表声明了重定位（size=0x%X）但没有地址", t.size)
-	}
-	entSize := t.ent
-	if entSize == 0 {
+	if tblJmp.size != 0 {
+		if tblJmp.addr == 0 {
+			return nil, fmt.Errorf("DT_JMPREL 声明了 size=0x%X 但没有地址", tblJmp.size)
+		}
+		withAddend := false
+		switch pltRel {
+		case DT_RELA:
+			withAddend = true
+		case DT_REL:
+			withAddend = false
+		case 0:
+			// 没有 DT_PLTREL：x86-64 与 aarch64 都是 RELA 语义（并按下面的条目尺寸校验兜底）
+			withAddend = true
+		default:
+			return nil, fmt.Errorf("DT_PLTREL=%d 既不是 DT_REL(%d) 也不是 DT_RELA(%d)", pltRel, DT_REL, DT_RELA)
+		}
+		entSize := uint64(RelEntrySize)
 		if withAddend {
 			entSize = RelaEntrySize
-		} else {
-			entSize = RelEntrySize
 		}
+		rs, rerr := f.readRelTable(tblJmp.addr, tblJmp.size, entSize, withAddend)
+		if rerr != nil {
+			return nil, fmt.Errorf("DT_JMPREL 表：%w", rerr)
+		}
+		out = append(out, rs...)
 	}
-	if withAddend && entSize != RelaEntrySize {
-		return nil, fmt.Errorf("DT_RELAENT=%d，本包只支持 %d", entSize, RelaEntrySize)
+	if relr.size != 0 {
+		if relr.addr == 0 {
+			return nil, fmt.Errorf("DT_RELR 声明了 size=0x%X 但没有地址", relr.size)
+		}
+		entSize := relr.ent
+		if entSize == 0 {
+			entSize = 8
+		}
+		if entSize != 8 {
+			return nil, fmt.Errorf("DT_RELRENT=%d，本包只支持 8（ELF64）", entSize)
+		}
+		rs, rerr := f.decodeRelr(relr.addr, relr.size)
+		if rerr != nil {
+			return nil, fmt.Errorf("DT_RELR 表：%w", rerr)
+		}
+		out = append(out, rs...)
 	}
-	if !withAddend && entSize != RelEntrySize {
-		return nil, fmt.Errorf("DT_RELENT=%d，本包只支持 %d", entSize, RelEntrySize)
+	return out, nil
+}
+
+// readRelTable 读一张由 (VA, size, 条目尺寸) 描述的动态重定位表。
+// withAddend 表示 RELA 语义（条目 24 字节，带 r_addend）；否则 REL 语义（16 字节）。
+func (f *File) readRelTable(addr, size, entSize uint64, withAddend bool) ([]Reloc, error) {
+	if entSize == 0 {
+		return nil, fmt.Errorf("重定位表 0x%X 的条目尺寸为 0", addr)
 	}
-	off, err := f.VAtoOffset(t.addr)
+	off, err := f.VAtoOffset(addr)
 	if err != nil {
-		return nil, fmt.Errorf("重定位表 VA 0x%X：%w", t.addr, err)
+		return nil, fmt.Errorf("重定位表 VA 0x%X：%w", addr, err)
 	}
-	if uint64(off)+t.size > uint64(len(f.Data)) {
-		return nil, fmt.Errorf("重定位表 0x%X+0x%X 超出文件", off, t.size)
+	if uint64(off)+size > uint64(len(f.Data)) {
+		return nil, fmt.Errorf("重定位表 0x%X+0x%X 超出文件", off, size)
 	}
-	n := int(t.size / entSize)
+	n := int(size / entSize)
 	out := make([]Reloc, 0, n)
 	for i := 0; i < n; i++ {
 		o := off + i*int(entSize)
@@ -721,17 +814,58 @@ func (f *File) DynRelocs() ([]Reloc, error) {
 	return out, nil
 }
 
+// decodeRelr 把 DT_RELR（压缩相对重定位）解成显式的槽位。
+// 格式（gABI）：每个条目是 Elf64_Addr；最低位为 0 的条目是「起始地址」base，
+// 最低位为 1 的条目的其余位是 bitmap —— 第 i 位 = 1 表示 base+i*8 处有一条相对重定位。
+// 这些条目的类型**不写在表里**，按架构隐含 = R_*_RELATIVE（见 relativeRelocType）。
+func (f *File) decodeRelr(addr, size uint64) ([]Reloc, error) {
+	want, err := relativeRelocType(f.Machine)
+	if err != nil {
+		return nil, err
+	}
+	off, err := f.VAtoOffset(addr)
+	if err != nil {
+		return nil, fmt.Errorf("DT_RELR VA 0x%X：%w", addr, err)
+	}
+	if uint64(off)+size > uint64(len(f.Data)) {
+		return nil, fmt.Errorf("DT_RELR 0x%X+0x%X 超出文件", off, size)
+	}
+	var out []Reloc
+	var base uint64
+	for o := off; o+8 <= off+int(size); o += 8 {
+		v := binary.LittleEndian.Uint64(f.Data[o:])
+		if v&1 == 0 {
+			base = v
+			continue
+		}
+		bits := v >> 1
+		for i := 0; i < 63; i++ {
+			if bits>>uint(i)&1 != 0 {
+				out = append(out, Reloc{Offset: base + uint64(i)*8, Type: want})
+			}
+		}
+	}
+	return out, nil
+}
+
+// relativeRelocType 返回本架构的相对重定位类型号（不认识的架构报错，绝不猜）。
+func relativeRelocType(machine uint16) (uint32, error) {
+	switch machine {
+	case EM_X86_64:
+		return R_X86_64_RELATIVE, nil
+	case EM_AARCH64:
+		return R_AARCH64_RELATIVE, nil
+	default:
+		return 0, fmt.Errorf("架构 %d 没有登记相对重定位类型号", machine)
+	}
+}
+
 // RelativeRelocs 只返回本架构的 R_*_RELATIVE 项（其它类型丢弃）。
 // ET_EXEC/静态链接的目标返回空切片 —— 它们没有动态重定位。类型号不认识的架构返回错误。
 func (f *File) RelativeRelocs() ([]Reloc, error) {
-	var want uint32
-	switch f.Machine {
-	case EM_X86_64:
-		want = R_X86_64_RELATIVE
-	case EM_AARCH64:
-		want = R_AARCH64_RELATIVE
-	default:
-		return nil, fmt.Errorf("架构 %d 没有登记相对重定位类型号", f.Machine)
+	want, werr := relativeRelocType(f.Machine)
+	if werr != nil {
+		return nil, werr
 	}
 	all, err := f.DynRelocs()
 	if err != nil {

@@ -1027,15 +1027,24 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				}
 				imgSecs = kept
 			}
-			// #597 守卫 2（fail-closed，**两个架构都要**）：加密范围里只要出现一条**非 R_*_RELATIVE**
-			// 的动重定位，就拒绝打包、非零退出、**不落产物**。
+			// #597 守卫 2（fail-closed，**两个架构都要**）：加密范围内**每一条**动重定位都必须
+			// ① 类型是运行期应用器认识的那种、② 在重定位应用表里；否则拒绝打包、非零退出、**不落产物**。
 			//
 			// 为什么不能放过去：ld.so 在入口点之前会按动态表**无条件改写**那个槽位（实测 aarch64 的
 			// R_AARCH64_GLOB_DAT 就落在加密段尾：rva 0x1FFD8/0x1FFE8/0x1FFF0）；运行期应用器只还原
-			// R_*_RELATIVE（stub 的 vm_reloc_fix 对其它类型走 vm_reloc_bad=3 硬门），于是密文的
-			// Poly1305 tag 已经变了 —— 产物要么验签失败、要么崩，**没有静默正确的可能**。
+			// R_*_RELATIVE（stub 的 vm_reloc_fix 对其它类型走 vm_reloc_bad=3 硬门），
+			// 且只碰**表里登记过**的位置，于是密文的 Poly1305 tag 已经变了 —— 产物要么验签失败、
+			// 要么崩，**没有静默正确的可能**。
 			// internal/inject.BuildPayload 只校验"表里的槽位都在加密范围内"（必要方向），
-			// 这里补上**反方向**：加密范围内**每一条**动重定位都必须在表里、且都是应用器认识的那种。
+			// 这里的反方向由 guardELFRelocsInRange 判（两条都要）。
+			//
+			// 覆盖面（#597 复评 F4）：动重定位来自 internal/load/elf.DynRelocs，它读**三张**表 ——
+			// DT_RELA/DT_REL（.rela.dyn）、DT_JMPREL（+DT_PLTRELSZ/DT_PLTREL，.rela.plt，含 IRELATIVE
+			// 这种 r_offset 落在可执行段里的情形）、DT_RELR（压缩相对重定位，按架构隐含 R_*_RELATIVE）。
+			// 少了任何一张，这条守卫对**那一类**槽位就是空的。
+			// 边界（如实登记，见 #597 复评 F3）：记表的循环对 **ET_EXEC 不建表**，所以对 ET_EXEC 产物
+			// 一旦加密范围里真的出现相对重定位，(b) 会把它**拒绝**掉 —— 这是有意的 fail-closed，
+			// 而不是"支持 ET_EXEC 的相对重定位"。
 			if len(imgSecs) > 0 {
 				dynAll, derr := f.DynRelocs()
 				if derr != nil {
@@ -1045,28 +1054,17 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				if relType == 0 {
 					fatalf("机器类型 0x%X 没有登记相对重定位类型号（无法判断加密范围里的重定位是否可还原）", f.Machine)
 				}
-				bad := 0
-				for _, r := range dynAll {
-					inside := false
-					for _, s := range imgSecs {
-						lo, hi := imageBase+uint64(s.RVA), imageBase+uint64(s.RVA+s.Size)
-						if r.Offset >= lo && r.Offset < hi {
-							inside = true
-							break
-						}
+				bad := guardELFRelocsInRange(imgSecs, imgRelocs, dynAll, imageBase, relType)
+				for i, m := range bad {
+					if i >= 4 {
+						break
 					}
-					if !inside || r.Type == relType {
-						continue
-					}
-					if bad < 4 {
-						fmt.Fprintf(os.Stderr, "[!] ELF 整体加密：加密范围里有一条**非 R_*_RELATIVE** 的动重定位 r_offset=RVA 0x%X type=%d —— 运行期无法还原 ld.so 写进去的值\n", r.Offset-imageBase, r.Type)
-					}
-					bad++
+					fmt.Fprintf(os.Stderr, "[!] ELF 整体加密：%s\n", m)
 				}
-				if bad > 0 {
-					fatalf("拒绝打包：%d 条非相对动重定位落在要加密的范围里（RVA 见上）。ld.so 会在入口点之前**无条件改写**这些槽位，而运行期应用器只认识 R_*_RELATIVE(type=%d) ⇒ 这个产物要么验签失败、要么跑错。\n    可操作选项：去掉 -enc-image-elf-pie-relocs / -enc-image-elf-pie（不加密这些范围），或改用把这些槽位放在加密范围之外的链接布局。", bad, relType)
+				if len(bad) > 0 {
+					fatalf("拒绝打包：%d 条动重定位落在要加密的范围里、但运行期还原不了（RVA 见上）。ld.so 会在入口点之前按动态表**无条件改写**这些槽位，而运行期应用器只认识 R_*_RELATIVE(type=%d)、且只碰重定位应用表里登记过的位置 ⇒ 这个产物要么验签失败、要么跑错。\n    可操作选项：去掉 -enc-image-elf-pie-relocs / -enc-image-elf-pie（不加密这些范围），或改用把这些槽位放在加密范围之外的链接布局。", len(bad), relType)
 				}
-				fmt.Printf("[*] ELF 整体加密：加密范围内的动重定位全部是 R_*_RELATIVE(type=%d)，共核对 %d 条动态项（没有 ld.so 会在入口点前改写、而应用器无法还原的槽位）", relType, len(dynAll))
+				fmt.Printf("[*] ELF 整体加密：加密范围内的动重定位全部可还原（R_*_RELATIVE(type=%d) 且在应用表里），共核对 %d 条动态项（DT_RELA/DT_REL + DT_JMPREL + DT_RELR）", relType, len(dynAll))
 				fmt.Println()
 			}
 			// fail-closed 的最后一道自洽检查：要写进解密表的每个范围，必须能用**产物自己**的程序头
@@ -1816,6 +1814,50 @@ func elfRelativeRelocType(machine uint16) uint32 {
 		return elfload.R_AARCH64_RELATIVE
 	}
 	return 0
+}
+
+// guardELFRelocsInRange 是 #597 守卫 2 的判定核心（抽成纯函数，便于单测与复评独立复核）：
+// 加密范围 imgSecs 里出现的**每一条**动态重定位都必须同时满足两件事 ——
+//
+//	(a) 类型是运行期应用器认识的那种（R_*_RELATIVE）；否则 ld.so 写进去的值我们还原不出来；
+//	(b) 它的位置**在重定位应用表 table 里**；否则运行期那个"先减 delta → 验签 → 解密 → 再加回
+//	    delta"的协议根本不会碰它，密文的 AEAD tag 已经变了。
+//
+// 为什么要查 (b)（#597 复评 F3）：记表的循环在调用点上方，条件写的是
+// "if f.EType == elfload.ET_DYN && len(imgSecs) > 0" ⇒ 对 **ET_EXEC** 产物表恒为空，
+// 而 ld.so 对 ET_EXEC 同样会在入口点之前按 DT_RELA 改写槽位。少了 (b)，这条"反方向"检查
+// 在那类产物上就是**空转**（看起来在保护、实际不生效）。现在这类情形直接拒绝打包。
+//
+// 覆盖的表：(DT_RELA/DT_REL + DT_JMPREL + DT_RELR，见 internal/load/elf.DynRelocs)。
+// 返回人类可读的问题列表（空 = 通过）；顺序与输入一致（前几条会被打到 stderr）。
+func guardELFRelocsInRange(imgSecs []inject.ImgSection, table []inject.ImgReloc, dynAll []elfload.Reloc, imageBase uint64, relType uint32) []string {
+	var bad []string
+	recorded := make(map[uint32]bool, len(table))
+	for _, r := range table {
+		recorded[r.RVA] = true
+	}
+	for _, r := range dynAll {
+		inside := false
+		for _, s := range imgSecs {
+			lo, hi := imageBase+uint64(s.RVA), imageBase+uint64(s.RVA+s.Size)
+			if r.Offset >= lo && r.Offset < hi {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			continue
+		}
+		rva := uint32(r.Offset - imageBase)
+		if r.Type != relType {
+			bad = append(bad, fmt.Sprintf("加密范围里有一条**非 R_*_RELATIVE** 的动重定位 r_offset=RVA 0x%X type=%d —— 运行期无法还原 ld.so 写进去的值", rva, r.Type))
+			continue
+		}
+		if !recorded[rva] {
+			bad = append(bad, fmt.Sprintf("加密范围里的相对动重定位 r_offset=RVA 0x%X 没有登记进重定位应用表（ET_EXEC 不建表；或该范围没走记表分支）—— 运行期不会还原 ld.so 写进去的值", rva))
+		}
+	}
+	return bad
 }
 
 // elfSectionName 按原始镜像的节头表反查一个 VA 落在哪个节里（找不到返回 "-"）。

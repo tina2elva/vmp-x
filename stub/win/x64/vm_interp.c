@@ -2223,9 +2223,20 @@ static void vm_antidebug(void) { }
  * （退出码 0xC0DE0000|code；POSIX 只暴露低 8 位，与 0xC0DE0007 同族）。
  *
  * 为什么必须有它（STATUS #599，本轮定位）：入口蹦床（stub/<平台>/vm_entry_asm.S）**丢弃**
- * vm_run 的返回码，只把 ctx.regs[RAX] 交给调用方。于是解释器一旦"中途退出"
- * （96=指令预算超限 / 97=弹出过多 / 98=未知操作码 / 99=压穿客户机栈），调用方拿到的就是
- * "循环跑到一半的 RAX"，表现为一次**正常返回的错值** —— 这正是本仓库最忌讳的失败形态。 */
+ * vm_run 的返回码，只把 ctx.regs[RAX] 交给调用方。于是解释器一旦"中途退出"，调用方拿到的就是
+ * "跑到一半的 RAX"，表现为一次**正常返回的错值** —— 这正是本仓库最忌讳的失败形态。
+ *
+ * vm_run_inner 里一共**三处** `return 1`，逐条的归属与可达性：
+ *   ① `vm->pc >= vm->codeLen`（跑出字节码末尾）→ **已改成 100**，走本硬门。
+ *      可达性：正常产物里**不可达** —— codegen 给每个被 lift 的函数都以 RET 收尾，且字节码是
+ *      AEAD 认证过的（改一个字节就验签失败），"没有 RET 的字节码"进不来；这里只是兜底。
+ *   ② `OP_CALLR` 的 `addr == 0`（间接调用空指针）→ **已改成 101**，走本硬门。
+ *      可达性：**可达**（客户机程序自己通过空函数指针调用）。原生语义就是崩，本硬门同样
+ *      "不返回任何值"，比把当时的 RAX 当返回值更贴近原生、也更响亮。
+ *   ③ `OP_HALT` → **保留 1**：它是历史定义的"正常停机"（x86-32 的字节码用例以 HALT 结束，
+ *      Go 参考实现同样返回 1），不是失败，故不进硬门。
+ * 其余异常码：96=指令预算超限（诊断开关）/ 97=弹出过多 / 98=未知操作码或寄存器索引越界 /
+ *   99=压穿客户机栈 —— 全部走本硬门。 */
 static void vm_fail_closed(u32 code) {
 #if defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64))
     /* Linux：走裸 syscall 硬门退出（退出码 0xC0DE0000|code；POSIX 只暴露低 8 位）。
@@ -2389,9 +2400,9 @@ int vm_run(vm_ctx_t *vm) {
     }
 #endif /* !VM_RELEASE */
     int rc = vm_run_inner(vm, rsp_start);
-    /* 解释器"中途退出"绝不能当成客户机返回值传出去：入口蹦床丢弃这里的返回码，
-     * 只把 ctx.regs[RAX] 交给调用方 ⇒ 会变成"循环跑到一半的 RAX"这种静默错值（#599 的病灶）。
-     * 1 = OP_HALT 是历史定义的正常停机（x86-32 的字节码用例以 HALT 结束），保持原语义。 */
+    /* 解释器"中途退出"绝不能当成客户机返回值传出去：入口蹦床丢弃这里的返回码、只取 ctx.regs[RAX]。
+     * 只有 0(OP_RET) 与 1(OP_HALT，历史定义的正常停机) 放行；其余（96/97/98/99/100/101）全部硬门，
+     * 逐条归属与可达性见 vm_fail_closed 的注释。 */
     if (rc != 0 && rc != 1) vm_fail_closed((u32)rc);
     /* XMM 边界同步（出口）：把 guest 算出来的 xmm0-xmm5 写回蹦床帧的保存槽，
      * 这样出口 asm 恢复 xmm0 时交还给调用方的就是**被保护函数的返回值**（xmm0 承载 FP 返回值）。 */
@@ -2563,7 +2574,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             return 97; /* 弹出过多：SP 高过进入值（返回地址会取错，进而跳到任意地址） */
         }
 #endif
-        if (vm->pc >= vm->codeLen) return 1;
+        /* 跑出字节码末尾 = 这个函数没有以 RET 收尾 —— 不是正常返回，走硬门（见 vm_fail_closed）。
+         * 用 100 而不是 1：1 是 OP_HALT 的历史语义，混用会让"异常"看起来像"正常停机"。 */
+        if (vm->pc >= vm->codeLen) return 100;
         u32 pc = vm->pc;
         u8 op = vmb_byte(&bcs, pc);
 #ifndef VM_RELEASE
@@ -3100,7 +3113,9 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
             vm_diag[10] = vm_last_call_args[2];
             vm_diag[11] = vm_last_call_args[3];
 #endif
-            if (addr == 0) return 1;
+            /* 间接调用空指针：客户机自己走到这条路上时，原生语义就是崩 —— 用 101 走硬门，
+             * 而不是把"当时的 RAX"当返回值交回去（见 vm_fail_closed）。 */
+            if (addr == 0) return 101;
             vm->regs[VRAX] = vm_call_native(vm, addr);
 #ifndef VM_RELEASE
             vm_call_ring[(vm_call_ring_n & 7u) * 2u] = addr | 0x8000000000000000ull;

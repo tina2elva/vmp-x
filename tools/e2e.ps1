@@ -302,6 +302,110 @@ foreach ($c in $cases) {
     }
 }
 
+# ---- #599 hard-gate regression: an abnormal interpreter exit must NOT become a return value ----
+# The per-call instruction budget (VM_STEP_BUDGET) is compiled in only for -diag builds, and it is
+# the one switch that deterministically drives the interpreter into "abnormal exit": sum_to 20000000
+# is about 8x10^7 bytecodes, far past the 2x10^7 budget, so the trip is certain.
+# Three things must hold at once:
+#   1. control: the SAME product still answers n=1000 normally (500500, rc=0) -- so "no output" below
+#      cannot be blamed on the product simply failing to start;
+#   2. the tripping run writes NOTHING to stdout (no value is handed back at all);
+#   3. its exit code is in the hard-gate family: 3221225501 (0xC000001D ud2 trap) or 0xC0DE00xx (gate exit).
+# NOTE: the constants below are DECIMAL on purpose -- Windows PowerShell 5.1 parses the literal
+# 0xC000001D as a NEGATIVE Int32 (-1073741795), so comparing it against a widened int64 never matches.
+# Before the #599 fix this run printed a number and exited 0 -- the "silently wrong value" mode.
+Write-Output "[*] #599 hard-gate regression (-diag blob: budget trips -> no value + hard-gate rc)"
+$gateBlob = "build\e2e_gate_blob.bin"
+$gateMan = "build\e2e_gate_blob.json"
+$gateExe = "build\e2e_gate_prod.exe"
+$gateBad = @()
+$gateTrip = ""
+$gateU = 0
+$gateCtl = ""
+& .\build\vmpbuild.exe -src stub/win/x64 -out $gateBlob -manifest $gateMan -entry vm_entry -diag 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { $gateBad += "vmpbuild -diag (the instruction-budget switch) failed" }
+else {
+    & .\build\vmpack.exe -exe build\target.exe -func sum_to -blob $gateBlob -manifest $gateMan -out $gateExe -report build\e2e_gate_prod.json 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $gateBad += "packing the -diag product failed" }
+    else {
+        $gateCtl = Run-FileDiag $gateExe @("sum_to", "1000") 30
+        if ($gateCtl -notmatch "^rc=0 ") { $gateBad += ("control run (n=1000) did not exit 0: " + $gateCtl) }
+        elseif ($gateCtl -notmatch "out\[500500\]") { $gateBad += ("control run (n=1000) was not 500500: " + $gateCtl) }
+        $gateTrip = Run-FileDiag $gateExe @("sum_to", "20000000") 120
+        $gateRc = $null
+        if ($gateTrip -match "^rc=(-?[0-9]+) ") { $gateRc = [int64]$Matches[1] }
+        if ($null -eq $gateRc) { $gateBad += ("tripping run reported no exit code: " + $gateTrip) }
+        else {
+            $gateU = if ($gateRc -lt 0) { $gateRc + 4294967296 } else { $gateRc }
+            if ($gateTrip -notmatch "out\[\]") {
+                $gateBad += ("a value WAS returned on the tripping run (this is exactly #599): " + $gateTrip)
+            } elseif (-not (($gateU -eq 3221225501) -or (($gateU -band 4294967040) -eq 3235643392))) {
+                $gateBad += ("tripping run exit code 0x" + ("{0:X8}" -f $gateU) + " is neither a trap nor a hard-gate code: " + $gateTrip)
+            }
+        }
+    }
+}
+if ($gateBad.Count -gt 0) {
+    $fail++
+    foreach ($gm in $gateBad) { Write-Host ("  [FAIL] #599 hard gate: " + $gm) }
+    $failLines += ("E2EFAIL #599-hard-gate: " + ($gateBad -join "; "))
+} else {
+    $pass++
+    Write-Host ("  [OK  ] #599 hard gate: n=1000 -> 500500 (rc=0); n=20000000 -> no output, rc=0x" + ("{0:X8}" -f $gateU))
+}
+# ---- #599 second silent exit: "pc ran past the end of the bytecode" (vm_interp.c used to return 1) ----
+# Same pathology as the instruction budget: rc=1 was discarded by the entry thunk, so the caller got
+# the mid-run RAX back as the function result. It is now code 100 and goes through the same hard gate.
+# How to reach it deterministically: hand the interpreter bytecode that has NO RET at all.
+# runbc (compiled by this script from stub/win/x64/blob_probe.c) takes a raw bytecode file, so we
+# build a blob with -random-opcodes=false (identity encoding: OP_MOV_RI32=0x12, OP_RET=0x02 -- see
+# internal/vm/opcodes.go and stub/win/x64/vm_opcodes.h) and feed two files:
+#   control: MOV_RI32 R0,0x11223344 ; RET   -> rax=287454020 rc=0
+#   overrun: MOV_RI32 R0,0x11223344         -> NO value at all, hard-gate/trap exit code
+# Before the fix the overrun file printed "rax=287454020 rc=1" and exited 1: a value WAS handed back.
+Write-Output "[*] #599 hard-gate regression: bytecode with no RET (pc overrun -> code 100)"
+$bcBlob = "build\e2e_bc_blob.bin"
+$bcMan = "build\e2e_bc_blob.json"
+$bcBad = @()
+$bcOkOut = ""
+$bcOvOut = ""
+$bcOvU = 0
+& .\build\vmpbuild.exe -src stub/win/x64 -out $bcBlob -manifest $bcMan -entry vm_entry -random-opcodes=false 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { $bcBad += "vmpbuild -random-opcodes=false failed" }
+else {
+    $bcManRaw = Get-Content $bcMan -Raw
+    $bcRunOff = ""
+    if ($bcManRaw -match '"vm_run"\s*:\s*(\d+)') { $bcRunOff = $Matches[1] }
+    if ($bcRunOff -eq "") { $bcBad += "manifest has no vm_run offset" }
+    else {
+        $bcDir = (Get-Location).Path
+        [System.IO.File]::WriteAllBytes((Join-Path $bcDir "build\e2e_bc_ret.vmb"), [byte[]](0x12, 0x00, 0x44, 0x33, 0x22, 0x11, 0x02))
+        [System.IO.File]::WriteAllBytes((Join-Path $bcDir "build\e2e_bc_overrun.vmb"), [byte[]](0x12, 0x00, 0x44, 0x33, 0x22, 0x11))
+        $bcOkOut = Run-FileDiag "build/runbc.exe" @($bcBlob, $bcRunOff, "build\e2e_bc_ret.vmb", "0") 30
+        if ($bcOkOut -notmatch "^rc=0 ") { $bcBad += ("control bytecode (with RET) did not exit 0: " + $bcOkOut) }
+        elseif ($bcOkOut -notmatch "out\[rax=287454020 rc=0 ") { $bcBad += ("control bytecode (with RET) did not return 287454020: " + $bcOkOut) }
+        $bcOvOut = Run-FileDiag "build/runbc.exe" @($bcBlob, $bcRunOff, "build\e2e_bc_overrun.vmb", "0") 30
+        $bcOvRc = $null
+        if ($bcOvOut -match "^rc=(-?[0-9]+) ") { $bcOvRc = [int64]$Matches[1] }
+        if ($null -eq $bcOvRc) { $bcBad += ("overrun bytecode reported no exit code: " + $bcOvOut) }
+        else {
+            $bcOvU = if ($bcOvRc -lt 0) { $bcOvRc + 4294967296 } else { $bcOvRc }
+            if ($bcOvOut -match "rax=") { $bcBad += ("a value WAS returned for bytecode with no RET: " + $bcOvOut) }
+            elseif (-not (($bcOvU -eq 3221225501) -or (($bcOvU -band 4294967040) -eq 3235643392))) {
+                $bcBad += ("overrun bytecode exit code 0x" + ("{0:X8}" -f $bcOvU) + " is neither a trap nor a hard-gate code: " + $bcOvOut)
+            }
+        }
+    }
+}
+if ($bcBad.Count -gt 0) {
+    $fail++
+    foreach ($bm in $bcBad) { Write-Host ("  [FAIL] #599 pc-overrun gate: " + $bm) }
+    $failLines += ("E2EFAIL #599-overrun-gate: " + ($bcBad -join "; "))
+} else {
+    $pass++
+    Write-Host ("  [OK  ] #599 pc-overrun gate: with RET -> rax=287454020 rc=0 ; without RET -> no value, rc=0x" + ("{0:X8}" -f $bcOvU))
+}
+
 # clock() has ~1ms granularity, so native and protected runs use different
 # iteration counts and we compare per-iteration cost.
 Write-Output "[*] benchmark (per-iteration cost, clock ticks ~ ms)..."

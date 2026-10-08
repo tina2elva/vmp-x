@@ -68,6 +68,148 @@ func synthPIE(t *testing.T) []byte {
 	return data
 }
 
+// synthRelocs 造一个最小的 ET_DYN，可以带 DT_JMPREL（PLT/IFUNC 表）与 DT_RELR（压缩相对重定位）。
+// 这两张表在 #597 复评（F4）之前**根本没被读**：守卫 2 因此对它们空转。用例里断言"读到了"
+// 就是那条可失败校准 —— 旧实现下这些条目一条都不会出现。
+func synthRelocs(t *testing.T, withJmp, withRelr bool) []byte {
+	const loadVA = uint64(0x400000)
+	const dynOff = uint64(0x1000)
+	const relaOff = uint64(0x2000)
+	const jmpRelOff = uint64(0x2100)
+	const relrOff = uint64(0x2200)
+	const slotVA = uint64(0x401500)
+	data := make([]byte, 0x3000)
+
+	copy(data[0:], []byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0})
+	binary.LittleEndian.PutUint16(data[16:], ET_DYN)
+	binary.LittleEndian.PutUint16(data[18:], EM_X86_64)
+	binary.LittleEndian.PutUint64(data[24:], loadVA+0x800)
+	binary.LittleEndian.PutUint64(data[32:], 64)
+	binary.LittleEndian.PutUint16(data[52:], EhdrSize)
+	binary.LittleEndian.PutUint16(data[54:], PhdrSize)
+	binary.LittleEndian.PutUint16(data[56:], 2)
+	putPhdr := func(i int, typ, flags uint32, off, va, filesz, memsz uint64) {
+		o := 64 + i*PhdrSize
+		binary.LittleEndian.PutUint32(data[o:], typ)
+		binary.LittleEndian.PutUint32(data[o+4:], flags)
+		binary.LittleEndian.PutUint64(data[o+8:], off)
+		binary.LittleEndian.PutUint64(data[o+16:], va)
+		binary.LittleEndian.PutUint64(data[o+24:], va)
+		binary.LittleEndian.PutUint64(data[o+32:], filesz)
+		binary.LittleEndian.PutUint64(data[o+40:], memsz)
+		binary.LittleEndian.PutUint64(data[o+48:], PageAlign)
+	}
+	putPhdr(0, PT_LOAD, PF_R, 0, loadVA, uint64(len(data)), uint64(len(data)))
+	putPhdr(1, PT_DYNAMIC, PF_R, dynOff, loadVA+dynOff, 0x100, 0x100)
+
+	i := 0
+	putDyn := func(tag, val uint64) {
+		o := int(dynOff) + i*16
+		binary.LittleEndian.PutUint64(data[o:], tag)
+		binary.LittleEndian.PutUint64(data[o+8:], val)
+		i++
+	}
+	putRela := func(off uint64, dst uint64, typ uint32, addend uint64) {
+		o := int(off)
+		binary.LittleEndian.PutUint64(data[o:], dst)
+		binary.LittleEndian.PutUint64(data[o+8:], uint64(typ))
+		binary.LittleEndian.PutUint64(data[o+16:], addend)
+	}
+	putDyn(DT_RELA, loadVA+relaOff)
+	putDyn(DT_RELASZ, RelaEntrySize)
+	putDyn(DT_RELAENT, RelaEntrySize)
+	putRela(relaOff, slotVA, R_X86_64_RELATIVE, slotVA)
+	if withJmp {
+		// 两条 PLT 条目：JUMP_SLOT（目标在可写段）与 IRELATIVE（r_offset 指向 **可执行段里的 PLT 桩**，
+		// 也就是打包端的加密范围 —— 这正是"漏读 DT_JMPREL ⇒ 守卫空转"的真实形态）。
+		putDyn(DT_JMPREL, loadVA+jmpRelOff)
+		putDyn(DT_PLTRELSZ, 2*RelaEntrySize)
+		putDyn(DT_PLTREL, DT_RELA)
+		putRela(jmpRelOff, 0x402000, 7 /* R_X86_64_JUMP_SLOT */, 0)
+		putRela(jmpRelOff+RelaEntrySize, 0x401000, 37 /* R_X86_64_IRELATIVE */, 0x401200)
+	}
+	if withRelr {
+		putDyn(DT_RELR, loadVA+relrOff)
+		putDyn(DT_RELRSZ, 2*8)
+		putDyn(DT_RELRENT, 8)
+		binary.LittleEndian.PutUint64(data[int(relrOff):], 0x401600) // base
+		// bitmap：第 1 位与第 3 位置位 ⇒ 0x401608 与 0x401618
+		binary.LittleEndian.PutUint64(data[int(relrOff)+8:], (1<<1|1<<3)<<1|1)
+	}
+	putDyn(DT_NULL, 0)
+	return data
+}
+
+func TestDynRelocsCoversPltAndRelr(t *testing.T) {
+	f, err := Parse(synthRelocs(t, true, true))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	all, err := f.DynRelocs()
+	if err != nil {
+		t.Fatalf("DynRelocs: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("动态重定位条数 = %d，期望 5（1 DT_RELA + 2 DT_JMPREL + 2 DT_RELR）", len(all))
+	}
+	if all[1].Offset != 0x402000 || all[1].Type != 7 {
+		t.Errorf("DT_JMPREL 第 0 条解析错: %+v", all[1])
+	}
+	if all[2].Offset != 0x401000 || all[2].Type != 37 {
+		t.Errorf("DT_JMPREL 第 1 条（IRELATIVE）解析错: %+v", all[2])
+	}
+	if all[3].Offset != 0x401608 || all[3].Type != R_X86_64_RELATIVE {
+		t.Errorf("DT_RELR bitmap 第 1 位解析错: %+v", all[3])
+	}
+	if all[4].Offset != 0x401618 || all[4].Type != R_X86_64_RELATIVE {
+		t.Errorf("DT_RELR bitmap 第 3 位解析错: %+v", all[4])
+	}
+	// IRELATIVE 落在可执行段 [0x401000,0x401200) 里 ⇒ 打包端的加密范围守卫必须看得见它
+	if in := RelocsInVA(all, 0x401000, 0x401200); len(in) != 1 || in[0].Type != 37 {
+		t.Errorf("加密范围内应当看得见 IRELATIVE，得到 %+v", in)
+	}
+	rel, err := f.RelativeRelocs()
+	if err != nil {
+		t.Fatalf("RelativeRelocs: %v", err)
+	}
+	if len(rel) != 3 {
+		t.Errorf("相对重定位条数 = %d，期望 3（DT_RELA 1 条 + DT_RELR 2 条）", len(rel))
+	}
+}
+
+// fail-closed：DT_JMPREL/DT_RELR 声明了表但地址/尺寸/语义坏掉时必须报错，不许当成"没有"。
+func TestDynRelocsPltRelrFailsClosed(t *testing.T) {
+	d := synthRelocs(t, true, false)
+	binary.LittleEndian.PutUint64(d[0x1000+3*16+8:], 0) // DT_JMPREL 的 d_ptr 清零
+	f, err := Parse(d)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if _, err := f.DynRelocs(); err == nil {
+		t.Fatal("DT_JMPREL 有 size 但地址为 0 必须报错")
+	}
+	// DT_PLTREL 是无意义的值
+	d2 := synthRelocs(t, true, false)
+	binary.LittleEndian.PutUint64(d2[0x1000+5*16+8:], 99) // DT_PLTREL 的 d_val
+	f2, err := Parse(d2)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if _, err := f2.DynRelocs(); err == nil {
+		t.Fatal("DT_PLTREL=99 必须报错（不能猜语义）")
+	}
+	// DT_RELRENT 不是 8
+	d3 := synthRelocs(t, false, true)
+	binary.LittleEndian.PutUint64(d3[0x1000+3*16+8:], 16) // DT_RELRENT 的 d_val
+	f3, err := Parse(d3)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if _, err := f3.DynRelocs(); err == nil {
+		t.Fatal("DT_RELRENT=16 必须报错（本包只支持 ELF64 的 8）")
+	}
+}
+
 func TestDynRelocsSynthetic(t *testing.T) {
 	f, err := Parse(synthPIE(t))
 	if err != nil {
