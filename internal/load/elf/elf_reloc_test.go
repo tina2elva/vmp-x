@@ -140,7 +140,10 @@ func synthRelocs(t *testing.T, withJmp, withRelr bool) []byte {
 	return data
 }
 
-func TestDynRelocsCoversPltAndRelr(t *testing.T) {
+// DT_JMPREL 必须被读到（含 IRELATIVE —— 它的 r_offset 落在可执行段 = 打包端的加密范围）；
+// DT_RELR 则**故意不解析**：它是隐式 addend 表，打包端改为"带 DT_RELR 就拒绝打包"（见 HasRELR）。
+// 这条用例是那条策略的可失败校准：若 DynRelocs 又把 RELR 条目塞回来（或 HasRELR 失灵），它会红。
+func TestDynRelocsCoversPltAndDetectsRelr(t *testing.T) {
 	f, err := Parse(synthRelocs(t, true, true))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -149,8 +152,8 @@ func TestDynRelocsCoversPltAndRelr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DynRelocs: %v", err)
 	}
-	if len(all) != 5 {
-		t.Fatalf("动态重定位条数 = %d，期望 5（1 DT_RELA + 2 DT_JMPREL + 2 DT_RELR）", len(all))
+	if len(all) != 3 {
+		t.Fatalf("动态重定位条数 = %d，期望 3（1 DT_RELA + 2 DT_JMPREL；DT_RELR 不入列）", len(all))
 	}
 	if all[1].Offset != 0x402000 || all[1].Type != 7 {
 		t.Errorf("DT_JMPREL 第 0 条解析错: %+v", all[1])
@@ -158,11 +161,9 @@ func TestDynRelocsCoversPltAndRelr(t *testing.T) {
 	if all[2].Offset != 0x401000 || all[2].Type != 37 {
 		t.Errorf("DT_JMPREL 第 1 条（IRELATIVE）解析错: %+v", all[2])
 	}
-	if all[3].Offset != 0x401608 || all[3].Type != R_X86_64_RELATIVE {
-		t.Errorf("DT_RELR bitmap 第 1 位解析错: %+v", all[3])
-	}
-	if all[4].Offset != 0x401618 || all[4].Type != R_X86_64_RELATIVE {
-		t.Errorf("DT_RELR bitmap 第 3 位解析错: %+v", all[4])
+	// RELR 条目描述的那些槽位**不**该出现在结果里（我们不再解码 RELR）
+	if in := RelocsInVA(all, 0x401600, 0x401700); len(in) != 0 {
+		t.Errorf("DT_RELR 的槽位不该被解出来（本包不做 RELR 解码），得到 %+v", in)
 	}
 	// IRELATIVE 落在可执行段 [0x401000,0x401200) 里 ⇒ 打包端的加密范围守卫必须看得见它
 	if in := RelocsInVA(all, 0x401000, 0x401200); len(in) != 1 || in[0].Type != 37 {
@@ -172,8 +173,63 @@ func TestDynRelocsCoversPltAndRelr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RelativeRelocs: %v", err)
 	}
-	if len(rel) != 3 {
-		t.Errorf("相对重定位条数 = %d，期望 3（DT_RELA 1 条 + DT_RELR 2 条）", len(rel))
+	if len(rel) != 1 {
+		t.Errorf("相对重定位条数 = %d，期望 1（只有 DT_RELA 那条）", len(rel))
+	}
+	// 带 DT_RELR 与不带 DT_RELR 的目标必须被分开认出来（打包端据此拒绝）
+	has, err := f.HasRELR()
+	if err != nil {
+		t.Fatalf("HasRELR: %v", err)
+	}
+	if !has {
+		t.Error("带 DT_RELR 的目标必须被 HasRELR 认出来（否则打包端会放行不可还原的产物）")
+	}
+	f2, err := Parse(synthRelocs(t, true, false))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	has2, err := f2.HasRELR()
+	if err != nil {
+		t.Fatalf("HasRELR: %v", err)
+	}
+	if has2 {
+		t.Error("没有 DT_RELR 的目标不该被认成带 RELR")
+	}
+}
+
+// 隐式 addend（DT_REL 语义）的条目：ImplicitAddend 必须为真、加数不读、且**不进 RelativeRelocs**
+// （否则调用方拿它去跑 NormalizeRelocSlots 会把真实槽位清零 —— #597 复评 R3）。
+func TestDynRelocsImplicitAddendNotNormalizable(t *testing.T) {
+	d := synthRelocs(t, false, false)
+	// 把动态表改成 REL 语义：DT_RELA→DT_REL、DT_RELASZ→DT_RELSZ、DT_RELAENT→DT_RELENT(16)
+	binary.LittleEndian.PutUint64(d[0x1000+0:], DT_REL)
+	binary.LittleEndian.PutUint64(d[0x1000+16:], DT_RELSZ)
+	binary.LittleEndian.PutUint64(d[0x1000+24:], RelEntrySize)
+	binary.LittleEndian.PutUint64(d[0x1000+32:], DT_RELENT)
+	binary.LittleEndian.PutUint64(d[0x1000+40:], RelEntrySize)
+	f, err := Parse(d)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	all, err := f.DynRelocs()
+	if err != nil {
+		t.Fatalf("DynRelocs: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("DT_REL 表条数 = %d，期望 1（16 字节条目）", len(all))
+	}
+	if !all[0].ImplicitAddend {
+		t.Errorf("DT_REL 语义的条目必须标成 ImplicitAddend: %+v", all[0])
+	}
+	if all[0].Addend != 0 {
+		t.Errorf("隐式 addend 的条目不该读到 r_addend: %+v", all[0])
+	}
+	rel, err := f.RelativeRelocs()
+	if err != nil {
+		t.Fatalf("RelativeRelocs: %v", err)
+	}
+	if len(rel) != 0 {
+		t.Errorf("隐式 addend 的条目必须被 RelativeRelocs 过滤掉（否则会清零真实槽位），得到 %+v", rel)
 	}
 }
 
@@ -198,15 +254,30 @@ func TestDynRelocsPltRelrFailsClosed(t *testing.T) {
 	if _, err := f2.DynRelocs(); err == nil {
 		t.Fatal("DT_PLTREL=99 必须报错（不能猜语义）")
 	}
-	// DT_RELRENT 不是 8
+	// DT_RELR 的 d_ptr 为 0 但 DT_RELRSZ 非 0：仍然必须认成"带 RELR"（fail-closed，不许当成没有，
+	// 否则打包端会放行一个它无法还原的产物）
 	d3 := synthRelocs(t, false, true)
-	binary.LittleEndian.PutUint64(d3[0x1000+3*16+8:], 16) // DT_RELRENT 的 d_val
+	binary.LittleEndian.PutUint64(d3[0x1000+3*16+8:], 0) // DT_RELR 的 d_ptr 清零（DT_RELRSZ 仍非 0）
 	f3, err := Parse(d3)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if _, err := f3.DynRelocs(); err == nil {
-		t.Fatal("DT_RELRENT=16 必须报错（本包只支持 ELF64 的 8）")
+	has, herr := f3.HasRELR()
+	if herr != nil {
+		t.Fatalf("HasRELR: %v", herr)
+	}
+	if !has {
+		t.Fatal("DT_RELR 的 d_ptr 为 0 但 DT_RELRSZ 非 0 时也必须认成带 RELR（不能当成没有）")
+	}
+	// 读不出动态表时必须报错（不允许"读不到就当没有"）
+	d4 := synthRelocs(t, false, true)
+	binary.LittleEndian.PutUint64(d4[64+56+32:], 0x7FFFFFFF) // PT_DYNAMIC 的 p_filesz
+	f4, err := Parse(d4)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if _, herr := f4.HasRELR(); herr == nil {
+		t.Fatal("PT_DYNAMIC 越界时 HasRELR 必须报错（不能当成没有 DT_RELR）")
 	}
 }
 

@@ -310,9 +310,11 @@ foreach ($c in $cases) {
 #   1. control: the SAME product still answers n=1000 normally (500500, rc=0) -- so "no output" below
 #      cannot be blamed on the product simply failing to start;
 #   2. the tripping run writes NOTHING to stdout (no value is handed back at all);
-#   3. its exit code is in the hard-gate family: 3221225501 (0xC000001D ud2 trap) or 0xC0DE00xx (gate exit).
+#   3. its exit code is in the hard-gate family: 3221225501 (0xC000001D, the ud2 trap) or 0xC0DE00xx
+#      (the gate exit; the family base 0xC0DE0000 = 3235774464).
 # NOTE: the constants below are DECIMAL on purpose -- Windows PowerShell 5.1 parses the literal
 # 0xC000001D as a NEGATIVE Int32 (-1073741795), so comparing it against a widened int64 never matches.
+# (An earlier revision had 3235643392 = 0xC0DC0000 here: a wrong value that made this branch dead code.)
 # Before the #599 fix this run printed a number and exited 0 -- the "silently wrong value" mode.
 Write-Output "[*] #599 hard-gate regression (-diag blob: budget trips -> no value + hard-gate rc)"
 $gateBlob = "build\e2e_gate_blob.bin"
@@ -339,7 +341,7 @@ else {
             $gateU = if ($gateRc -lt 0) { $gateRc + 4294967296 } else { $gateRc }
             if ($gateTrip -notmatch "out\[\]") {
                 $gateBad += ("a value WAS returned on the tripping run (this is exactly #599): " + $gateTrip)
-            } elseif (-not (($gateU -eq 3221225501) -or (($gateU -band 4294967040) -eq 3235643392))) {
+            } elseif (-not (($gateU -eq 3221225501) -or (($gateU -band 4294967040) -eq 3235774464))) {
                 $gateBad += ("tripping run exit code 0x" + ("{0:X8}" -f $gateU) + " is neither a trap nor a hard-gate code: " + $gateTrip)
             }
         }
@@ -391,7 +393,7 @@ else {
         else {
             $bcOvU = if ($bcOvRc -lt 0) { $bcOvRc + 4294967296 } else { $bcOvRc }
             if ($bcOvOut -match "rax=") { $bcBad += ("a value WAS returned for bytecode with no RET: " + $bcOvOut) }
-            elseif (-not (($bcOvU -eq 3221225501) -or (($bcOvU -band 4294967040) -eq 3235643392))) {
+            elseif (-not (($bcOvU -eq 3221225501) -or (($bcOvU -band 4294967040) -eq 3235774464))) {
                 $bcBad += ("overrun bytecode exit code 0x" + ("{0:X8}" -f $bcOvU) + " is neither a trap nor a hard-gate code: " + $bcOvOut)
             }
         }

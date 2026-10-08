@@ -1038,10 +1038,15 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 			// internal/inject.BuildPayload 只校验"表里的槽位都在加密范围内"（必要方向），
 			// 这里的反方向由 guardELFRelocsInRange 判（两条都要）。
 			//
-			// 覆盖面（#597 复评 F4）：动重定位来自 internal/load/elf.DynRelocs，它读**三张**表 ——
-			// DT_RELA/DT_REL（.rela.dyn）、DT_JMPREL（+DT_PLTRELSZ/DT_PLTREL，.rela.plt，含 IRELATIVE
-			// 这种 r_offset 落在可执行段里的情形）、DT_RELR（压缩相对重定位，按架构隐含 R_*_RELATIVE）。
-			// 少了任何一张，这条守卫对**那一类**槽位就是空的。
+			// 覆盖面（#597 复评 F4，round-3 按 R1/R2 收紧）：
+			//   · DynRelocs 读 DT_RELA/DT_REL（.rela.dyn）与 DT_JMPREL（+DT_PLTRELSZ/DT_PLTREL，
+			//     .rela.plt，含 IRELATIVE 这种 r_offset 落在可执行段里的情形）；
+			//   · **隐式 addend** 的条目（DT_REL 语义 / RELR）另有一条判据 (c)：落在加密范围里直接拒绝
+			//     —— 表里没有 r_addend，NormalizeRelocSlots 与运行期应用器都按 0 处理，会把真实槽位清零；
+			//   · **DT_RELR 不解析**：只要目标带 DT_RELR 且要加密任何范围，整个打包就被拒绝
+			//     （见上面的 HasRELR 分支）。RELR 是隐式 addend 表，而运行期应用器只读 DT_RELA/DT_REL
+			//     （vm_interp.c 的 vm_reloc_fix），没有 RELR 还原路径 ⇒ 放行 = 交付运行期必硬门的坏产物。
+			//     RELR 支持（含 stub 应用器 + 运行期端到端用例）登记为后续项。
 			// 边界（如实登记，见 #597 复评 F3）：记表的循环对 **ET_EXEC 不建表**，所以对 ET_EXEC 产物
 			// 一旦加密范围里真的出现相对重定位，(b) 会把它**拒绝**掉 —— 这是有意的 fail-closed，
 			// 而不是"支持 ET_EXEC 的相对重定位"。
@@ -1054,6 +1059,19 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				if relType == 0 {
 					fatalf("机器类型 0x%X 没有登记相对重定位类型号（无法判断加密范围里的重定位是否可还原）", f.Machine)
 				}
+				// #597 复评 R1/R2：目标带 DT_RELR（压缩相对重定位）⇒ **直接拒绝打包**，不依赖任何
+				// RELR 解码器。理由：DT_RELR 的条目是**隐式 addend**（加数在槽位里，表里没有 r_addend），
+				// 而运行期应用器只读 DT_RELA/DT_REL（stub/win/x64/vm_interp.c 的 vm_reloc_fix 按
+				// DT_RELA/DT_RELASZ 找表），根本没有 RELR 还原路径 ⇒ "记进应用表就一定能还原"这条推理
+				// 对 RELR 不成立，放行等于交付一个运行期必然硬门的坏产物。
+				// （RELR 支持登记为后续项；解码器曾经写错过三处，见 internal/load/elf.HasRELR 的注释。）
+				hasRelr, hrerr := f.HasRELR()
+				if hrerr != nil {
+					fatalf("读不出动态表（无法判断目标是否带 DT_RELR）：%v", hrerr)
+				}
+				if hasRelr {
+					fatalf("拒绝打包：目标带 DT_RELR（压缩相对重定位），而要加密至少 %d 个范围。DT_RELR 的条目是隐式 addend（加数在槽位里），运行期应用器只读 DT_RELA/DT_REL、没有 RELR 还原路径 ⇒ 无法保证这些槽位可还原。\n    可操作选项：去掉 -enc-image-elf-pie / -enc-image-elf（不加密 ELF 原镜像），或让目标不带 DT_RELR（例如关掉 -z pack-relative-relocs）。", len(imgSecs))
+				}
 				bad := guardELFRelocsInRange(imgSecs, imgRelocs, dynAll, imageBase, relType)
 				for i, m := range bad {
 					if i >= 4 {
@@ -1064,7 +1082,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				if len(bad) > 0 {
 					fatalf("拒绝打包：%d 条动重定位落在要加密的范围里、但运行期还原不了（RVA 见上）。ld.so 会在入口点之前按动态表**无条件改写**这些槽位，而运行期应用器只认识 R_*_RELATIVE(type=%d)、且只碰重定位应用表里登记过的位置 ⇒ 这个产物要么验签失败、要么跑错。\n    可操作选项：去掉 -enc-image-elf-pie-relocs / -enc-image-elf-pie（不加密这些范围），或改用把这些槽位放在加密范围之外的链接布局。", len(bad), relType)
 				}
-				fmt.Printf("[*] ELF 整体加密：加密范围内的动重定位全部可还原（R_*_RELATIVE(type=%d) 且在应用表里），共核对 %d 条动态项（DT_RELA/DT_REL + DT_JMPREL + DT_RELR）", relType, len(dynAll))
+				fmt.Printf("[*] ELF 整体加密：加密范围内的动重定位全部可还原（R_*_RELATIVE(type=%d)、显式 addend、且在应用表里），共核对 %d 条动态项（DT_RELA/DT_REL + DT_JMPREL；带 DT_RELR 的目标已在上面按 fail-closed 拒绝）", relType, len(dynAll))
 				fmt.Println()
 			}
 			// fail-closed 的最后一道自洽检查：要写进解密表的每个范围，必须能用**产物自己**的程序头
@@ -1819,8 +1837,10 @@ func elfRelativeRelocType(machine uint16) uint32 {
 // guardELFRelocsInRange 是 #597 守卫 2 的判定核心（抽成纯函数，便于单测与复评独立复核）：
 // 加密范围 imgSecs 里出现的**每一条**动态重定位都必须同时满足两件事 ——
 //
-//	(a) 类型是运行期应用器认识的那种（R_*_RELATIVE）；否则 ld.so 写进去的值我们还原不出来；
-//	(b) 它的位置**在重定位应用表 table 里**；否则运行期那个"先减 delta → 验签 → 解密 → 再加回
+//	(a) 不是隐式 addend 的条目（DT_REL 语义 / RELR）：这类条目的加数在槽位里，而
+//	    NormalizeRelocSlots 与运行期应用器都按 r_addend=0 处理 ⇒ 会把真实槽位清零；
+//	(b) 类型是运行期应用器认识的那种（R_*_RELATIVE）；否则 ld.so 写进去的值我们还原不出来；
+//	(c) 它的位置**在重定位应用表 table 里**；否则运行期那个"先减 delta → 验签 → 解密 → 再加回
 //	    delta"的协议根本不会碰它，密文的 AEAD tag 已经变了。
 //
 // 为什么要查 (b)（#597 复评 F3）：记表的循环在调用点上方，条件写的是
@@ -1849,6 +1869,10 @@ func guardELFRelocsInRange(imgSecs []inject.ImgSection, table []inject.ImgReloc,
 			continue
 		}
 		rva := uint32(r.Offset - imageBase)
+		if r.ImplicitAddend {
+			bad = append(bad, fmt.Sprintf("加密范围里有**隐式 addend** 的动重定位（DT_REL 语义 / RELR）r_offset=RVA 0x%X type=%d —— 加数在槽位里，打包端的 NormalizeRelocSlots 与运行期应用器都按 r_addend=0 处理（会把真实槽位清零），没有还原路径", rva, r.Type))
+			continue
+		}
 		if r.Type != relType {
 			bad = append(bad, fmt.Sprintf("加密范围里有一条**非 R_*_RELATIVE** 的动重定位 r_offset=RVA 0x%X type=%d —— 运行期无法还原 ld.so 写进去的值", rva, r.Type))
 			continue

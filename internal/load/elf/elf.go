@@ -625,7 +625,14 @@ type Reloc struct {
 	Offset uint64 // r_offset：链接期 VA
 	Type   uint32 // r_info 的低 32 位（ELF64：sym<<32 | type）
 	Sym    uint32 // r_info 的高 32 位
-	Addend int64  // r_addend（DT_REL 语义的目标没有这项，按 0 处理）
+	Addend int64  // r_addend（只有 RELA 语义的表有这项；隐式 addend 的表按 0 处理，见 ImplicitAddend）
+	// ImplicitAddend 表示"这张表不写 r_addend，加数就在槽位里"（DT_REL 语义、以及 DT_RELR）。
+	//
+	// 为什么要区分（#597 复评 R3）：打包端的 NormalizeRelocSlots 是拿 r.Addend **重写槽位**的，
+	// 对隐式 addend 的条目来说 Addend 恒为 0 ⇒ 会把真实槽位**清零**（评审在真实 RELR 二进制上
+	// 实测 changed=63 ⇒ 直接把镜像改坏）。所以这类条目一律不进重定位应用表、也绝不走
+	// NormalizeRelocSlots；一旦落在加密范围里就拒绝打包（见 cmd/vmpack 的守卫 2 与 HasRELR）。
+	ImplicitAddend bool
 }
 
 // DynamicEntries 读 PT_DYNAMIC（没有这个段就返回 nil，不报错）。
@@ -680,7 +687,7 @@ func (f *File) DynRelocs() ([]Reloc, error) {
 	// 这三张表都会在**入口点之前**被 ld.so 改写，所以它们的目标落在加密范围里就必须能被
 	// 运行期应用器还原（否则密文的 AEAD tag 已经变了）。详见 cmd/vmpack 的守卫 2。
 	type table struct{ addr, size, ent uint64 }
-	var tbl, tblRel, tblJmp, relr table
+	var tbl, tblRel, tblJmp table
 	var pltRel uint64
 	for _, e := range ents {
 		switch e.Tag {
@@ -702,13 +709,11 @@ func (f *File) DynRelocs() ([]Reloc, error) {
 			tblJmp.size = e.Val
 		case DT_PLTREL:
 			pltRel = e.Val
-		case DT_RELR:
-			relr.addr = e.Val
-		case DT_RELRSZ:
-			relr.size = e.Val
-		case DT_RELRENT:
-			relr.ent = e.Val
 		}
+		// DT_RELR（压缩相对重定位）**故意不在这里解析**：它是隐式 addend 表，本包的运行期应用器
+		// （stub 的 vm_reloc_fix）只读 DT_RELA/DT_REL，根本没有 RELR 还原路径 ⇒ 解出来的条目
+		// 也"不可还原"。打包端因此改为"目标带 DT_RELR 且要加密任何范围就拒绝打包"
+		// （见 HasRELR 与 cmd/vmpack 的守卫 2），不依赖任何解码器。
 	}
 	var out []Reloc
 	// DT_RELA 优先（x86-64/aarch64 都是 RELA）；没有再退回 DT_REL。
@@ -767,24 +772,38 @@ func (f *File) DynRelocs() ([]Reloc, error) {
 		}
 		out = append(out, rs...)
 	}
-	if relr.size != 0 {
-		if relr.addr == 0 {
-			return nil, fmt.Errorf("DT_RELR 声明了 size=0x%X 但没有地址", relr.size)
-		}
-		entSize := relr.ent
-		if entSize == 0 {
-			entSize = 8
-		}
-		if entSize != 8 {
-			return nil, fmt.Errorf("DT_RELRENT=%d，本包只支持 8（ELF64）", entSize)
-		}
-		rs, rerr := f.decodeRelr(relr.addr, relr.size)
-		if rerr != nil {
-			return nil, fmt.Errorf("DT_RELR 表：%w", rerr)
-		}
-		out = append(out, rs...)
-	}
 	return out, nil
+}
+
+// HasRELR 报告目标是否带 DT_RELR（压缩相对重定位 / RELR）。
+//
+// 为什么打包端需要它（#597 复评 R1/R2）：DT_RELR 的条目没有 r_addend —— 加数在槽位里，
+// 而**运行期应用器只读 DT_RELA/DT_REL**（stub/win/x64/vm_interp.c 里的 vm_reloc_fix 只按
+// DT_RELA/DT_RELASZ 找表），根本没有 RELR 还原路径。于是"记进应用表 ⇒ 运行期可还原"这条
+// 推理对 RELR **不成立**，放行它等于产出一个运行期必然硬门的坏产物。
+//
+// 所以本包**不做 RELR 解码**（解码器曾经写错过三处：bitmap 之后缺 base += 63*8、首个 bitmap 的
+// base 应是 addr+8、裸地址条目本身也是一条重定位；评审用真实产物对照 readelf：readelf 解出 203 条，
+// 当时的解码器只给 202 条、去重 68 条、139 条重复、>= 0x5970 的条目全丢）。打包端改为
+// "带 DT_RELR 且要加密任何范围 ⇒ 直接拒绝打包"，不依赖解码正确性。RELR 支持登记为后续项。
+func (f *File) HasRELR() (bool, error) {
+	ents, err := f.DynamicEntries()
+	if err != nil {
+		return false, err
+	}
+	for _, e := range ents {
+		switch e.Tag {
+		case DT_RELR:
+			if e.Val != 0 {
+				return true, nil
+			}
+		case DT_RELRSZ:
+			if e.Val != 0 {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // readRelTable 读一张由 (VA, size, 条目尺寸) 描述的动态重定位表。
@@ -805,45 +824,16 @@ func (f *File) readRelTable(addr, size, entSize uint64, withAddend bool) ([]Relo
 	for i := 0; i < n; i++ {
 		o := off + i*int(entSize)
 		info := binary.LittleEndian.Uint64(f.Data[o+8:])
-		r := Reloc{Offset: binary.LittleEndian.Uint64(f.Data[o:]), Type: uint32(info), Sym: uint32(info >> 32)}
+		r := Reloc{
+			Offset:         binary.LittleEndian.Uint64(f.Data[o:]),
+			Type:           uint32(info),
+			Sym:            uint32(info >> 32),
+			ImplicitAddend: !withAddend,
+		}
 		if withAddend {
 			r.Addend = int64(binary.LittleEndian.Uint64(f.Data[o+16:]))
 		}
 		out = append(out, r)
-	}
-	return out, nil
-}
-
-// decodeRelr 把 DT_RELR（压缩相对重定位）解成显式的槽位。
-// 格式（gABI）：每个条目是 Elf64_Addr；最低位为 0 的条目是「起始地址」base，
-// 最低位为 1 的条目的其余位是 bitmap —— 第 i 位 = 1 表示 base+i*8 处有一条相对重定位。
-// 这些条目的类型**不写在表里**，按架构隐含 = R_*_RELATIVE（见 relativeRelocType）。
-func (f *File) decodeRelr(addr, size uint64) ([]Reloc, error) {
-	want, err := relativeRelocType(f.Machine)
-	if err != nil {
-		return nil, err
-	}
-	off, err := f.VAtoOffset(addr)
-	if err != nil {
-		return nil, fmt.Errorf("DT_RELR VA 0x%X：%w", addr, err)
-	}
-	if uint64(off)+size > uint64(len(f.Data)) {
-		return nil, fmt.Errorf("DT_RELR 0x%X+0x%X 超出文件", off, size)
-	}
-	var out []Reloc
-	var base uint64
-	for o := off; o+8 <= off+int(size); o += 8 {
-		v := binary.LittleEndian.Uint64(f.Data[o:])
-		if v&1 == 0 {
-			base = v
-			continue
-		}
-		bits := v >> 1
-		for i := 0; i < 63; i++ {
-			if bits>>uint(i)&1 != 0 {
-				out = append(out, Reloc{Offset: base + uint64(i)*8, Type: want})
-			}
-		}
 	}
 	return out, nil
 }
@@ -862,6 +852,10 @@ func relativeRelocType(machine uint16) (uint32, error) {
 
 // RelativeRelocs 只返回本架构的 R_*_RELATIVE 项（其它类型丢弃）。
 // ET_EXEC/静态链接的目标返回空切片 —— 它们没有动态重定位。类型号不认识的架构返回错误。
+//
+// **隐式 addend 的条目（DT_REL 语义）一律不返回**（#597 复评 R3）：调用方拿这些条目去跑
+// NormalizeRelocSlots 会把槽位清零（Addend 恒为 0）。落在加密范围里的这类条目由打包端
+// 守卫 2 直接拒绝打包，不会走到这里。
 func (f *File) RelativeRelocs() ([]Reloc, error) {
 	want, werr := relativeRelocType(f.Machine)
 	if werr != nil {
@@ -873,7 +867,7 @@ func (f *File) RelativeRelocs() ([]Reloc, error) {
 	}
 	var out []Reloc
 	for _, r := range all {
-		if r.Type == want {
+		if r.Type == want && !r.ImplicitAddend {
 			out = append(out, r)
 		}
 	}

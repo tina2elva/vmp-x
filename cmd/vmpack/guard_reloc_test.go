@@ -44,4 +44,10 @@ func TestGuardELFRelocsInRange(t *testing.T) {
 	if bad := guardELFRelocsInRange(secs, nil, []elf.Reloc{{Offset: inRel, Type: 37 /* R_X86_64_IRELATIVE */}}, base, elf.R_X86_64_RELATIVE); len(bad) != 1 {
 		t.Fatalf("⑤ 加密范围内的 IRELATIVE 必须被拒绝，得到 %v", bad)
 	}
+	// ⑥ 隐式 addend 的条目（DT_REL 语义 / RELR）落在加密范围里 ⇒ 拒绝。
+	// 这类条目的加数在槽位里，NormalizeRelocSlots 与运行期应用器都按 r_addend=0 处理 ⇒ 会清零真实槽位
+	// （#597 复评 R2/R3）。**即使**它被记进了应用表也必须拒绝 —— 所以这里故意给一个"已入表"的输入。
+	if bad := guardELFRelocsInRange(secs, []inject.ImgReloc{{RVA: 0x1008}}, []elf.Reloc{{Offset: inRel, Type: elf.R_X86_64_RELATIVE, ImplicitAddend: true}}, base, elf.R_X86_64_RELATIVE); len(bad) != 1 {
+		t.Fatalf("⑥ 隐式 addend（DT_REL/RELR）的条目即使入表也必须被拒绝，得到 %v", bad)
+	}
 }
