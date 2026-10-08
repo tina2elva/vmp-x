@@ -2219,6 +2219,25 @@ static void vm_antidebug(void) {
 static void vm_antidebug(void) { }
 #endif
 
+/* 解释器内部异常的统一出口（fail-closed）：**不返回**，走与取钥/授权同一族的硬门
+ * （退出码 0xC0DE0000|code；POSIX 只暴露低 8 位，与 0xC0DE0007 同族）。
+ *
+ * 为什么必须有它（STATUS #599，本轮定位）：入口蹦床（stub/<平台>/vm_entry_asm.S）**丢弃**
+ * vm_run 的返回码，只把 ctx.regs[RAX] 交给调用方。于是解释器一旦"中途退出"
+ * （96=指令预算超限 / 97=弹出过多 / 98=未知操作码 / 99=压穿客户机栈），调用方拿到的就是
+ * "循环跑到一半的 RAX"，表现为一次**正常返回的错值** —— 这正是本仓库最忌讳的失败形态。 */
+static void vm_fail_closed(u32 code) {
+#if defined(VM_BLOB_TARGET_LINUX) && (defined(__x86_64__) || defined(VM_ARCH_AARCH64))
+    /* Linux：走裸 syscall 硬门退出（退出码 0xC0DE0000|code；POSIX 只暴露低 8 位）。
+     * 这两个原语在公共段（VM_KEY_EXTERNAL 之外）定义，所以任何构建都能用。 */
+    vm_lx_sys3(VM_LX_EXIT_GROUP, (long)(0xC0DE0000u | code), 0, 0);
+#else
+    (void)code; /* Windows/其它目标上没有可用的取钥原语（PEB 走查只在 -key-external 构建里），只能 ud2 */
+#endif
+    /* 兜底：ud2 ⇒ 非法指令异常，进程必然**异常终止**、不返回任何值。 */
+    __builtin_trap();
+}
+
 int vm_run(vm_ctx_t *vm) {
     VM_DBG_WIN("vm:run-entry\n"); /* 诊断：入口蹦床已成功调用到 VM 解释器（说明蹦床存活） */
     vm_antidebug();
@@ -2370,6 +2389,10 @@ int vm_run(vm_ctx_t *vm) {
     }
 #endif /* !VM_RELEASE */
     int rc = vm_run_inner(vm, rsp_start);
+    /* 解释器"中途退出"绝不能当成客户机返回值传出去：入口蹦床丢弃这里的返回码，
+     * 只把 ctx.regs[RAX] 交给调用方 ⇒ 会变成"循环跑到一半的 RAX"这种静默错值（#599 的病灶）。
+     * 1 = OP_HALT 是历史定义的正常停机（x86-32 的字节码用例以 HALT 结束），保持原语义。 */
+    if (rc != 0 && rc != 1) vm_fail_closed((u32)rc);
     /* XMM 边界同步（出口）：把 guest 算出来的 xmm0-xmm5 写回蹦床帧的保存槽，
      * 这样出口 asm 恢复 xmm0 时交还给调用方的就是**被保护函数的返回值**（xmm0 承载 FP 返回值）。 */
 #if defined(VM_BLOB_USES_WIN64) && !defined(VM_GUEST_ARM64)
@@ -2496,10 +2519,15 @@ __attribute__((noinline)) static u32 vm_fp_step(vm_ctx_t *vm, vm_bcs_t *s, u32 p
     return pc + 15;
 }
 
-/* 一次调用的指令预算（诊断用）：超了就以 96 返回。
+/* 一次调用的指令预算：**诊断用，必须显式打开**（-DVM_STEP_BUDGET_ON=1；vmpbuild -diag 会带上）。
  * 为什么需要：arm64 上带循环的 sum_to 在探针里"永不返回"，我们需要它快速返回、
- * 并把环形缓冲（最近执行的 pc/op）留下来，才能看出是哪条分支没让 pc 前进。 */
-#ifndef VM_RELEASE
+ * 并把环形缓冲（最近执行的 pc/op）留下来，才能看出是哪条分支没让 pc 前进。
+ * 为什么不再默认编进产物（STATUS #599，本轮 t1 定位）：20,000,000 条字节码对**合法**程序远远不够
+ * （2×10^7 次循环 ≈ 8×10^7 条），而"超限就 return 96"这条路径是**静默**的 ——
+ * 入口蹦床（stub/<平台>/vm_entry_asm.S）丢弃 vm_run 的返回码、只把 ctx.regs[RAX] 交给调用方，
+ * 于是调用方拿到"循环跑到一半的 RAX"，看起来就是一次正常返回的错值。
+ * 现在默认不编入；打开时超限仍返回 96，但 vm_run 会把它变成硬门（见 vm_fail_closed）——绝不返回错值。 */
+#ifdef VM_STEP_BUDGET_ON
 #define VM_STEP_BUDGET 20000000u
 #endif
 
@@ -2519,7 +2547,8 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
     vm_bcs_t bcs;
     vm_bcs_init(&bcs, vm);
     for (;;) {
-#ifndef VM_RELEASE
+#ifdef VM_STEP_BUDGET_ON
+        /* 超限返回 96，但 vm_run 会把它变成硬门（vm_fail_closed）——绝不返回错值。 */
         if (++steps > VM_STEP_BUDGET) return 96;
 #endif
         /* 诊断用（见 vm_run_inner 的注释）：客户机压栈越过给它的栈下界时当场返回 99。

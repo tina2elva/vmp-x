@@ -152,7 +152,11 @@ $packTime = (Get-Item build\target_vmp.exe).LastWriteTime
 
 $cases = @(
     @{ f = "check_key"; args = @(0, 1, 10, 255, 12345, 1000000, 4294967295) },
-    @{ f = "sum_to";    args = @(0, 1, 2, 10, 100, 1000, 9999) },
+    # 20000000 is the STATUS #599 regression case: this loop is about 8x10^7 bytecodes, far past
+    # the interpreter's diagnostic per-call instruction budget (2x10^7). While that budget was
+    # compiled into the product, exceeding it handed the caller the mid-loop RAX (a wrong value
+    # returned "normally"). This case pins down "a legitimate long loop must match native".
+    @{ f = "sum_to";    args = @(0, 1, 2, 10, 100, 1000, 9999, 20000000) },
     @{ f = "framed";    args = @(0, 1, 7, 1000, 123456) },
     @{ f = "mem_ops";   args = @(0, 3, 9, 17, 100) },
     @{ f = "calls_helper";    args = @(0, 1, 5, 1000) },

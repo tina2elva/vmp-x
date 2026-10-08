@@ -742,6 +742,12 @@ func compile(cc, stageRoot, src, tmp, opcodeValuesPath, keyPath, guest string, v
 	// 因此 blob 里既没有那一族字符串，也没有那几条导出查表/落盘代码。要排查平台问题时用 -diag 打开。
 	if !diag {
 		common = append(common, "-DVM_NO_DIAG=1")
+	} else {
+		// 诊断用的一次调用指令预算（VM_STEP_BUDGET）**只在 -diag 构建里编入**：
+		// 它默认在产物里会让合法的大行程循环被截断，而截断的返回码被入口蹦床丢弃 ⇒
+		// 调用方拿到循环中途的 RAX，即"正常返回的错值"（STATUS #599）。
+		// 需要留活口的是**诊断**（arm64 探针里那个永不返回的循环），所以绑在 -diag 上。
+		common = append(common, "-DVM_STEP_BUDGET_ON=1")
 	}
 
 	// 只编译 BLOB.sources 里显式列出的文件（测试/工具程序不能被链进 blob）
