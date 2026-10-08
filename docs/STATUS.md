@@ -10904,5 +10904,72 @@ tier (3)，分类器就只说这一档、缺的档显式 SKIP，不超出实测�
 
 **互指**：`#599` 是本条的**依据**（现象 + 首轮修复），本条是**收口**；`#597` 同上（决策在本条落地）。`#598` 的 M5 几何修复是本条 `amd64` 三态正常的前提。
 
+### 601. 文档指针按现状修正 + `#600` 的 `DT_RELR` fail-closed 决策落成 committed 用例（含一次 CI 误红的如实记录）
+
+**范围与 sha**：`abe97ef`（文档）、`7fae066`（RELR 用例）、`3b57533`（readelf 口径版本稳健化）。
+三条都**不碰被验产品代码**（`cmd/`、`internal/`、`stub/` 一行未改）；改的是 `AGENTS.md`、`docs/HANDOFF.md`、`tools/e2e_elf_image.sh`。
+
+#### 601.1 为什么先改文档（`abe97ef`）
+
+`AGENTS.md` 原先写"**唯一权威任务书**是 `docs/HANDOFF.md`"，而 HANDOFF 停在 2026-10-02（正文写 T1–T6 全完成、**未做项「无」**、e2e 165/0、dll 3/3），`STATUS` 已到 `#600`（e2e 186/0、dll 7/0、32 位 12/12）⇒ 新会话按旧指针读会拿到**错误的现状**（这正是本条的起点）。
+处置：AGENTS 的"当前任务"改为指向 `docs/STATUS.md` 的**最后一条**，并点明 HANDOFF 已降级为历史任务书（只有纪律与验收口径仍有效）；HANDOFF 文首加状态横幅，§2「仍未做：无」、§7 第 1 条、附录 B 第 2 条的旧数字**就地标注**"2026-10-02 口径"（**原文保留，不静默删**）。纯文档，被验代码零改动。
+
+#### 601.2 RELR committed 用例（`7fae066` + `3b57533`）
+
+`#600.5` 自己登记的缺口是："`HasRELR→fatalf` 目前只有单测 + 手工端到端，**没有 committed e2e**"。本条补上，顺带把**已与 readelf 逐项对齐的解码算法**钉进仓库（将来做真支持时直接用）。
+用例构造：**同一份源码编两份，只差 `-Wl,-z,pack-relative-relocs`**（夹具把两个绝对指针槽放在 `.text` 里，逼出 TEXTREL 类的相对重定位）：
+1. **夹具校准**：relr 变体必须有 `DT_RELR` 与 `.relr.dyn`，norel 变体必须一条都没有（否则用例空转）；
+2. **解码器对账**：脚本内 python 用已校准的算法独立解码，**条目数**必须等于 readelf 印的 `contains N entries`；较新 binutils 还会印 "which relocate N locations"，**有就一并硬断言**，没有就打印 `[NOTE]` + 原始 `.relr.dyn` 块（**大声登记，不静默放过**）；
+3. **主断言**：带 `DT_RELR` 且要加密范围 ⇒ `vmpack` 非零退出、**不落产物、不落报告**、信息里点名 `DT_RELR`；
+4. **单变量对照**：同一份源码去掉 `pack-relative-relocs` ⇒ 必须打包成功且与原生逐字节一致（143/5050）⇒ 触发拒绝的**确实**是 `DT_RELR`，不是别的。
+
+**校准（两条都能红，本轮亲测）**：
+- 去掉 `-Wl,-z,pack-relative-relocs` ⇒ 第 1 步的 readelf 断言直接 FAIL；
+- 把 `cmd/vmpack/main.go` 的 `hasRelr` 守卫临时改成 `if false && hasRelr`（**只在 WSL 副本里做，随后 rsync 恢复、`git status` 干净**）⇒
+  `[MISMATCH] the packer ACCEPTED a DT_RELR target while it had ranges to encrypt` + `[FAIL] a DT_RELR target with encryptable ranges must be refused` + `e2e_elf_image exit=1`。
+
+**解码算法（已与 readelf 对齐；真支持时按这个来）**：偶数条目 = 槽位地址，`base = 条目 + 8`；奇数条目 = 位图，bit `i`(1..63) ⇒ 槽位 `base + (i-1)*8`，之后 `base += 63*8`。
+`#600.5` 记的旧解码器三处缺陷（bitmap 之后缺 `base += 63*8`、首个 bitmap 的 base 应为 `addr+8`、裸地址条目本身也是一条重定位却被丢掉）正是本算法要保证的事。
+
+#### 601.3 一次 CI 误红，如实记录（run `37773529727`，linux-amd64）
+
+`7fae066` 的 CI **红了**：夹具与 `.relr.dyn` 断言都过，红在
+`[FAIL] readelf did not report how many locations the RELR table relocates`。
+根因是**我的解析太脆**（**不是产品缺陷**）：`which relocate N locations` 是较新 binutils 才有的措辞，CI runner（`ubuntu-latest`）的 readelf 不印它。`3b57533` 把口径改成**版本稳健**（条目数硬断言；位置数有则硬断言、无则 `[NOTE]` + 打印原始块）。两条分支本轮都在 WSL 亲测：真实分支 `[OK] 5 location(s) over 5 entry/entries`；把 sed 打瘸模拟旧措辞 ⇒ 走 `[NOTE]` 分支、主断言仍 `[OK]`、脚本 `exit=0`。
+**顺带记一条环境差异**：同一份夹具，WSL（binutils 2.46）解出 **5** 条条目，CI runner 解出 **3** 条 —— 工具链不同 ⇒ RELR 打包形态不同；所以对账口径**不能写死数字**，只能"本机自洽"。
+
+#### 601.4 终局门禁与 CI（冻结 sha = `3b57533`，跑前 `git status --short` 为空）
+
+- `tools/preflight.ps1` ⇒ `[+] preflight: OK`。
+- `tools/gates.ps1` ⇒ `total 15 gates, 0 failed, 0 skipped`；`e2e: 186 passed, 0 skipped, 0 failed`、`dll e2e: 7 passed, 0 failed`、`32-bit e2e 12/12`（两种模式）、WSL 全 step `[OK]`。
+  新用例确实在门禁路径里跑过：`~/vmp-x/build/wsl_elf_image_encryption.log` 里有
+  `[OK  ] RELR decode calibrated against readelf: 5 location(s) over 5 entry/entries`、
+  `[OK  ] #600 RELR fail-closed: DT_RELR target + encryptable ranges -> rc=1, no artifact, refusal names DT_RELR`、
+  `[OK  ] #600 RELR control: the same source without DT_RELR packs and answers exactly like native (143/5050)`。
+- CI **三个作业全绿**：run `37774579834`（`windows-amd64` / `linux-amd64` / `linux-arm64` 全 success）。
+  CI 侧亲核证据：`linux-amd64` 作业里三条 RELR `[OK]`，且那一步打印了 `Relocation section '.relr.dyn' at offset 0x738 contains 3 entries:` ⇒ **CI 侧走的确实是 `[NOTE]` 分支**，与设计一致（本机走硬断言分支）。
+
+#### 601.5 未做项 / 如实降级（醒目）
+
+- **RELR 真支持仍未做**（解码进 `internal/load/elf` + `stub` 运行期应用器 + 端到端）—— 本轮只把"拒绝"钉住。实现要点（本轮已摸清，供下一轮直接用）：
+  1. 运行期 `vm_reloc_fix`（`stub/win/x64/vm_interp.c:3383`）现在只读 `DT_RELA/DT_REL`（`tabVA = withAddend ? relaVA : relVA`），且 `!withAddend` 直接硬门（`:3493`）⇒ RELR 要**另加一条表**，并在 `lo..hi` 内的槽位上用 `addend = *slot - delta` 还原密文（隐式 addend；显式路径用的是表里的 `r_addend`，**两者机制不同**，不能照搬）；
+  2. 表地址要套用同样的"运行期窗口 / 链接期窗口"两段判定（`DT_RELR` 的 `d_ptr` 是否被 ld.so **就地加 `l_addr`** 需实测确认）；
+  3. `DT_RELR` 表本身**不能落在被加密的范围里**（应用器在验签/解密**之前**就要读它）⇒ 打包端需要一条**新守卫**；
+  4. 打包端守卫 2 现在把"隐式 addend"一律拒（`cmd/vmpack/main.go:1873`）⇒ 要按 1/2/3 放宽到"**仅 RELR 且确实可还原**"；
+  5. `#600.5` 的取向声明、`docs/TODO.md` 的登记项与本条 601.2 的第 3 步要**同一轮**一起翻转（拒绝 ⇒ 必须与原生一致）。
+- **位置数对账在旧 binutils 上退化为 `[NOTE]`**（条目数仍是硬断言）：若将来要更强口径，需要一条**不依赖 readelf 措辞**的独立判据。
+- 运行期方案 (b)、win/arm64、TEE/远程证明等仍如 `#600.7`。
+
+**本批真实改动文件（`git show --stat`）**
+
+| 提交 | 文件 |
+|---|---|
+| `abe97ef` | `AGENTS.md`、`docs/HANDOFF.md` |
+| `7fae066` | `tools/e2e_elf_image.sh` |
+| `3b57533` | `tools/e2e_elf_image.sh` |
+
+**互指**：本条是 `#600.5` 登记缺口的**补齐**；`#600` 的取向（不支持 RELR ⇒ 拒绝打包）在本条被**测试化**。真支持落地时，601.2 的第 3 步会从"必须拒绝"翻转成"必须与原生一致"。
+
+
 
 
