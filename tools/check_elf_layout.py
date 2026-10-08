@@ -785,13 +785,24 @@ def selftest(path, manifest, report, blob):
         # M4 (E4): PLANT the #585 defect -- give a non-top LOAD a bss beyond its file image.
         # Shape-independent: after the fix no LOAD carries bss at all, so "remove an existing bss"
         # would have no input (that is exactly how the analogous PE calibration went wrong once).
+        #
+        # The mutation needs a non-top LOAD with a file image bigger than a page. Legal products can
+        # genuinely have none: on the one-RWX-segment shape the payload segment IS the top, and a
+        # minimal original image has every other LOAD one page or smaller. That is "no input", not
+        # "the calibration failed" -- so it is a deliberate SKIP, said out loud, exactly like the
+        # window-shaped calibrations below (t2 found this line failing the whole --selftest, exit 1).
+        # E4 ITSELF is not weakened: it still fails a real planted bss, and that is calibrated here
+        # on every shape that has somewhere to plant it.
         planted = None
         for p in elf.loads:
             if p["filesz"] > 0x2000 and align_up(p["vaddr"] + p["filesz"], 4096) < elf.top_bss_edge():
                 planted = p
                 break
         if planted is None:
-            results.append(("E4", False, "no non-top LOAD to plant a bss on"))
+            print("[SKIP] CAL  E4: no plantable non-top LOAD on this product (every LOAD is either "
+                  "one page or smaller, or IS the page-aligned top) -- there is nothing to inject a "
+                  "bss into, so this calibration is deliberately skipped, NOT counted as a pass; "
+                  "E4 itself still fails a real planted bss (see the shapes that have one)")
         else:
             def m4(d, p=planted):
                 struct.pack_into("<Q", d, p["hdr"] + 32, p["filesz"] - 0x1000)  # shrink filesz
@@ -826,10 +837,25 @@ def selftest(path, manifest, report, blob):
         # longer matches the blob), so the calibration additionally requires E5''s own failure
         # line to name the planted address -- otherwise E3 would be doing the work.
         pref = elf.image_base
+        # E5 only runs on ET_DYN, and even then its bookkeeping half returns early unless the report
+        # declares an encrypted range. Planting a VA in either case can never make E5 fail, so the
+        # calibration must SKIP rather than report a false "not caught". (This line used to be an
+        # unreachable ET_EXEC guard, which hid both cases: t2 found the E4 one, and covering the
+        # ET_EXEC product with this same edit is what exposed the missing imgSections guard.)
         if elf.etype != ET_DYN:
-            pass  # 上面已经 SKIP 过了
+            print("[SKIP] CAL  E5-payload: this product is ET_EXEC, so E5 does not run at all -- "
+                  "there is no VA-coverage assertion for the planted VA to trip; deliberate SKIP, "
+                  "NOT counted as a pass")
         elif pref == 0:
             print("[SKIP] CAL  E5-payload: preferred base is 0, RVA and VA cannot be told apart")
+        elif not report.get("imgSections"):
+            # SECOND "no input" case of the same family: with no declared encrypted range E5's
+            # bookkeeping half returns early, so the planted VA cannot make E5 fail either. Plain
+            # packs of a PIE target take this route (the packer skips the image encryption unless
+            # -enc-image-elf-pie is given); it is a deliberate SKIP, not a pass.
+            print("[SKIP] CAL  E5-payload: the report declares no encrypted range "
+                  "(imgSections=%r), so E5 checks nothing on this product and the planted VA could "
+                  "not trip it -- deliberate SKIP, NOT counted as a pass" % (report.get("imgSections"),))
         else:
             planted = None
             for off in range(0, pl["filesz"] - 7, 8):
