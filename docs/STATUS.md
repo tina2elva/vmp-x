@@ -10639,4 +10639,12 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
 - aarch64 的"加密范围内相对重定位"运行期那半仍然没有可跑用例（`#376/#377` 把只读数据节加密关掉；
   可执行段内重定位在 amd64 上也会崩），登记在 `tools/check_elf_layout.py` 的 E5 覆盖缺口一节。
 
+**CI（代码 sha `c34a0c0`）**：run **37725768163** —— `windows-amd64` / `linux-amd64` / `linux-arm64` **三作业全绿**。
+CI 日志里能看到新口径真的在跑（不是只在本机）：`[*] 形状账：report.payloadWXFallback 必须与产物程序头里的载荷形状一致`、
+`[OK] aarch64: measured payload shape tier(s) in this run: (3) one W+X payload segment`（CI 的 aarch64 夹具 PT_NOTE=1 ⇒ 两件产物都落
+tier (3)，分类器就只说这一档、缺的档显式 SKIP，不超出实测宣称）。
+
+**本条之后仍未做**：多目标全量加密（`-enc-image-elf` 之外）在 aarch64 上的运行期验证仍缺可跑用例（见 E5 覆盖缺口）；
+上一轮 `#597` 的"可执行段内含重定位是否该 fail-closed 拒绝"仍是独立待办。
+
 
