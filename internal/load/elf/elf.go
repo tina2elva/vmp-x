@@ -283,18 +283,38 @@ func (f *File) canDropPHDR() bool {
 	return true
 }
 
-// AddLoadSegmentFromNote 把第一个 PT_NOTE 改写为指向 payload 的 PT_LOAD(R+X)，
+// AddLoadSegmentFromNote 把第一个可复用槽位改写为指向 payload 的 PT_LOAD(R+X)，
 // payload 追加到文件尾（页对齐）。返回新段的虚拟地址与**文件偏移**。
 //
 // 这里只给 R+X：blob 里 .bss（解释器的明文解密缓存）需要的**写**权限由调用方
 // 用 AddOverlayLoadSegment 覆盖成单独的 RW 段——这样代码页不会变成可写（去掉 RWX）。
 func (f *File) AddLoadSegmentFromNote(payload []byte) (uint64, int64, error) {
-	noteIdx := f.sparePhdrSlot()
-	if noteIdx < 0 {
+	return f.AddLoadSegmentFromNoteSized(payload, len(payload))
+}
+
+// AddLoadSegmentFromNoteSized 与 AddLoadSegmentFromNote 同义，但段只**映射** payload 的
+// 前 mapLen 字节（filesz = memsz = mapLen），文件的其余字节留给调用方用
+// AddOverlayLoadSegment 按别的权限映射。
+//
+// 为什么需要它（M5，STATUS #597）：载荷几何必须让"可写窗口"**不在载荷 RX 段的
+// vaddr 范围之内**。glibc 只在 DT_TEXTREL 路径按 PT_LOAD 重设保护，载荷 RX 段一旦
+// 页对齐后盖住窗口所在的页，解释器第一次写自己的解密缓存就 SIGSEGV（实测）。
+// 于是调用方把 [0, bssOff) 映射成 RX、[bssOff, …) 另起一段 —— 前者就靠这里的 mapLen。
+//
+// **整个 payload 都会被追加到文件尾**（不是只有前 mapLen 字节）：后面那几段的
+// p_offset 指向的正是这份字节。只追加前缀会造成 p_offset 越过 EOF，内核 mmap 之后
+// 一碰那一页就 SIGBUS（实测：textrel 夹具 rc=135，gdb 报 SIGBUS 在尾部页上）——
+// 也就是说"未映射的字节"必须在**文件里真的存在**，只是没有被这个段映射。
+func (f *File) AddLoadSegmentFromNoteSized(payload []byte, mapLen int) (uint64, int64, error) {
+	slot := f.sparePhdrSlot()
+	if slot < 0 {
 		return 0, 0, fmt.Errorf("没有可复用的 PT_NOTE 段")
 	}
+	if mapLen < 0 || mapLen > len(payload) {
+		return 0, 0, fmt.Errorf("mapLen=%d 超出 payload 长度 %d", mapLen, len(payload))
+	}
 
-	// 追加 payload（页对齐）
+	// 追加整个 payload（页对齐）；段只映射前 mapLen 字节。
 	fileOff := AlignUp(uint64(len(f.Data)), PageAlign)
 	for uint64(len(f.Data)) < fileOff {
 		f.Data = append(f.Data, 0)
@@ -308,14 +328,64 @@ func (f *File) AddLoadSegmentFromNote(payload []byte) (uint64, int64, error) {
 		Off:    fileOff,
 		Vaddr:  va,
 		Paddr:  va,
-		Filesz: uint64(len(payload)),
-		Memsz:  uint64(len(payload)),
+		Filesz: uint64(mapLen),
+		Memsz:  uint64(mapLen),
 		Align:  PageAlign,
 	}
-	f.Progs[noteIdx] = p
-	off := int(f.Phoff) + noteIdx*PhdrSize
+	f.Progs[slot] = p
+	off := int(f.Phoff) + slot*PhdrSize
 	writePhdr(f.Data, off, p)
 	return va, int64(fileOff), nil
+}
+
+// SparePhdrSlots 返回**还能**改写成新段的槽位数（判据与 sparePhdrSlot 完全一致）。
+//
+// 调用方必须先问这个数再决定"能不能分段"：分段需要 2 个槽（RX 前缀 + RW 窗口），
+// 载荷尾部需要 R+X 时是 3 个。槽位不够时 inject 侧退回"整段 RWX"——整段可写，
+// 对 glibc 的 TEXTREL 保护重设同样免疫（M5 的成因是"RX 段覆盖窗口"，不是 RWX 本身）。
+//
+// 关键：必须**按 sparePhdrSlot 的优先级顺序**模拟消耗，不能简单地对 PR_NOTE / PT_NULL /
+// PT_PHDR 各数一遍。实测过的反例：aarch64 夹具（1 个 PT_NOTE + 若干被改成 PT_NULL 的 NOTE）
+// 里 PT_NULL 排在 PT_NOTE **后面** —— 前置 PT_NULL 被用掉后，sparePhdrSlot 的 PT_NOTE 分支
+// 不再匹配，PT_NULL 分支只找到**已消耗**的那些索引 ⇒ 第二个段"没有可复用槽位"。
+// 于是分包前数出 2 个、真去分段时第二个却失败（打出来的告警还会说"需要 2 个"）。
+func (f *File) SparePhdrSlots() int {
+	used := make([]bool, len(f.Progs))
+	n := 0
+	// 每一趟都精准复刻 sparePhdrSlot 的对应分支：**类型优先 + 取最低空闲索引**。
+	// 只要少模拟一处"连续调用"的语义，计数就会比真实可用槽位多（实测过两次：
+	// ① aarch64 夹具里 PT_NULL 排在 PT_NOTE 后面；② PT_NULL 排在 PT_NOTE **前面**），
+	// 后果都是"先数出够用、真去分段时第二个段报没有可复用槽位"。
+	// takeLowest：把该类型中**索引最小**的空闲槽位记下来（sparePhdrSlot 就是从前往后找的）。
+	// 不能拿 p_vaddr 当"先后"（PT_NULL/PT_PHDR 的 p_vaddr 通常是 0，会 tie，选错槽位 —— 实测踩过）。
+	takeLowest := func(want func(Program) bool) bool {
+		idx := -1
+		for i, p := range f.Progs {
+			if used[i] || !want(p) {
+				continue
+			}
+			idx = i
+			break
+		}
+		if idx < 0 {
+			return false
+		}
+		used[idx] = true
+		n++
+		return true
+	}
+	drain := func(want func(Program) bool) {
+		for takeLowest(want) {
+		}
+	}
+	drain(func(p Program) bool { return p.Type == PT_NOTE })
+	drain(func(p Program) bool { return p.Type == PT_GNU_RELRO })
+	if f.canDropPHDR() {
+		// 这一对必须**同趟**取最低空闲索引：若先扫 PT_PHDR，最低空闲的 PT_NULL 会被当成 PHDR
+		// 用掉，下一趟再找不到它，于是把一个排在前面的 PT_NULL 后面的 PT_NOTE 误判成"不可达"。
+		drain(func(p Program) bool { return p.Type == PT_PHDR || p.Type == PT_NULL })
+	}
+	return n
 }
 
 // MakeBssFileBacked 把每个 "memsz > filesz" 的 PT_LOAD 改成**整段文件承载**

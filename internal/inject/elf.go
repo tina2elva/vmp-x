@@ -94,37 +94,118 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		fmt.Printf("[*] ELF：%d 个带 .bss 的段改成文件承载（否则高层载荷段会让内核漏映射这段 bss）\n", n)
 	}
 
-	newVA, payloadOff, err := f.AddLoadSegmentFromNote(pl.Data)
-	if err != nil {
-		return nil, err
-	}
-	if newVA != baseVA {
-		return nil, fmt.Errorf("新段 VA 与预估不一致（预估 0x%X，实际 0x%X）", baseVA, newVA)
-	}
-
-	// blob 里的 .bss（解释器的明文解密缓存）需要写权限，但代码段不该可写（RWX 是安全坏味道）。
-	// 做法：上面的段是 R+X，再用一个**重叠的** PT_LOAD 把 .bss 那一截覆盖成 R+W。
-	// 因为 blob 构建时已把 .bss 起止都对齐到 0x1000，所以两段的页不会交错。
-	if pl.BSSSize > 0 {
-		if err := f.AddOverlayLoadSegment(baseVA+uint64(pl.BSSOff), payloadOff+int64(pl.BSSOff),
-			uint64(pl.BSSSize), elf.PF_R|elf.PF_W); err != nil {
-			// 没有空槽位可复用（例如动态链接的 ELF 里 PT_PHDR 不能丢）：
-			// 退回"整段 RWX"并**明确告警**，而不是悄悄接受一个可写的代码段。
-			if !f.SetLoadSegmentFlags(newVA, elf.PF_R|elf.PF_X|elf.PF_W) {
-				return nil, fmt.Errorf("添加可写覆盖段失败且无法退回: %w", err)
+	// ---- 载荷分段（M5 的核心，见 STATUS #597）----
+	//
+	// 形状：RX 前缀 [0, bssOff) + RW 窗口 [bssOff, bssOff+bssSize) + R+X 尾部 […, len(Data))。
+	// 三者 VA 相邻、**不重叠** ⇒ 不存在任何"非可写 LOAD 盖住可写窗口"的形状。
+	//
+	// 为什么必须不重叠：glibc 只在 DT_TEXTREL 路径按 PT_LOAD 重设回原保护。老形状是
+	// "整段 RX + 重叠的 RW 覆盖段"，它靠"后映射者胜"才拿到可写；一旦 glibc 按 RX 段把页
+	// 重设成只读（#597 的 textrel 实测），解释器第一次写自己的解密缓存就 SIGSEGV。
+	// 整段可写（RWX）对这种重设同样免疫 —— 所以槽位不够时退回**整段 RWX**，
+	// 而不是退回那个重叠形状（上一轮的洞正是在这里）。
+	//
+	// 槽位账：前缀 + 窗口 = 2 个；若载荷在窗口之后还有字节（尾部，装着**可执行蹦床**：
+	// 两段版把尾部并进 RW 段时 normal/textrel 两个产物都立刻 SIGSEGV）则要 3 个。
+	spare := f.SparePhdrSlots()
+	segments := 1
+	tailSize := 0
+	// 窗口必须整帧落在页上：内核只按页 mmap/mprotect，窗口若从页中间开始，那页的前半截
+	// 仍被 RX 前缀段覆盖 —— glibc 按前缀段把该页设成只读时，窗口的前几个字节就跟着变只读
+	// （实测：这是同一个 SIGSEGV，只是窗口小了一半）。blob 构建把 .bss 起止都对齐到 0x1000，
+	// 所以真实产物永远满足；这里留一条守卫，不满足就整段 RWX（而不是假装分得很干净）。
+	pageOK := pl.BSSOff%elf.PageAlign == 0 && pl.BSSSize%elf.PageAlign == 0
+	if pl.BSSSize > 0 && pl.BSSOff > 0 && pl.BSSOff < len(pl.Data) && pageOK {
+		if end := pl.BSSOff + pl.BSSSize; end > len(pl.Data) {
+			segments = 1 // 窗口越出载荷（不该发生）：退回单段
+		} else {
+			segments = 2
+			if tailSize = len(pl.Data) - end; tailSize > 0 {
+				segments = 3
 			}
-			fmt.Printf("[warn] 无法为该 ELF 分段（%v）：payload 段退回 RWX（代码页可写）\n", err)
+		}
+	} else if pl.BSSSize > 0 && !pageOK {
+		fmt.Printf("[warn] 载荷的可写窗口未按页对齐（bssOff=0x%X bssSize=0x%X）：无法切成独立段 ⇒ 整段 RWX\n",
+			pl.BSSOff, pl.BSSSize)
+	}
+	// 分段方案的选择（**这条梯子就是"绝不再产生重叠形状"的保证**）：
+	//   ① spare >= segments         ：两段/三段**相邻**拆分（代码页保持只读，最好）；
+	//   ② spare == 2 且有窗口+尾部   ：两段拆分，窗口与尾部合并成**一段 RWX**
+	//      （窗口与尾部同权限时直接切一刀是对的：W 与 R+X 各自都在，而且仍与别的段不重叠）；
+	//   ③ 其它（只剩 1 个槽）        ：整段 RWX。
+	// ②/③ 都是"整个那段可写"，所以对 glibc 的 TEXTREL 保护重设免疫；它们都不产生重叠段。
+	split := segments >= 2 && spare >= segments
+	// ②：窗口自带可执行尾部（tailSize 紧跟在窗口之后、同一段里）—— 只有恰好 2 个槽时用。
+	splitRWXWindow := !split && segments == 3 && spare == 2
+
+	var newVA uint64
+	var payloadOff int64
+	if !split && !splitRWXWindow {
+		// 单段（无可写窗口，或槽位不够）：**整段**映射。有窗口时给 RWX —— 整段可写 ⇒ 无重叠形状。
+		wholeFlags := uint32(elf.PF_R | elf.PF_X)
+		if pl.BSSSize > 0 {
+			wholeFlags |= elf.PF_W
+		}
+		newVA, payloadOff, err = f.AddLoadSegmentFromNote(pl.Data)
+		if err != nil {
+			return nil, err
+		}
+		if newVA != baseVA {
+			return nil, fmt.Errorf("新段 VA 与预估不一致（预估 0x%X，实际 0x%X）", baseVA, newVA)
+		}
+		if !f.SetLoadSegmentFlags(newVA, wholeFlags) {
+			return nil, fmt.Errorf("无法设置载荷段权限（VA 0x%X 不在程序头表里）", newVA)
+		}
+		if pl.BSSSize > 0 {
+			fmt.Printf("[warn] 无法为该 ELF 分段（可复用程序头槽位 %d 个，需要 %d 个）：payload 段**整段退回 RWX**（代码页可写）；"+
+				"整段可写 ⇒ 对 glibc 的 TEXTREL 保护重设免疫，且不产生任何重叠段\n", spare, segments)
 			warnRWX = true
 		}
-	}
-
-	// 顺序修正（很关键）：内核按程序头表顺序依次 mmap 各 PT_LOAD，**重叠区间上后面的覆盖前面的**。
-	// 可写覆盖段必须排在 payload 段之后，否则 .bss 会被随后的 RX 映射盖回去 ——
-	// 解释器写解密缓存就 SIGSEGV（SEGV_ACCERR，Linux 实测；PE 侧按节合并、写标志生效，不暴露此问题）。
-	// 实测：payload 复用 PT_NOTE（索引 1），覆盖段落到更低的索引 0（可丢弃的 PT_PHDR），
-	// 于是 payload 后映射、把 RW 盖掉。
-	if pi, oi := payloadPhdrIndex(f, newVA), payloadPhdrIndex(f, baseVA+uint64(pl.BSSOff)); pi >= 0 && oi >= 0 && oi < pi {
-		f.SwapPhdrs(oi, pi)
+	} else {
+		// 前缀：只映射 [0, bssOff)，段本身仍是 RX 且**止于 bssOff**。
+		newVA, payloadOff, err = f.AddLoadSegmentFromNoteSized(pl.Data, pl.BSSOff)
+		if err != nil {
+			return nil, err
+		}
+		if newVA != baseVA {
+			return nil, fmt.Errorf("新段 VA 与预估不一致（预估 0x%X，实际 0x%X）", baseVA, newVA)
+		}
+		// 窗口与尾部都指向**已经追加进文件**的那份载荷字节（不新增文件内容）。
+		// 段顺序 = 程序头槽位顺序（sparePhdrSlot 返回递增的槽位），内核按表顺序 mmap
+		// ⇒ 窗口在自己所在的页上必然是最后映射者。
+		winSize := uint64(pl.BSSSize)
+		winFlags := uint32(elf.PF_R | elf.PF_W)
+		if splitRWXWindow {
+			// ②：只多一个槽 —— 窗口与紧随其后的尾部合成**一段 RWX**（[bssOff, len(Data))）。
+			// 这一段自己可写，所以不存在"非可写段盖住窗口"；它仍然与别的段不重叠。
+			winSize += uint64(tailSize)
+			winFlags |= elf.PF_X
+		}
+		if err := f.AddOverlayLoadSegment(newVA+uint64(pl.BSSOff), payloadOff+int64(pl.BSSOff),
+			winSize, winFlags); err != nil {
+			return nil, fmt.Errorf("添加可写窗口段失败（已按槽位数预算过分段）: %w", err)
+		}
+		if tailSize > 0 && !splitRWXWindow {
+			if err := f.AddOverlayLoadSegment(newVA+uint64(pl.BSSOff+pl.BSSSize),
+				payloadOff+int64(pl.BSSOff+pl.BSSSize), uint64(tailSize), elf.PF_R|elf.PF_X); err != nil {
+				return nil, fmt.Errorf("添加载荷尾部段失败（已按槽位数预算过分段）: %w", err)
+			}
+		}
+		if splitRWXWindow {
+			// ②：只有 2 个槽 —— 代码页仍是只读，但**窗口与尾部的这一段**是 RWX（可写）。
+			// 醒目告警的原因与 ③ 一样：这一段整段可写，是回退而不是首选形状。
+			fmt.Printf("[warn] 可复用程序头槽位只有 %d 个（三段需要 %d 个）：退而求其次 —— RX 前缀 [0, 0x%X) 保持只读，"+
+				"但窗口+尾部合成**一段 RWX** [0x%X, 0x%X)（该段可写，代码页中只有这一截可写；两段相邻不重叠，"+
+				"整段可写 ⇒ 对 glibc 的 TEXTREL 保护重设免疫）\n",
+				spare, segments, pl.BSSOff, pl.BSSOff, pl.BSSOff+pl.BSSSize+tailSize)
+			warnRWX = true
+		} else if tailSize > 0 {
+			fmt.Printf("[*] ELF 载荷分段：RX 前缀 [0, 0x%X) + RW 窗口 [0x%X, 0x%X) + R+X 尾部 0x%X 字节"+
+				"（三段相邻不重叠；可复用槽位 %d，用 %d）\n", pl.BSSOff, pl.BSSOff, pl.BSSOff+pl.BSSSize, tailSize, spare, segments)
+		} else {
+			fmt.Printf("[*] ELF 载荷分段：RX 前缀 [0, 0x%X) + RW 窗口 [0x%X, 0x%X)"+
+				"（两段相邻不重叠；可复用槽位 %d，用 %d）\n", pl.BSSOff, pl.BSSOff, pl.BSSOff+pl.BSSSize, spare, segments)
+		}
 	}
 
 	// 重定位应用表（运行期应用器的契约，见 RelocTableHeaderSize）连同"到底加密了哪些范围"
@@ -143,14 +224,4 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		ImgPrefBase:      imageBase,
 		ImgEType:         f.EType,
 	}, nil
-}
-
-// payloadPhdrIndex 按 VA 找出某个 PT_LOAD 在程序头表里的索引（找不到返回 -1）。
-func payloadPhdrIndex(f *elf.File, va uint64) int {
-	for i, p := range f.Progs {
-		if p.Type == elf.PT_LOAD && p.Vaddr == va {
-			return i
-		}
-	}
-	return -1
 }

@@ -6,24 +6,27 @@ Everything is derived from the PRODUCT FILE plus the same build's blob manifest 
 
   E1 program-header inventory
         every PT_LOAD is file-backed inside the file, satisfies p_offset == p_vaddr (mod p_align),
-        has p_memsz >= p_filesz, and the only allowed VA overlap is the injector's RW overlay:
-        an RW segment fully inside an earlier RX segment and listed AFTER it. The loader maps in
-        table order and later mappings win, so inverting that order silently kills the
-        interpreter's writable window (internal/inject/elf.go documents the measured failure).
-  E2 payload segments vs the report
-        one PT_LOAD at exactly report.sectionRVA carrying the payload (executable, filesz ==
-        report.sectionSize). The interpreter's writable window (manifest bssOff/bssSize) must be
-        MAPPED and WRITABLE, and two implementations are legal:
-          (a) a dedicated RW PT_LOAD at sectionRVA + bssOff, filesz == memsz == bssSize -- what the
-              injector produces when it can split the payload (RX code + RW bss); or
-          (b) the payload LOAD itself is writable (PF_W) and its FILE IMAGE carries the bss bytes
-              (the range is inside p_filesz and inside the file) -- this is internal/inject/elf.go's
-              documented fallback to ONE RWX segment when no second PT_NOTE slot can be reused
-              (it prints a loud "[warn] ... 退回 RWX" when it does).
-        Requiring (a) unconditionally was an amd64-only assumption: the aarch64 fixture built by the
-        CI toolchain has a single PT_NOTE, so CI takes route (b) -- CI run 37128895442 went red here
-        and the same shape is reproducible locally by blanking one PT_NOTE (see the arm64 case in
-        tools/e2e_elf_image.sh).
+        has p_memsz >= p_filesz, and NO PT_LOAD overlaps another one. The injector used to emit one
+        allowed overlap ("RX payload segment + an RW segment overlaying its bss"); that shape is the
+        M5 defect (STATUS #597) and is rejected here on purpose -- the injector now emits ADJACENT
+        segments instead (or makes the whole payload RWX).
+  E2 payload segments vs the report + the M5 no-overlap invariant
+        one PT_LOAD at exactly report.sectionRVA carrying the payload. Legal layouts are:
+          (a) split, three ADJACENT segments: RX prefix filesz == memsz == bssOff, then the RW
+              window at sectionRVA+bssOff (filesz == memsz == bssSize), then an R+X tail for
+              whatever the payload still carries (filesz == memsz == sectionSize-bssOff-bssSize);
+          (b) one RWX segment: the payload LOAD is writable and filesz == memsz == sectionSize
+              (the no-spare-slot fallback: no second/third reusable program header, e.g. the
+              1-PT_NOTE aarch64 fixtures -- CI run 37128895442 took this route); or
+          (c) one RX segment and no writable window at all (manifest bssSize == 0).
+        The payload LOAD's filesz is therefore allowed to be either report.sectionSize (whole
+        payload) or bssOff (split prefix only).
+        On top of the layout, E2 asserts the M5 invariant on every product:
+        NO NON-WRITABLE PT_LOAD MAY INTERSECT THE WRITABLE WINDOW [bss_va, bss_va+bss_size), compared
+        per 4 KiB page (the granularity the kernel and glibc's mprotect work at). glibc re-protects
+        each PT_LOAD on the DT_TEXTREL path; when the payload's RX segment covers the window's page
+        the window turns read-only and the interpreter SIGSEGVs on its first write (measured).
+        When there is no writable window the invariant has no input and E2 says so explicitly.
   E3 payload byte identity
         file bytes at (sectionRVA + o) == blob[o] for every o in [0, blobSize).
   E4 bss mapping invariant (STATUS #585)
@@ -144,6 +147,26 @@ class ELF:
                     return off
         return None
 
+    def va_to_off(self, va):
+        """File offset of a VA according to ANY PT_LOAD (None when nothing maps it).
+
+        Deliberately wider than the old "first PT_LOAD whose p_filesz covers it" helper: the
+        injector's split layout maps the payload with three separate segments and the tests
+        below want the offset of every mapped byte, not only the ones inside the first segment.
+        """
+        o = self._va_to_off_unbounded(va)
+        if o is not None and o < len(self.data):
+            return o
+        return None
+
+    def _va_to_off_unbounded(self, va):
+        for p in self.progs:
+            if p["type"] != PT_LOAD:
+                continue
+            if p["vaddr"] <= va < p["vaddr"] + p["filesz"]:
+                return p["off"] + (va - p["vaddr"])
+        return None
+
     def read(self, va, n):
         o = self.va_to_off(va)
         if o is None or o + n > len(self.data):
@@ -222,7 +245,22 @@ class Report:
         raise Fail(m)
 
 
-def check_inventory(elf, rep):
+def payload_window_va(elf, manifest, report):
+    """The writable window's VA (manifest bssOff relative to report.sectionRVA), or None."""
+    if elf is None or manifest is None or report is None:
+        return None
+    if int(manifest.get("bssSize") or 0) <= 0:
+        return None
+    return elf.image_base + int(report["sectionRVA"]) + int(manifest.get("bssOff") or 0)
+
+
+def check_inventory(elf, rep, manifest=None, report=None):
+    """E1 also carries the DIRECT M5 test: an RX payload segment whose vaddr range swallows the
+    writable window is the measured cause of the SIGSEGV (STATUS #597), whatever the rest of the
+    program-header table looks like. It is asserted here -- not only in E2 -- so that the invariant
+    survives any future legal-shape relaxation in E2, and it is derived from report+manifest, not
+    from "does this segment look like a payload segment"."""
+    win = payload_window_va(elf, manifest, report)
     if not elf.loads:
         rep.fail("E1", "no PT_LOAD at all")
     n = len(elf.data)
@@ -238,8 +276,33 @@ def check_inventory(elf, rep):
             if p["off"] % al != p["vaddr"] % al:
                 rep.fail("E1", "LOAD vaddr=0x%X: p_offset(0x%X) != p_vaddr (mod 0x%X)"
                          % (p["vaddr"], p["off"], al))
-    # the injector's overlay is the only allowed overlap: RW, fully inside the earlier RX segment,
-    # and listed AFTER it (table order decides which mapping wins).
+    # The injector's OLD shape used to be "one RX payload LOAD + an RW segment overlapping it".
+    # That shape is the M5 defect (glibc re-protects the page from the RX segment on the DT_TEXTREL
+    # path and the interpreter's writable window turns read-only -> SIGSEGV, STATUS #597), so the
+    # injector must not emit it any more; keep rejecting it here. The injector's CURRENT shapes are
+    # ADJACENT segments (or one writable payload segment) and need no overlap exemption at all.
+    # Direct M5 assertion (see the docstring): the interpreter's writable window must not sit inside
+    # ANY non-writable PT_LOAD's vaddr range. This one does not care what the table looks like, so a
+    # later "this overlap is allowed" relaxation in the loop above cannot silently disable it.
+    # The comparison is PER PAGE, which is the granularity the kernel maps at: a segment whose
+    # PAGE-RANGE covers the window's page is what makes glibc re-protect that page read-only -- even
+    # if its last bytes land just short of the window's first byte. Page rounding does NOT false-red
+    # the correct split shape: there the prefix ends exactly at the window (0x...C3000), whose
+    # page-aligned end is the window's own first page, so the ranges stay disjoint.
+    if win is not None and int(manifest.get("bssSize") or 0) > 0:
+        wend = win + int(manifest["bssSize"])
+        wlo, whi = win // 4096, (wend - 1) // 4096
+        for q in elf.loads:
+            if q["flags"] & PF_W or q["memsz"] == 0:
+                continue
+            qlo = q["vaddr"] // 4096
+            qhi = (q["vaddr"] + q["memsz"] - 1) // 4096
+            if qlo <= whi and wlo <= qhi:
+                rep.fail("E1", "non-writable LOAD (vaddr=0x%X memsz=0x%X flags=0x%X) covers the "
+                               "interpreter's writable window [0x%X,0x%X): glibc re-protects the page "
+                               "from that LOAD on the DT_TEXTREL path, so the window turns read-only "
+                               "and the product SIGSEGVs on its first write (STATUS #597)"
+                         % (q["vaddr"], q["memsz"], q["flags"], win, wend))
     for a in elf.loads:
         for b in elf.loads:
             if b["i"] <= a["i"]:
@@ -247,17 +310,61 @@ def check_inventory(elf, rep):
             if b["vaddr"] >= a["vaddr"] + a["memsz"] or a["vaddr"] >= b["vaddr"] + b["memsz"]:
                 continue  # disjoint
             inside = b["vaddr"] >= a["vaddr"] and b["vaddr"] + b["memsz"] <= a["vaddr"] + a["memsz"]
-            if not (inside and (b["flags"] & PF_W) and not (b["flags"] & PF_X)):
-                rep.fail("E1", "LOAD[%d] (vaddr=0x%X flags=0x%X) overlaps LOAD[%d] (vaddr=0x%X flags=0x%X) "
-                               "and is not the injector's inner RW overlay"
-                         % (b["i"], b["vaddr"], b["flags"], a["i"], a["vaddr"], a["flags"]))
+            if inside and (a["flags"] & PF_W) and (b["flags"] & a["flags"]) == a["flags"]:
+                # A segment nested inside an EARLIER WRITABLE segment whose permissions are a
+                # subset of it: the later mapping wins and grants nothing new, so the effective
+                # permissions are identical over that page range. Harmless -- and it must stay
+                # legal because a link-editor product can legitimately carry one (PT_GNU_RELRO
+                # nested in the RW LOAD).
+                continue
+            if inside and (b["flags"] & PF_W) and not (b["flags"] & PF_X):
+                rep.fail("E1", "the RX payload LOAD at 0x%X is OVERLAPPED by a later RW segment at 0x%X: "
+                               "this is the M5 defect shape -- glibc re-protects that page from the RX "
+                               "segment on the DT_TEXTREL path and the writable window turns read-only "
+                               "(STATUS #597); split the payload into ADJACENT segments or make the whole "
+                               "payload RWX instead"
+                         % (a["vaddr"], b["vaddr"]))
+            rep.fail("E1", "LOAD[%d] (vaddr=0x%X flags=0x%X) overlaps LOAD[%d] (vaddr=0x%X flags=0x%X) "
+                           "and is not an allowed shape"
+                     % (b["i"], b["vaddr"], b["flags"], a["i"], a["vaddr"], a["flags"]))
     rep.ok("E1", "%d PT_LOAD in range, congruence/order constraints hold" % len(elf.loads))
 
 
 def check_payload(elf, manifest, report, rep):
+    """E2 -- payload segments vs the report, and the M5 no-overlap invariant.
+
+    Legal layouts (all of them are facts about the PRODUCT's program headers):
+
+      (a) split in THREE ADJACENT segments (the preferred shape; needs 3 reusable program headers):
+            [1] PT_LOAD sec_va                  RX   filesz == memsz == bssOff
+            [2] PT_LOAD sec_va + bssOff         RW   filesz == memsz == bssSize
+            [3] PT_LOAD sec_va + bssOff+bssSize R+X  filesz == memsz == the rest of the payload
+      (a2) split in TWO ADJACENT segments (needs 2; used when the payload has a tail but only two
+          reusable headers): the RX prefix above, plus ONE RWX segment covering the writable window
+          AND the tail that follows it. Legal because that segment is itself writable, so no
+          non-writable LOAD can cover the window.
+      (b) one segment: the payload LOAD is RWX and filesz == memsz == report.sectionSize (the
+          no-spare-header fallback, e.g. 2 reusable headers and no tail -- it needs only one).
+      (c) one segment, no writable window at all (manifest bssSize == 0): plain RX.
+
+    The payload LOAD's filesz is therefore allowed to be report.sectionSize (whole payload),
+    bssOff (split prefix) or -- in (a2) -- the prefix again.
+
+    On top of the layout, E2 asserts the M5 invariant on every product:
+      NO NON-WRITABLE PT_LOAD MAY INTERSECT THE WRITABLE WINDOW [bss_va, bss_va+bss_size),
+    compared per 4 KiB page (the granularity the kernel and glibc's mprotect work at). glibc
+    re-protects each PT_LOAD on the DT_TEXTREL path; when the payload's RX segment covers the
+    window's page the window turns read-only and the interpreter SIGSEGVs on its first write
+    (STATUS #597, measured). When there is no writable window the invariant has no input and E2
+    says so explicitly.
+    """
     sec_rva = int(report["sectionRVA"])
     sec_va = elf.image_base + sec_rva
     sec_size = int(report["sectionSize"])
+    bss_off, bss_size = int(manifest["bssOff"]), int(manifest["bssSize"])
+    bss_va = sec_va + bss_off
+    bss_end = bss_va + bss_size
+
     p = None
     for q in elf.loads:
         if q["vaddr"] == sec_va:
@@ -265,66 +372,159 @@ def check_payload(elf, manifest, report, rep):
     if p is None:
         rep.fail("E2", "no PT_LOAD at imageBase(0x%X) + report.sectionRVA(0x%X) = 0x%X"
                  % (elf.image_base, sec_rva, sec_va))
-    if p["filesz"] != sec_size:
-        rep.fail("E2", "payload LOAD filesz 0x%X != report.sectionSize 0x%X" % (p["filesz"], sec_size))
     if not (p["flags"] & PF_X):
         rep.fail("E2", "payload LOAD at 0x%X is not executable (flags=0x%X)" % (sec_va, p["flags"]))
-    if p["flags"] & PF_W:
-        rep.info("E2", "payload LOAD is RWX (the injector fell back to one segment: no W+X-free split)")
-    bss_off, bss_size = int(manifest["bssOff"]), int(manifest["bssSize"])
-    shape = "no bss in the payload"
-    if bss_size > 0:
-        bss_va = sec_va + bss_off
-        bss_end = bss_va + bss_size
-        # The interpreter's writable window (bss) must be MAPPED and WRITABLE. Two implementations
-        # are legal, and both are shape-independent statements about fields the product carries:
-        #   (a) a dedicated RW overlay PT_LOAD at sectionRVA+bssOff, filesz == memsz == bssSize
-        #       (what the injector produces when it can split the payload: RX code + RW bss);
-        #   (b) the payload LOAD itself is writable AND its FILE IMAGE carries the bss bytes
-        #       ([bss_va, bss_end) inside p_filesz and inside the file). This is the injector's
-        #       documented fallback to ONE RWX segment when there is no second reusable PT_NOTE
-        #       slot (internal/inject/elf.go prints a loud "[warn] ... 退回 RWX" there).
-        # Requiring (a) unconditionally was an amd64-only assumption: the aarch64 fixture built by
-        # the CI toolchain has a single PT_NOTE, so CI takes route (b) -- run 37128895442 went red
-        # here and the same shape is reproducible locally by blanking one PT_NOTE.
-        overlay = None
+    # NOTE: a filesz mismatch is recorded as a soft error instead of failing immediately. Every
+    # other E2 assertion still runs, because the M5 window invariant below is the one that must
+    # never be skippable -- and the calibration "grow the payload segment over the window" changes
+    # p_memsz (not p_filesz), so it can only trip that invariant if the checks after this point
+    # still execute.
+    soft = []
+    if p["filesz"] != sec_size and p["filesz"] != bss_off:
+        soft.append("payload LOAD filesz 0x%X is neither report.sectionSize (0x%X, one segment) "
+                    "nor manifest bssOff (0x%X, split prefix)" % (p["filesz"], sec_size, bss_off))
+
+    def at(va):
         for q in elf.loads:
-            if q["vaddr"] == bss_va:
-                overlay = q
-        if overlay is not None:
-            if not (overlay["flags"] & PF_W):
-                rep.fail("E2", "overlay LOAD at 0x%X is not writable (flags=0x%X)" % (bss_va, overlay["flags"]))
-            if overlay["filesz"] != bss_size or overlay["memsz"] != bss_size:
-                rep.fail("E2", "overlay LOAD at 0x%X is 0x%X/0x%X, expected 0x%X"
-                         % (bss_va, overlay["filesz"], overlay["memsz"], bss_size))
-            shape = "overlay @0x%X (0x%X)" % (bss_va, bss_size)
+            if q["vaddr"] == va:
+                return q
+        return None
+
+    tail_size = sec_size - bss_off - bss_size
+    if tail_size < 0:
+        rep.fail("E2", "manifest bssOff(0x%X) + bssSize(0x%X) exceeds report.sectionSize (0x%X): the "
+                       "interpreter's writable window would run past the payload"
+                 % (bss_off, bss_size, sec_size))
+
+    if p["filesz"] == bss_off and p["flags"] & PF_W:
+        rep.fail("E2", "split' payload prefix at 0x%X is writable (flags=0x%X): the RX prefix must "
+                       "stop at the writable window, not carry the write bit itself"
+                 % (sec_va, p["flags"]))
+
+    if p["filesz"] == sec_size:
+        # route (b)/(c): the whole payload in one segment.
+        if bss_size > 0 and not (p["flags"] & PF_W):
+            rep.fail("E2", "payload LOAD at 0x%X maps the whole payload (filesz == sectionSize) but is "
+                           "NOT writable (flags=0x%X), so nothing maps the interpreter's writable window"
+                     % (sec_va, p["flags"]))
+        if p["memsz"] != sec_size:
+            rep.fail("E2", "one-segment payload LOAD at 0x%X is 0x%X/0x%X, expected filesz == memsz "
+                           "== sectionSize 0x%X" % (sec_va, p["filesz"], p["memsz"], sec_size))
+        if bss_size > 0:
+            if bss_end > sec_va + p["memsz"] or bss_off + bss_size > p["filesz"]:
+                rep.fail("E2", "the writable window [0x%X,0x%X) is not inside the one-segment payload "
+                               "LOAD (filesz 0x%X memsz 0x%X)" % (bss_va, bss_end, p["filesz"], p["memsz"]))
+            shape = ("one RWX payload LOAD @0x%X (0x%X), window [0x%X,0x%X) file-backed inside it"
+                     % (sec_va, p["filesz"], bss_va, bss_end))
+            rep.info("E2", "payload LOAD is RWX: the injector fell back to ONE segment (fewer than 2 "
+                           "reusable program-header slots); the whole payload is writable, so no "
+                           "non-writable LOAD can cover the window (the M5 defect shape is impossible)")
         else:
-            # (b) Which segment actually backs bss_va: the LAST matching LOAD in program-header
-            # order (the kernel maps in table order, so a later segment wins).
-            cover = None
-            for q in elf.loads:
-                if q["vaddr"] <= bss_va < q["vaddr"] + q["memsz"]:
-                    cover = q
-            if cover is None:
-                rep.fail("E2", "bss [0x%X,0x%X) is mapped by NO PT_LOAD and there is no RW overlay "
-                               "(manifest bssOff=0x%X bssSize=0x%X) -- the interpreter would fault on its "
-                               "first write" % (bss_va, bss_end, bss_off, bss_size))
-            if not (cover["flags"] & PF_W):
-                rep.fail("E2", "bss [0x%X,0x%X) is mapped by a NON-writable LOAD (vaddr=0x%X flags=0x%X) and "
-                               "there is no RW overlay: the interpreter's writable window would fault"
-                         % (bss_va, bss_end, cover["vaddr"], cover["flags"]))
-            if bss_end > cover["vaddr"] + cover["memsz"]:
-                rep.fail("E2", "bss [0x%X,0x%X) is only partly mapped: the writable LOAD at 0x%X ends at 0x%X"
-                         % (bss_va, bss_end, cover["vaddr"], cover["vaddr"] + cover["memsz"]))
-            d = bss_va - cover["vaddr"]
-            if d + bss_size > cover["filesz"]:
-                rep.fail("E2", "bss [0x%X,0x%X) is neither overlaid nor file-backed: the writable LOAD at "
-                               "0x%X has p_filesz=0x%X, whose image stops at 0x%X"
-                         % (bss_va, bss_end, cover["vaddr"], cover["filesz"], cover["vaddr"] + cover["filesz"]))
-            if cover["off"] + d + bss_size > len(elf.data):
-                rep.fail("E2", "bss [0x%X,0x%X) file image runs past EOF (file is 0x%X bytes)"
-                         % (bss_va, bss_end, len(elf.data)))
-            shape = "bss file-backed inside the writable payload LOAD @0x%X (0x%X)" % (cover["vaddr"], bss_size)
+            shape = "one RX payload LOAD @0x%X (0x%X), no writable window" % (sec_va, p["filesz"])
+    else:
+        # route (a)/(a2): the injector split the payload. Every piece must be ADJACENT and page-aligned.
+        if p["filesz"] != bss_off or p["memsz"] != bss_off:
+            rep.fail("E2", "split payload prefix at 0x%X is 0x%X/0x%X, expected filesz == memsz == bssOff 0x%X "
+                           "(the RX prefix must STOP at the writable window)"
+                     % (sec_va, p["filesz"], p["memsz"], bss_off))
+        if bss_size > 0 and (bss_off % 4096 or bss_size % 4096):
+            rep.fail("E2", "split payload has a non-page-aligned window (bssOff=0x%X bssSize=0x%X): the "
+                           "kernel maps whole pages, so such a window cannot be split off on its own"
+                     % (bss_off, bss_size))
+        win = at(bss_va) if bss_size > 0 else None
+        if bss_size > 0:
+            if win is None:
+                rep.fail("E2", "no PT_LOAD at the writable window start 0x%X (manifest bssOff=0x%X): the "
+                               "interpreter's writable window is not mapped" % (bss_va, bss_off))
+            if not (win["flags"] & PF_W):
+                rep.fail("E2", "the window segment at 0x%X is not writable (flags=0x%X)"
+                         % (bss_va, win["flags"]))
+            if win["filesz"] != win["memsz"]:
+                rep.fail("E2", "the window segment at 0x%X is 0x%X/0x%X: a file image shorter than "
+                               "memsz would lose its anonymous tail (the kernel maps bss as ONE global "
+                               "range, STATUS #585)" % (bss_va, win["filesz"], win["memsz"]))
+            if tail_size > 0:
+                # (a): separate R+X tail  |  (a2): the tail is inside the same RWX segment
+                if win["filesz"] == bss_size:
+                    tail = at(bss_end)
+                    if tail is not None and tail["vaddr"] + tail["memsz"] == sec_va + sec_size:
+                        if tail["filesz"] != tail_size or tail["memsz"] != tail_size:
+                            rep.fail("E2", "payload tail at 0x%X is 0x%X/0x%X, expected filesz == memsz "
+                                           "== 0x%X" % (bss_end, tail["filesz"], tail["memsz"], tail_size))
+                        if (tail["flags"] & PF_X) and not (tail["flags"] & PF_W):
+                            shape = ("RX prefix @0x%X (0x%X) + RW window [0x%X,0x%X) + R+X tail @0x%X "
+                                     "(0x%X)" % (sec_va, bss_off, bss_va, bss_end, bss_end, tail_size))
+                        elif tail["flags"] & PF_W:
+                            shape = ("RX prefix @0x%X (0x%X) + RW window [0x%X,0x%X) + RW(X) tail @0x%X "
+                                     "(0x%X)" % (sec_va, bss_off, bss_va, bss_end, bss_end, tail_size))
+                        else:
+                            rep.fail("E2", "payload tail at 0x%X is neither executable nor writable "
+                                           "(flags=0x%X): those bytes are unmappable as code or data"
+                                     % (bss_end, tail["flags"]))
+                    else:
+                        rep.fail("E2", "payload byte(s) after the writable window are not mapped by a "
+                                       "single adjacent LOAD (expected one at 0x%X covering 0x%X bytes): "
+                                       "the two-segment version merged them into the RW window and both "
+                                       "the normal and the textrel fixture died on their first write "
+                                       "(the tail holds executable trampolines)"
+                                 % (bss_end, tail_size))
+                elif win["filesz"] == bss_size + tail_size:
+                    if not (win["flags"] & PF_X):
+                        rep.fail("E2", "the RWX window+tail segment at 0x%X is not executable "
+                                       "(flags=0x%X): the tail bytes hold executable trampolines"
+                                 % (bss_va, win["flags"]))
+                    shape = ("RX prefix @0x%X (0x%X) + RWX window+tail segment [0x%X,0x%X) covering "
+                             "0x%X + 0x%X bytes (two adjacent segments, the 2-reusable-header route)"
+                             % (sec_va, bss_off, bss_va, bss_end + tail_size, bss_size, tail_size))
+                    rep.info("E2", "the window and the following tail live in ONE RWX segment: the "
+                                   "injector had exactly 2 reusable program-header slots (a third "
+                                   "would have let it keep the code page non-writable)")
+                else:
+                    rep.fail("E2", "the window segment at 0x%X is 0x%X/0x%X, expected filesz == memsz == "
+                                   "bssSize (0x%X) for a separate window, or the window+tail (0x%X) for "
+                                   "the 2-slot route" % (bss_va, win["filesz"], win["memsz"], bss_size,
+                                                        bss_size + tail_size))
+            else:
+                if win["filesz"] != bss_size:
+                    rep.fail("E2", "the window segment at 0x%X is 0x%X/0x%X, expected 0x%X (== bssSize)"
+                             % (bss_va, win["filesz"], win["memsz"], bss_size))
+                shape = "RX prefix @0x%X (0x%X) + RW window [0x%X,0x%X) (adjacent; the payload ends at " \
+                        "the window edge so there is no tail)" % (sec_va, bss_off, bss_va, bss_end)
+        else:
+            shape = "RX prefix @0x%X (0x%X), no writable window" % (sec_va, p["filesz"])
+
+    # ---- M5 invariant, checked on whatever shape the product really has ----
+    if bss_size > 0:
+        win_lo, win_hi = bss_va, bss_end
+        offenders = []
+        for q in elf.loads:
+            if q["flags"] & PF_W:
+                continue  # writable segments are allowed to hold the window
+            lo = max(win_lo // 4096, q["vaddr"] // 4096)
+            hi = min((win_hi + 4095) // 4096, (q["vaddr"] + q["memsz"] + 4095) // 4096)
+            if lo < hi:
+                offenders.append((q, lo, hi))
+        if offenders:
+            for q, lo, hi in offenders[:4]:
+                rep.lines.append("[----] E2  non-writable LOAD vaddr=0x%X memsz=0x%X flags=0x%X shares "
+                                 "page(s) [0x%X,0x%X) with the writable window [0x%X,0x%X)"
+                                 % (q["vaddr"], q["memsz"], q["flags"], lo * 4096, hi * 4096, win_lo, win_hi))
+            q = offenders[0][0]
+            rep.fail("E2", "non-writable LOAD (vaddr=0x%X flags=0x%X) intersects the writable window "
+                           "[0x%X,0x%X): glibc re-protects that page from this LOAD on the DT_TEXTREL "
+                           "path, the interpreter's writable window turns read-only and the product "
+                           "SIGSEGVs on its first write (STATUS #597)"
+                     % (q["vaddr"], q["flags"], win_lo, win_hi))
+        rep.ok("E2", "no non-writable LOAD intersects the writable window [0x%X,0x%X)" % (win_lo, win_hi))
+    else:
+        rep.info("E2", "no writable window in this payload (manifest bssSize=0): the "
+                       "\"non-writable LOAD must not cover the window\" invariant is vacuous here")
+
+    # every payload byte must be file-backed (through whichever PT_LOAD maps it)
+    if elf.va_to_off(sec_va + sec_size - 1) is None:
+        soft.append("the last payload byte (vaddr 0x%X) is not file-backed" % (sec_va + sec_size - 1))
+    if soft:
+        rep.fail("E2", "; ".join(soft))
     rep.ok("E2", "payload @0x%X (RVA 0x%X, 0x%X bytes) + %s" % (sec_va, sec_rva, sec_size, shape))
 
 
@@ -335,9 +535,14 @@ def check_identity(elf, manifest, report, blob, rep):
         rep.fail("E3", "blob is 0x%X bytes, manifest says blobSize 0x%X" % (len(blob), blob_size))
     diffs = []
     for o in range(blob_size):
-        got = elf.read(sec_rva + o, 1)
-        if got is None:
+        # Every payload byte must be file-backed -- through whichever PT_LOAD maps it. The
+        # injector's split layout maps [bssOff, sectionSize) with its own segments (RW window,
+        # R+X tail), so reading through the FIRST segment alone would falsely report "not
+        # file-backed" for bytes the product really does carry (that was a hole the two-segment
+        # version of this gate had).
+        if elf.va_to_off(sec_rva + o) is None:
             rep.fail("E3", "blob offset 0x%X (vaddr 0x%X) is not file-backed" % (o, sec_rva + o))
+        got = elf.read(sec_rva + o, 1)
         if got[0] != blob[o]:
             diffs.append(o)
             if len(diffs) <= 8:
@@ -463,8 +668,13 @@ def check_relocs(elf, report, rep):
 
     # (b) encrypted ranges vs the recorded relocations
     secs = report.get("imgSections")
-    if secs is None:
-        rep.info("E5", "report has no imgSections: cannot cross-check the relocation record")
+    if not secs:
+        # The report carries imgSections=null (or an empty list) when the packer did not encrypt any
+        # image range on purpose -- a plain pack of an ET_DYN target skips the image unless
+        # -enc-image-elf-pie is given. Anything that iterates this field must handle null, not just
+        # its absence: the field IS present in that report.
+        rep.info("E5", "report declares no encrypted range (imgSections=%r): there is no relocation "
+                       "bookkeeping to cross-check on this product" % (secs,))
         return
     found = 0
     where = []
@@ -503,7 +713,7 @@ def check_relocs(elf, report, rep):
 def run_checks(path, manifest, report, blob, quiet=False):
     elf = ELF(open(path, "rb").read())
     rep = Report()
-    for fn, args in ((check_inventory, (elf, rep)),
+    for fn, args in ((check_inventory, (elf, rep, manifest, report)),
                      (lambda e, r: check_payload(e, manifest, report, r), (elf, rep)),
                      (lambda e, r: check_identity(e, manifest, report, blob, r), (elf, rep)),
                      (check_bss, (elf, rep)),
@@ -528,8 +738,12 @@ def _expect_fail(rep, check, needle=None):
     fails = [l for l in rep.lines if l.startswith("[FAIL]") and l.split()[1] == check]
     if not fails:
         return (False, "expected %s to fail, it passed" % check)
-    if needle is not None and needle not in fails[0]:
-        return (False, "%s failed but not for the planted reason (want %r in %r)" % (check, needle, fails[0]))
+    # The needle may live in ANY of that check's failure lines: one mutation can legitimately trip
+    # several assertions of the SAME check (e.g. an invalid payload prefix shape also puts the
+    # segment's page range over the window). Requiring it in fails[0] would report "caught for the
+    # wrong reason" while the planted reason IS present further down the list.
+    if needle is not None and not any(needle in l for l in fails):
+        return (False, "%s failed but not for the planted reason (want %r in %r)" % (check, needle, fails))
     return (True, fails[0])
 
 
@@ -591,13 +805,21 @@ def selftest(path, manifest, report, blob):
         # M5b (E5, encrypted-range bookkeeping): the report claims one more in-range reloc than
         # the product actually holds. Report-side mutation on purpose: it is shape-independent
         # (works whether the product has 0 or many in-range relocs) and ONLY E5 reads that field.
-        elif "imgSections" in report:
+        elif report.get("imgSections"):
             rep5 = dict(report)
             rep5["imgRelocCount"] = int(report.get("imgRelocCount") or 0) + 1
             results.append(("E5-bookkeeping", *_expect_fail(
                 run_checks(path, manifest, rep5, blob, True), "E5", "imgRelocCount=")))
         else:
-            print("[SKIP] CAL  E5-bookkeeping: this product's report has no imgSections field")
+            # "No input" -- this product was packed WITHOUT image encryption (that is exactly why
+            # report.imgSections is absent), so there is no encrypted range whose relocation
+            # bookkeeping could be cross-checked. Reporting a bare OK would be the fake-green this
+            # file exists to avoid, so it is recorded as a deliberate SKIP and SAID OUT LOUD in the
+            # summary. The calibration does run on the products that really carry imgSections
+            # (elf_enc_pie.json / elf_enc_pierel*.json in tools/wsl_linux.sh).
+            results.append(("E5-bookkeeping", None,
+                            "this product was packed without image encryption (report has no "
+                            "imgSections): no encrypted range exists to cross-check"))
 
         # M6 (E5, payload absolute-VA coverage): plant a preferred-base VA inside the payload
         # segment where no RELATIVE entry covers it. E3 also trips on this byte (the payload no
@@ -651,57 +873,130 @@ def selftest(path, manifest, report, blob):
                 run_checks(mutate(path, m7, tmp, "e5t"), manifest, report, blob, True), "E5",
                 "wantBase=0x%X" % planted_slot)))
 
-        # E2's two legal shapes also change which calibrations are possible: the overlay ones need
-        # an overlay segment. Resolve it once, shape-independently.
-        ov = None
-        if int(manifest["bssSize"]) > 0:
-            want_ov = elf.image_base + int(report["sectionRVA"]) + int(manifest["bssOff"])
-            for q in elf.loads:
-                if q["vaddr"] == want_ov:
-                    ov = q
+        # E2's legal shapes decide which calibrations are possible. Resolve the two payload
+        # pieces of the SPLIT shape once, shape-independently; on the one-RWX-segment fallback
+        # there is no window segment at all and the window-shaped calibrations SKIP loudly
+        # (they would have no input, and faking a red on a legal product is worse than a SKIP).
+        sec_va = elf.image_base + int(report["sectionRVA"])
+        sec_size = int(report["sectionSize"])
+        bss_off, bss_size = int(manifest["bssOff"]), int(manifest["bssSize"])
+        win_va = sec_va + bss_off
+        tail_size = sec_size - bss_off - bss_size
+        pl_hdr = pl["hdr"]
 
-        # M8 (E2 route (a)): delete the RW overlay, so the bss is neither overlaid nor inside a
-        # writable segment. On amd64 the payload LOAD is RX, so route (b) cannot rescue it and E2
-        # itself must fail.
-        if ov is None:
-            print("[SKIP] CAL  E2-overlay: this product has no RW overlay segment to remove "
-                  "(the injector took the one-RWX-segment route)")
+        def phdr(va):
+            for q in elf.loads:
+                if q["vaddr"] == va:
+                    return q
+            return None
+
+        # A segment is identified by (vaddr, write bit) -- NOT by vaddr alone: after a calibration
+        # moves the window's p_vaddr onto the payload base, a vaddr-only lookup would silently return
+        # the payload segment and every later mutation would be applied to the wrong program header
+        # (that happened; the calibration then "failed" for a reason nobody planted).
+        win = None
+        if bss_size > 0:
+            for q in elf.loads:
+                if q["vaddr"] == win_va and (q["flags"] & PF_W):
+                    win = q
+                    break
+        pl_is_rwx_split = win is None and (pl["flags"] & PF_W) and bss_size > 0
+
+        # M8 (E2 route (a)): delete the RW window segment. The window is then neither overlaid nor
+        # inside a writable segment, so E2 must catch it (plus the M5 invariant must notice that
+        # the RX prefix no longer stops at bssOff).
+        if win is None:
+            print("[SKIP] CAL  E2-window: this product has no separate RW window segment "
+                  "(the injector took the one-RWX-segment fallback: the whole payload is writable, "
+                  "so the window-removal mutation has no input -- the SKIP is deliberate, not a pass)")
         else:
-            def m8(d, ho=ov["hdr"]):
+            def m8(d, ho=win["hdr"]):
                 struct.pack_into("<I", d, ho, 0)  # p_type = PT_NULL
-            results.append(("E2-overlay", *_expect_fail(
-                run_checks(mutate(path, m8, tmp, "e2o"), manifest, report, blob, True), "E2",
-                "no RW overlay")))
+            results.append(("E2-window", *_expect_fail(
+                run_checks(mutate(path, m8, tmp, "e2w"), manifest, report, blob, True), "E2")))
 
         # M9 (E2 route (b)): only meaningful on a product that really uses route (b). Declare a
         # bigger writable window than the payload LOAD's file image carries; E2 must catch it with
-        # one of its own bss lines (all of them start with "bss [").
-        if ov is not None or int(manifest["bssSize"]) <= 0:
-            print("[SKIP] CAL  E2-filebacked: this product uses the RW-overlay shape (nothing to shrink)")
+        # one of its own window lines.
+        if win is not None or bss_size <= 0:
+            print("[SKIP] CAL  E2-filebacked: this product does not use the one-RWX-segment shape "
+                  "(nothing to over-extend)")
         else:
             man9 = dict(manifest)
-            man9["bssSize"] = int(manifest["bssSize"]) + 0x2000
+            man9["bssSize"] = bss_size + 0x2000
             results.append(("E2-filebacked", *_expect_fail(
-                run_checks(path, man9, report, blob, True), "E2", "bss [")))
+                run_checks(path, man9, report, blob, True), "E2", "writable window")))
 
-        # M5 (E1, the ordering rule): list the RW overlay BEFORE the payload segment
-        if ov is not None:
-            a, b = pl["hdr"], ov["hdr"]
-
-            def m5(d):
-                ea = bytes(d[a:a + 56])
-                eb = bytes(d[b:b + 56])
-                d[a:a + 56] = eb
-                d[b:b + 56] = ea
-            results.append(("E1-order", *_expect_fail(run_checks(mutate(path, m5, tmp, "e1o"), manifest, report, blob, True), "E1")))
+        # M10 (THE M5 INVARIANT, both the direct E1 test and E2's own): grow the payload prefix's
+        # p_memsz over the writable window while leaving p_filesz alone. That is EXACTLY the defect
+        # geometry -- an RX segment whose mapped pages cover the window's page -- so E1's direct
+        # assertion must fire with its own wording (STATUS #597), and E2's independent invariant must
+        # fire on the same product. Both are required: if either check is ever relaxed into a no-op
+        # this calibration goes red instead of silently passing.
+        if win is None or pl["filesz"] > sec_size:
+            print("[SKIP] CAL  E1/E2-M5-window: this product has no separate window segment whose page "
+                  "the payload prefix could be grown over (the whole payload is already one writable "
+                  "segment, so growing it adds nothing) -- the SKIP is deliberate, not a pass")
         else:
-            print("[SKIP] CAL  E1-order: this product has no RW overlay segment")
+            def m10(d, ho=pl["hdr"]):
+                struct.pack_into("<Q", d, ho + 40, sec_size)  # p_memsz = whole payload (>= window)
+            mut = mutate(path, m10, tmp, "e2m5")
+            results.append(("E1-M5-window-covers", *_expect_fail(
+                run_checks(mut, manifest, report, blob, True), "E1",
+                "covers the interpreter's writable window")))
+            results.append(("E2-M5-window-covers", *_expect_fail(
+                run_checks(mut, manifest, report, blob, True), "E2",
+                "expected filesz == memsz == bssOff")))
+
+        # M11 (E1, the M5 defect shape itself): put the window segment's program header back to the
+        # OLD overlaying shape -- window start moved into the payload base and its size grown so it
+        # swallows the window, i.e. an RW segment fully inside the earlier RX payload segment. That
+        # shape must be rejected by E1 (it is the measured cause of the SIGSEGV).
+        if win is None or pl["filesz"] > bss_off + 0x1000:
+            print("[SKIP] CAL  E1-M5-overlap: no window segment to re-shape")
+        else:
+            def m11(d, ho=win["hdr"], base=sec_va, off=pl["off"]):
+                # Rebuild this program header as the OLD overlaying segment:
+                #   vaddr = the payload base, filesz == memsz == the payload size, flags = R|W.
+                # It is then an RW segment fully inside the earlier RX payload segment -- the exact
+                # shape whose page glibc re-protects read-only (STATUS #597).
+                struct.pack_into("<I", d, ho + 4, PF_R | PF_W)   # p_flags
+                struct.pack_into("<Q", d, ho + 8, off)           # p_offset = the payload's own image
+                struct.pack_into("<Q", d, ho + 16, base)         # p_vaddr
+                struct.pack_into("<Q", d, ho + 24, base)         # p_paddr
+                struct.pack_into("<Q", d, ho + 32, sec_size)     # p_filesz = whole payload
+                struct.pack_into("<Q", d, ho + 40, sec_size)     # p_memsz = whole payload
+            # The needle is the shared rejection wording, not one specific message: this shape can
+            # legitimately be reported either by the direct M5 assertion above or by the pair loop's
+            # "not an allowed shape" line, depending on whether the RX segment's page range reaches
+            # the window's page. What must hold is that E1 REJECTS the shape at all.
+            results.append(("E1-M5-overlap", *_expect_fail(
+                run_checks(mutate(path, m11, tmp, "e1m5"), manifest, report, blob, True), "E1",
+                "is not an allowed shape")))
+
+        # M12 (E2, the "two-segment merge" defect): merge the R+X tail INTO the writable window
+        # (grow the window's filesz/memsz over the tail and make it RW only). That is the two-segment
+        # version that made BOTH the normal and the textrel fixture die -- E2 must reject it.
+        if win is None or tail_size <= 0:
+            print("[SKIP] CAL  E2-tail-merged: this product has no separate window+tail split")
+        else:
+            def m12(d, ho=win["hdr"], sz=bss_size + tail_size):
+                struct.pack_into("<I", d, ho + 4, PF_R | PF_W)  # drop PF_X
+                struct.pack_into("<Q", d, ho + 32, sz)          # p_filesz = window + tail
+                struct.pack_into("<Q", d, ho + 40, sz)          # p_memsz
+            results.append(("E2-tail-merged", *_expect_fail(
+                run_checks(mutate(path, m12, tmp, "e2tm"), manifest, report, blob, True), "E2",
+                "not executable")))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
     bad = 0
-    for name, good, detail in results:
-        if good:
+    for entry in results:
+        name, good = entry[0], entry[1]
+        detail = entry[2] if len(entry) > 2 else ""
+        if good is None:
+            print("[SKIP] CAL  %s: %s (deliberate -- not counted as a pass)" % (name, detail))
+        elif good:
             print("[OK  ] CAL  mutation caught by %s" % name)
         else:
             print("[FAIL] CAL  mutation NOT caught by %s (%s)" % (name, detail))

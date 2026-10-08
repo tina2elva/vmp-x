@@ -67,15 +67,72 @@ echo "[*] packing..."
     -blob build/vm_interp_linux.bin -manifest build/vm_interp_linux.json \
     -out build/linux_target.vmp -report build/linux_vmp.json
 
-# 断言：注入后的 ELF 里**没有**同时可写又可执行的段（RWX 是安全坏味道）。
-# 可写数据（解释器的明文解密缓存）应当落在单独的 R+W 覆盖段里。
+# 断言（M5 之后**加强**的判据，不再只是"不能有 W+X"）：注入后的 ELF 里，
+#   ① 载荷的可写窗口**不得**被任何非可写 LOAD 的 vaddr 范围盖住 —— 这正是 #597 的 SIGSEGV 成因
+#      （老形状"整段 RX + 重叠的 RW 覆盖段"就是靠"后映射者胜"，glibc 在 DT_TEXTREL 路径按 PT_LOAD
+#      重设保护时就把窗口那页设成只读）；
+#   ② 载荷权限只允许三种合法形状（都从程序头事实判定，不看打包端措辞）：
+#      (a) 独立 RW 窗口段 + 窗口之前的载荷段是 RX（代码页保持只读，最好）；
+#      (b) 载荷段**整段 RWX**（可复用程序头槽位不够时的回退：整段可写 ⇒ 对 TEXTREL 保护重设免疫，
+#          且没有任何重叠段）——Go 的 ET_EXEC 目标只有 1 个可复用槽，走的正是这条；
+#      (c) 载荷段整段 RX（manifest bssSize=0，根本没有可写窗口）。
+# 老断言"任何 W+X 段都不允许"把 (b) 这条**合法回退**也拒了（历史产物靠"重叠形状"躲过它 —— 而那
+# 正是要修的缺陷）。判据换成"窗口不被非可写段盖住"以后，形状空间是**真的收窄了**（重叠形状直接红，
+# tools/check_elf_layout.py 的 E1/E2 也会抓），而合法回退不再假红。
 if command -v readelf >/dev/null 2>&1; then
-    wx=$(readelf -lW build/linux_target.vmp | awk '$1=="LOAD" && $0 ~ /W/ && $0 ~ /E/ {print}')
-    if [ -n "$wx" ]; then
-        echo "[!] 存在 W+X 段（RWX）:"; echo "$wx"
+    if ! ELF_PACKED=build/linux_target.vmp ELF_REPORT=build/linux_vmp.json \
+         ELF_MANIFEST=build/vm_interp_linux.json python3 - <<'PY'
+import json, os, struct, sys
+d = open(os.environ["ELF_PACKED"], "rb").read()
+rep = json.load(open(os.environ["ELF_REPORT"]))
+man = json.load(open(os.environ["ELF_MANIFEST"]))
+phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+loads = []
+for i in range(phn):
+    o = phoff + i * pes
+    t, fl, off, va, pa, fsz, msz, al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1:
+        loads.append(dict(flags=fl, off=off, vaddr=va, filesz=fsz, memsz=msz))
+base = min(l["vaddr"] & ~0xFFF for l in loads)
+sec_va = base + int(rep["sectionRVA"])
+sec_size = int(rep["sectionSize"])
+bss_off, bss_size = int(man["bssOff"]), int(man["bssSize"])
+bss_va, bss_end = sec_va + bss_off, sec_va + bss_off + bss_size
+PF_W, PF_X = 2, 1
+pl = next((l for l in loads if l["vaddr"] == sec_va), None)
+assert pl is not None, "no payload LOAD at 0x%X" % sec_va
+win = next((l for l in loads if l["vaddr"] == bss_va), None)
+ok_rwx_one_seg = (pl["flags"] & PF_W) and pl["filesz"] == sec_size and pl["memsz"] == sec_size
+ok_no_window = bss_size == 0 and not (pl["flags"] & PF_W)
+ok_split = (not (pl["flags"] & PF_W)) and pl["filesz"] == bss_off \
+    and win is not None and (win["flags"] & PF_W) and win["filesz"] >= bss_size
+if not (ok_split or ok_rwx_one_seg or ok_no_window):
+    print("    unexpected payload shape: payload flags=0x%X filesz=0x%X memsz=0x%X ; window=%r"
+          % (pl["flags"], pl["filesz"], pl["memsz"], win))
+    sys.exit(1)
+if ok_rwx_one_seg:
+    print("    payload is ONE RWX segment (not enough reusable program headers): writable everywhere, no overlap")
+elif ok_split:
+    print("    payload split: RX prefix up to 0x%X + RW window [0x%X,0x%X)" % (bss_off, bss_va, bss_end))
+else:
+    print("    payload is one RX segment and there is no writable window")
+if bss_size > 0:
+    for l in loads:
+        if l["flags"] & PF_W:
+            continue
+        lo = max(bss_va // 4096, l["vaddr"] // 4096)
+        hi = min((bss_end + 4095) // 4096, (l["vaddr"] + l["memsz"] + 4095) // 4096)
+        if lo < hi:
+            print("    [FAIL] non-writable LOAD vaddr=0x%X memsz=0x%X covers the window page(s) [0x%X,0x%X)"
+                  % (l["vaddr"], l["memsz"], lo * 4096, hi * 4096))
+            sys.exit(1)
+print("    [+ ] no non-writable LOAD covers the writable window [0x%X,0x%X)" % (bss_va, bss_end))
+PY
+    then
+        echo "[!] 载荷形状/窗口保护检查失败（见上）"
         exit 1
     fi
-    echo "[+] 段权限检查通过：没有 W+X 段"
+    echo "[+] 段权限检查通过：可写窗口没有被任何非可写 LOAD 的 vaddr 范围盖住"
 fi
 
 pass=0
