@@ -918,7 +918,8 @@ fi
 #
 # 本条用例做三件事（全是真断言，不是复述策略）：
 #   1. **夹具校准**：readelf 必须真的解出 DT_RELR 与 .relr.dyn，且用"已与 readelf 对齐的解码器"
-#      独立解出的槽位数必须等于 readelf 报的 "which relocate N locations"（否则用例空转）；
+#      独立解出的**条目数**必须等于 readelf 印的 "contains N entries"（所有 binutils 版本都印）；
+#      较新 binutils 还会印 "which relocate N locations"，有就一并硬断言，没有就大声登记（见下面）；
 #   2. **主断言**：带 DT_RELR 的目标 + 要加密范围 ⇒ vmpack 非零退出、**不落产物/不落报告**、信息里点名 DT_RELR；
 #   3. **单变量对照**：同一份源码、同样开关，只把 -z pack-relative-relocs 去掉 ⇒ 必须打包成功
 #      且与原生逐字节一致（⇒ 触发拒绝的确实是 DT_RELR，不是别的）。
@@ -986,8 +987,13 @@ EOF
     if readelf -dW build/elf_target_norel | grep -q 'RELR'; then
         fail "the single-variable control unexpectedly carries DT_RELR (the control would be vacuous)"
     fi
-    RLR_EXPECT="$(readelf -rW build/elf_target_relr | sed -n 's/.*which relocate \([0-9][0-9]*\) locations.*/\1/p' | head -n 1)"
-    [ -n "$RLR_EXPECT" ] || fail "readelf did not report how many locations the RELR table relocates"
+    # 版本差异（本轮 CI 实测踩到）：**条目数**在所有 binutils 上都印（"contains N entries"）；
+    # 而 "which relocate N locations" 是较新 binutils 才有的措辞 —— ubuntu-latest 的 binutils 没有它，
+    # 条用例因此在 linux-amd64 作业上误红过一次。所以：条目数**硬断言**；位置数有则一并硬断言，
+    # 没有就大声登记（并把原始块打给 reviewer 看），不静默放过。
+    RLR_ENTRIES_READELF="$(readelf -rW build/elf_target_relr | sed -n 's/.*relr\.dyn.*contains \([0-9][0-9]*\) entr.*/\1/p' | head -n 1)"
+    [ -n "$RLR_ENTRIES_READELF" ] || fail "readelf did not report how many entries the RELR table has"
+    RLR_LOCS_READELF="$(readelf -rW build/elf_target_relr | sed -n 's/.*which relocate \([0-9][0-9]*\) locations.*/\1/p' | head -n 1)"
     RLR_DECODED="$(RLR_ART=build/elf_target_relr python3 - <<'PY'
 import os, struct
 d = open(os.environ["RLR_ART"], "rb").read()
@@ -1026,14 +1032,26 @@ for e in ents:
             if e & (1 << i):
                 addrs.append(base + (i - 1) * 8)
         base += 63 * 8
-print(len(addrs))
+print("%d %d" % (len(ents), len(addrs)))
 PY
 )"
-    if [ "$RLR_EXPECT" != "$RLR_DECODED" ]; then
-        echo "[MISMATCH] RELR decode: readelf says $RLR_EXPECT location(s), the calibrated decoder says [$RLR_DECODED]"
-        fail "the calibrated RELR decoder disagrees with readelf on the fixture"
+    RLR_ENTRIES_FILE="${RLR_DECODED%% *}"
+    RLR_LOCS_FILE="${RLR_DECODED##* }"
+    if [ "$RLR_ENTRIES_READELF" != "$RLR_ENTRIES_FILE" ]; then
+        echo "[MISMATCH] RELR entries: readelf says [$RLR_ENTRIES_READELF], the file/decode says [$RLR_ENTRIES_FILE]"
+        fail "the calibrated RELR decoder reads a different number of entries than readelf"
     fi
-    echo "[OK  ] RELR decode calibrated against readelf: $RLR_EXPECT location(s) on the fixture"
+    if [ -n "$RLR_LOCS_READELF" ]; then
+        if [ "$RLR_LOCS_READELF" != "$RLR_LOCS_FILE" ]; then
+            echo "[MISMATCH] RELR locations: readelf says [$RLR_LOCS_READELF], the calibrated decoder says [$RLR_LOCS_FILE]"
+            fail "the calibrated RELR decoder disagrees with readelf on the fixture"
+        fi
+        echo "[OK  ] RELR decode calibrated against readelf: $RLR_LOCS_READELF location(s) over $RLR_ENTRIES_READELF entry/entries"
+    else
+        echo "[NOTE] this readelf does not print 'which relocate N locations' (older binutils wording)"
+        echo "[NOTE]   entries are still calibrated against readelf ($RLR_ENTRIES_READELF); locations = $RLR_LOCS_FILE (binutils 2.46 cross-check recorded in STATUS #601)"
+        readelf -rW build/elf_target_relr | sed -n '/relr\.dyn/,$p' | sed 's/^/    | /'
+    fi
     # ---- 2. 主断言：带 DT_RELR + 要加密范围 ⇒ 拒绝，且不落产物/不落报告 ----
     RLR_N_RC=0; RLR_N="$(run_target "$TARGET_RUN" ./build/elf_target_relr check-key 10 2>&1)" || RLR_N_RC=$?
     RLR_N_SUM_RC=0; RLR_N_SUM="$(run_target "$TARGET_RUN" ./build/elf_target_relr sum-to 100 2>&1)" || RLR_N_SUM_RC=$?
