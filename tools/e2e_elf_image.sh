@@ -162,6 +162,35 @@ if [ -n "$BLOB_GUEST" ]; then GUESTARG="-guest $BLOB_GUEST"; fi
     -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
     -out build/elf_target_$TAG.enc -report build/elf_enc_$TAG.json || fail "pack (default -enc-image-elf)"
 
+# 形状账（t6/F6）：打包端必须把"是否退回载荷内含 W+X 段"写进报告，且与产物程序头一致。
+# 这条对**三种模式**（默认 / PIE / PIE_RELOCS）都跑：报告说拆开了、产物却有一个 W+X 载荷段
+# （或反过来）当场红；"槽位够的目标不得走回退"由这个"报告 ↔ 程序头"对账在 CI 上落地。
+echo "[*] 形状账：report.payloadWXFallback 必须与产物程序头里的载荷形状一致"
+ELF_PACKED=build/elf_target_$TAG.enc ELF_REPORT=build/elf_enc_$TAG.json \
+ELF_MANIFEST=build/vm_interp_elf.json python3 - <<'PY' || fail "payloadWXFallback disagrees with the product"
+import json, os, struct
+d = open(os.environ["ELF_PACKED"], "rb").read()
+rep = json.load(open(os.environ["ELF_REPORT"]))
+man = json.load(open(os.environ["ELF_MANIFEST"]))
+phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+loads = []
+for i in range(phn):
+    o = phoff + i * pes
+    t, fl, off, va, pa, fsz, msz, al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1:
+        loads.append(dict(flags=fl, vaddr=va, filesz=fsz, memsz=msz))
+base = min((l["vaddr"] & ~0xFFF for l in loads), default=0)
+sec_va = base + int(rep["sectionRVA"])
+sec_end = sec_va + int(rep["sectionSize"])
+payload_wx = any((l["flags"] & 2) and (l["flags"] & 1)
+                 for l in loads if l["vaddr"] < sec_end and sec_va < l["vaddr"] + l["memsz"])
+got = rep.get("payloadWXFallback")
+assert isinstance(got, bool), "report.payloadWXFallback is %r (want a JSON bool)" % (got,)
+assert got == payload_wx, ("report.payloadWXFallback=%s but the product's payload W+X segment presence "
+                           "is %s -- declared shape contradicts the program headers" % (got, payload_wx))
+print("    payloadWXFallback=%s matches the product (payload W+X segment present: %s)" % (got, payload_wx))
+PY
+
 if [ "$PIE" = "1" ] || [ "$PIE_RELOCS" = "1" ]; then
     echo "[*] PIE: target must be ET_DYN and the report must carry the relocation bookkeeping"
     ELF_TARGET="$TARGET" ELF_REPORT=build/elf_enc_$TAG.json ELF_MODE=$([ "$PIE_RELOCS" = "1" ] && echo relocs || echo pie) \
@@ -460,12 +489,16 @@ int main(int argc, char **argv) {
 }
 EOF
     "$A64_CC" -fPIE -pie -O1 -o build/elf_target_a64reloc build/a64_pie_reloc.c || fail "build aarch64 PIE fixture"
-    # 形状判定（t14/R2）：形状是**产物程序头的事实**，不是打包端的措辞。
-    #   (a) sectionRVA+bssOff 处有独立 RW 覆盖段（p_flags 含 W、p_filesz == p_memsz == bssSize）；
-    #   (b) 没有覆盖段，而覆盖 bss_va 的那个 LOAD 可写、且它的文件镜像承载整个 bss。
+    # 形状判定（t14/R2，t6/F2 按新三档重写）：形状是**产物程序头的事实**，不是打包端的措辞。
+    # 注入器只可能发出下面几种（见 internal/inject/elf.go 的槽位梯子与 tools/check_elf_layout.py 的 E2）：
+    #   (1) 三段相邻：RX 前缀 [..) + RW 窗口 [..) + R+X 尾部 [..)（槽位够；载荷无尾部时没有第三段）；
+    #   (2) 前缀只读 + **一段 W+X 的"窗口+尾部"**（2 个槽位且载荷有尾部）；
+    #   (3) **整段 W+X 载荷段**（槽位 <2：窗口/尾部都在这一段里）；
+    #   (0) 整段 RX、没有可写窗口（manifest bssSize=0）。
+    # 老的重叠形状（RX 载荷段盖住窗口 + 嵌套 RW）现在只可能是**缺陷**，单列 (DEFECT) 交给调用方判死。
     # 不能只 grep 打包端的告警文本：internal/load/elf/elf.go 的槽位优先级是
-    # PT_NOTE -> PT_GNU_RELRO -> PT_PHDR(仅静态) -> PT_NULL，换一个会产出 RELRO 的 linker 时覆盖段
-    # 就从 RELRO 槽位分出来、**没有**任何 '退回 RWX' 文案，而产物完全合法（就是 t8 的 R2）。
+    # PT_NOTE -> PT_GNU_RELRO -> PT_PHDR(仅静态) -> PT_NULL，换一个会产出 RELRO 的 linker 时槽位数
+    # 不同 ⇒ 产物可能落在 (2) 而不是 (3)，两者都合法，而**没有**任何 '退回' 文案。文案只作记录。
     a64_note_count() {  # $1 = ELF file -> PT_NOTE count on stdout
         python3 - "$1" <<'PY'
 import struct, sys
@@ -474,7 +507,7 @@ phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H",
 print(sum(1 for i in range(phn) if struct.unpack_from("<I", d, phoff + i * pes)[0] == 4))
 PY
     }
-    a64_payload_shape() {  # $1 packed, $2 report, $3 manifest -> "(a) ..." / "(b) ..." / "(none) ..."
+    a64_payload_shape() {  # $1 packed, $2 report, $3 manifest -> "(1) ..." / "(2) ..." / "(3) ..." / "(0) ..." / "(DEFECT) ..." / "(none) ..."
         ELF_PACKED="$1" ELF_REPORT="$2" ELF_MANIFEST="$3" python3 - <<'PY'
 import json, os, struct
 d = open(os.environ["ELF_PACKED"], "rb").read()
@@ -489,26 +522,72 @@ for i in range(phn):
         loads.append(dict(flags=fl, off=off, vaddr=va, filesz=fsz, memsz=msz))
 base = min((l["vaddr"] & ~0xFFF for l in loads), default=0)
 sec_va = base + int(rep["sectionRVA"])
+sec_size = int(rep["sectionSize"])
 bss_off, bss_size = int(man["bssOff"]), int(man["bssSize"])
 bss_va, bss_end = sec_va + bss_off, sec_va + bss_off + bss_size
-ov = next((l for l in loads if l["vaddr"] == bss_va), None)
-if ov is not None and (ov["flags"] & 2) and ov["filesz"] == bss_size and ov["memsz"] == bss_size:
-    print("(a) RX payload + RW overlay LOAD @0x%X (0x%X)" % (bss_va, bss_size))
-else:
-    cover = None
-    for l in loads:                      # the LAST LOAD covering bss_va wins (kernel maps in table order)
-        if l["vaddr"] <= bss_va < l["vaddr"] + l["memsz"]:
-            cover = l
-    rel = (bss_va - cover["vaddr"]) if cover is not None else 0
-    if (cover is not None and (cover["flags"] & 2) and bss_end <= cover["vaddr"] + cover["memsz"]
-            and rel + bss_size <= cover["filesz"] and cover["off"] + rel + bss_size <= len(d)):
-        print("(b) one writable RWX payload LOAD @0x%X, bss file-backed (0x%X)" % (cover["vaddr"], bss_size))
+tail = sec_size - bss_off - bss_size
+PF_W, PF_X = 2, 1
+
+def at(va):
+    return next((l for l in loads if l["vaddr"] == va), None)
+
+def fs(f):   # flags -> "R-X"/"RW-"/"RWX" 这样的可读串
+    return ("R" if f & 4 else "-") + ("W" if f & PF_W else "-") + ("X" if f & PF_X else "-")
+
+pl = at(sec_va)
+win = at(bss_va) if bss_size > 0 else None
+# 老的重叠形状（#597 的成因）：载荷段**不可写但 vaddr 范围盖住窗口**，且窗口那一段是嵌套 RW 段。
+# 它不是任何一档合法形状，单列 (DEFECT) 让调用方判死（此前分类器把它与新的相邻形状混为一谈）。
+if (pl is not None and not (pl["flags"] & PF_W) and bss_size > 0
+        and pl["memsz"] >= bss_off + bss_size and win is not None and (win["flags"] & PF_W)):
+    print("(DEFECT) old overlay shape: non-writable payload LOAD @0x%X (flags=%s memsz=0x%X) covers the "
+          "window [0x%X,0x%X) and an RW segment @0x%X is nested inside it"
+          % (pl["vaddr"], fs(pl["flags"]), pl["memsz"], bss_va, bss_end, win["vaddr"]))
+elif pl is None:
+    print("(none) no payload LOAD at sectionRVA (0x%X)" % sec_va)
+elif bss_size == 0:
+    if pl["flags"] & PF_W:
+        print("(none) manifest bssSize=0 but the payload LOAD is writable (flags=%s)" % fs(pl["flags"]))
     else:
-        print("(none) bss [0x%X,0x%X) is neither overlaid nor file-backed inside a writable LOAD" % (bss_va, bss_end))
+        print("(0) one %s payload LOAD @0x%X (0x%X), no writable window (manifest bssSize=0)"
+              % (fs(pl["flags"]), pl["vaddr"], pl["filesz"]))
+elif pl["filesz"] == sec_size:
+    if (pl["flags"] & PF_W) and (pl["flags"] & PF_X):
+        print("(3) ONE W+X payload segment @0x%X (flags=%s filesz=0x%X memsz=0x%X), window [0x%X,0x%X) "
+              "file-backed inside it" % (pl["vaddr"], fs(pl["flags"]), pl["filesz"], pl["memsz"], bss_va, bss_end))
+    else:
+        print("(none) the payload LOAD maps the whole payload but is not W+X (flags=%s)" % fs(pl["flags"]))
+elif pl["filesz"] == bss_off and not (pl["flags"] & PF_W):
+    prefix = "RX prefix @0x%X (flags=%s filesz=0x%X)" % (pl["vaddr"], fs(pl["flags"]), pl["filesz"])
+    if win is None:
+        print("(none) %s but no segment at the writable window start 0x%X" % (prefix, bss_va))
+    elif not (win["flags"] & PF_W):
+        print("(none) %s and the window segment @0x%X is not writable (flags=%s)"
+              % (prefix, bss_va, fs(win["flags"])))
+    elif (win["flags"] & PF_X) and win["filesz"] == bss_size + tail and win["memsz"] == win["filesz"]:
+        print("(2) %s + **W+X window+tail** segment [0x%X,0x%X) (flags=%s filesz=0x%X) -- code page stays "
+              "read-only, that one span is writable" % (prefix, bss_va, bss_end + tail, fs(win["flags"]), win["filesz"]))
+    elif win["filesz"] == bss_size and win["memsz"] == bss_size:
+        window = "RW window [0x%X,0x%X) (flags=%s filesz=0x%X)" % (bss_va, bss_end, fs(win["flags"]), win["filesz"])
+        tl = at(bss_end) if tail > 0 else None
+        if tail == 0:
+            print("(1) %s + %s -- payload ends at the window edge, no tail" % (prefix, window))
+        elif tl is not None and (tl["flags"] & PF_X) and not (tl["flags"] & PF_W) and tl["filesz"] == tail:
+            print("(1) THREE adjacent segments: %s + %s + R+X tail @0x%X (flags=%s filesz=0x%X)"
+                  % (prefix, window, bss_end, fs(tl["flags"]), tl["filesz"]))
+        else:
+            print("(none) %s + %s but the payload tail @0x%X (0x%X bytes) is missing or not R+X"
+                  % (prefix, window, bss_end, tail))
+    else:
+        print("(none) window segment @0x%X is flags=%s 0x%X/0x%X, expected 0x%X (or window+tail 0x%X)"
+              % (bss_va, fs(win["flags"]), win["filesz"], win["memsz"], bss_size, bss_size + tail))
+else:
+    print("(none) payload LOAD @0x%X is flags=%s filesz=0x%X memsz=0x%X -- not a legal M5 shape"
+          % (pl["vaddr"], fs(pl["flags"]), pl["filesz"], pl["memsz"]))
 PY
     }
     A64_NOTE_ASBUILT="$(a64_note_count build/elf_target_a64reloc)"
-    echo "    as-built aarch64 fixture: PT_NOTE=$A64_NOTE_ASBUILT (the injector needs a second reusable slot for the RW overlay)"
+    echo "    as-built aarch64 fixture: PT_NOTE=$A64_NOTE_ASBUILT (the injector needs 3 reusable slots for the three-segment split, 2 for prefix + W+X window+tail, 1 for the whole-payload W+X fallback)"
     ./build/vmpack -exe build/elf_target_a64reloc -func checkKey -func sumTo \
         -enc-image-elf-pie -enc-image-elf-pie-relocs \
         -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
@@ -532,11 +611,11 @@ PY
         --report build/elf_enc_a64reloc.json --selftest || fail "aarch64 layout gate (packing half of the reloc contract)"
     A64_SHAPE1="$(a64_payload_shape build/elf_target_a64reloc.enc build/elf_enc_a64reloc.json build/vm_interp_elf.json)"
     echo "[OK  ] aarch64: product 1 (as-built fixture, PT_NOTE=$A64_NOTE_ASBUILT) payload shape $A64_SHAPE1"
-    # 第二种**合法**形状：注入器拿不到第二个可复用的 PT_NOTE 槽位时，payload 段整段退回 RWX，bss 由
-    # payload 段自己的文件镜像承载 —— 此时"没有 RW 覆盖段"是正确的。CI 的 gcc/ld 13 夹具只有 1 个
-    # PT_NOTE，于是 CI 走的正是这条路；本机 ld 15 的夹具有 2 个，一直走"RX + RW 覆盖段"，所以
-    # 2026-10-03 的 CI run 37128895442 在本机复现不出来。这里把多余的 PT_NOTE 抹掉，把 CI 那种形状
-    # **在本机也造出来**（(b) 的门禁与校准必须接受它）。
+    # 第二种**合法**形状（槽位更少那一档）：只留 1 个可复用的 PT_NOTE，注入器就拿不到"三段相邻"或
+    # "前缀 + W+X 窗口+尾部"所需的 2~3 个槽位，只能退回**整段 W+X 载荷段**（窗口/尾部都在那一段里，
+    # 由该段自己的文件镜像承载）。CI 的 gcc/ld 13 夹具只有 1 个 PT_NOTE，走的正是这条；本机 ld 15 的
+    # 夹具有 2 个（于是落在 (1)/(2) 档），所以 2026-10-03 的 CI run 37128895442 在本机复现不出来。
+    # 这里把多余的 PT_NOTE 抹掉，把 CI 那种形状**在本机也造出来**（门禁与校准必须接受它）。
     python3 - build/elf_target_a64reloc build/elf_target_a64reloc_rwx <<'PY' || fail "build the one-NOTE (RWX fallback) fixture"
 import os, struct, sys
 src, dst = sys.argv[1], sys.argv[2]
@@ -547,19 +626,19 @@ for i in notes[1:]:
     struct.pack_into("<I", d, phoff + i * phentsize, 0)   # p_type = PT_NULL: leave exactly one NOTE slot
 open(dst, "wb").write(d)
 os.chmod(dst, 0o755)
-print("    fixture has %d PT_NOTE; kept 1 so the injector cannot place the RW overlay" % len(notes))
+print("    fixture has %d PT_NOTE; kept 1 so the injector cannot take the split shapes ((1)/(2))" % len(notes))
 PY
     RWX_OUT="$(./build/vmpack -exe build/elf_target_a64reloc_rwx -func checkKey -func sumTo \
         -enc-image-elf-pie -enc-image-elf-pie-relocs \
         -blob build/vm_interp_elf.bin -manifest build/vm_interp_elf.json \
         -out build/elf_target_a64reloc_rwx.enc -report build/elf_enc_a64reloc_rwx.json 2>&1)" || fail "pack the one-RWX-segment aarch64 case"
     # (R2) 判定只认**产物形状**，不认告警文本：打包端的槽位优先级里 PT_GNU_RELRO 也是候选
-    # （internal/load/elf/elf.go 的 sparePhdrSlot），换一个会产出 RELRO 的 linker 时覆盖段从 RELRO
-    # 槽位分出来、**没有** '退回 RWX' 文案，而产物完全合法 —— 把文案当不变量就会假红。文案只作记录。
-    if printf '%s' "$RWX_OUT" | grep -q '退回 RWX'; then
-        echo "[INFO] aarch64: pack output announced the one-RWX-segment fallback in words (informational; the assertion below is on program headers)"
+    # （internal/load/elf/elf.go 的 sparePhdrSlot），换一个会产出 RELRO 的 linker 时槽位数不同 ⇒
+    # 产物可能落在 (2) 而不是 (3)，两者都合法、告警文案也不同 —— 把文案当不变量就会假红。文案只作记录。
+    if printf '%s' "$RWX_OUT" | grep -q '退回'; then
+        echo "[INFO] aarch64: pack output announced a fallback in words (informational; the assertion below is on program headers)"
     else
-        echo "[INFO] aarch64: no '退回 RWX' line in this run's pack output (informational only -- the shape is asserted from the product below)"
+        echo "[INFO] aarch64: no fallback line in this run's pack output (informational only -- the shape is asserted from the product below)"
     fi
     a64_reloc_bookkeeping build/elf_enc_a64reloc_rwx.json
     python3 tools/check_elf_layout.py --packed build/elf_target_a64reloc_rwx.enc \
@@ -567,19 +646,42 @@ PY
         --report build/elf_enc_a64reloc_rwx.json --selftest || fail "aarch64 layout gate (one-RWX-segment shape)"
     A64_SHAPE2="$(a64_payload_shape build/elf_target_a64reloc_rwx.enc build/elf_enc_a64reloc_rwx.json build/vm_interp_elf.json)"
     echo "[OK  ] aarch64: product 2 (one-PT_NOTE fixture, PT_NOTE=$(a64_note_count build/elf_target_a64reloc_rwx)) payload shape $A64_SHAPE2"
-    # (R1) 只宣称**本 run 实测到**的形状：CI 的夹具只有 1 个 PT_NOTE ⇒ 两个产物都走 (b)，
-    # 这时说 "both ... accepted" 就是超出实测的宣称（t8 的 R1）。
-    A64_SEEN_A=0; A64_SEEN_B=0
-    case "$A64_SHAPE1" in "(a)"*) A64_SEEN_A=1;; "(b)"*) A64_SEEN_B=1;; *) fail "product 1 has no legal payload shape: $A64_SHAPE1";; esac
-    case "$A64_SHAPE2" in "(a)"*) A64_SEEN_A=1;; "(b)"*) A64_SEEN_B=1;; *) fail "product 2 has no legal payload shape: $A64_SHAPE2";; esac
-    if [ "$A64_SEEN_A" = 1 ] && [ "$A64_SEEN_B" = 1 ]; then
-        echo "[OK  ] aarch64: both legal payload shapes verified in this run ((a) RX payload + RW overlay; (b) one writable RWX payload segment with the bss file-backed)"
+    # report.payloadWXFallback 必须与**实测档位**一致：档位 (1)（纯拆分、代码页全只读）⇒ false；
+    # 档位 (2)/(3)（载荷里存在 W+X 段）⇒ true。这条就是"槽位足够的目标不得走回退"的产物侧断言：
+    # 不猜槽位数，直接看程序头落在哪一档。
+    a64_assert_flag() {  # $1 = shape line, $2 = report path
+        case "$1" in
+            "(1)"*) a64_want=False;;
+            "(2)"*|"(3)"*) a64_want=True;;
+            *) return 0;;
+        esac
+        ELF_REPORT="$2" A64_WANT="$a64_want" python3 - <<'PY' || fail "payloadWXFallback disagrees with the measured shape ($1 / $2)"
+import json, os
+rep = json.load(open(os.environ["ELF_REPORT"]))
+got = rep.get("payloadWXFallback")
+want = os.environ["A64_WANT"] == "True"
+assert isinstance(got, bool), "report.payloadWXFallback is %r (want a JSON bool)" % (got,)
+assert got == want, "report.payloadWXFallback=%s but the measured shape needs %s" % (got, want)
+print("    payloadWXFallback=%s matches the measured shape" % got)
+PY
+    }
+    # (R1) 只宣称**本 run 实测到**的档位：CI 的夹具只有 1 个 PT_NOTE ⇒ 两个产物都落在 (3)，
+    # 这时说 "三档都测过" 就是超出实测的宣称（t8 的 R1）。
+    A64_SEEN_1=0; A64_SEEN_2=0; A64_SEEN_3=0
+    case "$A64_SHAPE1" in "(1)"*) A64_SEEN_1=1;; "(2)"*) A64_SEEN_2=1;; "(3)"*) A64_SEEN_3=1;; *) fail "product 1 has no legal payload shape: $A64_SHAPE1";; esac
+    case "$A64_SHAPE2" in "(1)"*) A64_SEEN_1=1;; "(2)"*) A64_SEEN_2=1;; "(3)"*) A64_SEEN_3=1;; *) fail "product 2 has no legal payload shape: $A64_SHAPE2";; esac
+    a64_assert_flag "$A64_SHAPE1" build/elf_enc_a64reloc.json
+    a64_assert_flag "$A64_SHAPE2" build/elf_enc_a64reloc_rwx.json
+    A64_SEEN_LIST=""
+    [ "$A64_SEEN_1" = 1 ] && A64_SEEN_LIST="(1) three adjacent segments"
+    [ "$A64_SEEN_2" = 1 ] && A64_SEEN_LIST="$A64_SEEN_LIST (2) prefix + W+X window+tail"
+    [ "$A64_SEEN_3" = 1 ] && A64_SEEN_LIST="$A64_SEEN_LIST (3) one W+X payload segment"
+    echo "[OK  ] aarch64: measured payload shape tier(s) in this run:$A64_SEEN_LIST"
+    if [ "$A64_SEEN_1" = 1 ] && [ "$A64_SEEN_2" = 1 ] && [ "$A64_SEEN_3" = 1 ]; then
+        echo "[OK  ] aarch64: all three legal payload tiers verified in this run (no fallback beyond what the slot count forces)"
     else
-        A64_MISSING="(a) RX payload + RW overlay"
-        [ "$A64_SEEN_A" = 1 ] && A64_MISSING="(b) one writable RWX payload segment with the bss file-backed"
-        echo "[SKIP] aarch64: only the shape(s) actually measured are claimed -- $A64_MISSING was NOT constructed in this run"
-        echo "[SKIP] aarch64:   as-built fixture PT_NOTE=$A64_NOTE_ASBUILT: with a single reusable slot the injector cannot place the RW overlay, so both products take the fallback;"
-        echo "[SKIP] aarch64:   that shape is covered where the fixture has >= 2 PT_NOTEs (this machine's ld) and by the layout gate's E2-overlay calibration"
+        echo "[SKIP] aarch64: only the tier(s) actually measured are claimed -- the missing tier(s) were NOT constructed in this run"
+        echo "[SKIP] aarch64:   as-built fixture PT_NOTE=$A64_NOTE_ASBUILT: fewer reusable slots force a lower tier, and the tier a product lands in is asserted from its program headers + report.payloadWXFallback"
     fi
     # qemu 的 -L 是**前缀**：guest 里的 /lib/ld-linux-aarch64.so.1 会被解析成 <前缀>/lib/... ，
     # 所以前缀要取"loader 所在目录的上一级"（例如 /usr/aarch64-linux-gnu/lib -> /usr/aarch64-linux-gnu）。

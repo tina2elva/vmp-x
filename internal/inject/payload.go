@@ -343,6 +343,12 @@ type Result struct {
 	ImgPrefBase uint64 `json:"imgPrefBase"`
 	// ImgEType：e_type（2=ET_EXEC、3=ET_DYN/PIE）。=3 时运行期**必须**做 delta 应用。
 	ImgEType uint16 `json:"imgEType"`
+	// PayloadWXFallback：本次注入**是否退回**了"载荷里存在可写+可执行段"的形状。
+	//   false = 纯拆分：载荷各段全部只读（RX 前缀 / RW 窗口 / R+X 尾部），代码页不可写；
+	//   true  = 回退：窗口与尾部合并成一段 RWX，或（槽位更少时）整个载荷段 RWX。
+	// 两种回退都"整段可写 ⇒ 对 glibc 的 TEXTREL 保护重设免疫"，且都不产生重叠段；但它确实
+	// 让代码页可写，所以必须能在报告/门禁/CI 里被断言（ELF 侧由 ApplyELF 填；PE 侧目前恒为 false）。
+	PayloadWXFallback bool `json:"payloadWXFallback"`
 }
 
 // BuildPayload 组装 payload；baseRVA 是 payload 将被放置的地址（相对镜像基址）

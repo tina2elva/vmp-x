@@ -13,9 +13,10 @@ import (
 // 注意：这里不新增节头（section header）。内核加载只看程序头，
 // 因此不影响执行；若希望 readelf -S 也可读，再补节头。
 func ApplyELF(f *elf.File, opt Options) (*Result, error) {
-	// warnRWX 记录是否因为无法分段而退回可写代码段（供报告/CI 断言用）
-	warnRWX := false
-	_ = warnRWX
+	// payloadWX 记录本次是否**退回**了"载荷里存在可写+可执行段"的形状（②窗口+尾部合并成
+	// 一段 RWX，或 ③整段 RWX）。它落进报告（Result.PayloadWXFallback），门禁据此断言
+	// "报告说的形状"与"产物程序头里的形状"一致 —— 例如可复用槽位足够的目标不得走回退。
+	payloadWX := false
 	imageBase := f.ImageBase()
 	// ET_DYN(PIE) 的首选基址**可以就是 0**（gcc 默认布局：第一个 PT_LOAD 的 p_vaddr = 0，
 	// 内核把它映射到 load_bias）。此时 RVA == VA，本函数里所有 "imageBase + RVA" 的算术照样成立，
@@ -96,17 +97,18 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 
 	// ---- 载荷分段（M5 的核心，见 STATUS #597）----
 	//
-	// 形状：RX 前缀 [0, bssOff) + RW 窗口 [bssOff, bssOff+bssSize) + R+X 尾部 […, len(Data))。
-	// 三者 VA 相邻、**不重叠** ⇒ 不存在任何"非可写 LOAD 盖住可写窗口"的形状。
+	// 首选形状：RX 前缀 [0, bssOff) + RW 窗口 [bssOff, bssOff+bssSize) + R+X 尾部
+	// […, len(Data))。三者 VA 相邻、**不重叠** ⇒ 不存在任何"非可写 LOAD 盖住可写窗口"的形状。
 	//
 	// 为什么必须不重叠：glibc 只在 DT_TEXTREL 路径按 PT_LOAD 重设回原保护。老形状是
 	// "整段 RX + 重叠的 RW 覆盖段"，它靠"后映射者胜"才拿到可写；一旦 glibc 按 RX 段把页
 	// 重设成只读（#597 的 textrel 实测），解释器第一次写自己的解密缓存就 SIGSEGV。
-	// 整段可写（RWX）对这种重设同样免疫 —— 所以槽位不够时退回**整段 RWX**，
-	// 而不是退回那个重叠形状（上一轮的洞正是在这里）。
+	// 回退形状（下面梯子的 ②③）都让那一整段**可写** —— 整段可写对这种重设同样免疫 ——
+	// 但**绝不**退回那个重叠形状（上一轮的洞正是在这里）。
 	//
 	// 槽位账：前缀 + 窗口 = 2 个；若载荷在窗口之后还有字节（尾部，装着**可执行蹦床**：
 	// 两段版把尾部并进 RW 段时 normal/textrel 两个产物都立刻 SIGSEGV）则要 3 个。
+	// 槽位不足时按下面的梯子降级（每降一级都会打醒目告警，并写进报告）。
 	spare := f.SparePhdrSlots()
 	segments := 1
 	tailSize := 0
@@ -159,7 +161,7 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		if pl.BSSSize > 0 {
 			fmt.Printf("[warn] 无法为该 ELF 分段（可复用程序头槽位 %d 个，需要 %d 个）：payload 段**整段退回 RWX**（代码页可写）；"+
 				"整段可写 ⇒ 对 glibc 的 TEXTREL 保护重设免疫，且不产生任何重叠段\n", spare, segments)
-			warnRWX = true
+			payloadWX = true
 		}
 	} else {
 		// 前缀：只映射 [0, bssOff)，段本身仍是 RX 且**止于 bssOff**。
@@ -171,8 +173,11 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 			return nil, fmt.Errorf("新段 VA 与预估不一致（预估 0x%X，实际 0x%X）", baseVA, newVA)
 		}
 		// 窗口与尾部都指向**已经追加进文件**的那份载荷字节（不新增文件内容）。
-		// 段顺序 = 程序头槽位顺序（sparePhdrSlot 返回递增的槽位），内核按表顺序 mmap
-		// ⇒ 窗口在自己所在的页上必然是最后映射者。
+		//
+		// 这里**不依赖程序头表顺序**：三段按页互不相交，所以内核先映射谁都不影响结果
+		// （实测产物里窗口段甚至排在载荷前缀段**之前**：PH[0]=RWX 窗口+尾部、PH[1]=RX 前缀）。
+		// 老形状才依赖"后映射者胜"—— 那正是 #597 的脆弱点：glibc 在 DT_TEXTREL 路径按
+		// PT_LOAD 重设保护时不管映射顺序，RX 段盖住窗口页就把窗口设成了只读。
 		winSize := uint64(pl.BSSSize)
 		winFlags := uint32(elf.PF_R | elf.PF_W)
 		if splitRWXWindow {
@@ -198,7 +203,7 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 				"但窗口+尾部合成**一段 RWX** [0x%X, 0x%X)（该段可写，代码页中只有这一截可写；两段相邻不重叠，"+
 				"整段可写 ⇒ 对 glibc 的 TEXTREL 保护重设免疫）\n",
 				spare, segments, pl.BSSOff, pl.BSSOff, pl.BSSOff+pl.BSSSize+tailSize)
-			warnRWX = true
+			payloadWX = true
 		} else if tailSize > 0 {
 			fmt.Printf("[*] ELF 载荷分段：RX 前缀 [0, 0x%X) + RW 窗口 [0x%X, 0x%X) + R+X 尾部 0x%X 字节"+
 				"（三段相邻不重叠；可复用槽位 %d，用 %d）\n", pl.BSSOff, pl.BSSOff, pl.BSSOff+pl.BSSSize, tailSize, spare, segments)
@@ -223,5 +228,8 @@ func ApplyELF(f *elf.File, opt Options) (*Result, error) {
 		ImgRelocCount:    len(opt.ImgRelocs),
 		ImgPrefBase:      imageBase,
 		ImgEType:         f.EType,
+		// "载荷里存在可写+可执行段"这个事实必须随产物一起落进报告：门禁拿它与程序头对账，
+		// 于是"报告说拆开了、产物却有一个 RWX 载荷段"（或反过来）会当场红，而不是靠人眼看日志。
+		PayloadWXFallback: payloadWX,
 	}, nil
 }

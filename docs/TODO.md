@@ -1126,7 +1126,15 @@ EOF
 
 ## 「小而真」批次（`STATUS #596`）新登记 / 更新的待办
 
-- [ ] **M5：加密的**可执行**范围里含重定位 ⇒ 产物 SIGSEGV（amd64 也崩）**。实测（`t3` + `t12` 独立复现）：native `rc=0/143`；
+- [x] **M5：加密的**可执行**范围里含重定位 ⇒ 产物 SIGSEGV（amd64 也崩）** —— **已落地（`STATUS #598`）**：
+      载荷改成**相邻不重叠**的三段（RX 前缀 + RW 窗口 + R+X 尾部；槽位 2 时前缀只读 + 一段 W+X「窗口+尾部」；
+      槽位 1 时整段 W+X）⇒ 老形状「RX 段盖住可写窗口 + 靠后映射者胜」被彻底移除；门禁把这条件做成
+      **任何非可写 LOAD 都不得与可写窗口相交**（E1 直接断言 + E2 独立不变量），并把 `report.payloadWXFallback` 与程序头对账
+      ⇒ **槽位足够的目标不得走回退**在 CI 上可断言。实测：textrel 夹具 `native=143 / packed=143 (rc=0)`（修前 `rc=139`）、
+      普通 PIE MATCH、输出逐字节一致。复核记录：t5 的 E4 校准「静默 no-op ⇒ 醒目 SKIP」保留，但 t5 那句
+      「ET_EXEC 守卫是死代码 / 假报 not caught」**经复核不实**（ET_EXEC 上该守卫本来就有效），且 t5 新加的
+      `imgSections` 支**属过度 SKIP，已按 F1 撤回**。
+      （以下为原登记，保留作为根因与现场证据）实测（`t3` + `t12` 独立复现）：native `rc=0/143`；
       `-enc-image-elf-pie` 打包 ⇒ `rc=139`；再加 `-enc-image-elf-pie-relocs`（范围内 1 条、应用表 RVA=0xE210 len=0x28）⇒ `rc=139`。
       `t12` 的夹具：`.text` 内一个指针 + `-Wl,-z,notext`（readelf 有 TEXTREL，`R_X86_64_RELATIVE` r_offset `0x1288`
       落在被加密的 X 范围内）。与架构无关、与是否 opt-in 无关 ⇒ 待查：打包端是否该**拒绝（fail-closed）**这种范围，或运行期应用器要能处理可执行段内槽位。

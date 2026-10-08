@@ -10569,3 +10569,74 @@ PowerShell 5.1 在没有 BOM 时按 ANSI 读，中文变乱码**并可能直接�
   门禁 `tools/check_elf_layout.py` 的 E1（"唯一允许的 VA 重叠是覆盖段"→ 三段的相邻/顺序约束）与 E2（载荷 LOAD `filesz` 的期望）、`tools/e2e_elf_image.sh` 的形状分类器、
   以及"只 1 个槽"的 RWX 回退路径（CI 的 aarch64 夹具就走这条）。
 
+### 598. M5 三段布局落地（非重叠载荷几何 + 门禁不变量 + 7 条评审修复）
+
+**代码 sha**：`1a238fe`（t1：三段布局 + 门禁 E1/E2/E4 不变量）→ `13d2687`（t5：E4/E5-payload 校准的
+无输入情形改成醒目 SKIP）→ 本条 t6 的修复提交（见下）。**#597 的老形状**（整段 RX + 重叠的 RW 覆盖段，
+靠"后映射者胜"拿到可写）已从打包端彻底移除。
+
+**1. t1：载荷拆成相邻不重叠的段（这就是 M5 的修法）**
+
+- 首选：`RX 前缀 [0,bssOff)` + `RW 窗口 [bssOff,+bssSize)` + `R+X 尾部 […,len)`（三者 VA 相邻不重叠，
+  所以与程序头表顺序无关 —— 实测产物里窗口段甚至排在载荷前缀段**之前**）。
+- 槽位梯子：① 槽位够 → 三段相邻；② 只剩 2 个可用槽且载荷有尾部 → 前缀只读 + **一段 W+X 的"窗口+尾部"**；
+  ③ 只剩 1 个槽 → **整段 W+X 载荷段**。②③ 都"整段可写 ⇒ 对 glibc 的 TEXTREL 保护重设免疫"，
+  且**都不产生重叠段**（上一轮的洞是 `split` 为假时退回老的重叠形状）。
+- 实测：textrel 夹具（`.text` 内指针 + `-Wl,-z,notext`，readelf 有 TEXTREL）`native=143 / packed=143 (rc=0)`
+  （修前 `rc=139`）；普通 PIE 同样 MATCH；两个函数输出逐字节一致。`readelf -lW`：前缀止于 `0x8000`、
+  窗口恰 `0x1000`、尾部 `0x17d` R E。
+- 新增 `internal/inject/elf_m5_test.go`：四条路径都不重叠、窗口必被可写段完整覆盖、没有任何非可写段的
+  页范围与窗口相交。
+
+**2. t5：把"静默 no-op"升级为醒目 SKIP（并撤回一支过度 SKIP）**
+
+- **E4 校准**：E4 要往一个 `filesz>0x2000 且非 top` 的 LOAD 里种 bss；合法的"整段 W+X"产物里载荷段自己
+  就是 top、原镜像剩下的 LOAD 各只有一页 ⇒ **没有对象可种**。原实现把它写成 `results.append(("E4", False, …))`
+  ⇒ 整个 `--selftest` 被它判红。现在改成**醒目 SKIP**（见 t6 更正），且 **E4 本体一行未动**。
+- **更正 t5 提交信息里的一句不实叙述**：t5 说 E5-payload 的 ET_EXEC 守卫是"死代码 / ET_EXEC 假报 not caught" ——
+  **不对**。复核（t3）实测：ET_EXEC 产物上该守卫 pre-t5 本来就 exit 0、没有该行 ⇒ 它是**可达且有效**的守卫；
+  ET_EXEC 上 `check_relocs()` 直接 return，本来就没有 E5 断言可被种中的 VA 触发。
+- **新增的 `imgSections` 那一支经复核属过度 SKIP，已按 F1 撤回**：E5 的 (a) 半（载荷内绝对 VA 覆盖扫描）
+  在 (b) 的账目半提前 return 之前就跑，所以"报告没有加密范围"的 plain-pack PIE **仍然有输入** ——
+  实测 A/B：pre-t5 `[OK] CAL mutation caught by E5-payload` → post-t5 SKIP → 手工种同一 VA 后门禁本体
+  `[FAIL] E5 1 of 1 payload absolute VA(s) have no RELATIVE relocation (holding 0x401000)`。**只撤这一支**，
+  ET_EXEC 与 `pref==0` 两支保留。
+
+**3. t6：t3 七条发现的处置**
+
+- **F1（已修）**：撤掉 `imgSections` 那一支（保留 ET_EXEC / `pref==0` 两支），并在注释里写明"不要再加回来"
+  及其理由。证据：同一 PIE 产物重新出现 `[OK] CAL mutation caught by E5-payload`；1 槽整段 W+X 形状仍 exit 0。
+- **F2（已修）**：`tools/e2e_elf_image.sh` 的形状分类器按**实测档位**重写为 (1)/(2)/(3)/(0)，并单列 `(DEFECT)`
+  识别老的重叠形状（此前它与新的相邻形状**不可区分**，CI 日志与实现相反）；删掉第 576/582 行对已删
+  `E2-overlay calibration` 的引用，`[OK]` 文案改成"实测到哪几档就宣称哪几档"。
+- **F3（已修，取"真校准"那一支）**：原来叫 `E2-M5-window-covers` 的校准其实命中的是 E2 的**形状**检查（前缀不再止于
+  bssOff），E2 在那里就 return、走不到它自己的不变量 ⇒ 改名 `E2-prefix-not-stopped-at-window`；另建一条真正的
+  `E2-M5-window-covers`：把**一个非载荷、非可写的 LOAD** 的 vaddr 范围撑到盖住窗口页（载荷形状不动）⇒
+  E2 走到自己的不变量并以**它自己的原话** `intersects the writable window` 变红。两条都实测可红。
+- **F4（已修）**：E2 判据文案现在把窗口段的 `flags`/`filesz`/`memsz` 打出来，是 W+X 就明说
+  `**W+X window+tail**`；模块/函数 docstring 与 E1 内联注释统一成三档词汇，文件内不再有互相矛盾的形状描述。
+- **F5（已修）**：E5(a) 的两处扫描（8 字节步长 + 逐字节全扫）从 `p["filesz"]`（分段后只剩前缀）改成
+  `sectionSize`（读字节仍走 `elf.read()/va_to_off()`，按任意 PT_LOAD 折算），INFO 里写明扫描范围
+  `payload [0x…,0x…) (sectionSize 0x…, scanned in full …)`。
+- **F6（已修）**：新增 `Result.PayloadWXFallback`（`report.payloadWXFallback`，自动随 `WriteReport` 落进报告），
+  取代原来赋值后从不读的死变量 `warnRWX`；门禁 E2 断言"报告声明的形状 ↔ 产物程序头里的 W+X 载荷段"一致，
+  `tools/e2e.sh` 与 `tools/e2e_elf_image.sh`（三种模式）各加同一对账 ⇒ **槽位足够的目标不得走回退**在 CI 上落地
+  （aarch64 那边按实测档位断言：档 (1) ⇒ flag=false，档 (2)/(3) ⇒ flag=true）；删掉重复定义的 `va_to_off`；
+  把 `internal/inject/elf.go` 的"窗口必然最后映射"注释改成"**不重叠 ⇒ 与顺序无关**"（实测产物里窗口段可以
+  排在载荷前缀段之前，正确性只来自页不相交）。
+- **F7（已按实际措辞登记，就是本条）**：不照抄"死代码+ET_EXEC 假报 not caught"，按实际写成"把静默 no-op 升级为
+  醒目 SKIP；新增的 `imgSections` 支经复核属过度 SKIP，已按 F1 撤回"。
+
+**本机门禁（t6 终局，工作区干净）**：`tools/preflight.ps1` ⇒ `[+] preflight: OK`；`tools/wsl_linux.ps1` ⇒
+`[OK] wsl_linux: every step passed`；`tools/gates.ps1` ⇒ `total 15 gates, 0 failed, 0 skipped`（e2e 183/0、dll 7/0）。
+形状口径与 CI run 号见本条末尾追加。
+
+**未做项 / 如实登记**
+
+- **CI 三作业**：见本条末尾的 run 号（本条首版只记本机门禁）。
+- 上一轮 `#597` 登记的"打包端是否该 fail-closed 拒绝可执行段内含重定位的范围"**仍未做** —— M5 修的是几何，
+  该 fail-closed 选项独立存在。
+- aarch64 的"加密范围内相对重定位"运行期那半仍然没有可跑用例（`#376/#377` 把只读数据节加密关掉；
+  可执行段内重定位在 amd64 上也会崩），登记在 `tools/check_elf_layout.py` 的 E5 覆盖缺口一节。
+
+
