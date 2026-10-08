@@ -909,6 +909,182 @@ PY
     echo "[OK  ] #597 fail-closed: non-relative reloc inside an encryptable range -> rc=$G2_RC, no artifact, refusal names the R_*_RELATIVE kernel the applier implements"
 fi
 
+# ---- RELR（DT_RELR 压缩相对重定位）---- 打包端 fail-closed 决策的 committed 见证 ----
+#
+# 取向（docs/STATUS.md #600 §600.5）：**不支持 RELR** —— 目标带 DT_RELR 且要加密任何范围 ⇒ 拒绝打包。
+# 理由：RELR 的条目是**隐式 addend**（加数在槽位里，条目里没有 r_addend），而运行期应用器
+# （stub/win/x64/vm_interp.c 的 vm_reloc_fix）只读 DT_RELA/DT_REL，没有 RELR 还原路径
+# ⇒ "记进应用表就能还原"这条推理对 RELR 不成立（放行 = 交付运行期必硬门的坏产物）。
+#
+# 本条用例做三件事（全是真断言，不是复述策略）：
+#   1. **夹具校准**：readelf 必须真的解出 DT_RELR 与 .relr.dyn，且用"已与 readelf 对齐的解码器"
+#      独立解出的槽位数必须等于 readelf 报的 "which relocate N locations"（否则用例空转）；
+#   2. **主断言**：带 DT_RELR 的目标 + 要加密范围 ⇒ vmpack 非零退出、**不落产物/不落报告**、信息里点名 DT_RELR；
+#   3. **单变量对照**：同一份源码、同样开关，只把 -z pack-relative-relocs 去掉 ⇒ 必须打包成功
+#      且与原生逐字节一致（⇒ 触发拒绝的确实是 DT_RELR，不是别的）。
+#
+# 解码算法（本轮用独立 python 与 readelf **逐项对齐**；将来做真支持时按这个来）：
+#   偶数条目 = 槽位地址，base = 条目 + 8；
+#   奇数条目 = 位图，bit i (1..63) ⇒ 槽位 base + (i-1)*8，之后 base += 63*8。
+#   夹具实测：条目 [0x3d78, 0x3, 0x80001] ⇒ 槽位 {0x3d78, 0x3d80, 0x4008}，与 readelf -rW 完全一致。
+#   旧解码器的三个已知缺陷（bitmap 之后缺 base += 63*8、首个 bitmap 的 base 应为 addr+8、
+#   裸地址条目本身也是一条重定位却被丢掉）—— 本条用例就是钉住这类回归的最小样本。
+#
+# 校准（改之前必须能红）：
+#   A. 去掉夹具的 -Wl,-z,pack-relative-relocs ⇒ 第 1 步的 readelf 断言直接 FAIL（用例不空转）；
+#   B. 临时注释掉 cmd/vmpack/main.go 的 hasRelr 分支 ⇒ 第 2 步"rc≠0 且不落产物"变红。
+if [ -z "$QEMU" ] && [ "$GOARCH_TARGET" = "amd64" ]; then
+    echo "[*] RELR: a DT_RELR target must be refused (fail-closed, no artifact); the same source without RELR must pack and match native"
+    # 本块用**自己的** blob（同 #597 块的理由：后续步骤会重建 build/vm_interp_elf.bin）。
+    RLRBLOB=build/vm_interp_elf_relr
+    ./build/vmpbuild -src "$BLOB_SRC" $([ -n "$BLOB_CC" ] && echo "-cc $BLOB_CC") $([ -n "$BLOB_GUEST" ] && echo "-guest $BLOB_GUEST") $BLOB_EXTRA \
+        -out "$RLRBLOB.bin" -manifest "$RLRBLOB.json" -entry vm_entry >/dev/null || fail "build the RELR block's own blob"
+    cat > build/relr_target.c <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int g_a = 7;
+static int g_b = 9;
+
+/* Two absolute pointer slots inside the EXECUTABLE section: the linker must emit
+ * R_X86_64_RELATIVE for them, and with -z pack-relative-relocs those entries go to
+ * .relr.dyn (DT_RELR) instead of .rela.dyn. */
+__asm__(".section .text\n"
+        ".globl relr_tbl\n"
+        "relr_tbl:\n"
+        ".quad g_a\n"
+        ".quad g_b\n"
+        ".previous\n");
+extern int *const relr_tbl[2];
+
+__attribute__((noinline)) unsigned long checkKey(unsigned long x) { return ((x * 7) + 42) ^ 0xFF; }
+__attribute__((noinline)) long sumTo(long n) { long s = 0; for (long i = 1; i <= n; i++) s += i; return s; }
+
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: relr_target <check-key|sum-to> <arg>\n"); return 2; }
+    /* a slot the loader never applied reads as a WRONG VALUE: print the difference so the
+     * failure is a distinct output, not just a crash. */
+    long da = (long)relr_tbl[0] - (long)&g_a;
+    long db = (long)relr_tbl[1] - (long)&g_b;
+    if (da != 0 || db != 0) { printf("BADSLOTS %ld %ld\n", da, db); return 4; }
+    unsigned long v = strtoul(argv[2], 0, 0);
+    if (strcmp(argv[1], "check-key") == 0) printf("%lu\n", checkKey(v));
+    else if (strcmp(argv[1], "sum-to") == 0) printf("%ld\n", sumTo((long)v));
+    else return 2;
+    return 0;
+}
+EOF
+    for rlrmode in relr norel; do
+        if [ "$rlrmode" = relr ]; then RLR_FLAGS="-Wl,-z,notext -Wl,-z,pack-relative-relocs"; else RLR_FLAGS="-Wl,-z,notext"; fi
+        # shellcheck disable=SC2086
+        gcc -fPIE -pie -O1 $RLR_FLAGS -o "build/elf_target_$rlrmode" build/relr_target.c || fail "build the RELR fixture ($rlrmode)"
+    done
+    # ---- 1. 夹具校准：relr 变体必须真的带 DT_RELR + .relr.dyn；norel 变体必须一条都没有 ----
+    readelf -dW build/elf_target_relr | grep -q 'RELR' || fail "the RELR fixture has no DT_RELR dynamic tag (the case would be vacuous)"
+    readelf -rW build/elf_target_relr | grep -q '.relr.dyn' || fail "the RELR fixture has no .relr.dyn relocation section"
+    if readelf -dW build/elf_target_norel | grep -q 'RELR'; then
+        fail "the single-variable control unexpectedly carries DT_RELR (the control would be vacuous)"
+    fi
+    RLR_EXPECT="$(readelf -rW build/elf_target_relr | sed -n 's/.*which relocate \([0-9][0-9]*\) locations.*/\1/p' | head -n 1)"
+    [ -n "$RLR_EXPECT" ] || fail "readelf did not report how many locations the RELR table relocates"
+    RLR_DECODED="$(RLR_ART=build/elf_target_relr python3 - <<'PY'
+import os, struct
+d = open(os.environ["RLR_ART"], "rb").read()
+phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+loads, dyn = [], None
+for i in range(phn):
+    o = phoff + i * pes
+    t, fl, off, va, _pa, fsz, msz, _al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1:
+        loads.append((va, msz, off))
+    elif t == 2:
+        dyn = va
+def off_of(va):
+    for v, msz, off in loads:
+        if v <= va < v + msz:
+            return off + (va - v)
+    return None
+do = off_of(dyn)
+relr = rsz = 0
+for j in range(0x400 // 16):
+    tag, val = struct.unpack_from("<QQ", d, do + j * 16)
+    if tag == 0:
+        break
+    if tag == 36: relr = val
+    if tag == 35: rsz = val
+ro = off_of(relr)
+ents = [struct.unpack_from("<Q", d, ro + 8 * k)[0] for k in range(rsz // 8)]
+# calibrated algorithm (must agree with readelf)
+addrs, base = [], 0
+for e in ents:
+    if (e & 1) == 0:
+        addrs.append(e)
+        base = e + 8
+    else:
+        for i in range(1, 64):
+            if e & (1 << i):
+                addrs.append(base + (i - 1) * 8)
+        base += 63 * 8
+print(len(addrs))
+PY
+)"
+    if [ "$RLR_EXPECT" != "$RLR_DECODED" ]; then
+        echo "[MISMATCH] RELR decode: readelf says $RLR_EXPECT location(s), the calibrated decoder says [$RLR_DECODED]"
+        fail "the calibrated RELR decoder disagrees with readelf on the fixture"
+    fi
+    echo "[OK  ] RELR decode calibrated against readelf: $RLR_EXPECT location(s) on the fixture"
+    # ---- 2. 主断言：带 DT_RELR + 要加密范围 ⇒ 拒绝，且不落产物/不落报告 ----
+    RLR_N_RC=0; RLR_N="$(run_target "$TARGET_RUN" ./build/elf_target_relr check-key 10 2>&1)" || RLR_N_RC=$?
+    RLR_N_SUM_RC=0; RLR_N_SUM="$(run_target "$TARGET_RUN" ./build/elf_target_relr sum-to 100 2>&1)" || RLR_N_SUM_RC=$?
+    if [ "$RLR_N_RC" -ne 0 ] || [ "$RLR_N" != "143" ] || [ "$RLR_N_SUM_RC" -ne 0 ] || [ "$RLR_N_SUM" != "5050" ]; then
+        echo "[MISMATCH] RELR fixture native: check-key rc=$RLR_N_RC out=[$RLR_N] (want 143); sum-to rc=$RLR_N_SUM_RC out=[$RLR_N_SUM] (want 5050)"
+        fail "the RELR fixture does not run natively"
+    fi
+    RLR_OUT="build/elf_relr_${TAG}_refused.enc"
+    RLR_REP="build/elf_relr_${TAG}_refused.json"
+    rm -f "$RLR_OUT" "$RLR_REP"
+    RLR_RC=0
+    RLR_MSG="$("./build/vmpack" -exe build/elf_target_relr -func checkKey -func sumTo \
+        -enc-image-elf-pie -enc-image-elf-pie-relocs \
+        -blob "$RLRBLOB.bin" -manifest "$RLRBLOB.json" \
+        -out "$RLR_OUT" -report "$RLR_REP" 2>&1)" || RLR_RC=$?
+    if [ "$RLR_RC" -eq 0 ]; then
+        echo "[MISMATCH] the packer ACCEPTED a DT_RELR target while it had ranges to encrypt"
+        printf '%s\n' "$RLR_MSG" | tail -n 3 | sed 's/^/    /'
+        fail "a DT_RELR target with encryptable ranges must be refused (the runtime has no RELR restore path)"
+    fi
+    # loud message: ASCII keyword only (Chinese literals do not survive this harness pipe)
+    printf '%s' "$RLR_MSG" | grep -aqF 'DT_RELR' || fail "the refusal must name DT_RELR (so the user knows which knob to turn off)"
+    # and no artifact / no report may be left behind
+    if [ -f "$RLR_OUT" ] || [ -f "$RLR_REP" ]; then
+        fail "a refused RELR pack must not leave an artifact or a report behind"
+    fi
+    echo "[OK  ] #600 RELR fail-closed: DT_RELR target + encryptable ranges -> rc=$RLR_RC, no artifact, refusal names DT_RELR"
+    # ---- 3. 单变量对照：同一份源码去掉 -z pack-relative-relocs ⇒ 必须能打包且与原生一致 ----
+    RLR_C_OUT="build/elf_relr_${TAG}_control.enc"
+    RLR_C_REP="build/elf_relr_${TAG}_control.json"
+    rm -f "$RLR_C_OUT" "$RLR_C_REP"
+    RLR_C_RC=0
+    RLR_C_MSG="$("./build/vmpack" -exe build/elf_target_norel -func checkKey -func sumTo \
+        -enc-image-elf-pie -enc-image-elf-pie-relocs \
+        -blob "$RLRBLOB.bin" -manifest "$RLRBLOB.json" \
+        -out "$RLR_C_OUT" -report "$RLR_C_REP" 2>&1)" || RLR_C_RC=$?
+    if [ "$RLR_C_RC" -ne 0 ]; then
+        echo "[MISMATCH] the DT_RELR-free control was refused too (rc=$RLR_C_RC) -- the refusal is not specific to DT_RELR"
+        printf '%s\n' "$RLR_C_MSG" | tail -n 3 | sed 's/^/    /'
+        fail "the DT_RELR-free control must still pack"
+    fi
+    [ -f "$RLR_C_OUT" ] || fail "the DT_RELR-free control produced no artifact"
+    RLR_C_GRC=0; RLR_C_GOT="$(run_target "$TARGET_RUN" "./$RLR_C_OUT" check-key 10 2>&1)" || RLR_C_GRC=$?
+    RLR_C_SUM_RC=0; RLR_C_SUM="$(run_target "$TARGET_RUN" "./$RLR_C_OUT" sum-to 100 2>&1)" || RLR_C_SUM_RC=$?
+    if [ "$RLR_C_GRC" -ne 0 ] || [ "$RLR_C_GOT" != "$RLR_N" ] || [ "$RLR_C_SUM_RC" -ne 0 ] || [ "$RLR_C_SUM" != "$RLR_N_SUM" ]; then
+        echo "[MISMATCH] DT_RELR-free control product: check-key native=[$RLR_N](rc=$RLR_N_RC) packed=[$RLR_C_GOT](rc=$RLR_C_GRC); sum-to native=[$RLR_N_SUM](rc=$RLR_N_SUM_RC) packed=[$RLR_C_SUM](rc=$RLR_C_SUM_RC)"
+        fail "the DT_RELR-free control product is not identical to native"
+    fi
+    echo "[OK  ] #600 RELR control: the same source without DT_RELR packs and answers exactly like native (143/5050)"
+fi
+
 # ---- aarch64：加密范围内重定位 —— 打包侧的范围等式 + 运行期"必须与原生一致"都是真断言 ----
 # #376/#377 把 aarch64 的只读数据节加密默认关掉（根因未定，AGENTS.md 禁止打开），所以
 # "加密范围里带 R_AARCH64_RELATIVE" 这条运行期路径一直没有可跑用例。本块做两件**都跑**的事：
