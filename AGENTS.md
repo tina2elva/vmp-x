@@ -1,7 +1,9 @@
 # AGENTS.md —— 在这个仓库里工作前必读
 
-**当前任务**：vmp-x 的加固收尾。**唯一权威任务书**是 `docs/HANDOFF.md`，请先完整读它，
-再读 `docs/STATUS.md` 的 `#378`（接线步骤与行号）、`#379`/`#380`（前置三重确认）、`#381`（(5)(6) 评估）、`#382`（(2) 选型）。
+**当前任务**：vmp-x 的加固收尾 —— 主体**已完成**，现处「收口 + 边界项」阶段。
+**现状的权威来源是 `docs/STATUS.md` 的最后一条**（当前 `#600`，2026-10-08）；`docs/HANDOFF.md` 是
+2026-10-02 的**历史**任务书，其中的进度、未做项与验收数字**已漂移**，只有它的**纪律与验收口径**仍然有效。
+当前未做项以 `docs/TODO.md` 尾部为准（RELR 真支持、运行期方案 (b)、win/arm64 暂缓、TEE/远程证明）。
 
 ## 动手前
 1. `git log --oneline -5` 与 `git status --short`：**这个工作区可能有另一个会话同时在改**。
@@ -19,7 +21,7 @@
 
 ## 完成一项的验收（缺一不可，全部要有证据）
 1. `powershell -NoProfile -ExecutionPolicy Bypass -File tools/preflight.ps1` → `[+] preflight: OK`；
-2. `tools/gates.ps1` → `total 15 gates, 0 failed, 0 skipped`（e2e 183/0、dll 7/0、arm64 客户机 OK、Linux 半场经 WSL）；
+2. `tools/gates.ps1` → `total 15 gates, 0 failed, 0 skipped`（`#600` 实测：e2e **186**/0、dll 7/0、32 位 12/12、Linux 半场经 WSL 14 step 全 OK）；
    **跳过的 step 单独记账**（退出码 77 约定）—— 缺 WSL/i686 的机器上会打印 `N skipped` 与醒目提示，不再混进 `[OK]`；
 3. CI **三个作业全绿**（`windows-amd64` / `linux-amd64` / `linux-arm64`；`gh run list` 取 run 号）；
 4. `docs/STATUS.md` 追加一条：做了什么、证据（含 run 号与命令）、**未做项**。
