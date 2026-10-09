@@ -11181,6 +11181,45 @@ run `37875821334` 上 `linux-amd64` 与 `linux-arm64` 都红了，原因是**工
 
 **仍未做**：aarch64 在 CI 上仍是 `[SKIP]`（CI 的交叉工具链不产出 DT_RELR）；要在 CI 上也真跑，
 需要换一个认 `-z pack-relative-relocs` 的交叉链接器。
+### 605. DT_RELR"表落在加密范围内 ⇒ 拒绝"的 committed 负例（`#603.5` 的最后一条缺口）
+
+**范围与 sha**：`c6d0cb4`。改 `cmd/vmpack/main.go` 与 `tools/e2e_elf_image.sh`。
+
+#### 605.1 判据顺序：先查表位置、再解码
+
+原顺序是「先 `RelrRelocs()` 解码 → 再查表是否落在加密范围」。表位置这条守卫是**结构性**的、与表内容
+无关；放在解码之后，一旦夹具的假表解码不过，报出来的就是解码错误 —— 那条守卫**没法用负例钉住**。
+改成先查表位置后，"表落在密文里"这个失败模式会稳定地报出自己的原因。该拒绝信息同时加了 ASCII 关键字
+`[DT_RELR_TABLE_IN_ENCRYPTED_RANGE]`（e2e 要 grep；带中文的串在 harness 管子里不可靠）。
+
+#### 605.2 负例夹具的造法（可复现）
+
+把正例夹具复制一份，用 python 改两处 + 写一处：
+1. `DT_RELR` 指向 `.rodata` 里的 `relr_tbl`（符号地址用 `readelf -sW` 取；
+   `.rodata` 是打包端的数据节候选 ⇒ 必然被加密）；
+2. `DT_RELRSZ` = 16；
+3. 把那两个槽位在文件里的 16 字节写成 `{addr, 0}` —— **能干净解码**的两个条目
+   （8 字节对齐、且都在 PT_LOAD 内；VA 0 在 PIE 里落在第一个 PT_LOAD 里）。
+
+第 3 步是关键：没有它，"关掉守卫"时打包会**因为解码失败**而拒绝，校准就变成"红得不对"
+（本轮第一版就是这样：校准只红在"缺 ASCII 关键字"上，没有证明守卫是唯一挡住坏产物的东西）。
+
+#### 605.3 校准（两步都实测）
+
+- **关掉守卫**（`if false && rtabSz != 0`）⇒ `[MISMATCH] the packer ACCEPTED a DT_RELR table sitting inside a range it encrypts` + `[FAIL]` + `e2e rc=1`；
+- **守卫在** ⇒ `[OK  ] #604.7 RELR guard: DT_RELR table inside an encrypted range -> refused (rc=1), no artifact, ASCII keyword present`，`e2e rc=0`。
+
+#### 605.4 证据
+
+- `tools/preflight.ps1` ⇒ `[+] preflight: OK`；`tools/gates.ps1` ⇒ `total 16 gates, 0 failed, 0 skipped`（`wsl_linux: every step passed`）。
+- CI **三个作业全绿**：run `37879377953`。
+
+#### 605.5 未做项
+
+- **aarch64 在 CI 上仍是 `[SKIP]`**（CI 的交叉工具链不产出 DT_RELR）—— 与本条无关，仍挂在 `docs/TODO.md`。
+- `#602.5` 的另一条（差分测试扩随机程序、fail-closed 分支清单）仍未做。
+
+**互指**：本条结清 `#603.5` 登记的两条未做项中的最后一条；`#604.7` 的断言与它配对（正例：真跑还原路径；负例：坏布局被拒）。
 
 
 
