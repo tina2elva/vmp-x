@@ -37,4 +37,41 @@ if ($rc -ne 0 -or $out -notmatch "PASS: 0 failure") {
     exit 1
 }
 Write-Host "[OK  ] harness: interpreter semantics (real vm_interp.c, hand-written bytecode)"
+
+# ---- guest-stack guard (rc=97): minimal repro + control (STATUS #607) ----
+# Why: after wiring random bytecode programs into the C-vs-Go-reference-VM differential, the very
+# first run had one program make the C interpreter take a hard gate while the Go reference VM ran
+# it fine. Diagnosed as DELIBERATE fail-closed behaviour, not a bug:
+#     vm_interp.c:  if (rsp_start - vm->regs[VRSP] > VM_MARGIN) return 99;  // stack below its floor
+#                   if (vm->regs[VRSP] > rsp_start)             return 97;  // SP above entry
+# Measured (STATUS #607.2): with SP above entry the UNDERFLOWED first check fires, so the code is 99,
+# NOT 97 -- i.e. the 97 branch is unreachable (dead). Two independent proofs: removing the 97 branch
+# changes mode 0 not at all, and on Linux mode 0 exits with 99. This probe therefore asserts only
+# "abnormal exit + no output"; it does not name 97.
+# mode 0: write the guest SP ABOVE its entry value -> expect an abnormal exit (0xC000001D) and
+#         NO output at all (the program must not reach its own printf).
+# mode 1: write the SP EQUAL to the entry value -> expect a clean run printing rc=0 (this proves
+#         the guard keys on the VALUE, not on "the program wrote SP at all").
+# This is also one instance of "every hard-gate branch needs a test that really reaches it"
+# (STATUS #602.5): remove that guard and mode 0 stops trapping, so this check turns red.
+& gcc -O1 -w -I stub/win/x64 -o build/rsp_guard_probe.exe `
+    stub/win/x64/rsp_guard_probe.c stub/win/x64/vm_crypto.c stub/win/x64/vm_kdf.c stub/win/x64/vm_entry_asm.S
+if ($LASTEXITCODE -ne 0) { Write-Host "[!] harness: rsp_guard_probe build failed"; exit 1 }
+$g1 = [string](& .\build\rsp_guard_probe.exe 1 2>&1 | Out-String)
+$rc1 = $LASTEXITCODE
+$g0 = [string](& .\build\rsp_guard_probe.exe 0 2>&1 | Out-String)
+$rc0 = $LASTEXITCODE
+# PowerShell 5.1 parses a literal like 0xC000001D as a NEGATIVE Int32, so compare with a DECIMAL
+# constant (AGENTS.md records this trap). Also: with no output the captured value can be $null, and
+# $null -ne "" is TRUE in PowerShell -- cast to [string] before judging emptiness.
+$trapCode = -1073741795
+if ($rc1 -ne 0 -or $g1 -notmatch "rc=0") {
+    Write-Host ("[!] harness: rsp guard control (mode 1) failed: rc=" + $rc1 + " out=" + $g1)
+    exit 1
+}
+if ($rc0 -ne $trapCode -or $g0.Trim().Length -ne 0) {
+    Write-Host ("[!] harness: rsp guard (mode 0) did NOT trap as expected: rc=" + $rc0 + " out=" + $g0)
+    exit 1
+}
+Write-Host "[OK  ] harness: guest-stack guard (SP above entry -> hard gate/ud2, code 99 in practice; SP == entry -> runs)"
 exit 0
