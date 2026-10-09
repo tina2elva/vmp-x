@@ -11162,6 +11162,25 @@ run `37875821334` 上 `linux-amd64` 与 `linux-arm64` 都红了，原因是**工
 - `#603.5` 的另一条（"DT_RELR 表落在加密范围内 ⇒ 拒绝"的新守卫缺 committed 负例）**仍未做**。
 
 **互指**：本条补上 `#603.5` 的第 1 条未做项；`#603` 的机制与契约测试是本条的前提。
+#### 604.6 后续（`2c7c9ac`）：amd64 夹具改放 `.rodata`，CI 上从此**真跑**
+
+604.3 里 amd64 之所以要降级成 `[SKIP]`，根因是夹具把指针槽放在 `.text`，而**较老的 ld 不把
+`.text` 里的相对重定位打包进 RELR** ⇒ 加密范围里没有 RELR 槽位。
+
+改法：槽位改放 `.rodata`（`const int *const tbl[2]`）。两条性质合起来保证**两端都必然真跑**：
+1. 非 `.text` 的相对重定位**会**被 RELR 打包（CI 上那 3 条 `.init_array`/`.data` 条目就是这类）；
+2. `.rodata` 是打包端的数据节候选，且其中没有显式 RELA 相对重定位 ⇒ 不会被"范围含重定位就跳过"排除
+   ⇒ 该范围被加密，RELR 槽位必然落在里面。
+
+⇒ `in_range == 0` 不再可能是工具链布局差异，那条断言**恢复为硬断言**（不再是 SKIP）。
+
+**证据（CI run `37877475244`，三作业全绿）**：linux-amd64 上亲核到
+`[OK  ] RELR accounting: 5 slot(s) decoded, 2 inside encrypted range(s)`、`[OK  ] #603 RELR: ...`、
+`[OK  ] RELR contract KAT: the C-side expansion agrees with the Go/readelf vectors`。
+即：**CI 上现在真的走运行期 RELR 还原路径**（此前是 SKIP）。
+
+**仍未做**：aarch64 在 CI 上仍是 `[SKIP]`（CI 的交叉工具链不产出 DT_RELR）；要在 CI 上也真跑，
+需要换一个认 `-z pack-relative-relocs` 的交叉链接器。
 
 
 
