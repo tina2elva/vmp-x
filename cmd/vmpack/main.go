@@ -1065,10 +1065,10 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				// 两条 fail-closed：
 				//   ① 解码必须成功 —— RelrRelocs 对尺寸/越界/槽位不在 PT_LOAD 内都报错，绝不放行半张表；
 				//   ② **DT_RELR 表自身不得落在被加密的范围里** —— 应用器在验签/解密**之前**就要读它。
-				relrSlots, rerr := f.RelrRelocs()
-				if rerr != nil {
-					fatalf("拒绝打包：目标带 DT_RELR，但解码失败：%v（解码是 fail-closed 的，绝不放行半张表）", rerr)
-				}
+				// 判据顺序：**先查表位置、再解码**（STATUS #604.7）。表位置这条守卫是**结构性**的、与表内容
+				// 无关；放在解码之前，才能让"表落在密文里"这个失败模式**稳定地**报出它自己的原因（否则会被
+				// 解码错误抢先盖掉，这条守卫就没法用 committed 负例钉住了）。
+				// 末尾的 ASCII 关键字同样是给 e2e 用的（带中文的串在 harness 管子里不可靠，见 AGENTS.md）。
 				rtabVA, rtabSz, terr := f.RelrTableRange()
 				if terr != nil {
 					fatalf("读不出 DT_RELR 表地址：%v", terr)
@@ -1079,9 +1079,13 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 						sLo := imageBase + uint64(s.RVA)
 						sHi := sLo + uint64(s.Size)
 						if rLo < sHi && sLo < rHi {
-							fatalf("拒绝打包：DT_RELR 表 [0x%X,0x%X) 落在要加密的范围 [0x%X,0x%X) 里 —— 运行期应用器在验签/解密**之前**就要读这张表，落在密文里会算出垃圾槽位。\n    可操作选项：不加密该范围（去掉 -enc-image-elf-pie-relocs / -enc-image-elf-pie），或改用把 .relr.dyn 放在加密范围之外的链接布局。", rLo, rHi, sLo, sHi)
+							fatalf("拒绝打包：DT_RELR 表 [0x%X,0x%X) 落在要加密的范围 [0x%X,0x%X) 里 —— 运行期应用器在验签/解密**之前**就要读这张表，落在密文里会算出垃圾槽位。\n    可操作选项：不加密该范围（去掉 -enc-image-elf-pie-relocs / -enc-image-elf-pie），或改用把 .relr.dyn 放在加密范围之外的链接布局。 [DT_RELR_TABLE_IN_ENCRYPTED_RANGE]", rLo, rHi, sLo, sHi)
 						}
 					}
+				}
+				relrSlots, rerr := f.RelrRelocs()
+				if rerr != nil {
+					fatalf("拒绝打包：目标带 DT_RELR，但解码失败：%v（解码是 fail-closed 的，绝不放行半张表）", rerr)
 				}
 				if len(relrSlots) > 0 {
 					inRange := 0

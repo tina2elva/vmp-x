@@ -1115,6 +1115,83 @@ PY
         fail "the DT_RELR product is not byte-identical to native (the runtime RELR restore is the only thing between the ciphertext and the addend)"
     fi
     echo "[OK  ] #603 RELR: DT_RELR target + encryptable ranges -> packs, and the product answers exactly like native (143/5050)"
+    # ---- 2b. 守卫负例（`#604.7`）：**DT_RELR 表自身落在被加密的范围里 ⇒ 拒绝打包** ----
+    # 造法：把正例夹具复制一份，用 python 把 DT_RELR 指向 .rodata 里的 `relr_tbl`（.rodata 会被加密）、
+    # DT_RELRSZ 改成 16。守卫是**结构性判据**（已挪到解码之前），所以表内容如何都不影响它触发。
+    RLR_G_IN=build/elf_target_relr_guardin
+    python3 - build/elf_target_relr "$RLR_G_IN" <<'PY' || fail "build the guard negative fixture"
+import struct, subprocess, sys
+src, dst = sys.argv[1], sys.argv[2]
+d = bytearray(open(src, "rb").read())
+out = subprocess.run(["readelf", "-sW", src], capture_output=True, text=True).stdout
+addr = None
+for ln in out.splitlines():
+    p = ln.split()
+    if len(p) >= 8 and p[-1] == "relr_tbl":
+        addr = int(p[1], 16)
+        break
+assert addr is not None, "relr_tbl symbol not found"
+phoff, pes, phn = struct.unpack_from("<Q", d, 0x20)[0], struct.unpack_from("<H", d, 0x36)[0], struct.unpack_from("<H", d, 0x38)[0]
+dyn = None
+for i in range(phn):
+    o = phoff + i * pes
+    if struct.unpack_from("<I", d, o)[0] == 2:
+        dyn = struct.unpack_from("<Q", d, o + 8)[0]
+        break
+assert dyn is not None, "no PT_DYNAMIC"
+doff = None
+for i in range(phn):
+    o = phoff + i * pes
+    t, fl, off, va, pa, fsz, msz, al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1 and va <= dyn < va + msz:
+        doff = off + (dyn - va)
+        break
+assert doff is not None, "cannot map PT_DYNAMIC"
+hits = 0
+for j in range(0x400 // 16):
+    o = doff + j * 16
+    tag = struct.unpack_from("<Q", d, o)[0]
+    if tag == 0:
+        break
+    if tag == 36:    # DT_RELR
+        struct.pack_into("<Q", d, o + 8, addr); hits += 1
+    elif tag == 35:  # DT_RELRSZ
+        struct.pack_into("<Q", d, o + 8, 16); hits += 1
+assert hits == 2, "expected exactly DT_RELR + DT_RELRSZ, patched %d" % hits
+# 让这张"假表"**能干净解码** —— 这样"关掉守卫 ⇒ 打包成功（产出坏产物）"才是真的校准。
+#   条目 0 = addr（8 字节对齐、在某个 PT_LOAD 内）；条目 1 = 0（VA 0 在 PIE 里也在第一个 PT_LOAD 内）。
+toff = None
+for i in range(phn):
+    o = phoff + i * pes
+    t, fl, off, va, pa, fsz, msz, al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1 and va <= addr < va + msz:
+        toff = off + (addr - va)
+        break
+assert toff is not None, "cannot map relr_tbl in the file"
+struct.pack_into("<QQ", d, toff, addr, 0)
+open(dst, "wb").write(bytes(d))
+import os
+os.chmod(dst, 0o755)
+print("    guard fixture: DT_RELR -> 0x%X (.rodata), DT_RELRSZ=16" % addr)
+PY
+    RLR_G_OUT="build/elf_relr_${TAG}_guard.enc"
+    RLR_G_REP="build/elf_relr_${TAG}_guard.json"
+    rm -f "$RLR_G_OUT" "$RLR_G_REP"
+    RLR_G_RC=0
+    RLR_G_MSG="$("./build/vmpack" -exe "$RLR_G_IN" -func checkKey -func sumTo \
+        -enc-image-elf-pie -enc-image-elf-pie-relocs \
+        -blob "$RLRBLOB.bin" -manifest "$RLRBLOB.json" \
+        -out "$RLR_G_OUT" -report "$RLR_G_REP" 2>&1)" || RLR_G_RC=$?
+    if [ "$RLR_G_RC" -eq 0 ]; then
+        echo "[MISMATCH] the packer ACCEPTED a DT_RELR table sitting inside a range it encrypts"
+        printf '%s\n' "$RLR_G_MSG" | tail -n 3 | sed 's/^/    /'
+        fail "a DT_RELR table inside an encrypted range must be refused (the applier reads it BEFORE decrypt)"
+    fi
+    printf '%s' "$RLR_G_MSG" | grep -aqF 'DT_RELR_TABLE_IN_ENCRYPTED_RANGE' || fail "the refusal must carry the ASCII keyword [DT_RELR_TABLE_IN_ENCRYPTED_RANGE]"
+    if [ -f "$RLR_G_OUT" ] || [ -f "$RLR_G_REP" ]; then
+        fail "a refused pack must not leave an artifact or a report behind"
+    fi
+    echo "[OK  ] #604.7 RELR guard: DT_RELR table inside an encrypted range -> refused (rc=$RLR_G_RC), no artifact, ASCII keyword present"
     # ---- 3. 单变量对照：同一份源码去掉 -z pack-relative-relocs ⇒ 必须能打包且与原生一致 ----
     RLR_C_OUT="build/elf_relr_${TAG}_control.enc"
     RLR_C_REP="build/elf_relr_${TAG}_control.json"
