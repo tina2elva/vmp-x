@@ -1094,7 +1094,10 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 							}
 						}
 					}
-					fmt.Printf("[*] ELF 整体加密：DT_RELR 解出 %d 个槽位（隐式 addend），其中 %d 个落在加密范围内 —— 由运行期 RELR 段还原（addend = *slot − delta）", len(relrSlots), inRange)
+					// 末尾那段 ASCII 关键字是给 e2e 用的：断言必须能区分"真的解出了槽位、且至少有槽位落在
+					// 加密范围内"与"什么都没解出来"（否则 RELR 用例会**空转通过**），而带中文的串在
+					// harness 管子里不可靠（见 AGENTS.md）。格式：[DT_RELR slots=N in_range=M]
+					fmt.Printf("[*] ELF 整体加密：DT_RELR 解出 %d 个槽位（隐式 addend），其中 %d 个落在加密范围内 —— 由运行期 RELR 段还原（addend = *slot − delta）[DT_RELR slots=%d in_range=%d]", len(relrSlots), inRange, len(relrSlots), inRange)
 					fmt.Println()
 				}
 				bad := guardELFRelocsInRange(imgSecs, imgRelocs, dynAll, imageBase, relType)

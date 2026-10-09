@@ -1092,7 +1092,17 @@ PY
     fi
     [ -f "$RLR_OUT" ] || fail "packing the DT_RELR fixture produced no artifact"
     # 打包端必须如实记账（报告里点名 DT_RELR 槽位数；ASCII keyword only）
-    printf '%s' "$RLR_MSG" | grep -aqF 'DT_RELR' || fail "the packer must report how many DT_RELR slots it decoded"
+    # 空转防线（本轮实测踩到）：只查 "DT_RELR" 字样是不够的 —— 汇总行里也有这个词，而真正证明
+    # "这条用例没空转"的是**槽位记账**：必须解出槽位，且**至少一个落在加密范围内**（否则运行期
+    # 的 RELR 还原段根本没被走到）。打包端为此打了一段 ASCII 关键字 [DT_RELR slots=N in_range=M]。
+    RLR_ACC="$(printf '%s' "$RLR_MSG" | sed -n 's/.*\[DT_RELR slots=\([0-9][0-9]*\) in_range=\([0-9][0-9]*\)\].*/\1 \2/p' | head -n 1)"
+    if [ -z "$RLR_ACC" ]; then
+        printf '%s\n' "$RLR_MSG" | tail -n 4 | sed 's/^/    /'
+        fail "the packer printed no DT_RELR slot accounting (no slots decoded = the case would be vacuous)"
+    fi
+    RLR_SLOTS="${RLR_ACC%% *}"; RLR_INRANGE="${RLR_ACC##* }"
+    [ "$RLR_INRANGE" -gt 0 ] || fail "no DT_RELR slot fell inside an encrypted range ($RLR_SLOTS decoded) -- the case would be vacuous"
+    echo "[OK  ] RELR accounting: $RLR_SLOTS slot(s) decoded, $RLR_INRANGE inside encrypted range(s)"
     RLR_P_RC=0; RLR_GOT="$(run_target "$TARGET_RUN" "./$RLR_OUT" check-key 10 2>&1)" || RLR_P_RC=$?
     RLR_PS_RC=0; RLR_GOT_SUM="$(run_target "$TARGET_RUN" "./$RLR_OUT" sum-to 100 2>&1)" || RLR_PS_RC=$?
     if [ "$RLR_P_RC" -ne 0 ] || [ "$RLR_GOT" != "$RLR_N" ] || [ "$RLR_PS_RC" -ne 0 ] || [ "$RLR_GOT_SUM" != "$RLR_N_SUM" ]; then
@@ -1123,6 +1133,106 @@ PY
         fail "the DT_RELR-free control product is not identical to native"
     fi
     echo "[OK  ] #600 RELR control: the same source without DT_RELR packs and answers exactly like native (143/5050)"
+fi
+
+
+# ---- RELR（DT_RELR）在 aarch64 上的端到端 ----（STATUS #603.5 登记的唯一缺口）
+# 与 amd64 那块**同一套断言**，只是夹具用交叉 gcc、产物经 qemu 跑：
+#   夹具必须真的带 DT_RELR；带 DT_RELR + 要加密范围 ⇒ 打包成功，且产物与原生逐字节一致。
+# 为什么值得单列：RELR 的解码/还原代码是 arch 无关的（vm_relr_entry 纯算术、类型号按架构取
+# R_*_RELATIVE），但 aarch64 从没跑过这条路径 —— "代码看起来 arch 无关"不是证据。
+if [ -n "$QEMU" ] && [ "${GOARCH_TARGET}" = "arm64" ] && [ -n "${BLOB_CC}" ]; then
+    echo "[*] RELR (aarch64): a DT_RELR target must PACK and match native under qemu"
+    A64RLR_CC=${A64_CC:-aarch64-linux-gnu-gcc}
+    A64RLRBLOB=build/vm_interp_elf_relr_a64
+    ./build/vmpbuild -src "$BLOB_SRC" $([ -n "$BLOB_CC" ] && echo "-cc $BLOB_CC") $([ -n "$BLOB_GUEST" ] && echo "-guest $BLOB_GUEST") $BLOB_EXTRA \
+        -out "$A64RLRBLOB.bin" -manifest "$A64RLRBLOB.json" -entry vm_entry >/dev/null || fail "build the aarch64 RELR block own blob"
+    cat > build/relr_a64.c <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int g_a = 7;
+static int g_b = 9;
+
+/* aarch64 上同样把两个指针槽放进 .text：链接器为它们发 R_AARCH64_RELATIVE，
+ * 加上 -z pack-relative-relocs 后进 .relr.dyn（DT_RELR）。
+ *
+ * 前面那 16KB NOP 填充是**必须的**（本轮实测踩到）：小夹具的可执行段全落在**第一页**
+ * （ELF 头 + 程序头表）里，打包端会整段跳过加密、于是这条用例空转（没有任何槽位需要还原）。
+ * 填充把 .text 推过第一页，同时也让 PT_DYNAMIC 落到后面 —— aarch64 的守卫 1 只加密
+ * "PT_DYNAMIC 之前"的那一段，所以槽位必须在这段里才真的被加密。 */
+__asm__(".section .text\n"
+        ".globl relr_a64_pad\n"
+        "relr_a64_pad:\n"
+        ".space 16384, 0x90\n"
+        ".balign 8\n"
+        ".globl relr_tbl\n"
+        "relr_tbl:\n"
+        ".quad g_a\n"
+        ".quad g_b\n"
+        ".previous\n");
+extern int *const relr_tbl[2];
+
+__attribute__((noinline)) unsigned long checkKey(unsigned long x) { return ((x * 7) + 42) ^ 0xFF; }
+__attribute__((noinline)) long sumTo(long n) { long s = 0; for (long i = 1; i <= n; i++) s += i; return s; }
+
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: relr_a64 <check-key|sum-to> <arg>\n"); return 2; }
+    long da = (long)relr_tbl[0] - (long)&g_a;
+    long db = (long)relr_tbl[1] - (long)&g_b;
+    if (da != 0 || db != 0) { printf("BADSLOTS %ld %ld\n", da, db); return 4; }
+    unsigned long v = strtoul(argv[2], 0, 0);
+    if (strcmp(argv[1], "check-key") == 0) printf("%lu\n", checkKey(v));
+    else if (strcmp(argv[1], "sum-to") == 0) printf("%ld\n", sumTo((long)v));
+    else return 2;
+    return 0;
+}
+EOF
+    "$A64RLR_CC" -fPIE -pie -O1 -Wl,-z,notext -Wl,-z,pack-relative-relocs -o build/elf_target_relr_a64 build/relr_a64.c \
+        || fail "build the aarch64 RELR fixture"
+    # 夹具校准：必须真的带 DT_RELR（否则用例空转）。
+    readelf -dW build/elf_target_relr_a64 | grep -q 'RELR' || fail "the aarch64 RELR fixture has no DT_RELR dynamic tag (vacuous case)"
+    readelf -rW build/elf_target_relr_a64 | grep -q '.relr.dyn' || fail "the aarch64 RELR fixture has no .relr.dyn section"
+    # 注意：这里必须用**不加引号**的 $TARGET_RUN（= "qemu-aarch64 -L <ld dir>"）—— 既需要 -L 才能找到
+    # aarch64 的 ld.so，又不能用 run_target（那个 helper 把 runner 当**单个命令名**执行，含空格会失败）。
+    A64RLR_N_RC=0; A64RLR_N="$( $TARGET_RUN ./build/elf_target_relr_a64 check-key 10 2>&1 )" || A64RLR_N_RC=$?
+    if [ "$A64RLR_N_RC" -ne 0 ] || [ "$A64RLR_N" != "143" ]; then
+        echo "[MISMATCH] aarch64 RELR fixture native: rc=$A64RLR_N_RC out=[$A64RLR_N] (want 143)"
+        fail "the aarch64 RELR fixture does not run natively under qemu"
+    fi
+    A64RLR_OUT="build/elf_relr_a64_${TAG}.enc"
+    A64RLR_REP="build/elf_relr_a64_${TAG}.json"
+    rm -f "$A64RLR_OUT" "$A64RLR_REP"
+    A64RLR_RC=0
+    A64RLR_MSG="$("./build/vmpack" -exe build/elf_target_relr_a64 -func checkKey -func sumTo \
+        -enc-image-elf-pie -enc-image-elf-pie-relocs \
+        -blob "$A64RLRBLOB.bin" -manifest "$A64RLRBLOB.json" \
+        -out "$A64RLR_OUT" -report "$A64RLR_REP" 2>&1)" || A64RLR_RC=$?
+    if [ "$A64RLR_RC" -ne 0 ]; then
+        echo "[MISMATCH] the packer REFUSED an aarch64 DT_RELR target (rc=$A64RLR_RC)"
+        printf '%s\n' "$A64RLR_MSG" | tail -n 3 | sed 's/^/    /'
+        fail "an aarch64 DT_RELR target must pack (RELR is supported since STATUS #603)"
+    fi
+    # 空转防线（本轮实测踩到）：只查 "DT_RELR" 字样是不够的 —— 汇总行里也有这个词，而真正证明
+    # "这条用例没空转"的是**槽位记账**：必须解出槽位，且**至少一个落在加密范围内**（否则运行期
+    # 的 RELR 还原段根本没被走到）。打包端为此打了一段 ASCII 关键字 [DT_RELR slots=N in_range=M]。
+    A64RLR_ACC="$(printf '%s' "$A64RLR_MSG" | sed -n 's/.*\[DT_RELR slots=\([0-9][0-9]*\) in_range=\([0-9][0-9]*\)\].*/\1 \2/p' | head -n 1)"
+    if [ -z "$A64RLR_ACC" ]; then
+        printf '%s\n' "$A64RLR_MSG" | tail -n 4 | sed 's/^/    /'
+        fail "the packer printed no DT_RELR slot accounting (no slots decoded = the case would be vacuous)"
+    fi
+    A64RLR_SLOTS="${A64RLR_ACC%% *}"; A64RLR_INRANGE="${A64RLR_ACC##* }"
+    [ "$A64RLR_INRANGE" -gt 0 ] || fail "no DT_RELR slot fell inside an encrypted range ($A64RLR_SLOTS decoded) -- the case would be vacuous"
+    echo "[OK  ] RELR accounting: $A64RLR_SLOTS slot(s) decoded, $A64RLR_INRANGE inside encrypted range(s)"
+    A64RLR_P_RC=0; A64RLR_GOT="$( $TARGET_RUN "./$A64RLR_OUT" check-key 10 2>&1 )" || A64RLR_P_RC=$?
+    A64RLR_S_RC=0; A64RLR_SUM="$( $TARGET_RUN "./$A64RLR_OUT" sum-to 100 2>&1 )" || A64RLR_S_RC=$?
+    if [ "$A64RLR_P_RC" -ne 0 ] || [ "$A64RLR_GOT" != "$A64RLR_N" ] || [ "$A64RLR_S_RC" -ne 0 ] || [ "$A64RLR_SUM" != "5050" ]; then
+        echo "[MISMATCH] aarch64 DT_RELR product: check-key native=[$A64RLR_N](rc=$A64RLR_N_RC) packed=[$A64RLR_GOT](rc=$A64RLR_P_RC); sum-to packed=[$A64RLR_SUM](rc=$A64RLR_S_RC)"
+        printf '%s\n' "$A64RLR_GOT" | head -n 3 | sed 's/^/    /'
+        fail "the aarch64 DT_RELR product is not byte-identical to native (the arch-independent claim is unproven)"
+    fi
+    echo "[OK  ] #604 RELR (aarch64): DT_RELR target + encryptable ranges -> packs, and the product answers exactly like native under qemu (143/5050)"
 fi
 
 # ---- aarch64：加密范围内重定位 —— 打包侧的范围等式 + 运行期"必须与原生一致"都是真断言 ----
