@@ -1228,11 +1228,15 @@ EOF
       **BOM + CRLF**；纯 ASCII 的新脚本（如 `tools/harness.ps1`）不需要 BOM。
 ## RELR 落地后新登记（`STATUS #603`）
 
-- [ ] **aarch64 上的 RELR 端到端证据**：RELR 的 e2e 块与 C 侧 KAT 目前只跑 `amd64`(非 QEMU) 路径。
+- [x] **aarch64 上的 RELR 端到端证据 —— 已落地（`STATUS #604`，提交 `98d7bbf`）**：夹具（`.text` 前 16KB NOP 填充，否则可执行段全在第一页里、打包端整段跳过 ⇒ 空转）+ qemu 下与原生逐字节一致（143/5050），本机实测 slot=7 / in_range=2。
       代码是 arch 无关的（纯算术 + 按架构取 `R_*_RELATIVE`），但**没在 aarch64 上跑过**。
       做法：在 `tools/e2e_elf_image.sh` 的 aarch64 块里复刻 RELR 夹具（`aarch64-linux-gnu-gcc` + `-z pack-relative-relocs`），跑 qemu。
 - [ ] **"DT_RELR 表落在加密范围内 ⇒ 拒绝"这条新守卫缺 committed 负例**（`STATUS #603.5`）：
       需要构造一个 `.relr.dyn` 落在可加密范围里的目标，断言 `rc≠0` + 不落产物 + 信息含 `DT_RELR 表`。
 - [ ] **诊断/打包脚本的纪律（`STATUS #603.6`）**：① 任何探针先打印"未解引用的值"再解引用（本轮被自己插错的诊断骗到 SIGBUS）；
       ② 任何 `vmpbuild` 调用都必须检查退出码 —— 编译失败 + 旧 blob = 假结论（本轮的单变量实验就白跑了一轮）。
+- [ ] **CI 上 RELR 还原路径仍是 `[SKIP]`**（`STATUS #604.3/#604.5`）：CI 的交叉工具链不产出 DT_RELR，
+      CI 的 linker 又把 `.text` 的相对重定位留在 `.rela.dyn` ⇒ 两条 RELR 用例在 CI 上按约定醒目 SKIP。
+      要在 CI 上也真跑：换一个会产出 DT_RELR 的交叉工具链，或把 amd64 夹具改成"相对重定位不被 .text 吸收"的布局。
+- [ ] **"DT_RELR 表落在加密范围内 ⇒ 拒绝"缺 committed 负例**（`#603.5`，仍未做）。
 

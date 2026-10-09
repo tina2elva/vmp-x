@@ -11112,6 +11112,56 @@ tier (3)，分类器就只说这一档、缺的档显式 SKIP，不超出实测�
    并验证"补丁真的进了 blob"（本轮用 `strings blob | grep 诊断串` 核对）。
 
 **互指**：`#602.5` 的 KAT 规矩在本条执行；`#600.5` 的"RELR 支持"登记至此结清；本条翻转了 `#601.2` 第 3 步的断言方向。
+### 604. aarch64 的 DT_RELR 端到端（补 `#603.5` 的缺口）+ 堵住"用例空转"这个漏洞
+
+**范围与 sha**：`98d7bbf`（aarch64 用例 + 空转防线 + ASCII 记账关键字）、`006831e`（两条"能力相关"断言降级为醒目 SKIP）。
+
+#### 604.1 aarch64 端到端（`#603.5` 登记的缺口）
+
+同一套断言，夹具换交叉 gcc、产物经 qemu 跑：夹具必须真的带 DT_RELR → 原生回答 143 → 打包成功 →
+产物与原生逐字节一致（143/5050）。
+
+**两个必须知道的坑（都是本轮实测）**：
+1. **小夹具会整段跳过加密**：aarch64 的可执行段若全落在**第一页**（ELF 头+程序头表）里，打包端跳过它 ⇒
+   用例**空转**（没有任何槽位需要还原）。夹具因此在 `.text` 前面加了 **16KB NOP 填充**，把槽位与
+   `PT_DYNAMIC` 都推到第一页之后（aarch64 的守卫 1 只加密 "PT_DYNAMIC 之前"的那一段）。
+2. **arm64 下不能用 `run_target`**：它把 runner 当**单个命令名**执行，而 `TARGET_RUN` 是
+   `"qemu-aarch64 -L <ld dir>"`（含空格）⇒ 报 No such file or directory；直接 `$QEMU` 又找不到 ld.so。
+   正解是**不加引号**的 `$TARGET_RUN`（词分割正是它的用法）。
+
+#### 604.2 "用例空转"防线（本轮最有价值的一条）
+
+原来的断言只查打包端输出里有没有 "DT_RELR" 字样 —— 而**汇总行里也有这个词**，所以"一个槽位都没解出来"
+也能通过。现在打包端在记账行末尾打一段 ASCII 关键字（带中文的串在 harness 管子里不可靠）：
+
+> `[DT_RELR slots=N in_range=M]`
+
+e2e 解析它并断言 `in_range > 0` —— 否则这条用例"什么都没验"。
+
+#### 604.3 CI 上两条断言"红得正确"，处置为醒目 SKIP（`006831e`）
+
+run `37875821334` 上 `linux-amd64` 与 `linux-arm64` 都红了，原因是**工具链能力/布局**，不是产品缺陷：
+1. `linux-amd64`：CI 的 linker 把 `.text` 里的相对重定位留在 `.rela.dyn`（只把别处的 3 条打包进 `.relr.dyn`）
+   ⇒ 加密范围里没有 RELR 槽位 ⇒ 运行期 RELR 还原段没被走到；
+2. `linux-arm64`：CI 的交叉工具链**不产出 DT_RELR**（`-z pack-relative-relocs` 没生效）。
+
+按仓库既有约定（缺能力要**单独记账**、绝不混进 `[OK]`）：这两种情形改为打印 `[SKIP]` 三行说明并不 fail；
+能力具备时仍走硬断言。**如实降级**：在 CI 上这两条 RELR 还原路径是 `[SKIP]`，真跑的是本机（binutils 2.46）+ C 侧 KAT。
+
+#### 604.4 证据
+
+- 本机两种模式都是**真跑**：`amd64 → [OK] RELR accounting: 5 slot(s) decoded, 2 inside encrypted range(s)`；
+  `aarch64 → [OK] RELR accounting: 7 slot(s) decoded, 2 inside encrypted range(s)` + qemu 下 143/5050 与原生一致。
+- `tools/preflight.ps1` ⇒ OK；`tools/gates.ps1` ⇒ `total 16 gates, 0 failed, 0 skipped`（WSL 全 step OK）。
+- CI **三个作业全绿**：run `37876381092`（判定 sha = `006831e`）。
+
+#### 604.5 未做项
+
+- **CI 上 RELR 还原路径未被走到**（两条都是 `[SKIP]`）：要在 CI 上也真跑，需要一个能产出 DT_RELR 的
+  交叉工具链（或把 amd64 夹具换成"相对重定位不被 .text 吸收"的布局）。已登记在 `docs/TODO.md`。
+- `#603.5` 的另一条（"DT_RELR 表落在加密范围内 ⇒ 拒绝"的新守卫缺 committed 负例）**仍未做**。
+
+**互指**：本条补上 `#603.5` 的第 1 条未做项；`#603` 的机制与契约测试是本条的前提。
 
 
 
