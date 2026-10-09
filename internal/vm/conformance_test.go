@@ -214,6 +214,11 @@ func genRandomCases(seed int64, n int) []confCase {
 	return cases
 }
 
+// randDivInsns 由 emitRandInsn 填：生成的 DIV/IDIV 指令条数。
+// 与 randCasesWithLoop 同理 —— 防的是"这一类指令其实一条都没生成"的**空转**
+// （#604.2 的教训：断言必须能区分"真的验了"和"什么都没验"）。
+var randDivInsns int
+
 // randCasesWithLoop 由 genRandomCases 填：含**真循环**（往回跳）的程序条数。
 // 测试里断言它占相当比例 —— 防的是"循环生成悄悄失效、用例其实全是直行代码"这种**空转**
 // （#604.2 的教训：断言必须能区分"真的验了"和"什么都没验"）。
@@ -301,7 +306,7 @@ func emitRandInsn(rng *rand.Rand, buf *[]byte, patches *[]int, work []byte, base
 	a := work[rng.Intn(len(work))]
 	b := work[rng.Intn(len(work))]
 	w := widths[rng.Intn(len(widths))]
-	switch rng.Intn(12) {
+	switch rng.Intn(13) {
 	case 0:
 		*buf = append(*buf, OpMovRR, byte(w), d, a)
 	case 1:
@@ -343,6 +348,25 @@ func emitRandInsn(rng *rand.Rand, buf *[]byte, patches *[]int, work []byte, base
 			*patches = append(*patches, len(*buf))
 			*buf = append(*buf, 0, 0, 0, 0)
 		}
+	case 12: // DIV/IDIV —— **只生成不会 trap 的输入**
+		// 除零 / 商放不下会让解释器走硬门（ud2），而批量对拍里**一条 trap 就整个进程挂掉**
+		// ⇒ 随机程序里只喂安全输入：RDX=0（被除数高半）、RAX=小正数、除数寄存器=非零常数，
+		// 于是商必然放得下（三种宽度都成立）。
+		// 两个被约束的寄存器不能当除数：RAX(0) 是被除数低半、RDX(2) 是高半 ⇒ 除数只从 {1,3,5} 里挑。
+		divRegs := []byte{1, 3, 5}
+		dv := divRegs[rng.Intn(len(divRegs))]
+		kind := byte(KDivU)
+		if rng.Intn(2) == 0 {
+			kind = KDivS
+		}
+		*buf = append(*buf, OpMovRI, 64, 2) // RDX = 0
+		*buf = append(*buf, u64b(0)...)
+		*buf = append(*buf, OpMovRI, 64, 0) // RAX = 小正数（0..64）
+		*buf = append(*buf, u64b(uint64(rng.Intn(65)))...)
+		*buf = append(*buf, OpMovRI, byte(w), dv) // 除数 = 非零常数（2..255，任意宽度下都非零）
+		*buf = append(*buf, u64b(uint64(2+rng.Intn(254)))...)
+		*buf = append(*buf, OpAluU, kind, byte(w), 0, dv) // dst 不用：商→RAX、余→RDX
+		randDivInsns++
 	}
 }
 
@@ -409,7 +433,10 @@ func TestConformanceAgainstCInterpreter(t *testing.T) {
 		t.Fatalf("随机程序里带循环的只有 %d/%d 条 —— 循环生成八成失效了（这条用例的卖点就是循环覆盖）",
 			randCasesWithLoop, randProgramCount)
 	}
-	t.Logf("随机程序 %d 条，其中带真循环（往回跳）的 %d 条", randProgramCount, randCasesWithLoop)
+	t.Logf("随机程序 %d 条：带真循环（往回跳）的 %d 条、DIV/IDIV 指令 %d 条", randProgramCount, randCasesWithLoop, randDivInsns)
+	if randDivInsns == 0 {
+		t.Fatal("随机程序里一条 DIV/IDIV 都没有 —— 除法覆盖是假的")
+	}
 
 	// 写 cases 文件
 	dir := t.TempDir()
