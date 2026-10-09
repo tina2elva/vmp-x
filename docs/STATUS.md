@@ -11331,6 +11331,50 @@ if (vm->regs[VRSP] > rsp_start)             return 97; // 弹出过多：SP 高�
 - 随机差分的覆盖面（`#606.5`）：仍无"能跳回前面"的循环、无 PUSH/POP/CALL/DIV/FP/ATOMIC。
 
 **互指**：本条收口 `#606.3` 的发现；`#607.2` 的死分支是"硬门分支清单"这条纪律的第一个产出。
+### 608. 客户机栈判据调序：让 `rc=97` 重新可达（结清 `#607.2` 登记的处置项）
+
+**范围与 sha**：`6706412`。改 `stub/win/x64/vm_interp.c`、`stub/win/x64/rsp_guard_probe.c`、
+`tools/harness.ps1`、`tools/e2e_elf_image.sh`。
+
+#### 608.1 问题
+
+`#607.2` 实测：97 那条判据永远走不到 —— SP 高过进入值时，前一条 `rsp_start - SP` 在无符号下溢成
+≈2^64，于是 `99` 先命中。两条证据：删掉 97 行为不变；Linux 侧实测 rc=99。
+
+#### 608.2 改法：**调序**
+
+```c
+if (vm->regs[VRSP] > rsp_start)             return 97; // 先判这条（SP 高过进入值）
+if (rsp_start - vm->regs[VRSP] > VM_MARGIN) return 99; // 此时 SP <= rsp_start，减法不下溢
+```
+
+- 硬门**类别不变**（两条都走 `vm_fail_closed` ⇒ Windows `ud2` / Linux `exit_group`），只是**报出的码更准确**；
+- 只有"SP 高过进入值"这一类状态的码从 99 变成 97；"压栈越过下界"仍是 99（32 位那条历史注释说的就是它，不受影响）；
+- 仓库内没有别处**断言**这两个码（扫过一遍：只有注释提到 99）。
+
+#### 608.3 回归与校准（校准内建在断言里）
+
+`tools/e2e_elf_image.sh`（amd64 路径）新增：mode 1（SP == 进入值）⇒ 必须 `rc=0`；
+mode 0（SP > 进入值）⇒ 必须 `rc=97`。断言里写明"调序之前这条会红（那时是 99）"，
+所以**校准不需要额外步骤**：谁把顺序改回去，这条立刻红。
+
+精确码只能在这里断言 —— Linux 的硬门是 `exit_group(0xC0DE0000|code)`（低 8 位是 code），而 Windows 的 `ud2` 不带码；
+所以 `tools/harness.ps1` 那边仍只断言"异常终止且无输出"，两边注释互相指路。
+
+#### 608.4 证据
+
+- Linux 实测：mode 0 调序前 `rc=99` → 调序后 `rc=97`；mode 1 两版都是 `rc=0`；
+- Windows 实测：行为不变（mode 0 仍是 `0xC000001D` 且无输出，mode 1 仍 `rc=0`）；
+- `tools/e2e_elf_image.sh --strict` ⇒ `[OK  ] #608 guest-stack guard: SP above entry -> hard gate 97 (reachable), SP == entry -> rc=0`，整体 OK；
+- `tools/preflight.ps1` ⇒ OK（按既有约定重建了 `build/runbc*.exe`）；`tools/gates.ps1` ⇒ `total 16 gates, 0 failed, 0 skipped`。
+
+#### 608.5 未做项
+
+- 本条**无遗留**（`#607.2` 登记的处置项结清）。
+- 仍在册：随机差分覆盖面（`#606.5`：无"能跳回前面"的循环、无 PUSH/POP/CALL/DIV/FP/ATOMIC）、
+  aarch64 在 CI 上仍 `[SKIP]`（交叉工具链不产 DT_RELR）。
+
+**互指**：本条是 `#607.2` 的直接处置；两条判据的**语义**没变，变的只是可达性与报码准确度。
 
 
 
