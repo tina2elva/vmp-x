@@ -951,16 +951,15 @@ if [ -z "$QEMU" ] && [ "$GOARCH_TARGET" = "amd64" ]; then
 static int g_a = 7;
 static int g_b = 9;
 
-/* Two absolute pointer slots inside the EXECUTABLE section: the linker must emit
- * R_X86_64_RELATIVE for them, and with -z pack-relative-relocs those entries go to
- * .relr.dyn (DT_RELR) instead of .rela.dyn. */
-__asm__(".section .text\n"
-        ".globl relr_tbl\n"
-        "relr_tbl:\n"
-        ".quad g_a\n"
-        ".quad g_b\n"
-        ".previous\n");
-extern int *const relr_tbl[2];
+/* 两个指向本镜像的指针槽，放在**只读数据节**里（不是 .text）：
+ *   · 链接器为它们发 R_X86_64_RELATIVE；带 -z pack-relative-relocs 时进 .relr.dyn（DT_RELR）；
+ *   · .rodata 会被打包端整体加密，而它里面**没有**显式 RELA 相对重定位（全被 RELR 打包了）
+ *     ⇒ 不会被 -enc-image-elf-pie-relocs 的"范围含重定位就跳过"逻辑排除
+ *     ⇒ RELR 槽位**必然落在加密范围内**，运行期 RELR 还原段必然被走到。
+ * 为什么不用 .text（第一版就是那么写的，在 CI 上会空转）：较老的 ld 把 .text 里的相对重定位
+ * 留在 .rela.dyn（不打包进 RELR），于是加密范围里根本没有 RELR 槽位，用例静默变成空转
+ * —— 这正是 STATUS #604.3 记录的那次"红得正确"。 */
+__attribute__((used, section(".rodata"))) const int *const relr_tbl[2] = { &g_a, &g_b };
 
 __attribute__((noinline)) unsigned long checkKey(unsigned long x) { return ((x * 7) + 42) ^ 0xFF; }
 __attribute__((noinline)) long sumTo(long n) { long s = 0; for (long i = 1; i <= n; i++) s += i; return s; }
@@ -1101,16 +1100,13 @@ PY
         fail "the packer printed no DT_RELR slot accounting (no slots decoded = the case would be vacuous)"
     fi
     RLR_SLOTS="${RLR_ACC%% *}"; RLR_INRANGE="${RLR_ACC##* }"
+    # 夹具放在 .rodata 之后这条是**硬断言**（#604.6）：两种工具链上都必然有 RELR 槽位落在加密范围内，
+    # 所以"in_range==0"只可能是真的出问题（而非工具链布局差异），必须是红的。
     if [ "$RLR_INRANGE" -eq 0 ]; then
-        # 这不是产品缺陷，是**这条工具链的链接布局**：较老的 ld 把 .text 里的相对重定位留在 .rela.dyn
-        # （只把别处的打包进 .relr.dyn），于是加密范围里没有 RELR 槽位 ⇒ 运行期 RELR 还原段没被走到。
-        # 按仓库约定"未验证的单独记账"：**醒目 SKIP**，绝不混进 [OK]（CI runner 实测就是这一档）。
-        echo "[SKIP] RELR restore path NOT exercised here: $RLR_SLOTS RELR slot(s) decoded, none inside an encrypted range"
-        echo "[SKIP]   (this linker keeps the .text relative relocs in .rela.dyn instead of packing them into .relr.dyn;"
-        echo "[SKIP]    the restore path is exercised by the aarch64 case below and by the C-side contract KAT)"
-    else
-        echo "[OK  ] RELR accounting: $RLR_SLOTS slot(s) decoded, $RLR_INRANGE inside encrypted range(s)"
+        printf '%s\n' "$RLR_MSG" | tail -n 3 | sed 's/^/    /'
+        fail "no DT_RELR slot fell inside an encrypted range ($RLR_SLOTS decoded) -- the case would be vacuous"
     fi
+    echo "[OK  ] RELR accounting: $RLR_SLOTS slot(s) decoded, $RLR_INRANGE inside encrypted range(s)"
     RLR_P_RC=0; RLR_GOT="$(run_target "$TARGET_RUN" "./$RLR_OUT" check-key 10 2>&1)" || RLR_P_RC=$?
     RLR_PS_RC=0; RLR_GOT_SUM="$(run_target "$TARGET_RUN" "./$RLR_OUT" sum-to 100 2>&1)" || RLR_PS_RC=$?
     if [ "$RLR_P_RC" -ne 0 ] || [ "$RLR_GOT" != "$RLR_N" ] || [ "$RLR_PS_RC" -ne 0 ] || [ "$RLR_GOT_SUM" != "$RLR_N_SUM" ]; then
