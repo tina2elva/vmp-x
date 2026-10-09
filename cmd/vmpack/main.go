@@ -1041,12 +1041,12 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 			// 覆盖面（#597 复评 F4，round-3 按 R1/R2 收紧）：
 			//   · DynRelocs 读 DT_RELA/DT_REL（.rela.dyn）与 DT_JMPREL（+DT_PLTRELSZ/DT_PLTREL，
 			//     .rela.plt，含 IRELATIVE 这种 r_offset 落在可执行段里的情形）；
-			//   · **隐式 addend** 的条目（DT_REL 语义 / RELR）另有一条判据 (c)：落在加密范围里直接拒绝
-			//     —— 表里没有 r_addend，NormalizeRelocSlots 与运行期应用器都按 0 处理，会把真实槽位清零；
-			//   · **DT_RELR 不解析**：只要目标带 DT_RELR 且要加密任何范围，整个打包就被拒绝
-			//     （见上面的 HasRELR 分支）。RELR 是隐式 addend 表，而运行期应用器只读 DT_RELA/DT_REL
-			//     （vm_interp.c 的 vm_reloc_fix），没有 RELR 还原路径 ⇒ 放行 = 交付运行期必硬门的坏产物。
-			//     RELR 支持（含 stub 应用器 + 运行期端到端用例）登记为后续项。
+			//   · **显式表里的隐式 addend** 条目（DT_REL 语义）另有一条判据 (c)：落在加密范围里直接拒绝
+			//     —— 表里没有 r_addend，NormalizeRelocSlots 会按 0 把真实槽位清零；
+			//   · **DT_RELR 走一条独立的路**（STATUS #603）：它同样不写 r_addend，但运行期应用器现在有
+			//     专门的 RELR 段（隐式 addend：addend = *slot − delta）⇒ 允许落在加密范围里；代价是多了
+			//     一条**新守卫**：DT_RELR 表自身不能落在被加密的范围里（应用器在验签/解密**之前**就要读它）。
+			//     RELR 槽位**不进** imgRelocList/NormalizeRelocSlots —— 那条路会按 Addend=0 把真实槽位清零。
 			// 边界（如实登记，见 #597 复评 F3）：记表的循环对 **ET_EXEC 不建表**，所以对 ET_EXEC 产物
 			// 一旦加密范围里真的出现相对重定位，(b) 会把它**拒绝**掉 —— 这是有意的 fail-closed，
 			// 而不是"支持 ET_EXEC 的相对重定位"。
@@ -1059,18 +1059,43 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				if relType == 0 {
 					fatalf("机器类型 0x%X 没有登记相对重定位类型号（无法判断加密范围里的重定位是否可还原）", f.Machine)
 				}
-				// #597 复评 R1/R2：目标带 DT_RELR（压缩相对重定位）⇒ **直接拒绝打包**，不依赖任何
-				// RELR 解码器。理由：DT_RELR 的条目是**隐式 addend**（加数在槽位里，表里没有 r_addend），
-				// 而运行期应用器只读 DT_RELA/DT_REL（stub/win/x64/vm_interp.c 的 vm_reloc_fix 按
-				// DT_RELA/DT_RELASZ 找表），根本没有 RELR 还原路径 ⇒ "记进应用表就一定能还原"这条推理
-				// 对 RELR 不成立，放行等于交付一个运行期必然硬门的坏产物。
-				// （RELR 支持登记为后续项；解码器曾经写错过三处，见 internal/load/elf.HasRELR 的注释。）
-				hasRelr, hrerr := f.HasRELR()
-				if hrerr != nil {
-					fatalf("读不出动态表（无法判断目标是否带 DT_RELR）：%v", hrerr)
+				// DT_RELR（压缩相对重定位）**已支持**（STATUS #603）。运行期应用器
+				// （stub/win/x64/vm_interp.c 的 vm_relr_entry + vm_reloc_fix 的 RELR 段）按隐式
+				// addend 语义还原：addend = *slot − delta，验签前把槽位还原成原始密文，解密后再 += delta。
+				// 两条 fail-closed：
+				//   ① 解码必须成功 —— RelrRelocs 对尺寸/越界/槽位不在 PT_LOAD 内都报错，绝不放行半张表；
+				//   ② **DT_RELR 表自身不得落在被加密的范围里** —— 应用器在验签/解密**之前**就要读它。
+				relrSlots, rerr := f.RelrRelocs()
+				if rerr != nil {
+					fatalf("拒绝打包：目标带 DT_RELR，但解码失败：%v（解码是 fail-closed 的，绝不放行半张表）", rerr)
 				}
-				if hasRelr {
-					fatalf("拒绝打包：目标带 DT_RELR（压缩相对重定位），而要加密至少 %d 个范围。DT_RELR 的条目是隐式 addend（加数在槽位里），运行期应用器只读 DT_RELA/DT_REL、没有 RELR 还原路径 ⇒ 无法保证这些槽位可还原。\n    可操作选项：去掉 -enc-image-elf-pie / -enc-image-elf（不加密 ELF 原镜像），或让目标不带 DT_RELR（例如关掉 -z pack-relative-relocs）。", len(imgSecs))
+				rtabVA, rtabSz, terr := f.RelrTableRange()
+				if terr != nil {
+					fatalf("读不出 DT_RELR 表地址：%v", terr)
+				}
+				if rtabSz != 0 {
+					rLo, rHi := rtabVA, rtabVA+rtabSz
+					for _, s := range imgSecs {
+						sLo := imageBase + uint64(s.RVA)
+						sHi := sLo + uint64(s.Size)
+						if rLo < sHi && sLo < rHi {
+							fatalf("拒绝打包：DT_RELR 表 [0x%X,0x%X) 落在要加密的范围 [0x%X,0x%X) 里 —— 运行期应用器在验签/解密**之前**就要读这张表，落在密文里会算出垃圾槽位。\n    可操作选项：不加密该范围（去掉 -enc-image-elf-pie-relocs / -enc-image-elf-pie），或改用把 .relr.dyn 放在加密范围之外的链接布局。", rLo, rHi, sLo, sHi)
+						}
+					}
+				}
+				if len(relrSlots) > 0 {
+					inRange := 0
+					for _, r := range relrSlots {
+						for _, s := range imgSecs {
+							sLo := imageBase + uint64(s.RVA)
+							if r.Offset >= sLo && r.Offset < sLo+uint64(s.Size) {
+								inRange++
+								break
+							}
+						}
+					}
+					fmt.Printf("[*] ELF 整体加密：DT_RELR 解出 %d 个槽位（隐式 addend），其中 %d 个落在加密范围内 —— 由运行期 RELR 段还原（addend = *slot − delta）", len(relrSlots), inRange)
+					fmt.Println()
 				}
 				bad := guardELFRelocsInRange(imgSecs, imgRelocs, dynAll, imageBase, relType)
 				for i, m := range bad {
@@ -1082,7 +1107,7 @@ func packELF(exe, outPath string, stub []byte, entryOff, frameSkew int, descMagi
 				if len(bad) > 0 {
 					fatalf("拒绝打包：%d 条动重定位落在要加密的范围里、但运行期还原不了（RVA 见上）。ld.so 会在入口点之前按动态表**无条件改写**这些槽位，而运行期应用器只认识 R_*_RELATIVE(type=%d)、且只碰重定位应用表里登记过的位置 ⇒ 这个产物要么验签失败、要么跑错。\n    可操作选项：去掉 -enc-image-elf-pie-relocs / -enc-image-elf-pie（不加密这些范围），或改用把这些槽位放在加密范围之外的链接布局。", len(bad), relType)
 				}
-				fmt.Printf("[*] ELF 整体加密：加密范围内的动重定位全部可还原（R_*_RELATIVE(type=%d)、显式 addend、且在应用表里），共核对 %d 条动态项（DT_RELA/DT_REL + DT_JMPREL；带 DT_RELR 的目标已在上面按 fail-closed 拒绝）", relType, len(dynAll))
+				fmt.Printf("[*] ELF 整体加密：加密范围内的动重定位全部可还原（R_*_RELATIVE(type=%d)、显式 addend、且在应用表里），共核对 %d 条动态项（DT_RELA/DT_REL + DT_JMPREL；DT_RELR 另走 RELR 段，见上面的槽位记账）", relType, len(dynAll))
 				fmt.Println()
 			}
 			// fail-closed 的最后一道自洽检查：要写进解密表的每个范围，必须能用**产物自己**的程序头

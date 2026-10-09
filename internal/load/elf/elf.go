@@ -830,20 +830,9 @@ const RelrEntrySize = 8
 // fail-closed：条目尺寸不是 8、表越界/不是 8 的整数倍、或解出的槽位不在任何 PT_LOAD 内 ⇒ 报错，
 // 绝不返回"半张表"（少一条就可能让打包端放行一个运行期还原不了的槽位）。
 func (f *File) RelrRelocs() ([]Reloc, error) {
-	ents, err := f.DynamicEntries()
+	addr, size, ent, err := f.relrTags()
 	if err != nil {
 		return nil, err
-	}
-	var addr, size, ent uint64
-	for _, e := range ents {
-		switch e.Tag {
-		case DT_RELR:
-			addr = e.Val
-		case DT_RELRSZ:
-			size = e.Val
-		case DT_RELRENT:
-			ent = e.Val
-		}
 	}
 	if size == 0 {
 		return nil, nil
@@ -896,6 +885,37 @@ func (f *File) RelrRelocs() ([]Reloc, error) {
 		base += 63 * RelrEntrySize
 	}
 	return out, nil
+}
+
+// relrTags 读 DT_RELR / DT_RELRSZ / DT_RELRENT 三个标签（没有就都是 0）。
+func (f *File) relrTags() (addr, size, ent uint64, err error) {
+	ents, derr := f.DynamicEntries()
+	if derr != nil {
+		return 0, 0, 0, derr
+	}
+	for _, e := range ents {
+		switch e.Tag {
+		case DT_RELR:
+			addr = e.Val
+		case DT_RELRSZ:
+			size = e.Val
+		case DT_RELRENT:
+			ent = e.Val
+		}
+	}
+	return addr, size, ent, nil
+}
+
+// RelrTableRange 返回 DT_RELR 表自身的 (VA, size)（没有 DT_RELR 时返回 0, 0）。
+//
+// 打包端需要它做一条守卫：**DT_RELR 表不能落在被加密的范围里**。运行期应用器（vm_reloc_fix）
+// 在验签/解密**之前**就要读这张表来算出槽位地址 —— 表本身是密文的话，算出来的槽位就是垃圾。
+func (f *File) RelrTableRange() (uint64, uint64, error) {
+	addr, size, _, err := f.relrTags()
+	if err != nil {
+		return 0, 0, err
+	}
+	return addr, size, nil
 }
 
 // checkRelrSlot 是"解码失步"的兜底：解出的槽位必须 8 字节对齐，且完整落在某个 PT_LOAD 内。

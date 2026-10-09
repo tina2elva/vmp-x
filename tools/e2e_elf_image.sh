@@ -911,16 +911,17 @@ fi
 
 # ---- RELR（DT_RELR 压缩相对重定位）---- 打包端 fail-closed 决策的 committed 见证 ----
 #
-# 取向（docs/STATUS.md #600 §600.5）：**不支持 RELR** —— 目标带 DT_RELR 且要加密任何范围 ⇒ 拒绝打包。
-# 理由：RELR 的条目是**隐式 addend**（加数在槽位里，条目里没有 r_addend），而运行期应用器
-# （stub/win/x64/vm_interp.c 的 vm_reloc_fix）只读 DT_RELA/DT_REL，没有 RELR 还原路径
-# ⇒ "记进应用表就能还原"这条推理对 RELR 不成立（放行 = 交付运行期必硬门的坏产物）。
+# 取向（docs/STATUS.md #603）：**RELR 已支持**。运行期应用器（stub/win/x64/vm_interp.c 的
+# vm_relr_entry + vm_reloc_fix 的 RELR 段）按隐式 addend 语义还原：打包端加密的是槽位**原本的字节**，
+# 产物里躺着的是**密文 C**，而 ld.so 在入口点之前做的是 C += l_addr ⇒ 减回去就得到 C。
+# **这里不是 XOR 密码流**（显式表那条路是从表里的 r_addend 重算密文，RELR 没有 addend 可重算）。
+# 本块从 #600 的"断言拒绝"翻转为"断言产物与原生逐字节一致"，并新增 C 侧契约 KAT。
 #
 # 本条用例做三件事（全是真断言，不是复述策略）：
 #   1. **夹具校准**：readelf 必须真的解出 DT_RELR 与 .relr.dyn，且用"已与 readelf 对齐的解码器"
 #      独立解出的**条目数**必须等于 readelf 印的 "contains N entries"（所有 binutils 版本都印）；
 #      较新 binutils 还会印 "which relocate N locations"，有就一并硬断言，没有就大声登记（见下面）；
-#   2. **主断言**：带 DT_RELR 的目标 + 要加密范围 ⇒ vmpack 非零退出、**不落产物/不落报告**、信息里点名 DT_RELR；
+#   2. **主断言**：带 DT_RELR 的目标 + 要加密范围 ⇒ 打包成功，且产物与原生逐字节一致（143/5050）；
 #   3. **单变量对照**：同一份源码、同样开关，只把 -z pack-relative-relocs 去掉 ⇒ 必须打包成功
 #      且与原生逐字节一致（⇒ 触发拒绝的确实是 DT_RELR，不是别的）。
 #
@@ -933,9 +934,11 @@ fi
 #
 # 校准（改之前必须能红）：
 #   A. 去掉夹具的 -Wl,-z,pack-relative-relocs ⇒ 第 1 步的 readelf 断言直接 FAIL（用例不空转）；
-#   B. 临时注释掉 cmd/vmpack/main.go 的 hasRelr 分支 ⇒ 第 2 步"rc≠0 且不落产物"变红。
+#   B.（#600 时期）注释掉 cmd/vmpack 的 hasRelr 分支 ⇒ 当时"必须拒绝"那条断言会红。#603 之后这条
+#      校准改成：把 RELR 还原写回 XOR 密码流的老写法（*slot = (*slot - delta) ^ ks）⇒ 产物验签失败、
+#      第 2 步变红（实测 VMPELF verifyfail rva=4096，rc=132）。
 if [ -z "$QEMU" ] && [ "$GOARCH_TARGET" = "amd64" ]; then
-    echo "[*] RELR: a DT_RELR target must be refused (fail-closed, no artifact); the same source without RELR must pack and match native"
+    echo "[*] RELR: a DT_RELR target must PACK and match native; the same source without RELR stays the control"
     # 本块用**自己的** blob（同 #597 块的理由：后续步骤会重建 build/vm_interp_elf.bin）。
     RLRBLOB=build/vm_interp_elf_relr
     ./build/vmpbuild -src "$BLOB_SRC" $([ -n "$BLOB_CC" ] && echo "-cc $BLOB_CC") $([ -n "$BLOB_GUEST" ] && echo "-guest $BLOB_GUEST") $BLOB_EXTRA \
@@ -1052,33 +1055,52 @@ PY
         echo "[NOTE]   entries are still calibrated against readelf ($RLR_ENTRIES_READELF); locations = $RLR_LOCS_FILE (binutils 2.46 cross-check recorded in STATUS #601)"
         readelf -rW build/elf_target_relr | sed -n '/relr\.dyn/,$p' | sed 's/^/    | /'
     fi
-    # ---- 2. 主断言：带 DT_RELR + 要加密范围 ⇒ 拒绝，且不落产物/不落报告 ----
+    # ---- 2. 主断言：带 DT_RELR + 要加密范围 ⇒ **打包成功，且产物与原生逐字节一致** ----
+    # （#600 时这里是"必须拒绝"；STATUS #603 落地了运行期 RELR 还原路径之后翻转为"必须一致"。）
     RLR_N_RC=0; RLR_N="$(run_target "$TARGET_RUN" ./build/elf_target_relr check-key 10 2>&1)" || RLR_N_RC=$?
     RLR_N_SUM_RC=0; RLR_N_SUM="$(run_target "$TARGET_RUN" ./build/elf_target_relr sum-to 100 2>&1)" || RLR_N_SUM_RC=$?
     if [ "$RLR_N_RC" -ne 0 ] || [ "$RLR_N" != "143" ] || [ "$RLR_N_SUM_RC" -ne 0 ] || [ "$RLR_N_SUM" != "5050" ]; then
         echo "[MISMATCH] RELR fixture native: check-key rc=$RLR_N_RC out=[$RLR_N] (want 143); sum-to rc=$RLR_N_SUM_RC out=[$RLR_N_SUM] (want 5050)"
         fail "the RELR fixture does not run natively"
     fi
-    RLR_OUT="build/elf_relr_${TAG}_refused.enc"
-    RLR_REP="build/elf_relr_${TAG}_refused.json"
+    # ---- 1b. C 侧契约断言：同一组向量喂 C 侧展开器（vm_interp.c 的 vm_relr_entry）----
+    # 两侧算法错开一格，产物就是"验签失败"或更糟的静默错值 ⇒ 这条必须与上面的 Go/readelf 对账一起跑。
+    gcc -O1 -w -DVM_BLOB_TARGET_LINUX=1 -I stub/win/x64 -o build/relr_kat \
+        stub/win/x64/relr_kat.c stub/win/x64/vm_crypto.c stub/win/x64/vm_kdf.c stub/linux/amd64/vm_entry_asm.S \
+        || fail "build the C-side RELR KAT"
+    RLR_KAT_RC=0
+    RLR_KAT_OUT="$(./build/relr_kat 2>&1)" || RLR_KAT_RC=$?
+    if [ "$RLR_KAT_RC" -ne 0 ]; then
+        printf '%s\n' "$RLR_KAT_OUT" | tail -n 5 | sed 's/^/    /'
+        fail "the C-side RELR KAT failed (Go and C disagree on the slot expansion)"
+    fi
+    printf '%s' "$RLR_KAT_OUT" | grep -q 'PASS: 0 failure' || fail "the C-side RELR KAT did not report PASS"
+    echo "[OK  ] RELR contract KAT: the C-side expansion agrees with the Go/readelf vectors"
+
+    RLR_OUT="build/elf_relr_${TAG}_product.enc"
+    RLR_REP="build/elf_relr_${TAG}_product.json"
     rm -f "$RLR_OUT" "$RLR_REP"
     RLR_RC=0
     RLR_MSG="$("./build/vmpack" -exe build/elf_target_relr -func checkKey -func sumTo \
         -enc-image-elf-pie -enc-image-elf-pie-relocs \
         -blob "$RLRBLOB.bin" -manifest "$RLRBLOB.json" \
         -out "$RLR_OUT" -report "$RLR_REP" 2>&1)" || RLR_RC=$?
-    if [ "$RLR_RC" -eq 0 ]; then
-        echo "[MISMATCH] the packer ACCEPTED a DT_RELR target while it had ranges to encrypt"
+    if [ "$RLR_RC" -ne 0 ]; then
+        echo "[MISMATCH] the packer REFUSED a DT_RELR target (rc=$RLR_RC) although the runtime has a RELR restore path"
         printf '%s\n' "$RLR_MSG" | tail -n 3 | sed 's/^/    /'
-        fail "a DT_RELR target with encryptable ranges must be refused (the runtime has no RELR restore path)"
+        fail "a DT_RELR target must pack now (STATUS #603 made it supported)"
     fi
-    # loud message: ASCII keyword only (Chinese literals do not survive this harness pipe)
-    printf '%s' "$RLR_MSG" | grep -aqF 'DT_RELR' || fail "the refusal must name DT_RELR (so the user knows which knob to turn off)"
-    # and no artifact / no report may be left behind
-    if [ -f "$RLR_OUT" ] || [ -f "$RLR_REP" ]; then
-        fail "a refused RELR pack must not leave an artifact or a report behind"
+    [ -f "$RLR_OUT" ] || fail "packing the DT_RELR fixture produced no artifact"
+    # 打包端必须如实记账（报告里点名 DT_RELR 槽位数；ASCII keyword only）
+    printf '%s' "$RLR_MSG" | grep -aqF 'DT_RELR' || fail "the packer must report how many DT_RELR slots it decoded"
+    RLR_P_RC=0; RLR_GOT="$(run_target "$TARGET_RUN" "./$RLR_OUT" check-key 10 2>&1)" || RLR_P_RC=$?
+    RLR_PS_RC=0; RLR_GOT_SUM="$(run_target "$TARGET_RUN" "./$RLR_OUT" sum-to 100 2>&1)" || RLR_PS_RC=$?
+    if [ "$RLR_P_RC" -ne 0 ] || [ "$RLR_GOT" != "$RLR_N" ] || [ "$RLR_PS_RC" -ne 0 ] || [ "$RLR_GOT_SUM" != "$RLR_N_SUM" ]; then
+        echo "[MISMATCH] DT_RELR product: check-key native=[$RLR_N](rc=$RLR_N_RC) packed=[$RLR_GOT](rc=$RLR_P_RC); sum-to native=[$RLR_N_SUM](rc=$RLR_N_SUM_RC) packed=[$RLR_GOT_SUM](rc=$RLR_PS_RC)"
+        printf '%s\n' "$RLR_GOT" | head -n 3 | sed 's/^/    /'
+        fail "the DT_RELR product is not byte-identical to native (the runtime RELR restore is the only thing between the ciphertext and the addend)"
     fi
-    echo "[OK  ] #600 RELR fail-closed: DT_RELR target + encryptable ranges -> rc=$RLR_RC, no artifact, refusal names DT_RELR"
+    echo "[OK  ] #603 RELR: DT_RELR target + encryptable ranges -> packs, and the product answers exactly like native (143/5050)"
     # ---- 3. 单变量对照：同一份源码去掉 -z pack-relative-relocs ⇒ 必须能打包且与原生一致 ----
     RLR_C_OUT="build/elf_relr_${TAG}_control.enc"
     RLR_C_REP="build/elf_relr_${TAG}_control.json"

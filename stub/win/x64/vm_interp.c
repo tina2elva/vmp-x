@@ -3332,6 +3332,9 @@ static u32 vm_img_done;
 static u32 vm_reloc_bad;
 static u32 vm_reloc_bad_type;
 static u32 vm_reloc_bad_rva;
+/* DT_RELR 单条目展开的临时缓冲（位图最多 63 个槽位）。放 .bss：应用器跑在入口解密阶段，
+ * 单线程；不占调用链上的栈（蹦床帧只有 640+margin）。 */
+static u64 vm_relr_slots[64];
 
 #if defined(VM_ARCH_AARCH64)
 #define VM_RT_RELATIVE 1027u /* R_AARCH64_RELATIVE */
@@ -3369,6 +3372,34 @@ static u8 vm_reloc_ks(const u8 key[32], const u8 nonce[12], u32 off)
     return blk[off % 64u];
 }
 
+/* DT_RELR（压缩相对重定位）的**单条目**展开。纯函数，所以 stub/win/x64/relr_kat.c 能直接拿
+ * 真实条目与 readelf、以及 Go 侧 internal/load/elf.RelrRelocs 对账（同一组向量喂两侧）。
+ *
+ * 算法（三处旧缺陷的解毒剂，见 STATUS #601/#603）：
+ *   偶数条目 = 它本身就是**一个**槽位地址；之后 base = 条目 + 8；
+ *   奇数条目 = 位图：bit i（i = 1..63）置位 ⇒ 槽位 base + (i-1)*8；之后 base += 63*8。
+ * 返回真实槽位数（可能大于 cap；调用方必须保证 cap >= 63）。 */
+static u32 vm_relr_entry(u64 e, u64 *base, u64 *out, u32 cap)
+{
+    u32 n = 0;
+    if ((e & 1u) == 0u) {
+        if (cap > 0u) out[0] = e;
+        *base = e + 8u;
+        return 1u;
+    }
+    {
+        u32 i;
+        for (i = 1u; i < 64u; i++) {
+            if (e & ((u64)1u << i)) {
+                if (n < cap) out[n] = *base + (u64)(i - 1u) * 8u;
+                n++;
+            }
+        }
+    }
+    *base += 63u * 8u;
+    return n;
+}
+
 /* 处理"落在 [prefBase+rva, prefBase+rva+size) 内的 R_*_RELATIVE 槽位"：
  *
  *   back = 0（验签**之前**）→ 槽位 := **原始密文** = r_addend ^ 密码流
@@ -3392,6 +3423,7 @@ static int vm_reloc_fix(u64 base, u32 rva, u32 size, const u8 key[32], const u8 
     u64 dynVA = 0, dynSz = 0;
     u64 tabVA = 0, tabSz = 0, ent = 0, linkTab, rtTab;
     u64 relaVA = 0, relaSz = 0, relaEnt = 0, relVA = 0, relSz = 0, relEnt = 0;
+    u64 relrVA = 0, relrSz = 0, relrEnt = 0;
     u64 lo, hi;
     int haveDyn = 0, withAddend;
     u32 i, j;
@@ -3443,13 +3475,70 @@ static int vm_reloc_fix(u64 base, u32 rva, u32 size, const u8 key[32], const u8 
             else if (tag == 17u) relVA = val;
             else if (tag == 18u) relSz = val;
             else if (tag == 19u) relEnt = val;
+            else if (tag == 36u) relrVA = val;  /* DT_RELR    = 36 */
+            else if (tag == 35u) relrSz = val;  /* DT_RELRSZ  = 35 */
+            else if (tag == 37u) relrEnt = val; /* DT_RELRENT = 37 */
         }
     }
     withAddend = relaSz != 0u;
     tabVA = withAddend ? relaVA : relVA;
     tabSz = withAddend ? relaSz : relSz;
     ent = withAddend ? relaEnt : relEnt;
-    if (tabSz == 0u) return 0; /* 目标没有任何重定位项 */
+
+    /* ---- DT_RELR（压缩相对重定位，.relr.dyn）---- 与上面那张表**分开**处理：
+     *   · 条目**不写类型**（按架构隐含 R_*_RELATIVE）；
+     *   · 条目**不写 r_addend** —— 加数就在槽位里（隐式 addend）。
+     * ld.so 对这些槽位做的是 *slot += l_addr，所以"表里的 r_addend"这条路走不通：
+     * 打包端加密前的明文只能**反推**：addend = *slot − delta（delta 就是 l_addr）。
+     * 验签前把槽位还原成 *addend ^ 密码流 = 原始密文；解密后再 += delta 回到运行期值。
+     * 算法与 Go 侧 internal/load/elf.RelrRelocs、readelf 三方对齐（STATUS #601/#603）。 */
+    if (relrSz != 0u) {
+        u64 linkRelr, rb, k;
+        const u8 *rt;
+        if (relrEnt != 0u && relrEnt != 8u) { vm_reloc_bad = 2; return -2; }
+        if (relrSz % 8u != 0u || relrSz > (1u << 24)) { vm_reloc_bad = 1; return -1; }
+        /* 表地址与 DT_RELA 同样有"运行期窗口 / 链接期窗口"两种形态（glibc 会把指针型动态项就地
+         * 加 l_addr），所以两个窗口都试一次；都不在 ⇒ 硬门。 */
+        if (relrVA >= rtLo && relrVA + relrSz <= rtHi) linkRelr = relrVA - delta;
+        else if (relrVA >= linkLo && relrVA + relrSz <= linkHi) linkRelr = relrVA;
+        else { vm_reloc_bad = 8; return -8; }
+        if (!vm_elf_range_ok(eh, phoff, phnum, linkRelr, relrSz)) { vm_reloc_bad = 1; return -1; }
+        rt = (const u8 *)vm_elf_addr(base, prefBase, linkRelr);
+        rb = 0u;
+        for (k = 0; k < relrSz; k += 8u) {
+            u64 e = *(const u64 *)(rt + k);
+            u32 ns = vm_relr_entry(e, &rb, vm_relr_slots, 64u);
+            u32 si;
+            for (si = 0; si < ns; si++) {
+                u64 off = vm_relr_slots[si];
+                u64 *slot;
+                u64 plain;
+                u8 *pb = (u8 *)&plain;
+                u32 b;
+                if (off < lo || off >= hi) continue; /* 不在本次要处理的加密范围里 ⇒ 不动它 */
+                if (off + 8u > hi) {
+                    vm_reloc_bad = 4;
+                    vm_reloc_bad_rva = (u32)(off - prefBase);
+                    return -4;
+                }
+                slot = (u64 *)vm_elf_addr(base, prefBase, off);
+                if (back) {
+                    /* 解密后槽位 = 链接期 addend；加回装载基址 = 运行期值 */
+                    *slot += delta;
+                    continue;
+                }
+                /* RELR 的还原机制与上面显式表那条**不一样**，别照抄：
+                 *   · 打包端加密的是槽位**原本的字节**（链接期 addend），所以产物文件里躺着的是**密文 C**；
+                 *   · ld.so 在入口点之前对它做的是 C += l_addr（隐式 addend：加数就是内存里的值）；
+                 *   ⇒ 减回装载基址就**直接得到原始密文 C** —— 这里**不能**再 XOR 密码流。
+                 *     （显式表那条路是从表里的 r_addend **重算**密文 = r_addend ^ 密码流；RELR 的 addend
+                 *      不在表里，无从重算，只能这样反推。实测：XOR 之后验签必失败，报 VMPELF verifyfail。） */
+                *slot = *slot - delta;
+            }
+        }
+    }
+
+    if (tabSz == 0u) return 0; /* 目标没有（显式表里的）重定位项 */
     if (ent == 0u) ent = withAddend ? 24u : 16u;
     if (ent != (withAddend ? 24u : 16u)) { vm_reloc_bad = 2; return -2; }
     if (tabSz > (1u << 24) || tabSz % ent != 0u) { vm_reloc_bad = 1; return -1; }
