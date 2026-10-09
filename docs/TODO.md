@@ -1231,6 +1231,14 @@ EOF
 - [x] **aarch64 上的 RELR 端到端证据 —— 已落地（`STATUS #604`，提交 `98d7bbf`）**：夹具（`.text` 前 16KB NOP 填充，否则可执行段全在第一页里、打包端整段跳过 ⇒ 空转）+ qemu 下与原生逐字节一致（143/5050），本机实测 slot=7 / in_range=2。
       代码是 arch 无关的（纯算术 + 按架构取 `R_*_RELATIVE`），但**没在 aarch64 上跑过**。
       做法：在 `tools/e2e_elf_image.sh` 的 aarch64 块里复刻 RELR 夹具（`aarch64-linux-gnu-gcc` + `-z pack-relative-relocs`），跑 qemu。
+- [ ] **随机差分抓到的第一条：写客户机 RSP 会让解释器走硬门**（`STATUS #606.3`，提交 `9dae89f`）：
+      随机程序 `rnd#2(seed=1)` 里一条 `MOV16 RSP, RAX` ⇒ 批量对拍以 `0xC000001D` 结束（解释器 `ud2`），
+      而 Go 参考 VM 能跑完；把 RSP 从工作寄存器集合里拿掉后 400 条全部通过。
+      **待办**：造最小复现（一条 MOV16 RSP + RET）判定它是"解释器过严"还是"随机程序不该写 RSP"；
+      定性后要么修解释器，要么把这条限制写成生成器的显式注释（现在是注释 + 剔除，口径已如实写清）。
+- [ ] **随机程序覆盖面**（`STATUS #606.5`）：目前只有 MOV/ALU/CMP/LEA/LOAD/STORE + 跳向末尾的分支；
+      没覆盖 PUSH/POP、CALL/CALLR、DIV、FP、ATOMIC。下一个该加的是**能跳回前面的正经循环**
+      （`#599` 那类"大行程循环静默错值"就藏在循环里）。
 - [x] **"DT_RELR 表落在加密范围内 ⇒ 拒绝"的 committed 负例 —— 已落地（`STATUS #605`，提交 `c6d0cb4`）**：判据顺序改为先查表位置再解码；夹具把 DT_RELR 指向 `.rodata` 的 relr_tbl 并写成能干净解码的条目；断言 rc≠0 + 不落产物 + ASCII 关键字；关掉守卫 ⇒ 打包被接受（MISMATCH，能红）。（原登记如下）
       需要构造一个 `.relr.dyn` 落在可加密范围里的目标，断言 `rc≠0` + 不落产物 + 信息含 `DT_RELR 表`。
 - [ ] **诊断/打包脚本的纪律（`STATUS #603.6`）**：① 任何探针先打印"未解引用的值"再解引用（本轮被自己插错的诊断骗到 SIGBUS）；
