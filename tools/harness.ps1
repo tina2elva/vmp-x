@@ -75,4 +75,28 @@ if ($rc0 -ne $trapCode -or $g0.Trim().Length -ne 0) {
     exit 1
 }
 Write-Host "[OK  ] harness: guest-stack guard (SP above entry -> hard gate/ud2; SP == entry -> runs)"
+# ---- DIV/IDIV trap semantics (STATUS #611): same three programs as div_trap_probe.c ----
+# mode 2 control -> clean run printing rax=14 rdx=2 (100/7); modes 0/1 (divide by zero / quotient
+# overflow) -> the interpreter does __builtin_trap() (x86 #DE) => abnormal exit, NO output.
+# This is the half the batch differential cannot express (one trap kills the whole batch), so the
+# fault side is pinned here by process-level assertions; the Linux half (exact SIGILL code) is in
+# tools/e2e_elf_image.sh, and the Go reference side in internal/vm/TestRefDivFaultsMatchHardGate.
+& gcc -O1 -w -I stub/win/x64 -o build/div_trap_probe.exe `
+    stub/win/x64/div_trap_probe.c stub/win/x64/vm_crypto.c stub/win/x64/vm_kdf.c stub/win/x64/vm_entry_asm.S
+if ($LASTEXITCODE -ne 0) { Write-Host "[!] harness: div_trap_probe build failed"; exit 1 }
+$d2 = [string](& .\build\div_trap_probe.exe 2 2>&1 | Out-String)
+$d2rc = $LASTEXITCODE
+if ($d2rc -ne 0 -or $d2 -notmatch "rax=14 rdx=2") {
+    Write-Host ("[!] harness: DIV control failed: rc=" + $d2rc + " out=" + $d2)
+    exit 1
+}
+foreach ($dmode in 0, 1) {
+    $dm = [string](& .\build\div_trap_probe.exe $dmode 2>&1 | Out-String)
+    $dmrc = $LASTEXITCODE
+    if ($dmrc -ne $trapCode -or -not [string]::IsNullOrWhiteSpace($dm)) {
+        Write-Host ("[!] harness: DIV mode " + $dmode + " did not trap as expected: rc=" + $dmrc + " out=" + $dm)
+        exit 1
+    }
+}
+Write-Host "[OK  ] harness: DIV/IDIV traps (#DE -> ud2): divide-by-zero and quotient-overflow both abort; control gives 14 rem 2"
 exit 0

@@ -370,6 +370,57 @@ func emitRandInsn(rng *rand.Rand, buf *[]byte, patches *[]int, work []byte, base
 	}
 }
 
+// TestRefDivFaultsMatchHardGate：DIV/IDIV 的**故障语义**两侧都必须是"响亮失败"——
+// 除零 / 商放不下 ⇒ C 侧 __builtin_trap()（x86 的 #DE），Go 参考实现 refDiv 是 panic。
+// 批量对拍表达不了 trap（一条就挂掉整个进程），所以这一对用**两个独立断言**分别钉住两侧；
+// C 侧由 stub/win/x64/div_trap_probe.c + tools/harness.ps1 / tools/e2e_elf_image.sh 钉。
+func TestRefDivFaultsMatchHardGate(t *testing.T) {
+	prog := func(rdx, rax, dv uint64) []byte {
+		var b []byte
+		movri := func(dst byte, v uint64) {
+			b = append(b, OpMovRI, 64, dst)
+			b = append(b, u64b(v)...)
+		}
+		movri(2, rdx) // RDX：被除数高半
+		movri(0, rax) // RAX：被除数低半
+		movri(1, dv)  // RCX：除数
+		b = append(b, OpAluU, byte(KDivU), 64, 0, 1)
+		b = append(b, OpRet)
+		return b
+	}
+	cases := []struct {
+		name         string
+		rdx, rax, dv uint64
+		wantPanic    bool
+		wantQ, wantR uint64
+	}{
+		{"除零", 0, 100, 0, true, 0, 0},
+		{"商溢出", 1, ^uint64(0), 1, true, 0, 0},
+		{"安全除法（对照）", 0, 100, 7, false, 14, 2},
+	}
+	for _, c := range cases {
+		st := &RefState{}
+		code := prog(c.rdx, c.rax, c.dv)
+		panicked := func() (p bool) {
+			defer func() {
+				if recover() != nil {
+					p = true
+				}
+			}()
+			if _, err := st.Run(code, 256); err != nil {
+				t.Fatalf("%s: 参考实现报错（不是 panic）: %v", c.name, err)
+			}
+			return false
+		}()
+		if panicked != c.wantPanic {
+			t.Fatalf("%s: panic=%v，期望 %v（除零/商放不下必须响亮失败，绝不静默给错值）", c.name, panicked, c.wantPanic)
+		}
+		if !c.wantPanic && (st.Regs[0] != c.wantQ || st.Regs[2] != c.wantR) {
+			t.Fatalf("%s: 商=%d 余=%d，期望 %d/%d", c.name, st.Regs[0], st.Regs[2], c.wantQ, c.wantR)
+		}
+	}
+}
+
 type batchResult struct {
 	rc    uint32
 	flags uint32

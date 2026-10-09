@@ -1233,6 +1233,23 @@ if [ -z "$QEMU" ] && [ "${GOARCH_TARGET}" = "amd64" ]; then
     [ "$RSP_GATE_RC" -eq 97 ] || fail "SP above entry must hit hard gate 97, got rc=$RSP_GATE_RC (99 = the dead-branch ordering came back -- see STATUS #608)"
     echo "[OK  ] #608 guest-stack guard: SP above entry -> hard gate 97 (reachable), SP == entry -> rc=0"
 fi
+# ---- DIV/IDIV 的 trap 语义（STATUS #611）----
+# Linux 侧：__builtin_trap() 是 ud2 ⇒ **SIGILL** ⇒ shell rc = 128+4 = 132（注意：不是 vm_fail_closed
+# 那条 exit_group(0xC0DE0000|code) 路径，所以码不是低 8 位那一族）。这份精确码只有 Linux 侧看得到。
+if [ -z "$QEMU" ] && [ "${GOARCH_TARGET}" = "amd64" ]; then
+    echo "[*] DIV/IDIV traps: divide-by-zero and quotient-overflow must both die on SIGILL (STATUS #611)"
+    gcc -O1 -w -DVM_BLOB_TARGET_LINUX=1 -I stub/win/x64 -o build/div_trap_linux \
+        stub/win/x64/div_trap_probe.c stub/win/x64/vm_crypto.c stub/win/x64/vm_kdf.c stub/linux/amd64/vm_entry_asm.S \
+        || fail "build the DIV trap probe (Linux)"
+    DIV_CTL_RC=0; DIV_CTL_OUT="$(./build/div_trap_linux 2 2>&1)" || DIV_CTL_RC=$?
+    [ "$DIV_CTL_RC" -eq 0 ] || fail "DIV control must exit 0, got rc=$DIV_CTL_RC"
+    printf '%s' "$DIV_CTL_OUT" | grep -q 'rax=14 rdx=2' || fail "DIV control must compute 100/7 = 14 rem 2, got [$DIV_CTL_OUT]"
+    for divmode in 0 1; do
+        DIV_RC=0; ./build/div_trap_linux $divmode >/dev/null 2>&1 || DIV_RC=$?
+        [ "$DIV_RC" -eq 132 ] || fail "DIV mode $divmode must die on SIGILL (rc=132), got rc=$DIV_RC"
+    done
+    echo "[OK  ] #611 DIV/IDIV traps: divide-by-zero and quotient-overflow both SIGILL (132); control gives 14 rem 2"
+fi
 
 # ---- RELR（DT_RELR）在 aarch64 上的端到端 ----（STATUS #603.5 登记的唯一缺口）
 # 与 amd64 那块**同一套断言**，只是夹具用交叉 gcc、产物经 qemu 跑：
