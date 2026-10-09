@@ -1199,7 +1199,9 @@ EOF
       复现：`build/loop2.c` → `vmpbuild -src stub/linux/amd64` → `vmpack -exe … -func sumTo -func countIters -func lastI -func sumSmall -func sumAddOne`；
       诊断用 `vmpack -v`（打印 IR）与 `-dumpbytecode <dir>`（转储明文字节码）。线索：`sumTo` 的 IR 初始化是 `MOV_RI w=32`、循环体是 `w=64`。
 
-- [ ] **RELR（`DT_RELR` 压缩相对重定位）真正支持**（`STATUS #600`，`t8` 取向：本轮只做保守拒绝）：`cmd/vmpack` 现在是「目标带 `DT_RELR` 且要加密任何范围 ⇒ 直接拒绝打包」
+- [x] **RELR（`DT_RELR` 压缩相对重定位）真正支持 —— 已落地（`STATUS #603`，提交 `27ec250` + `7eeccd8`）**。
+      要点：Go 解码器（与 readelf 逐项对齐）+ 运行期 `vm_relr_entry`/`vm_reloc_fix` 的 RELR 段（**隐式 addend：`*slot -= delta` 直接拿回密文，不是 XOR 密码流**）+ C 侧契约 KAT（同向量喂两侧）+ e2e 断言"与原生逐字节一致"。新守卫：DT_RELR 表自身不得落在被加密的范围里。
+      （以下为原登记，保留作背景与旧取向的记录）`cmd/vmpack` 现在是「目标带 `DT_RELR` 且要加密任何范围 ⇒ 直接拒绝打包」
       （`internal/load/elf.HasRELR` + 守卫 2，不依赖解码器）。真支持需要：① 正确解码（旧 `decodeRelr` 已删；登记三处缺陷：bitmap 之后缺 `base += 63*8`、首个 bitmap 的 base 应为 `addr+8`、裸地址条目本身也是一条重定位却被丢掉 ——
       对照 `readelf`：真实产物解出 203 条，本仓库旧码给 202、去重 68、139 重复、`>=0x5970` 全丢）；② `stub` 运行期应用器认识 RELR 语义（隐式 addend：加数在槽位里）；③ 端到端验收（槽位放进加密范围并逐字节对照原生）。
       **⚠️ 措辞（`t9` 校准）**：被拒的那种布局在**关掉判据后其实能跑**（`rc=0`、与原生一致）⇒ 不能写「放行 = 运行期必然硬门」；正确说法是「没有可靠解码器时无法判定 ⇒ 保守拒绝」。
@@ -1224,4 +1226,13 @@ EOF
 - [ ] **动 `tools/*.ps1` 后必须逐文件核对 UTF-8 BOM**（`STATUS #602.6`）：本轮编辑工具又吃掉了
       `tools/gates.ps1` 的 BOM（HEAD 有、改完没有），靠提交前核对 HEAD↔工作区才发现。含中文的 .ps1 必须
       **BOM + CRLF**；纯 ASCII 的新脚本（如 `tools/harness.ps1`）不需要 BOM。
+## RELR 落地后新登记（`STATUS #603`）
+
+- [ ] **aarch64 上的 RELR 端到端证据**：RELR 的 e2e 块与 C 侧 KAT 目前只跑 `amd64`(非 QEMU) 路径。
+      代码是 arch 无关的（纯算术 + 按架构取 `R_*_RELATIVE`），但**没在 aarch64 上跑过**。
+      做法：在 `tools/e2e_elf_image.sh` 的 aarch64 块里复刻 RELR 夹具（`aarch64-linux-gnu-gcc` + `-z pack-relative-relocs`），跑 qemu。
+- [ ] **"DT_RELR 表落在加密范围内 ⇒ 拒绝"这条新守卫缺 committed 负例**（`STATUS #603.5`）：
+      需要构造一个 `.relr.dyn` 落在可加密范围里的目标，断言 `rc≠0` + 不落产物 + 信息含 `DT_RELR 表`。
+- [ ] **诊断/打包脚本的纪律（`STATUS #603.6`）**：① 任何探针先打印"未解引用的值"再解引用（本轮被自己插错的诊断骗到 SIGBUS）；
+      ② 任何 `vmpbuild` 调用都必须检查退出码 —— 编译失败 + 旧 blob = 假结论（本轮的单变量实验就白跑了一轮）。
 

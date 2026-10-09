@@ -11047,6 +11047,71 @@ tier (3)，分类器就只说这一档、缺的档显式 SKIP，不超出实测�
 ⇒ 教训：**动 `tools/*.ps1`（尤其含中文的）之后必须逐文件核对 BOM**，不能只看脚本能不能跑。
 
 **互指**：本条是 `#601.5` 与"测试地基"讨论的落地；`#602.5` 的 KAT 规矩在 RELR 那一轮执行。
+### 603. DT_RELR 真正落地：打包端 + 运行期**同一轮**改完，并被"契约测试先行"钉住
+
+**范围与 sha**：`27ec250`（Go 解码器 + 单测，纯新增）→ `7eeccd8`（运行期 + 打包端 + C 侧 KAT + e2e 翻转）+ 本条 docs。
+这是 `#602.5` 立下的"跨边界格式必须有 KAT"规矩的**第一个样板**；`#600.5` 登记的"RELR 真支持"至此结清。
+
+#### 603.1 关键机制：RELR 的还原**不是** XOR 密码流（这条走错了一次）
+
+显式表（DT_RELA）那条路的机制是：打包端加密的明文 = `r_addend`（归一过），运行期从**表里**取 addend
+**重算**密文 = `r_addend ^ 密码流`。RELR 没有 addend 可重算，所以我一开始照抄成
+`plain = *slot - delta` 再 XOR 密码流 —— **错**：产物 `VMPELF verifyfail rva=4096`（rc=132）。
+
+实测数据（本轮，运行期打的）：槽位内存值 `mem=72707992034013944`、`mem-delta=72608302150267640`，
+两者都是随机样而**都不是**链接期 addend（0x4014）⇒ 说明**产物文件里躺着的就是密文 C**。于是正确的还原是：
+
+- 打包端加密的是槽位**原本的字节**（链接期 addend）⇒ 文件里是密文 C；
+- ld.so 在入口点之前对槽位做的是 C += l_addr（隐式 addend：加数就是内存里的值）；
+- ⇒ 运行期只要 `*slot -= delta` 就**直接拿回密文 C**，**不再 XOR 密码流**；解密后再 `*slot += delta` 回到运行期值。
+
+这条差异已写进 `vm_interp.c` 的注释（"别照抄上面那条路"）。
+
+#### 603.2 改动（两侧同轮）
+
+| 文件 | 改动 |
+|---|---|
+| `internal/load/elf/elf.go` | `RelrRelocs()`（已与 readelf 逐项对齐的解码器，fail-closed）、`RelrTableRange()`、`relrTags()` |
+| `cmd/vmpack/main.go` | 把"带 DT_RELR 一律拒绝"换成**支持**；新增守卫：**DT_RELR 表自身不得落在被加密的范围里**（应用器在验签/解密**之前**就要读它）；报告如实打印解出槽位数与落在加密范围内的条数 |
+| `stub/win/x64/vm_interp.c` | `vm_relr_entry()`（单条目展开，纯函数）+ `vm_reloc_fix` 的 RELR 段（表地址两窗口判定 + 隐式 addend 还原） |
+| `stub/win/x64/relr_kat.c`（新增） | C 侧**契约 KAT**：与 Go 单测同一组向量喂两侧（金向量 / 两个位图窗口 / 位图后地址条目重置 base / 空位图仍推进窗口） |
+| `tools/e2e_elf_image.sh` | RELR 块从"断言拒绝"翻转成"断言打包成功且与原生逐字节一致"，并跑上面的 C KAT |
+
+**RELR 槽位不进** `imgRelocList`/`NormalizeRelocSlots`：那条路会按 `Addend=0` 把真实槽位清零（正是守卫 2 的判据 (c) 要防的事）。
+
+#### 603.3 契约测试先行（`#602.5` 的样板）
+
+1. **Go 侧**：`TestRelrGoldenVectorAgainstReadelf` 的向量来自**真实产物**（binutils 2.46 链接的 PIE 的 `readelf -rW` 输出）：
+   条目 `[0x3d78, 0x3, 0x80001]` ⇒ 槽位 `{0x3d78, 0x3d80, 0x4008}`；三处旧缺陷任何一个回来都会红。
+2. **C 侧**：`relr_kat.c` 用**同一组向量**喂 `vm_relr_entry` ⇒ 两侧算法错开一格就红。
+3. **端到端**：e2e 的真机断言（下面 603.4）。
+
+#### 603.4 证据
+
+- WSL 手工：RELR 目标（`.text` 内两个指针槽）打包成功，产物 `check-key 10 → 143`、`sum-to 100 → 5050`，与原生逐字节一致（修前 `rc=132 verifyfail`）。
+- `tools/e2e_elf_image.sh --strict` ⇒ `rc=0`，含 `[OK] RELR contract KAT` 与 `[OK] #603 RELR: ... packs, and the product answers exactly like native (143/5050)`。
+- `tools/preflight.ps1` ⇒ `[+] preflight: OK`；`tools/gates.ps1` ⇒ `total 16 gates, 0 failed, 0 skipped`（WSL 半场 `[OK] wsl_linux: every step passed`）。
+- CI **三个作业全绿**：run `37873404151`（`windows-amd64` / `linux-amd64` / `linux-arm64`）。
+- **校准（能红）**：把 RELR 还原写回 XOR 密码流的老写法 ⇒ 产物验签失败、主断言红（实测 `VMPELF verifyfail rva=4096`，`rc=132`）。
+
+#### 603.5 未做项 / 如实降级（醒目）
+
+- **aarch64 上的 RELR 端到端没有证据**：RELR e2e 块与 C KAT 都限定在 `amd64`/`$QEMU 为空` 的路径上。
+  代码是 arch 无关的（`vm_relr_entry` 纯算术；类型号按架构取 `R_*_RELATIVE`），但**没有在 aarch64 上跑过**。
+- **"DT_RELR 表落在加密范围内 ⇒ 拒绝"这条新守卫没有 committed 负例**：构造需要让 `.relr.dyn` 落进可加密范围，夹具没做。
+- **RELR 表本身的运行期读取**依赖它不在密文里（打包端守卫保证）；若守卫被改坏，运行期会是"算出垃圾槽位 ⇒ 验签失败"，
+  属 fail-closed，但没有专门的测试钉住。
+- 差分测试扩随机程序、fail-closed 分支清单（`#602.5` 的另两条）**仍未做**。
+
+#### 603.6 过程教训（两条，都值得记）
+
+1. **诊断代码自己会骗人**：我把 `vm_dbg_trace("RELR mem=", *slot)` 插在了 `slot = ...` **赋值之前**，
+   读未初始化指针 ⇒ **SIGBUS**，一度让我以为是应用器在写野地址。教训：探针也要**先校准**（先打印指针本身、不解引用）。
+2. **构建失败 + 旧产物 = 假结论**：某次 `vmpbuild` 因为我的诊断缺前向声明而编译失败，脚本用 `>/dev/null` 吞了错误后
+   继续用**上一次的 blob** 打包，于是单变量实验其实测的是同一份代码。教训：**任何打包脚本都必须检查 blob 构建的退出码**，
+   并验证"补丁真的进了 blob"（本轮用 `strings blob | grep 诊断串` 核对）。
+
+**互指**：`#602.5` 的 KAT 规矩在本条执行；`#600.5` 的"RELR 支持"登记至此结清；本条翻转了 `#601.2` 第 3 步的断言方向。
 
 
 
