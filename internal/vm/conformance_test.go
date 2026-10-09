@@ -201,7 +201,10 @@ func genRandomCases(seed int64, n int) []confCase {
 	rng := rand.New(rand.NewSource(seed))
 	var cases []confCase
 	for i := 0; i < n; i++ {
-		code, regs := randProgram(rng)
+		code, regs, hasLoop := randProgram(rng)
+		if hasLoop {
+			randCasesWithLoop++
+		}
 		cases = append(cases, confCase{
 			name: fmt.Sprintf("rnd#%d(seed=%d)", i, seed),
 			code: code,
@@ -210,6 +213,11 @@ func genRandomCases(seed int64, n int) []confCase {
 	}
 	return cases
 }
+
+// randCasesWithLoop 由 genRandomCases 填：含**真循环**（往回跳）的程序条数。
+// 测试里断言它占相当比例 —— 防的是"循环生成悄悄失效、用例其实全是直行代码"这种**空转**
+// （#604.2 的教训：断言必须能区分"真的验了"和"什么都没验"）。
+var randCasesWithLoop int
 
 // randImm 偏置到"边界值 + 随机值"：边界值让进位/借位/符号边界更常被踩到，随机值补覆盖面。
 func randImm(rng *rand.Rand) uint64 {
@@ -225,68 +233,47 @@ func randImm(rng *rand.Rand) uint64 {
 // （于是控制流永远在程序内、且必然终止）；内存访问一律 base=r15(=batchBufBase)、无 index、
 // disp 落在批量对拍的 256 字节窗口内。故意不用 PUSH/POP/CALL/DIV/FP ——
 // 它们要么依赖批量 runner 没设的栈，要么会 trap 改变 rc 语义，不适合放进这条随机对拍。
-func randProgram(rng *rand.Rand) ([]byte, [18]uint64) {
+func randProgram(rng *rand.Rand) ([]byte, [18]uint64, bool) {
 	const base = 15 // 与 genCases 里 LOAD/STORE 用的基址寄存器一致
-	// 故意**不含 RSP(4)**：程序里写客户机栈指针会让解释器走硬门（本轮实测：随机程序里一条
-	// MOV16 RSP, RAX 就让批量对拍以 0xC000001D 崩掉）。这条随机对拍的目标是**指令语义**，
-	// 不是"能不能乱改栈指针"，所以先把 RSP 从工作寄存器里拿掉；它作为独立问题登记。
+	// 循环计数器专用寄存器：**故意不在 work 里** ⇒ 循环体碰不到它 ⇒ 计数器严格递减 ⇒ 必然终止。
+	const counter = 6
+	// 故意**不含 RSP(4)**：程序里写客户机栈指针会让解释器走硬门（#606.3 实测：一条 MOV16 RSP, RAX
+	// 就让批量对拍以 0xC000001D 崩掉；#607/#608 已定性为有意的 fail-closed 守卫）。这条随机对拍
+	// 验的是**指令语义**，不是"能不能乱改栈指针"。
 	work := []byte{0, 1, 2, 3, 5}
-	kinds := []byte{KAdd, KSub, KAnd, KOr, KXor, KMul, KShl, KShr, KSar, KRol, KRor, KAdc, KSbb}
-	unary := []byte{KUNeg, KUNot, KUInc, KUDec}
-	widths := []uint32{8, 16, 32, 64}
-	scales := []byte{1, 2, 4, 8}
 
 	var buf []byte
 	var patches []int
+
+	// 约一半的程序带一个**真循环**（往回跳）—— #599 那类"大行程循环静默错值"就藏在循环里。
+	// 行程数受 Go 参考 VM 的 maxSteps（本测试传 4096）约束，所以按循环体长度反算上限并留足余量。
+	hasLoop := false
+	if rng.Intn(2) == 0 {
+		hasLoop = true
+		body := 2 + rng.Intn(7)
+		trips := []int{1, 2, 3, 5, 8, 13, 21, 50, 120}[rng.Intn(9)]
+		if cap := 2000 / (body + 2); cap > 0 && trips > cap {
+			trips = cap
+		}
+		if trips < 1 {
+			trips = 1
+		}
+		buf = append(buf, OpMovRI, 64, counter)
+		buf = append(buf, u64b(uint64(trips))...)
+		header := len(buf)
+		for i := 0; i < body; i++ {
+			emitRandInsn(rng, &buf, &patches, work, base)
+		}
+		// 尾部：counter -= 1; jne header（SUB 紧挨 JCC ⇒ 条件只取决于这次 SUB）
+		buf = append(buf, OpAluRI, byte(KSub), 64, counter, counter)
+		buf = append(buf, u32b(1)...)
+		buf = append(buf, OpJcc, 5 /* x86 条件码 NE = 5 */, 0, 0, 0, 0)
+		binary.LittleEndian.PutUint32(buf[len(buf)-4:], uint32(header))
+	}
+
 	n := 6 + rng.Intn(15)
 	for i := 0; i < n; i++ {
-		d := work[rng.Intn(len(work))]
-		a := work[rng.Intn(len(work))]
-		b := work[rng.Intn(len(work))]
-		w := widths[rng.Intn(len(widths))]
-		switch rng.Intn(12) {
-		case 0:
-			buf = append(buf, OpMovRR, byte(w), d, a)
-		case 1:
-			buf = append(buf, OpMovRI, byte(w), d)
-			buf = append(buf, u64b(randImm(rng))...)
-		case 2:
-			buf = append(buf, OpMovRI32, d)
-			buf = append(buf, u32b(uint32(randImm(rng)))...)
-		case 3:
-			buf = append(buf, OpAluRR, kinds[rng.Intn(len(kinds))], byte(w), d, a, b)
-		case 4:
-			buf = append(buf, OpAluRI, kinds[rng.Intn(len(kinds))], byte(w), d, a)
-			buf = append(buf, u32b(uint32(randImm(rng)))...)
-		case 5:
-			buf = append(buf, OpAluU, unary[rng.Intn(len(unary))], byte(w), d, a)
-		case 6:
-			buf = append(buf, OpCmpRR, byte(KCmp), byte(w), a, b)
-		case 7:
-			buf = append(buf, OpCmpRI, byte(KCmp), byte(w), a)
-			buf = append(buf, u32b(uint32(randImm(rng)))...)
-		case 8: // LEA：窗口内的 base+disp
-			buf = append(buf, OpLea, byte(w), d, base, 0xFF, scales[rng.Intn(len(scales))])
-			buf = append(buf, u32b(uint32(rng.Intn(200)))...)
-		case 9: // LOAD：disp+w 必须落在 256 字节窗口内
-			kind := byte(rng.Intn(2))
-			buf = append(buf, OpLoad, kind, byte(w), d, base, 0xFF, 0)
-			buf = append(buf, u32b(uint32(rng.Intn(257-int(w))))...)
-		case 10: // STORE
-			buf = append(buf, OpStore, byte(w), base, 0xFF, 0)
-			buf = append(buf, u32b(uint32(rng.Intn(257-int(w))))...)
-			buf = append(buf, a)
-		case 11: // 分支：目标先占位，最后统一回填到末尾的 RET
-			if rng.Intn(2) == 0 {
-				buf = append(buf, OpJcc, byte(rng.Intn(16)))
-				patches = append(patches, len(buf))
-				buf = append(buf, 0, 0, 0, 0)
-			} else {
-				buf = append(buf, OpJmp)
-				patches = append(patches, len(buf))
-				buf = append(buf, 0, 0, 0, 0)
-			}
-		}
+		emitRandInsn(rng, &buf, &patches, work, base)
 	}
 	end := uint32(len(buf))
 	buf = append(buf, OpRet)
@@ -299,7 +286,64 @@ func randProgram(rng *rand.Rand) ([]byte, [18]uint64) {
 		regs[k] = randImm(rng)
 	}
 	regs[base] = batchBufBase
-	return buf, regs
+	return buf, regs, hasLoop
+}
+
+// emitRandInsn 追加一条随机指令。循环体与主体**共用**这一个生成器（这样"循环里能出现什么"
+// 与"主体里能出现什么"永远一致，不会两条路各漂各的）。分支的目标先占位（0 占位），
+// 由 randProgram 在末尾统一回填到 RET —— 于是控制流永远留在程序内、且必然终止。
+func emitRandInsn(rng *rand.Rand, buf *[]byte, patches *[]int, work []byte, base byte) {
+	kinds := []byte{KAdd, KSub, KAnd, KOr, KXor, KMul, KShl, KShr, KSar, KRol, KRor, KAdc, KSbb}
+	unary := []byte{KUNeg, KUNot, KUInc, KUDec}
+	widths := []uint32{8, 16, 32, 64}
+	scales := []byte{1, 2, 4, 8}
+	d := work[rng.Intn(len(work))]
+	a := work[rng.Intn(len(work))]
+	b := work[rng.Intn(len(work))]
+	w := widths[rng.Intn(len(widths))]
+	switch rng.Intn(12) {
+	case 0:
+		*buf = append(*buf, OpMovRR, byte(w), d, a)
+	case 1:
+		*buf = append(*buf, OpMovRI, byte(w), d)
+		*buf = append(*buf, u64b(randImm(rng))...)
+	case 2:
+		*buf = append(*buf, OpMovRI32, d)
+		*buf = append(*buf, u32b(uint32(randImm(rng)))...)
+	case 3:
+		*buf = append(*buf, OpAluRR, kinds[rng.Intn(len(kinds))], byte(w), d, a, b)
+	case 4:
+		*buf = append(*buf, OpAluRI, kinds[rng.Intn(len(kinds))], byte(w), d, a)
+		*buf = append(*buf, u32b(uint32(randImm(rng)))...)
+	case 5:
+		*buf = append(*buf, OpAluU, unary[rng.Intn(len(unary))], byte(w), d, a)
+	case 6:
+		*buf = append(*buf, OpCmpRR, byte(KCmp), byte(w), a, b)
+	case 7:
+		*buf = append(*buf, OpCmpRI, byte(KCmp), byte(w), a)
+		*buf = append(*buf, u32b(uint32(randImm(rng)))...)
+	case 8: // LEA：窗口内的 base+disp
+		*buf = append(*buf, OpLea, byte(w), d, base, 0xFF, scales[rng.Intn(len(scales))])
+		*buf = append(*buf, u32b(uint32(rng.Intn(200)))...)
+	case 9: // LOAD：disp+w 必须落在 256 字节窗口内
+		kind := byte(rng.Intn(2))
+		*buf = append(*buf, OpLoad, kind, byte(w), d, base, 0xFF, 0)
+		*buf = append(*buf, u32b(uint32(rng.Intn(257-int(w))))...)
+	case 10: // STORE
+		*buf = append(*buf, OpStore, byte(w), base, 0xFF, 0)
+		*buf = append(*buf, u32b(uint32(rng.Intn(257-int(w))))...)
+		*buf = append(*buf, a)
+	case 11: // 分支：目标先占位，最后统一回填到末尾的 RET
+		if rng.Intn(2) == 0 {
+			*buf = append(*buf, OpJcc, byte(rng.Intn(16)))
+			*patches = append(*patches, len(*buf))
+			*buf = append(*buf, 0, 0, 0, 0)
+		} else {
+			*buf = append(*buf, OpJmp)
+			*patches = append(*patches, len(*buf))
+			*buf = append(*buf, 0, 0, 0, 0)
+		}
+	}
 }
 
 type batchResult struct {
@@ -360,6 +404,12 @@ func TestConformanceAgainstCInterpreter(t *testing.T) {
 	if len(cases) == 0 {
 		t.Fatal("没有生成任何用例")
 	}
+	// 防空转：随机程序里必须真的有相当比例带**循环**（往回跳），否则"循环覆盖"是假的。
+	if randCasesWithLoop < randProgramCount/4 {
+		t.Fatalf("随机程序里带循环的只有 %d/%d 条 —— 循环生成八成失效了（这条用例的卖点就是循环覆盖）",
+			randCasesWithLoop, randProgramCount)
+	}
+	t.Logf("随机程序 %d 条，其中带真循环（往回跳）的 %d 条", randProgramCount, randCasesWithLoop)
 
 	// 写 cases 文件
 	dir := t.TempDir()
