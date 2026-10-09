@@ -11456,6 +11456,51 @@ DIV/IDIV 是唯一会**改变 rc 语义**的指令类：除零 / 商放不下 �
 - aarch64 在 CI 上仍 `[SKIP]`（交叉工具链不产 DT_RELR）。
 
 **互指**：本条把 `#609.5` 的"DIV/IDIV"一项做掉（安全输入部分）；trap 部分与 `#607` 的进程级断言同族。
+### 611. DIV/IDIV 的 **trap 语义**两侧对齐（结清 `#610.5` 那条被有意绕开的面）
+
+**范围与 sha**：`58fb491`。新增 `stub/win/x64/div_trap_probe.c`；改 `tools/harness.ps1`、
+`tools/e2e_elf_image.sh`、`internal/vm/conformance_test.go`。
+
+#### 611.1 契约与"为什么需要三处断言"
+
+契约：**除零 / 商放不下 ⇒ 两侧都必须响亮失败，绝不静默给错值**（x86 的 #DE 语义）——
+C 侧是 `__builtin_trap()`，Go 侧是 `refDiv` 的 `panic`。
+
+批量对拍在这件事上**结构性地表达不了**：它一个进程跑几千条用例，一条 trap 就整个进程挂掉
+（`#606.3` 那次就是这么暴露的：只能靠二分定位）。所以这一面的正确做法是**进程级断言**，
+而且两侧各自钉：
+
+| 侧 | 断言点 | 期望 |
+|---|---|---|
+| C / Windows | `tools/harness.ps1`（第 16 道门禁） | 模式 0/1 **异常终止且无输出**（`ud2` 不带码，只能断言"死得干净"） |
+| C / Linux | `tools/e2e_elf_image.sh`（amd64 路径） | 模式 0/1 `rc=132`（**SIGILL** = 128+4；注意不是 `vm_fail_closed` 的 `exit_group` 码族） |
+| Go | `TestRefDivFaultsMatchHardGate` | 同样两个输入必须 `panic`；对照必须算出 14/2 |
+
+#### 611.2 三个程序（两侧共用同一组语义）
+
+| 模式 | RDX : RAX : 除数 | 期望 |
+|---|---|---|
+| 0 除零 | 0 : 100 : **0** | trap |
+| 1 商溢出 | **1** : 0xFFFF…FFFF : 1 | trap（128 位商放不进 64 位） |
+| 2 对照 | 0 : 100 : 7 | 商 **14**、余 **2** |
+
+#### 611.3 证据
+
+- Windows：模式 0/1 都是 `-1073741795`（= `0xC000001D`）且无输出；对照 `rc=0`（`rax=14 rdx=2`）；
+- Linux：模式 0/1 都是 `rc=132`（SIGILL）；对照 `rc=0` + 输出对；
+- `tools/harness.ps1` ⇒ `[OK  ] harness: DIV/IDIV traps (#DE -> ud2): divide-by-zero and quotient-overflow both abort; control gives 14 rem 2`；
+- `tools/e2e_elf_image.sh --strict` ⇒ `[OK  ] #611 DIV/IDIV traps: ... both SIGILL (132); control gives 14 rem 2`，整体 OK；
+- `go test ./internal/vm/ -run TestRefDivFaultsMatchHardGate` ⇒ PASS。
+
+#### 611.4 未做项（**本轮明确收口，不再往下拆**）
+
+这一面的"随机对拍覆盖面"到此为止：安全除法进随机对拍（`#610`）、trap 除法进程级断言（本条）。
+仍在册的只有原本就有的两条：
+
+- aarch64 在 CI 上仍 `[SKIP]`（交叉工具链不产 DT_RELR）—— 要动 CI 工具链，属基础设施改动；
+- 更广的指令面（PUSH/POP、CALL/CALLR、FP、ATOMIC、嵌套循环）—— **按需再扩**，不再为"覆盖面"单独开轮。
+
+**互指**：本条结清 `#610.5`；三处断言的模板来自 `#607/#608`（客户机栈守卫）。
 
 
 

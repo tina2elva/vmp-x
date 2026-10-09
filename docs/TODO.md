@@ -1246,9 +1246,10 @@ EOF
 - [x] **DIV/IDIV 已进随机对拍（安全输入部分）**（`STATUS #610`，提交 `e3f97ae`）：只喂**不会 trap** 的输入
       （RDX=0、RAX 小正数、除数非零常数、除数寄存器只从 {1,3,5} 挑）⇒ 商必然放得下；实测 477 条 DIV、
       8919 用例 0 不一致。
-- [ ] **trap 类除法（除零/商溢出）的对拍**：批量对拍是"一个进程跑几千条"，一条 trap 就全挂 ⇒
-      需要"一条用例一个进程"的设计（可参照 `rsp_guard_probe.c` 的进程级断言 + Linux 侧精确硬门码）。
-- [x] **"DT_RELR 表落在加密范围内 ⇒ 拒绝"的 committed 负例 —— 已落地（`STATUS #605`，提交 `c6d0cb4`）**：判据顺序改为先查表位置再解码；夹具把 DT_RELR 指向 `.rodata` 的 relr_tbl 并写成能干净解码的条目；断言 rc≠0 + 不落产物 + ASCII 关键字；关掉守卫 ⇒ 打包被接受（MISMATCH，能红）。（原登记如下）
+- [x] **trap 类除法（除零/商溢出）的对拍 —— 已落地（`STATUS #611`，提交 `58fb491`）**：用**进程级断言**钉两侧 ——
+      `stub/win/x64/div_trap_probe.c`（三个程序：除零/商溢出/对照）+ `tools/harness.ps1`（Windows：异常终止且无输出）
+      + `tools/e2e_elf_image.sh`（Linux：精确 `rc=132` = SIGILL）+ Go 侧 `TestRefDivFaultsMatchHardGate`（参考实现必须 panic）。
+      **随机对拍的覆盖面到此收口，不再往下拆**：更广的指令面（PUSH/POP、CALL、FP、ATOMIC、嵌套循环）按需再扩。
       需要构造一个 `.relr.dyn` 落在可加密范围里的目标，断言 `rc≠0` + 不落产物 + 信息含 `DT_RELR 表`。
 - [ ] **诊断/打包脚本的纪律（`STATUS #603.6`）**：① 任何探针先打印"未解引用的值"再解引用（本轮被自己插错的诊断骗到 SIGBUS）；
       ② 任何 `vmpbuild` 调用都必须检查退出码 —— 编译失败 + 旧 blob = 假结论（本轮的单变量实验就白跑了一轮）。
