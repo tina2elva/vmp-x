@@ -2567,11 +2567,15 @@ static int vm_run_inner(vm_ctx_t *vm, u64 rsp_start) {
 #ifndef VM_GUEST_ARM64
         /* 只对 x86-64 客户机生效：ARM64 客户机的 SP 用法与 VM_MARGIN（宿主侧常量）不是一个口径，
          * 直接套用会让 arm64 客户机差分误报（CI 上确实被它抓到过一次）。 */
-        if (rsp_start - vm->regs[VRSP] > (u64)VM_MARGIN) {
-            return 99; /* 压栈越过给它的栈下界 */
-        }
+        /* **顺序要紧**（STATUS #608）：必须先判"SP 高过进入值"。
+         * 反过来的话，SP 高过进入值时 `rsp_start - SP` 在无符号下会**下溢**成 ≈2^64 ⇒ 先命中
+         * 下面那条（99）⇒ 这条 97 永远走不到（实测：删掉它行为完全不变；Linux 侧 rc 报的是 99）。
+         * 调序之后：SP 高过进入值 ⇒ 97；SP 低于下界 ⇒ 99（此时 SP <= rsp_start，减法不下溢）。 */
         if (vm->regs[VRSP] > rsp_start) {
             return 97; /* 弹出过多：SP 高过进入值（返回地址会取错，进而跳到任意地址） */
+        }
+        if (rsp_start - vm->regs[VRSP] > (u64)VM_MARGIN) {
+            return 99; /* 压栈越过给它的栈下界 */
         }
 #endif
         /* 跑出字节码末尾 = 这个函数没有以 RET 收尾 —— 不是正常返回，走硬门（见 vm_fail_closed）。

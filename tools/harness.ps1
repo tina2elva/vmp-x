@@ -44,10 +44,11 @@ Write-Host "[OK  ] harness: interpreter semantics (real vm_interp.c, hand-writte
 # it fine. Diagnosed as DELIBERATE fail-closed behaviour, not a bug:
 #     vm_interp.c:  if (rsp_start - vm->regs[VRSP] > VM_MARGIN) return 99;  // stack below its floor
 #                   if (vm->regs[VRSP] > rsp_start)             return 97;  // SP above entry
-# Measured (STATUS #607.2): with SP above entry the UNDERFLOWED first check fires, so the code is 99,
-# NOT 97 -- i.e. the 97 branch is unreachable (dead). Two independent proofs: removing the 97 branch
-# changes mode 0 not at all, and on Linux mode 0 exits with 99. This probe therefore asserts only
-# "abnormal exit + no output"; it does not name 97.
+# Measured (STATUS #607.2): with SP above entry the UNDERFLOWED first check used to fire first, so the
+# code was 99 and the 97 branch was unreachable (dead). STATUS #608 fixed the ORDER (97 first), so 97
+# is reachable again. This Windows probe can only assert "abnormal exit + no output" (ud2 carries no
+# code); the exact-code assertion (rc=97) lives in tools/e2e_elf_image.sh, where the Linux hard gate
+# encodes the code in the exit status.
 # mode 0: write the guest SP ABOVE its entry value -> expect an abnormal exit (0xC000001D) and
 #         NO output at all (the program must not reach its own printf).
 # mode 1: write the SP EQUAL to the entry value -> expect a clean run printing rc=0 (this proves
@@ -73,5 +74,5 @@ if ($rc0 -ne $trapCode -or $g0.Trim().Length -ne 0) {
     Write-Host ("[!] harness: rsp guard (mode 0) did NOT trap as expected: rc=" + $rc0 + " out=" + $g0)
     exit 1
 }
-Write-Host "[OK  ] harness: guest-stack guard (SP above entry -> hard gate/ud2, code 99 in practice; SP == entry -> runs)"
+Write-Host "[OK  ] harness: guest-stack guard (SP above entry -> hard gate/ud2; SP == entry -> runs)"
 exit 0

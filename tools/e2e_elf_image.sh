@@ -1217,6 +1217,23 @@ PY
 fi
 
 
+# ---- 客户机栈守卫（rc=97）：**精确硬门码**的回归（STATUS #608）----
+# 只有 Linux 侧能断言"命中的是哪一条"：Linux 的硬门是 exit_group(0xC0DE0000|code)，低 8 位就是 code；
+# Windows 的 ud2 不带码（那边 tools/harness.ps1 只断言"异常终止且无输出"）。
+# 来由：#607 发现 97 那条判据**永远走不到**（SP 高过进入值时前一条减法无符号下溢，先命中 99）；
+# #608 把两条判据调序。这条断言在调序之前会红（那时报 99）—— 校准内建在断言里。
+if [ -z "$QEMU" ] && [ "${GOARCH_TARGET}" = "amd64" ]; then
+    echo "[*] guest-stack guard: the hard-gate code for SP-above-entry must be 97 (STATUS #608)"
+    gcc -O1 -w -DVM_BLOB_TARGET_LINUX=1 -I stub/win/x64 -o build/rsp_guard_linux \
+        stub/win/x64/rsp_guard_probe.c stub/win/x64/vm_crypto.c stub/win/x64/vm_kdf.c stub/linux/amd64/vm_entry_asm.S \
+        || fail "build the guest-stack guard probe (Linux)"
+    RSP_CTL_RC=0; ./build/rsp_guard_linux 1 >/dev/null 2>&1 || RSP_CTL_RC=$?
+    RSP_GATE_RC=0; ./build/rsp_guard_linux 0 >/dev/null 2>&1 || RSP_GATE_RC=$?
+    [ "$RSP_CTL_RC" -eq 0 ] || fail "guest-stack guard control (SP == entry) must exit 0, got rc=$RSP_CTL_RC"
+    [ "$RSP_GATE_RC" -eq 97 ] || fail "SP above entry must hit hard gate 97, got rc=$RSP_GATE_RC (99 = the dead-branch ordering came back -- see STATUS #608)"
+    echo "[OK  ] #608 guest-stack guard: SP above entry -> hard gate 97 (reachable), SP == entry -> rc=0"
+fi
+
 # ---- RELR（DT_RELR）在 aarch64 上的端到端 ----（STATUS #603.5 登记的唯一缺口）
 # 与 amd64 那块**同一套断言**，只是夹具用交叉 gcc、产物经 qemu 跑：
 #   夹具必须真的带 DT_RELR；带 DT_RELR + 要加密范围 ⇒ 打包成功，且产物与原生逐字节一致。
