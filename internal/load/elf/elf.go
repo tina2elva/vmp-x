@@ -782,10 +782,12 @@ func (f *File) DynRelocs() ([]Reloc, error) {
 // DT_RELA/DT_RELASZ 找表），根本没有 RELR 还原路径。于是"记进应用表 ⇒ 运行期可还原"这条
 // 推理对 RELR **不成立**，放行它等于产出一个运行期必然硬门的坏产物。
 //
-// 所以本包**不做 RELR 解码**（解码器曾经写错过三处：bitmap 之后缺 base += 63*8、首个 bitmap 的
-// base 应是 addr+8、裸地址条目本身也是一条重定位；评审用真实产物对照 readelf：readelf 解出 203 条，
-// 当时的解码器只给 202 条、去重 68 条、139 条重复、>= 0x5970 的条目全丢）。打包端改为
-// "带 DT_RELR 且要加密任何范围 ⇒ 直接拒绝打包"，不依赖解码正确性。RELR 支持登记为后续项。
+// 所以打包端现在仍是"带 DT_RELR 且要加密任何范围 ⇒ 直接拒绝打包"，不依赖解码正确性。
+//
+// **注意（STATUS #603）**：本包现在**有**一个经过校准的解码器 RelrRelocs（算法与 readelf 逐项对齐），
+// 但它**还没有对应的运行期还原路径** —— 只有等 stub 的应用器学会 RELR 语义（addend = *slot - delta）
+// 之后，打包端才允许把这批槽位放进加密范围。在那之前拒绝策略不变：宁可拒绝，也不交付运行期必硬门的
+// 坏产物。旧的错误解码器（对照 readelf：203 条它只给 202、去重 68、139 重复、>= 0x5970 全丢）已删除。
 func (f *File) HasRELR() (bool, error) {
 	ents, err := f.DynamicEntries()
 	if err != nil {
@@ -804,6 +806,114 @@ func (f *File) HasRELR() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// RelrEntrySize 是 DT_RELR 的条目尺寸（ELF64：恒为 8 字节）。
+const RelrEntrySize = 8
+
+// RelrRelocs 解码 DT_RELR（压缩相对重定位，.relr.dyn），返回**每一条被重定位的槽位**。
+//
+// 为什么单独一个函数（不塞进 DynRelocs）：RELR 的条目**不写类型**（按架构隐含 R_*_RELATIVE）、
+// 也**不写 r_addend**（加数在槽位里 ⇒ ImplicitAddend）—— 它的"能不能还原"与显式 addend 的表
+// 是两回事，运行期应用器要为它走另一条还原路径（addend = *slot - delta）。分开之后，调用方可以
+// 一边继续拒绝显式表里的隐式 addend，一边单独决定 RELR 怎么处理。
+//
+// 解码算法（**已与 readelf 逐项对齐**；见 tools/e2e_elf_image.sh 的 RELR 块与 STATUS #601/#602）：
+//
+//	条目为偶数 ⇒ 它**本身就是**一个槽位地址；base = 条目 + 8
+//	条目为奇数 ⇒ 位图：bit i（i = 1..63）置位 ⇒ 槽位 base + (i-1)*8；之后 base += 63*8
+//
+// 这个算法正是 #600.5 记的三处旧缺陷要避免的（bitmap 之后缺 base += 63*8、首个 bitmap 的 base 应为
+// addr+8、裸地址条目本身也是一条重定位却被丢掉）。真实夹具上的对照：条目 [0x3d78, 0x3, 0x80001]
+// ⇒ 槽位 {0x3d78, 0x3d80, 0x4008}，与 readelf -rW 完全一致（见 RelrRelocs 的单测）。
+//
+// fail-closed：条目尺寸不是 8、表越界/不是 8 的整数倍、或解出的槽位不在任何 PT_LOAD 内 ⇒ 报错，
+// 绝不返回"半张表"（少一条就可能让打包端放行一个运行期还原不了的槽位）。
+func (f *File) RelrRelocs() ([]Reloc, error) {
+	ents, err := f.DynamicEntries()
+	if err != nil {
+		return nil, err
+	}
+	var addr, size, ent uint64
+	for _, e := range ents {
+		switch e.Tag {
+		case DT_RELR:
+			addr = e.Val
+		case DT_RELRSZ:
+			size = e.Val
+		case DT_RELRENT:
+			ent = e.Val
+		}
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	if addr == 0 {
+		return nil, fmt.Errorf("DT_RELRSZ=0x%X 但没有 DT_RELR 表地址", size)
+	}
+	if ent != 0 && ent != RelrEntrySize {
+		return nil, fmt.Errorf("DT_RELRENT=%d，本包只支持 %d（ELF64）", ent, RelrEntrySize)
+	}
+	if size%RelrEntrySize != 0 {
+		return nil, fmt.Errorf("DT_RELRSZ=0x%X 不是 %d 的整数倍", size, RelrEntrySize)
+	}
+	if size > 1<<24 {
+		return nil, fmt.Errorf("DT_RELRSZ=0x%X 过大（疑似损坏）", size)
+	}
+	off, err := f.VAtoOffset(addr)
+	if err != nil {
+		return nil, fmt.Errorf("DT_RELR 表 VA 0x%X：%w", addr, err)
+	}
+	if uint64(off)+size > uint64(len(f.Data)) {
+		return nil, fmt.Errorf("DT_RELR 表越界（off=0x%X size=0x%X 文件 0x%X）", off, size, len(f.Data))
+	}
+	want, werr := relativeRelocType(f.Machine)
+	if werr != nil {
+		return nil, werr
+	}
+	var out []Reloc
+	var base uint64
+	for o := uint64(0); o < size; o += RelrEntrySize {
+		e := binary.LittleEndian.Uint64(f.Data[uint64(off)+o:])
+		if e&1 == 0 {
+			if err := f.checkRelrSlot(e); err != nil {
+				return nil, err
+			}
+			out = append(out, Reloc{Offset: e, Type: want, ImplicitAddend: true})
+			base = e + RelrEntrySize
+			continue
+		}
+		for i := uint(1); i < 64; i++ {
+			if e&(uint64(1)<<i) == 0 {
+				continue
+			}
+			slot := base + uint64(i-1)*RelrEntrySize
+			if err := f.checkRelrSlot(slot); err != nil {
+				return nil, err
+			}
+			out = append(out, Reloc{Offset: slot, Type: want, ImplicitAddend: true})
+		}
+		base += 63 * RelrEntrySize
+	}
+	return out, nil
+}
+
+// checkRelrSlot 是"解码失步"的兜底：解出的槽位必须 8 字节对齐，且完整落在某个 PT_LOAD 内。
+// 算法写错时槽位会跑到镜像之外 —— 宁可在这里报错，也不要交出一张错的表（#600.5 的三处旧缺陷
+// 都会以"槽位跑到别处"的形式出现）。
+func (f *File) checkRelrSlot(va uint64) error {
+	if va%RelrEntrySize != 0 {
+		return fmt.Errorf("DT_RELR 解出的槽位 0x%X 不是 %d 字节对齐（解码失步？）", va, RelrEntrySize)
+	}
+	for _, p := range f.Progs {
+		if p.Type != PT_LOAD {
+			continue
+		}
+		if va >= p.Vaddr && va+RelrEntrySize <= p.Vaddr+p.Memsz {
+			return nil
+		}
+	}
+	return fmt.Errorf("DT_RELR 解出的槽位 0x%X 不在任何 PT_LOAD 内（解码失步？）", va)
 }
 
 // readRelTable 读一张由 (VA, size, 条目尺寸) 描述的动态重定位表。

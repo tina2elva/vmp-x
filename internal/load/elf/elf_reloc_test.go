@@ -419,3 +419,228 @@ func TestRelativeRelocsRealPIE(t *testing.T) {
 	}
 	t.Skip("需要 build/pie_target（GOOS=linux GOARCH=amd64 go build -buildmode=pie）")
 }
+
+// ---- RELR（DT_RELR 压缩相对重定位）----
+//
+// 这些用例是"契约测试先行"的第一块：运行期应用器还没实现（打包端目前仍然拒绝带 DT_RELR 的目标），
+// 但**解码语义必须先钉死** —— 它是打包端判断"这些槽位能不能进加密范围"的唯一依据。
+
+// synthRelr 造一个只带 DT_RELR 的最小 ET_DYN：entries 就是 .relr.dyn 里的原始条目。
+// PT_LOAD 覆盖 [loadVA, loadVA+0x3000)，因此条目解出的槽位必须落在这个区间内。
+func synthRelr(t *testing.T, loadVA uint64, entries []uint64) []byte {
+	t.Helper()
+	const dynOff = uint64(0x1000)
+	const relrOff = uint64(0x2000)
+	const fileSize = uint64(0x3000)
+	data := make([]byte, fileSize)
+
+	copy(data[0:], []byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0})
+	binary.LittleEndian.PutUint16(data[16:], ET_DYN)
+	binary.LittleEndian.PutUint16(data[18:], EM_X86_64)
+	binary.LittleEndian.PutUint64(data[32:], 64)
+	binary.LittleEndian.PutUint16(data[52:], EhdrSize)
+	binary.LittleEndian.PutUint16(data[54:], PhdrSize)
+	binary.LittleEndian.PutUint16(data[56:], 2)
+	putPhdr := func(i int, typ, flags uint32, off, va, filesz, memsz uint64) {
+		o := 64 + i*PhdrSize
+		binary.LittleEndian.PutUint32(data[o:], typ)
+		binary.LittleEndian.PutUint32(data[o+4:], flags)
+		binary.LittleEndian.PutUint64(data[o+8:], off)
+		binary.LittleEndian.PutUint64(data[o+16:], va)
+		binary.LittleEndian.PutUint64(data[o+24:], va)
+		binary.LittleEndian.PutUint64(data[o+32:], filesz)
+		binary.LittleEndian.PutUint64(data[o+40:], memsz)
+		binary.LittleEndian.PutUint64(data[o+48:], PageAlign)
+	}
+	putPhdr(0, PT_LOAD, PF_R|PF_W, 0, loadVA, fileSize, fileSize)
+	putPhdr(1, PT_DYNAMIC, PF_R, dynOff, loadVA+dynOff, 0x100, 0x100)
+
+	i := 0
+	putDyn := func(tag, val uint64) {
+		o := int(dynOff) + i*16
+		binary.LittleEndian.PutUint64(data[o:], tag)
+		binary.LittleEndian.PutUint64(data[o+8:], val)
+		i++
+	}
+	putDyn(DT_RELR, loadVA+relrOff)
+	putDyn(DT_RELRSZ, uint64(len(entries))*RelrEntrySize)
+	putDyn(DT_RELRENT, RelrEntrySize)
+	putDyn(DT_NULL, 0)
+	for k, e := range entries {
+		binary.LittleEndian.PutUint64(data[int(relrOff)+k*RelrEntrySize:], e)
+	}
+	return data
+}
+
+// relrSlots 解码并返回槽位地址；顺带断言每一条都标着隐式 addend（否则它会被喂进
+// NormalizeRelocSlots 并**清零真实槽位** —— 那正是 #597 复评 R3 抓到的缺陷形态）。
+func relrSlots(t *testing.T, data []byte) []uint64 {
+	t.Helper()
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	rs, err := f.RelrRelocs()
+	if err != nil {
+		t.Fatalf("RelrRelocs: %v", err)
+	}
+	out := make([]uint64, 0, len(rs))
+	for _, r := range rs {
+		if !r.ImplicitAddend {
+			t.Fatalf("RELR 条目必须标成隐式 addend（槽位 0x%X）", r.Offset)
+		}
+		out = append(out, r.Offset)
+	}
+	return out
+}
+
+// TestRelrGoldenVectorAgainstReadelf 是本条最要紧的一条：**向量来自真实产物**
+// （Ubuntu binutils 2.46 链接的 PIE，readelf -rW 的输出）：
+//
+//	Relocation section '.relr.dyn' ... contains 3 entries which relocate 3 locations:
+//	0000:  0000000000003d78  0000000000003d78  __frame_dummy_init_array_entry
+//	0001:  0000000000000003  0000000000003d80  __do_global_dtors_aux_fini_array_entry
+//	0002:  0000000000080001  0000000000004008  __dso_handle
+//
+// 条目 [0x3d78, 0x3, 0x80001] ⇒ 槽位 {0x3d78, 0x3d80, 0x4008}。三处旧缺陷任何一个回来这里就红：
+// 缺 base += 63*8 ⇒ 第三个槽位错；首个 bitmap 的 base 不是 addr+8 ⇒ 第二个槽位错；
+// 丢掉裸地址条目 ⇒ 少第一条。tools/e2e_elf_image.sh 里还有一条同算法的 readelf 对账（CI 侧）。
+func TestRelrGoldenVectorAgainstReadelf(t *testing.T) {
+	const loadVA = 0x3000 // 覆盖 0x3000..0x6000，容得下这三个槽位
+	got := relrSlots(t, synthRelr(t, loadVA, []uint64{0x3d78, 0x3, 0x80001}))
+	want := []uint64{0x3d78, 0x3d80, 0x4008}
+	if len(got) != len(want) {
+		t.Fatalf("解出 %d 个槽位 %v，期望 %d 个 %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("第 %d 个槽位 = 0x%X，期望 0x%X（整组：%v）", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestRelrBitmapWindows：位图窗口的算术 —— 一条地址条目 + 两个位图。第二个位图必须从
+// **第一个窗口推进 63*8 之后**开始（这正是旧解码器漏掉的那一步）。
+func TestRelrBitmapWindows(t *testing.T) {
+	const loadVA = uint64(0x400000)
+	addr := loadVA + 0x1000
+	// bit0 是"这是位图"的标志位，数据位从 bit1 开始；slot = base + (bit-1)*8
+	d1 := (uint64(1)<<1 | uint64(1)<<3) | 1
+	d2 := (uint64(1) << 1) | (uint64(1) << 63) | 1
+	got := relrSlots(t, synthRelr(t, loadVA, []uint64{addr, d1, d2}))
+	base2 := addr + 8 + 63*8 // 第一个位图窗口之后
+	want := []uint64{
+		addr,             // 地址条目本身
+		addr + 8,         // bit1：base + 0
+		addr + 8 + 2*8,   // bit3：base + (3-1)*8
+		base2,            // 第二个窗口的 bit1
+		base2 + (63-1)*8, // 第二个窗口的 bit63
+	}
+	if len(got) != len(want) {
+		t.Fatalf("解出 %d 个槽位 %v，期望 %d 个 %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("第 %d 个槽位 = 0x%X，期望 0x%X（整组：%v）", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestRelrRelocsFailsClosed：解码器坏了/表坏了必须**报错**，绝不能返回半张表
+// （少一条就可能让打包端放行一个运行期还原不了的槽位）。改坏任一处 ⇒ 用例红。
+func TestRelrRelocsFailsClosed(t *testing.T) {
+	const loadVA = uint64(0x400000)
+	relrENT := 0x1000 + 2*16 + 8 // 动态表里 DT_RELRENT 的值
+	relrSZ := 0x1000 + 1*16 + 8  // DT_RELRSZ 的值
+
+	t.Run("DT_RELRENT 不是 8", func(t *testing.T) {
+		d := synthRelr(t, loadVA, []uint64{loadVA + 0x1000})
+		binary.LittleEndian.PutUint64(d[relrENT:], 16)
+		f, err := Parse(d)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if _, rerr := f.RelrRelocs(); rerr == nil {
+			t.Fatal("DT_RELRENT=16 时必须报错")
+		}
+	})
+
+	t.Run("DT_RELRSZ 不是 8 的整数倍", func(t *testing.T) {
+		d := synthRelr(t, loadVA, []uint64{loadVA + 0x1000})
+		binary.LittleEndian.PutUint64(d[relrSZ:], 12)
+		f, err := Parse(d)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if _, rerr := f.RelrRelocs(); rerr == nil {
+			t.Fatal("DT_RELRSZ=12 时必须报错")
+		}
+	})
+
+	t.Run("槽位落在 PT_LOAD 之外", func(t *testing.T) {
+		// 0x900000 是个合法地址但不在镜像里 —— 解码失步时正是这个形态。
+		d := synthRelr(t, loadVA, []uint64{0x900000})
+		f, err := Parse(d)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if _, rerr := f.RelrRelocs(); rerr == nil {
+			t.Fatal("槽位不在任何 PT_LOAD 内时必须报错")
+		}
+	})
+
+	t.Run("有 RELRSZ 没有 RELR 地址", func(t *testing.T) {
+		d := synthRelr(t, loadVA, []uint64{loadVA + 0x1000})
+		relrADDR := 0x1000 + 0*16 + 8 // DT_RELR 的值
+		binary.LittleEndian.PutUint64(d[relrADDR:], 0)
+		f, err := Parse(d)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if _, rerr := f.RelrRelocs(); rerr == nil {
+			t.Fatal("DT_RELRSZ 非 0 但 DT_RELR=0 时必须报错")
+		}
+	})
+
+	t.Run("DT_RELRENT=0 按 8 处理（规格默认）", func(t *testing.T) {
+		d := synthRelr(t, loadVA, []uint64{loadVA + 0x1000})
+		binary.LittleEndian.PutUint64(d[relrENT:], 0)
+		if got := relrSlots(t, d); len(got) != 1 || got[0] != loadVA+0x1000 {
+			t.Fatalf("DT_RELRENT=0 时应按 8 处理，解出 %v", got)
+		}
+	})
+}
+
+// TestRelrRelocsStayOutOfRelativeRelocs：RELR 的条目**不能**混进 RelativeRelocs ——
+// 那条路会把 Addend（隐式 addend 恒为 0）**写回槽位**，等于把真实槽位清零（#597 复评 R3）。
+// 这条同时钉住管线的另一半：打包端守卫 2 仍然按"隐式 addend"拒绝显式表里的这类条目，
+// 而 RELR 走的是 RelrRelocs 这条独立的路。
+func TestRelrRelocsStayOutOfRelativeRelocs(t *testing.T) {
+	const loadVA = uint64(0x400000)
+	d := synthRelr(t, loadVA, []uint64{loadVA + 0x1000, (uint64(1)<<1 | uint64(1)<<2) | 1})
+	f, err := Parse(d)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	relr, err := f.RelrRelocs()
+	if err != nil {
+		t.Fatalf("RelrRelocs: %v", err)
+	}
+	if len(relr) != 3 {
+		t.Fatalf("期望 3 条 RELR 槽位（1 地址 + 2 位图），得到 %d", len(relr))
+	}
+	all, err := f.DynRelocs()
+	if err != nil {
+		t.Fatalf("DynRelocs: %v", err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("DynRelocs 不应返回 RELR 条目（策略未变），得到 %+v", all)
+	}
+	rel, err := f.RelativeRelocs()
+	if err != nil {
+		t.Fatalf("RelativeRelocs: %v", err)
+	}
+	if len(rel) != 0 {
+		t.Fatalf("RELR 条目绝不能出现在 RelativeRelocs 里（会被 NormalizeRelocSlots 清零），得到 %+v", rel)
+	}
+}
