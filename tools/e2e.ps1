@@ -804,6 +804,20 @@ if ($LASTEXITCODE -ne 0) {
             if ($scTestTail.Length -gt 300) { $scTestTail = $scTestTail.Substring($scTestTail.Length - 300) }
             if (($scTestRc -eq 0) -and $scRan) { $pass++ }
             else { $fail++; $failLines += "E2EFAIL keywrap/selfcheck-predicate-test: the tagged predicate test did not report --- PASS (rc=" + $scTestRc + " ran=" + $scRan + "): " + $scTestTail }
+            # 13f) 随机差分：**随机字节码程序**在 C 解释器与 Go 参考 VM 下必须逐位一致。
+            #      与"单条指令 × 边界值"互补 —— 解释器的坑大多在指令序列里（上一条改写寄存器/标志后
+            #      下一条读到；#599 的静默错值就是循环体里多条指令的组合）。400 条程序、固定 seed、约 1 秒。
+            #      这里**显式**跑一次：默认 go test 只有在 build/vm_interp.bin 与 build/runbc.exe 都在时
+            #      才会跑它，而本步骤正好在两者都建好之后（这条纪律见 STATUS #602）。
+            CaseBanner "diff/random-programs-vs-go-refvm"
+            $dpOut = (go test -run TestConformanceAgainstCInterpreter -v ./internal/vm 2>&1 | Out-String)
+            $dpRc = $LASTEXITCODE
+            # 必须断言它**真的执行了**：SKIP（缺产物）会打印 "--- SKIP:"，不能算通过。
+            $dpRan = ($dpOut -match "--- PASS: TestConformanceAgainstCInterpreter")
+            $dpTail = ($dpOut -replace '\s+', ' ').Trim()
+            if ($dpTail.Length -gt 300) { $dpTail = $dpTail.Substring($dpTail.Length - 300) }
+            if (($dpRc -eq 0) -and $dpRan) { $pass++ }
+            else { $fail++; $failLines += "E2EFAIL diff/random-programs-vs-go-refvm: rc=" + $dpRc + " ran=" + $dpRan + ": " + $dpTail }
             # 14) C 侧的密钥名规则（A1）：编译**真的** stub/win/x64/vm_interp.c 并调用它的
             #     vm_ncrypt_keyname_ok()。keyname_probe.c include 的是那份源文件本体（不是副本），
             #     所以改坏 vm_interp.c 里那条规则会让这个探针红；Go 侧的镜像断言在

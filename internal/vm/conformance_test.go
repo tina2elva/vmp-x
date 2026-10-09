@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -18,6 +20,9 @@ const (
 type confCase struct {
 	name string
 	code []byte
+	// raw 是**重映射之前**的字节码（默认操作码表）。带随机操作码的 blob 会把 code 换成实际编码，
+	// 于是 DisasmAll(code) 会印出一堆 UNKNOWN —— 定位失败用例时要用 raw 才看得懂。
+	raw  []byte
 	regs [18]uint64
 }
 
@@ -179,7 +184,122 @@ func genCases() []confCase {
 		cases = append(cases, confCase{name: fmt.Sprintf("STORE w=%d", w), code: code, regs: regs})
 	}
 
+	// 8) **随机指令序列**（固定 seed ⇒ 可复现）。固定集合只覆盖"单条指令 × 边界值"，
+	//    而解释器的坑大多在**序列**里（上一条改写寄存器/标志后，下一条读到）——#599 的静默错值
+	//    就是循环体里多条指令的组合。随机程序由 C 解释器与 Go 参考 VM 各自跑一遍，逐位对拍。
+	cases = append(cases, genRandomCases(1, randProgramCount)...)
 	return cases
+}
+
+// randProgramCount 是随机程序条数。数量取"够密但不拖慢门禁"：每条 6~20 条指令，
+// 批量对拍一次跑完（现有的固定用例本来就是几千条）。
+const randProgramCount = 400
+
+// genRandomCases 生成随机字节码程序。seed 固定 ⇒ 每次跑的是**同一批**程序（失败可复现）；
+// 换 seed 就能扩展覆盖面（将来想 nightly 跑更多，直接调这个函数即可）。
+func genRandomCases(seed int64, n int) []confCase {
+	rng := rand.New(rand.NewSource(seed))
+	var cases []confCase
+	for i := 0; i < n; i++ {
+		code, regs := randProgram(rng)
+		cases = append(cases, confCase{
+			name: fmt.Sprintf("rnd#%d(seed=%d)", i, seed),
+			code: code,
+			regs: regs,
+		})
+	}
+	return cases
+}
+
+// randImm 偏置到"边界值 + 随机值"：边界值让进位/借位/符号边界更常被踩到，随机值补覆盖面。
+func randImm(rng *rand.Rand) uint64 {
+	edge := []uint64{0, 1, 0xFF, 0x100, 0x7FFF, 0x8000, 0xFFFFFFFF, 0x80000000,
+		0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF}
+	if rng.Intn(3) == 0 {
+		return edge[rng.Intn(len(edge))]
+	}
+	return rng.Uint64()
+}
+
+// randProgram 造一个随机程序：以 RET 结尾；所有分支的目标都回填到**末尾的 RET**
+// （于是控制流永远在程序内、且必然终止）；内存访问一律 base=r15(=batchBufBase)、无 index、
+// disp 落在批量对拍的 256 字节窗口内。故意不用 PUSH/POP/CALL/DIV/FP ——
+// 它们要么依赖批量 runner 没设的栈，要么会 trap 改变 rc 语义，不适合放进这条随机对拍。
+func randProgram(rng *rand.Rand) ([]byte, [18]uint64) {
+	const base = 15 // 与 genCases 里 LOAD/STORE 用的基址寄存器一致
+	// 故意**不含 RSP(4)**：程序里写客户机栈指针会让解释器走硬门（本轮实测：随机程序里一条
+	// MOV16 RSP, RAX 就让批量对拍以 0xC000001D 崩掉）。这条随机对拍的目标是**指令语义**，
+	// 不是"能不能乱改栈指针"，所以先把 RSP 从工作寄存器里拿掉；它作为独立问题登记。
+	work := []byte{0, 1, 2, 3, 5}
+	kinds := []byte{KAdd, KSub, KAnd, KOr, KXor, KMul, KShl, KShr, KSar, KRol, KRor, KAdc, KSbb}
+	unary := []byte{KUNeg, KUNot, KUInc, KUDec}
+	widths := []uint32{8, 16, 32, 64}
+	scales := []byte{1, 2, 4, 8}
+
+	var buf []byte
+	var patches []int
+	n := 6 + rng.Intn(15)
+	for i := 0; i < n; i++ {
+		d := work[rng.Intn(len(work))]
+		a := work[rng.Intn(len(work))]
+		b := work[rng.Intn(len(work))]
+		w := widths[rng.Intn(len(widths))]
+		switch rng.Intn(12) {
+		case 0:
+			buf = append(buf, OpMovRR, byte(w), d, a)
+		case 1:
+			buf = append(buf, OpMovRI, byte(w), d)
+			buf = append(buf, u64b(randImm(rng))...)
+		case 2:
+			buf = append(buf, OpMovRI32, d)
+			buf = append(buf, u32b(uint32(randImm(rng)))...)
+		case 3:
+			buf = append(buf, OpAluRR, kinds[rng.Intn(len(kinds))], byte(w), d, a, b)
+		case 4:
+			buf = append(buf, OpAluRI, kinds[rng.Intn(len(kinds))], byte(w), d, a)
+			buf = append(buf, u32b(uint32(randImm(rng)))...)
+		case 5:
+			buf = append(buf, OpAluU, unary[rng.Intn(len(unary))], byte(w), d, a)
+		case 6:
+			buf = append(buf, OpCmpRR, byte(KCmp), byte(w), a, b)
+		case 7:
+			buf = append(buf, OpCmpRI, byte(KCmp), byte(w), a)
+			buf = append(buf, u32b(uint32(randImm(rng)))...)
+		case 8: // LEA：窗口内的 base+disp
+			buf = append(buf, OpLea, byte(w), d, base, 0xFF, scales[rng.Intn(len(scales))])
+			buf = append(buf, u32b(uint32(rng.Intn(200)))...)
+		case 9: // LOAD：disp+w 必须落在 256 字节窗口内
+			kind := byte(rng.Intn(2))
+			buf = append(buf, OpLoad, kind, byte(w), d, base, 0xFF, 0)
+			buf = append(buf, u32b(uint32(rng.Intn(257-int(w))))...)
+		case 10: // STORE
+			buf = append(buf, OpStore, byte(w), base, 0xFF, 0)
+			buf = append(buf, u32b(uint32(rng.Intn(257-int(w))))...)
+			buf = append(buf, a)
+		case 11: // 分支：目标先占位，最后统一回填到末尾的 RET
+			if rng.Intn(2) == 0 {
+				buf = append(buf, OpJcc, byte(rng.Intn(16)))
+				patches = append(patches, len(buf))
+				buf = append(buf, 0, 0, 0, 0)
+			} else {
+				buf = append(buf, OpJmp)
+				patches = append(patches, len(buf))
+				buf = append(buf, 0, 0, 0, 0)
+			}
+		}
+	}
+	end := uint32(len(buf))
+	buf = append(buf, OpRet)
+	for _, p := range patches {
+		binary.LittleEndian.PutUint32(buf[p:], end)
+	}
+
+	var regs [18]uint64
+	for k := 0; k < 18; k++ {
+		regs[k] = randImm(rng)
+	}
+	regs[base] = batchBufBase
+	return buf, regs
 }
 
 type batchResult struct {
@@ -249,6 +369,7 @@ func TestConformanceAgainstCInterpreter(t *testing.T) {
 	buf = append(buf, u32b(uint32(len(cases)))...)
 	for i := range cases {
 		c := &cases[i]
+		c.raw = append([]byte(nil), c.code...)
 		if mapped, merr := Remap(c.code, oMap); merr == nil {
 			c.code = mapped
 		} else {
@@ -266,7 +387,38 @@ func TestConformanceAgainstCInterpreter(t *testing.T) {
 
 	out, err := exec.Command(runner, "batch", blob, fmt.Sprint(entry), casesPath, resPath).CombinedOutput()
 	if err != nil {
-		t.Fatalf("runbc batch 失败: %v | %s", err, string(out))
+		// 批量跑挂了（解释器走硬门 trap ⇒ ud2 / 崩溃）：用**二分**把"是哪一条"定位出来 ——
+		// 随机程序几百条，只报一句"batch 失败"等于没报。
+		// 注意**不能**用单条模式定位：那个入口要的是 .vmb 容器格式，不是裸字节码（本轮踩过）。
+		runPrefix := func(n int) error {
+			var b []byte
+			b = append(b, u32b(uint32(n))...)
+			for i := 0; i < n; i++ {
+				c := &cases[i]
+				b = append(b, u32b(uint32(len(c.code)))...)
+				for r := 0; r < 18; r++ {
+					b = append(b, u64b(c.regs[r])...)
+				}
+				b = append(b, c.code...)
+			}
+			if werr := os.WriteFile(casesPath, b, 0o644); werr != nil {
+				t.Fatal(werr)
+			}
+			_, e2 := exec.Command(runner, "batch", blob, fmt.Sprint(entry), casesPath, resPath).CombinedOutput()
+			return e2
+		}
+		lo, hi := 1, len(cases)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if runPrefix(mid) != nil {
+				hi = mid
+			} else {
+				lo = mid + 1
+			}
+		}
+		c := &cases[lo-1]
+		t.Fatalf("批量对拍失败（%v | %s）\n二分定位到第 %d 条 [%s]；它的原始字节码反汇编:\n%s",
+			err, string(out), lo-1, c.name, strings.Join(DisasmAll(c.raw), "\n"))
 	}
 
 	raw, err := os.ReadFile(resPath)
