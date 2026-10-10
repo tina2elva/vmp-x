@@ -1304,11 +1304,23 @@ int main(int argc, char **argv) {
     return 0;
 }
 EOF
-    "$A64RLR_CC" -fPIE -pie -O1 -Wl,-z,notext -Wl,-z,pack-relative-relocs -o build/elf_target_relr_a64 build/relr_a64.c \
-        || fail "build the aarch64 RELR fixture"
-    # 夹具校准：必须真的带 DT_RELR。CI 的交叉工具链**不产出** DT_RELR（-z pack-relative-relocs 没生效，
-    # 实测 linux-arm64 作业上夹具里没有该 tag）⇒ 按仓库约定醒目 SKIP（缺能力，不算通过）；本机（binutils 2.46）
-    # 上这条用例是真跑的。
+    # 夹具编译：**优先 clang+lld**（STATUS #612）。
+    # 为什么不用交叉 gcc：CI 镜像上那个 aarch64 binutils **不支持 RELR**，实测链接器只打印
+    #   "ld: warning: -z pack-relative-relocs ignored"
+    # 于是夹具里根本没有 DT_RELR、这条用例在 CI 上只能空转。lld 支持该特性（本机实测 clang 21 + lld 21
+    # 能正常产出 .relr.dyn）。两个链接器都试，谁能产出 DT_RELR 就用谁；都不能就按约定醒目 SKIP。
+    A64RLR_FIX=build/elf_target_relr_a64
+    rm -f "$A64RLR_FIX"
+    if command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1; then
+        clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu \
+            -fPIE -pie -O1 -Wl,-z,notext -Wl,-z,pack-relative-relocs \
+            -o "$A64RLR_FIX" build/relr_a64.c 2>/dev/null || rm -f "$A64RLR_FIX"
+    fi
+    if [ ! -f "$A64RLR_FIX" ]; then
+        "$A64RLR_CC" -fPIE -pie -O1 -Wl,-z,notext -Wl,-z,pack-relative-relocs -o "$A64RLR_FIX" build/relr_a64.c \
+            || fail "build the aarch64 RELR fixture (neither clang+lld nor the cross gcc could link it)"
+    fi
+    # 夹具校准：必须真的带 DT_RELR。两套链接器**都不产出**时按仓库约定醒目 SKIP（缺能力，不算通过）。
     if ! readelf -dW build/elf_target_relr_a64 | grep -q 'RELR'; then
         echo "[SKIP] aarch64 RELR: this cross toolchain does not emit DT_RELR (needs a linker that honours -z pack-relative-relocs)"
         RLR_A64_CAP=0
