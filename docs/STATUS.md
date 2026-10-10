@@ -11501,6 +11501,48 @@ C 侧是 `__builtin_trap()`，Go 侧是 `refDiv` 的 `panic`。
 - 更广的指令面（PUSH/POP、CALL/CALLR、FP、ATOMIC、嵌套循环）—— **按需再扩**，不再为"覆盖面"单独开轮。
 
 **互指**：本条结清 `#610.5`；三处断言的模板来自 `#607/#608`（客户机栈守卫）。
+### 613. aarch64 的 RELR 用例在 CI 上**真跑**了（结清 `#603.5`/`#604.5` 那条口子）
+
+**范围与 sha**：`a8cdb57`（第一次尝试）→ `40b77fb`（混合链接）→ `6670691`（CI 装 lld）。
+
+#### 613.1 根因链（三层，逐层用日志/实测钉死）
+
+1. CI 的 aarch64 交叉 binutils **不支持 RELR** —— 链接器只打 `ld: warning: -z pack-relative-relocs ignored`；
+2. ⇒ 夹具没有 `DT_RELR` ⇒ 那条校准断言把它判成"空转"并 **SKIP**（`#603.5`/`#604.5` 登记的缺口）；
+3. ⇒ 而 CI 的 arm64 作业**没装 clang/lld**（deps 只有 gcc/binutils-aarch64/qemu-user）⇒ 换链接器的路也走不通。
+
+#### 613.2 三次尝试（两次失败的原因都记下来了）
+
+- **① clang + `--sysroot`** ⇒ 失败：链不起来（bfd 找不到 `ld-linux-aarch64.so.1`；加 `--gcc-toolchain=/usr` 仍缺 `crtendS.o`）。
+  **正解是两个 `-B`**（交叉 gcc 的 crt 目录 + sysroot 的 lib），crt 目录用 `-print-file-name` 推导、不写死版本号。
+- **② 整条换成 clang** ⇒ 失败：clang 生成的 arm64 码里有 `EXTR` 等**提升器不支持的编码** ⇒ 打包直接 `[FAIL]`（"暂不支持的编码类"）。
+- **③ gcc 生成码 + lld 链接（混合）** ⇒ 成功：代码仍是提升器认的 gcc 码，只借 lld 的 RELR 打包能力。
+
+#### 613.3 CI 证据（决定性）
+
+run `38013512255`（三作业全绿）的 linux-arm64 日志里：
+
+```
+[*] aarch64 RELR fixture: linked with clang+lld
+[OK  ] #604 RELR (aarch64): DT_RELR target + encryptable ranges -> packs, and the product answers ...
+```
+
+⇒ 这条用例在 CI 上**从 SKIP 变成真跑**。
+
+#### 613.4 两条教训（本轮真金白银换的）
+
+1. **"能链上"不等于"走对了路"**：第一版漏了 `-fuse-ld=lld`，clang 静默退回不支持 RELR 的 bfd —— 链接成功但没 `DT_RELR`。
+   我当时还用 `2>/dev/null` 把 stderr 吞了，于是**"本机验证"其实是回退的 gcc 在起作用**，却以为修好了。
+   现在判据是"产出里真的有 DT_RELR"，且 clang 日志留在 `build/aarch64_relr_clang.log`。
+2. **失败信息必须说清"缺哪个前置"**：第二版只打一句 "(clang+lld path unavailable)"，害我多跑一轮 CI 才发现是 runner 没装 lld。
+   现在逐条报 `clang / ld.lld / crt 目录 / sysroot lib` 哪个缺。
+
+#### 613.5 未做项
+
+- 本条**无遗留**。CI 的 arm64 作业多装了 `clang + lld`（只影响**夹具链接**，blob 仍由交叉 gcc 产出）。
+- 仍在册的只有"按需再扩的指令面"（PUSH/POP、CALL、FP、ATOMIC、嵌套循环）—— 不为覆盖面单独开轮。
+
+**互指**：本条结清 `#604.5`；方法与 `#607/#608` 的进程级断言不同，但同样是"缺口必须真跑才算关闭"。
 
 
 
