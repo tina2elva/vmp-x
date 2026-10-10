@@ -1323,7 +1323,14 @@ EOF
     # **混合**：代码用交叉 gcc 编（提升器认 gcc 的码），只把**链接**交给 lld（拿到 RELR）。
     # 为什么不能整条换成 clang：本机实测 clang 生成的 arm64 码里有 EXTR 之类提升器不支持的编码 ⇒
     # 打包直接 [FAIL]（"暂不支持的编码类"）。所以只借 lld 的 RELR 打包能力。
-    if command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1 && [ -d "$A64CRT_DIR" ] && [ -d /usr/aarch64-linux-gnu/lib ]; then
+    # 前置条件**逐条报出缺哪个**：这一版第一轮就是"路径没走到但只打印一句话"，害我又跑了一轮 CI
+    # 才发现是 runner 上没装 lld（CI 的 deps 已补上 clang + lld）。
+    A64RLR_WHY=""
+    command -v clang >/dev/null 2>&1 || A64RLR_WHY="clang missing"
+    if [ -z "$A64RLR_WHY" ]; then command -v ld.lld >/dev/null 2>&1 || A64RLR_WHY="ld.lld missing (install the lld package)"; fi
+    if [ -z "$A64RLR_WHY" ]; then [ -d "$A64CRT_DIR" ] || A64RLR_WHY="cross crt dir not found ($A64CRT_DIR)"; fi
+    if [ -z "$A64RLR_WHY" ]; then [ -d /usr/aarch64-linux-gnu/lib ] || A64RLR_WHY="/usr/aarch64-linux-gnu/lib missing"; fi
+    if [ -z "$A64RLR_WHY" ]; then
         "$A64RLR_CC" -c -fPIE -O1 -o build/a64relr_fixture.o build/relr_a64.c >build/a64relr_clang.log 2>&1 && \
         clang --target=aarch64-linux-gnu -B"$A64CRT_DIR" -B/usr/aarch64-linux-gnu/lib \
             -fuse-ld=lld -fPIE -pie -Wl,-z,notext -Wl,-z,pack-relative-relocs \
@@ -1336,7 +1343,7 @@ EOF
     if [ ! -f "$A64RLR_FIX" ]; then
         "$A64RLR_CC" -fPIE -pie -O1 -Wl,-z,notext -Wl,-z,pack-relative-relocs -o "$A64RLR_FIX" build/relr_a64.c \
             || fail "build the aarch64 RELR fixture (neither clang+lld nor the cross gcc could link it)"
-        echo "[*] aarch64 RELR fixture: linked with $A64RLR_CC (clang+lld path unavailable)"
+        echo "[*] aarch64 RELR fixture: linked with $A64RLR_CC (clang+lld path unavailable: $A64RLR_WHY)"
     else
         echo "[*] aarch64 RELR fixture: linked with clang+lld"
     fi
