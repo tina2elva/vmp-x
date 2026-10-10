@@ -1305,20 +1305,40 @@ int main(int argc, char **argv) {
 }
 EOF
     # 夹具编译：**优先 clang+lld**（STATUS #612）。
-    # 为什么不用交叉 gcc：CI 镜像上那个 aarch64 binutils **不支持 RELR**，实测链接器只打印
-    #   "ld: warning: -z pack-relative-relocs ignored"
-    # 于是夹具里根本没有 DT_RELR、这条用例在 CI 上只能空转。lld 支持该特性（本机实测 clang 21 + lld 21
-    # 能正常产出 .relr.dyn）。两个链接器都试，谁能产出 DT_RELR 就用谁；都不能就按约定醒目 SKIP。
+    # 为什么不用交叉 gcc：CI 镜像上那个 aarch64 binutils **不支持 RELR**，链接器只打印
+    #   "ld: warning: -z pack-relative-relocs ignored" ⇒ 夹具没有 DT_RELR、用例只能空转。lld 支持该特性。
+    #
+    # 调用姿势是**试出来的**（本机实测，三种都试过）：
+    #   · 只给 --sysroot        ⇒ bfd 链接器报 cannot find ld-linux-aarch64.so.1 inside sysroot；
+    #   · 加 --gcc-toolchain=/usr ⇒ 仍 cannot open crtendS.o；
+    #   · **两个 -B**（交叉 gcc 的 crt 目录 + sysroot 的 lib）⇒ 成功并产出 DT_RELR。
+    # 所以这里用 -print-file-name 从交叉 gcc **推导** crt 目录（不写死版本号）。
+    #
+    # 判定"这条路径成功"的标准不是"能链上"，而是**产出里真的有 DT_RELR** —— 本机踩过：漏 -fuse-ld=lld
+    # 时 clang 会退回不支持 RELR 的 bfd，链接成功但没有 DT_RELR（我当时还把 stderr 吞了，于是"本机验证"
+    # 其实是回退的 gcc 在起作用 ⇒ CI 上仍然 SKIP）。现在失败/无 RELR 都在日志里可见。
     A64RLR_FIX=build/elf_target_relr_a64
     rm -f "$A64RLR_FIX"
-    if command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1; then
-        clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu \
-            -fPIE -pie -O1 -Wl,-z,notext -Wl,-z,pack-relative-relocs \
-            -o "$A64RLR_FIX" build/relr_a64.c 2>/dev/null || rm -f "$A64RLR_FIX"
+    A64CRT_DIR="$("$A64RLR_CC" -print-file-name=crtbeginS.o 2>/dev/null | xargs -r dirname)"
+    # **混合**：代码用交叉 gcc 编（提升器认 gcc 的码），只把**链接**交给 lld（拿到 RELR）。
+    # 为什么不能整条换成 clang：本机实测 clang 生成的 arm64 码里有 EXTR 之类提升器不支持的编码 ⇒
+    # 打包直接 [FAIL]（"暂不支持的编码类"）。所以只借 lld 的 RELR 打包能力。
+    if command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1 && [ -d "$A64CRT_DIR" ] && [ -d /usr/aarch64-linux-gnu/lib ]; then
+        "$A64RLR_CC" -c -fPIE -O1 -o build/a64relr_fixture.o build/relr_a64.c >build/a64relr_clang.log 2>&1 && \
+        clang --target=aarch64-linux-gnu -B"$A64CRT_DIR" -B/usr/aarch64-linux-gnu/lib \
+            -fuse-ld=lld -fPIE -pie -Wl,-z,notext -Wl,-z,pack-relative-relocs \
+            -o "$A64RLR_FIX" build/a64relr_fixture.o >>build/a64relr_clang.log 2>&1 || rm -f "$A64RLR_FIX"
+        if [ -f "$A64RLR_FIX" ] && ! readelf -dW "$A64RLR_FIX" | grep -q "RELR"; then
+            echo "[!] clang+lld produced no DT_RELR (log: build/a64relr_clang.log) -- falling back"
+            rm -f "$A64RLR_FIX"
+        fi
     fi
     if [ ! -f "$A64RLR_FIX" ]; then
         "$A64RLR_CC" -fPIE -pie -O1 -Wl,-z,notext -Wl,-z,pack-relative-relocs -o "$A64RLR_FIX" build/relr_a64.c \
             || fail "build the aarch64 RELR fixture (neither clang+lld nor the cross gcc could link it)"
+        echo "[*] aarch64 RELR fixture: linked with $A64RLR_CC (clang+lld path unavailable)"
+    else
+        echo "[*] aarch64 RELR fixture: linked with clang+lld"
     fi
     # 夹具校准：必须真的带 DT_RELR。两套链接器**都不产出**时按仓库约定醒目 SKIP（缺能力，不算通过）。
     if ! readelf -dW build/elf_target_relr_a64 | grep -q 'RELR'; then
